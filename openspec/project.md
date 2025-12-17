@@ -34,6 +34,11 @@ Walkie-songie is a P2P collaborative music application for creating real-time "c
 - Prefer explicit error handling over panics
 - Keep the library portion decoupled from the web app
 
+### Build Tooling
+- Use `trunk` (pure Rust) for wasm builds
+- If JS dependencies are unavoidable, use `pnpm` (never npm - security concerns)
+- Prefer Rust-based tooling over Node ecosystem where possible
+
 ### Architecture Patterns
 - **Library + App split**: Core functionality as a reusable library, web app as a thin client
 - **Streams-based**: Heavy use of Rust async streams for musical event flow
@@ -78,3 +83,5 @@ Ideas for future consideration, not yet ready to become change proposals:
 - **p2panda-net**: Full p2panda stack if we outgrow iroh-gossip+matchbox
 - **CRDT state sync**: Shared pitch class sets (union of all peers' active notes)
 - **Offline sync**: Catch up on musical events missed while disconnected
+- **Piano keyboard UI**: Integrate a web component for visual piano keyboard (will require pnpm for JS dep)
+- **Shared pitch class set mode**: Alternative to per-peer sets where all peers edit a single shared set directly (simpler model, different collaboration dynamic)
