@@ -86,11 +86,12 @@ This pattern is now **officially supported** in matchbox via the [custom_signall
 
 ```toml
 [dependencies]
-iroh = { version = "0.34", default-features = false }
-iroh-gossip = "0.34"
-matchbox_socket = "0.10"
+iroh = { version = "0.35", default-features = false }
+iroh-gossip = { version = "0.35", default-features = false, features = ["net"] }
+matchbox_socket = "0.13"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 ```
 
@@ -151,11 +152,11 @@ pub trait Channel {
 | matchbox Signaller trait is private | Issue #484 discusses making it public; can fork if needed |
 | API instability (both pre-1.0) | Pin versions, wrap in Channel trait |
 
-## Open Questions
+## Resolved Questions
 
-- [ ] Is matchbox Signaller trait public now, or need fork?
-- [ ] Bootstrap peers for iroh-gossip - use pre-shared keys or discovery?
-- [ ] App-level encryption needed beyond WebRTC's DTLS?
+- **Signaller trait**: Public since matchbox 0.10 via `SignallerBuilder` trait
+- **Bootstrap peers**: Pass iroh node ID as CLI arg / room URL; iroh's n0 discovery handles the rest
+- **Encryption**: WebRTC DTLS + iroh's QUIC encryption is sufficient for now
 
 ## Evolution Path
 
