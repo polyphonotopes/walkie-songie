@@ -143,10 +143,14 @@ fn hz_to_pitch_position(hz: f64, pitch_count: usize) -> f64 {
     }
 }
 
+/// Maximum allowed drag distance in semitones before snapping back.
+const MAX_DRAG_SEMITONES: i32 = 4;
+
 /// Create a piece indicator DOM element for a single piece.
 fn piece_indicator(state: Arc<AppState>, piece: Piece) -> Dom {
     let piece_id = piece.id.clone();
     let piece_id_for_move = piece.id.clone();
+    let piece_id_for_up = piece.id.clone();
     let original_pitch = piece.pitch;
     let tuning = state.tuning.lock_ref();
     let pitch_count = tuning.pitch_class_count();
@@ -160,93 +164,76 @@ fn piece_indicator(state: Arc<AppState>, piece: Piece) -> Dom {
         .attr("data-piece-id", &piece_id)
         .attr("data-key", &format!("{}", pitch_class)) // Snap to key position
         .attr("data-radius", "0.6") // Fixed radius for pieces
-        .attr("style", &format!(
-            "width: 32px; height: 32px; \
-             background: var(--manual); \
-             border-radius: 50%; \
-             cursor: grab; user-select: none; \
-             box-shadow: 0 0 12px var(--manual);"
-        ))
+        .attr("data-original-pitch", &original_pitch.to_string())
+        .style("width", "32px")
+        .style("height", "32px")
+        .style("background", "var(--manual)")
+        .style("border-radius", "50%")
+        .style("cursor", "grab")
+        .style("user-select", "none")
+        .style("box-shadow", "0 0 12px var(--manual)")
+        .style("transition", "none") // Disable transition during potential drag
         // Start drag on pointer down
         .event(move |e: events::PointerDown| {
-            // Store drag state: piece_id and starting key
             if let Some(target) = e.target() {
                 if let Ok(el) = target.dyn_into::<HtmlElement>() {
                     el.set_pointer_capture(e.pointer_id()).ok();
-                    // Store original pitch in a data attribute for drag calculation
-                    el.set_attribute("data-drag-start-pitch", &original_pitch.to_string()).ok();
                     el.set_attribute("data-dragging", "true").ok();
+                    el.set_attribute("data-drag-start-pitch", &original_pitch.to_string()).ok();
+                    // Switch to fixed positioning for smooth drag
+                    el.style().set_property("position", "fixed").ok();
+                    el.style().set_property("z-index", "1000").ok();
+                    el.style().set_property("pointer-events", "none").ok();
+                    // Position at cursor
+                    let x = e.x() as f64 - 16.0; // Center the 32px element
+                    let y = e.y() as f64 - 16.0;
+                    el.style().set_property("left", &format!("{}px", x)).ok();
+                    el.style().set_property("top", &format!("{}px", y)).ok();
+                    // Remove data-key so it doesn't snap back during drag
+                    el.remove_attribute("data-key").ok();
                 }
             }
         })
-        // Handle drag movement - use raw PointerEvent for coordinates
+        // Handle drag movement - piece follows cursor
         .event_with_options(
             &dominator::EventOptions { bubbles: true, preventable: true },
-            clone!(state, piece_id_for_move => move |e: events::PointerMove| {
+            clone!(state => move |e: events::PointerMove| {
                 if let Some(target) = e.target() {
                     if let Ok(el) = target.dyn_into::<HtmlElement>() {
-                        // Check if we're dragging
                         if el.get_attribute("data-dragging").as_deref() != Some("true") {
                             return;
                         }
+                        // Move piece to follow cursor
+                        let x = e.x() as f64 - 16.0;
+                        let y = e.y() as f64 - 16.0;
+                        el.style().set_property("left", &format!("{}px", x)).ok();
+                        el.style().set_property("top", &format!("{}px", y)).ok();
 
-                        // Get the keyboard element to calculate position
+                        // Calculate current key position for visual feedback
                         if let Some(kb) = get_keyboard() {
-                            // Get keyboard center via JS
-                            let kb_rect = js_sys::Reflect::get(&kb, &"getBoundingClientRect".into())
-                                .ok()
-                                .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
-                                .and_then(|f| f.call0(&kb).ok());
+                            if let Some((current_key, _)) = get_key_at_position(&kb, e.x() as f64, e.y() as f64) {
+                                // Store current hover key for constraint checking
+                                el.set_attribute("data-hover-key", &current_key.to_string()).ok();
 
-                            if let Some(rect) = kb_rect {
-                                let left = js_sys::Reflect::get(&rect, &"left".into())
-                                    .ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                let top = js_sys::Reflect::get(&rect, &"top".into())
-                                    .ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                let width = js_sys::Reflect::get(&rect, &"width".into())
-                                    .ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                let height = js_sys::Reflect::get(&rect, &"height".into())
-                                    .ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                // Visual feedback: change color if out of range
+                                if let Some(start_str) = el.get_attribute("data-drag-start-pitch") {
+                                    if let Ok(start_pitch) = start_str.parse::<i32>() {
+                                        let tuning = state.tuning.lock_ref();
+                                        let pc_count = tuning.pitch_class_count() as i32;
+                                        drop(tuning);
 
-                                let center_x = left + width / 2.0;
-                                let center_y = top + height / 2.0;
+                                        let start_pc = start_pitch.rem_euclid(pc_count);
+                                        let delta = shortest_delta(start_pc, current_key, pc_count);
 
-                                // Get pointer coordinates from event
-                                let client_x = e.x() as f64;
-                                let client_y = e.y() as f64;
-
-                                // Calculate angle from center to pointer
-                                let dx = client_x - center_x;
-                                let dy = client_y - center_y;
-                                let angle = dy.atan2(dx); // Radians, 0 = right, positive = clockwise
-
-                                // Convert angle to pitch class (0 at top, clockwise)
-                                let tuning = state.tuning.lock_ref();
-                                let pc_count = tuning.pitch_class_count() as f64;
-                                drop(tuning);
-
-                                let normalized = (angle + std::f64::consts::FRAC_PI_2) / (2.0 * std::f64::consts::PI);
-                                let current_pc = ((normalized * pc_count) % pc_count + pc_count) % pc_count;
-
-                                // Get starting pitch from data attribute
-                                if let Some(start_pitch_str) = el.get_attribute("data-drag-start-pitch") {
-                                    if let Ok(start_pitch) = start_pitch_str.parse::<i32>() {
-                                        let start_pc = start_pitch.rem_euclid(pc_count as i32) as f64;
-
-                                        // Calculate delta with spiral semantics
-                                        let mut delta = current_pc - start_pc;
-                                        if delta > pc_count / 2.0 {
-                                            delta -= pc_count;
-                                        } else if delta < -pc_count / 2.0 {
-                                            delta += pc_count;
+                                        if delta.abs() > MAX_DRAG_SEMITONES {
+                                            // Out of range - show warning color
+                                            el.style().set_property("background", "#666").ok();
+                                            el.style().set_property("box-shadow", "0 0 12px #666").ok();
+                                        } else {
+                                            // In range - show normal color
+                                            el.style().set_property("background", "var(--manual)").ok();
+                                            el.style().set_property("box-shadow", "0 0 12px var(--manual)").ok();
                                         }
-
-                                        // Apply delta to get new absolute pitch
-                                        let new_pitch = start_pitch + delta.round() as i32;
-
-                                        // Update the piece position
-                                        state.room.lock_mut().move_piece(&piece_id_for_move, new_pitch);
-                                        state.room_version.set(state.room_version.get() + 1);
                                     }
                                 }
                             }
@@ -255,18 +242,108 @@ fn piece_indicator(state: Arc<AppState>, piece: Piece) -> Dom {
                 }
             })
         )
-        // End drag on pointer up
-        .event(clone!(state => move |e: events::PointerUp| {
+        // End drag on pointer up - check constraints and commit or revert
+        .event(clone!(state, piece_id_for_up => move |e: events::PointerUp| {
             if let Some(target) = e.target() {
                 if let Ok(el) = target.dyn_into::<HtmlElement>() {
                     el.release_pointer_capture(e.pointer_id()).ok();
+
+                    let was_dragging = el.get_attribute("data-dragging").as_deref() == Some("true");
                     el.remove_attribute("data-dragging").ok();
-                    el.remove_attribute("data-drag-start-pitch").ok();
+
+                    if was_dragging {
+                        // Get start pitch and current hover key
+                        let start_pitch = el.get_attribute("data-drag-start-pitch")
+                            .and_then(|s| s.parse::<i32>().ok())
+                            .unwrap_or(original_pitch);
+
+                        let hover_key = el.get_attribute("data-hover-key")
+                            .and_then(|s| s.parse::<i32>().ok());
+
+                        // Reset element styling
+                        el.style().remove_property("position").ok();
+                        el.style().remove_property("z-index").ok();
+                        el.style().remove_property("pointer-events").ok();
+                        el.style().remove_property("left").ok();
+                        el.style().remove_property("top").ok();
+                        el.style().set_property("background", "var(--manual)").ok();
+                        el.style().set_property("box-shadow", "0 0 12px var(--manual)").ok();
+                        el.remove_attribute("data-drag-start-pitch").ok();
+                        el.remove_attribute("data-hover-key").ok();
+
+                        // Check if we have a valid drop target
+                        if let Some(end_key) = hover_key {
+                            let tuning = state.tuning.lock_ref();
+                            let pc_count = tuning.pitch_class_count() as i32;
+                            drop(tuning);
+
+                            let start_pc = start_pitch.rem_euclid(pc_count);
+                            let delta = shortest_delta(start_pc, end_key, pc_count);
+
+                            if delta.abs() <= MAX_DRAG_SEMITONES && delta != 0 {
+                                // Valid move - update CRDT
+                                let new_pitch = start_pitch + delta;
+                                state.room.lock_mut().move_piece(&piece_id_for_up, new_pitch);
+                            }
+                            // If delta == 0 or out of range, piece stays at original position
+                        }
+
+                        state.room_version.set(state.room_version.get() + 1);
+                        sync_active_pitches(&state);
+                    }
                 }
             }
-            sync_active_pitches(&state);
         }))
     })
+}
+
+/// Calculate the shortest delta between two pitch classes around the circle.
+fn shortest_delta(from_pc: i32, to_pc: i32, pc_count: i32) -> i32 {
+    let mut delta = to_pc - from_pc;
+    if delta > pc_count / 2 {
+        delta -= pc_count;
+    } else if delta < -pc_count / 2 {
+        delta += pc_count;
+    }
+    delta
+}
+
+/// Get the key index at a given screen position relative to the keyboard.
+/// Returns (key_index, distance_from_center) or None if outside keyboard.
+fn get_key_at_position(kb: &HtmlElement, client_x: f64, client_y: f64) -> Option<(i32, f64)> {
+    let kb_rect = js_sys::Reflect::get(kb, &"getBoundingClientRect".into())
+        .ok()
+        .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+        .and_then(|f| f.call0(kb).ok())?;
+
+    let left = js_sys::Reflect::get(&kb_rect, &"left".into())
+        .ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let top = js_sys::Reflect::get(&kb_rect, &"top".into())
+        .ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let width = js_sys::Reflect::get(&kb_rect, &"width".into())
+        .ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let height = js_sys::Reflect::get(&kb_rect, &"height".into())
+        .ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+    let center_x = left + width / 2.0;
+    let center_y = top + height / 2.0;
+
+    let dx = client_x - center_x;
+    let dy = client_y - center_y;
+    let distance = (dx * dx + dy * dy).sqrt();
+
+    // Calculate angle (0 at top, clockwise)
+    let angle = dy.atan2(dx);
+    let normalized = (angle + std::f64::consts::FRAC_PI_2) / (2.0 * std::f64::consts::PI);
+
+    // Get pitch class count from keyboard attribute
+    let notes_attr = kb.get_attribute("notes-in-octave")
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(12);
+
+    let key = ((normalized * notes_attr as f64) % notes_attr as f64 + notes_attr as f64) as i32 % notes_attr;
+
+    Some((key, distance))
 }
 
 /// Create the all-around-keyboard component with indicator child.
