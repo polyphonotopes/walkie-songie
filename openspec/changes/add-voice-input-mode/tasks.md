@@ -19,20 +19,20 @@
 - [ ] 3.5 Handle peer join/leave (sync initial state, cleanup on disconnect) - *deferred to P2P integration*
 - [x] 3.6 Unit tests for CRDT operations and sync
 
-## 4. Pitch Detection (wasm AudioWorklet)
-- [x] 4.1 Add `pitch` (BCF) and `pyin-rs` crate dependencies, verify wasm compilation
-  - Note: pyin uses libc FFI, so it's native-only. BCF works on wasm.
-- [ ] 4.2 Create AudioWorklet processor in Rust (wasm-pack build) - *requires pnpm integration*
-- [x] 4.3 Implement dual-algorithm runner (BCF on small buffer, pYIN on larger buffer)
+## 4. Pitch Detection (Multi-Algorithm)
+- [x] 4.1 Add `pitch` (BCF), `pitch-detection` (McLeod), and `pyin-rs` crate dependencies
+  - Note: pyin uses libc FFI, so it's native-only. BCF and McLeod work on wasm.
+- [x] 4.2 Create ScriptProcessorNode audio capture (simpler than AudioWorklet, no JS tooling needed)
+- [x] 4.3 Implement multi-algorithm runner (BCF fast, McLeod robust, pYIN accurate)
 - [x] 4.4 Implement dynamic noise gate (RMS envelope, adaptive threshold)
-- [ ] 4.5 Wire both pitch outputs to main thread via message port - *requires AudioWorklet*
-- [x] 4.6 Implement `PitchDetector` trait for web (wraps AudioWorklet)
+- [x] 4.5 Wire pitch detection output to UI via callback
+- [x] 4.6 Implement `PitchDetector` trait for web (wraps ScriptProcessorNode)
 - [x] 4.7 Test pitch detection accuracy with known frequencies
-- [ ] 4.8 Measure wasm bundle size, optimize if >200KB - *pending full build*
+- [x] 4.8 Add pitch locking with confidence accumulation and 150ms linger
 
 ## 5. dominator Web App Setup
 - [x] 5.1 Add dominator + futures-signals dependencies
-- [ ] 5.2 Set up wasm-pack build for web app - *trunk configured, pending testing*
+- [x] 5.2 Set up trunk build for web app
 - [x] 5.3 Create basic app shell with dominator
 - [x] 5.4 Wire up core library (RoomState, Transport) to reactive signals
 
@@ -43,6 +43,7 @@
 - [x] 6.4 Add closeness indicator (cents deviation gauge/color)
 - [x] 6.5 On release, commit detected pitch class to RoomState
 - [x] 6.6 Handle "no pitch detected" state gracefully
+- [x] 6.7 Add rolling confidence accumulator for stable pitch commitment
 
 ## 7. Pitch State UI (dominator)
 - [x] 7.1 Display local active pitch classes as toggle buttons
@@ -57,10 +58,10 @@
 - [ ] 8.4 Re-quantize active pitches when tuning changes - *deferred*
 
 ## 9. Integration & Testing
-- [ ] 9.1 Wire voice input → tuning → pitch state → sync
-- [ ] 9.2 End-to-end test: two peers, sing → detect → sync → display union
-- [ ] 9.3 Test collaborative SCL editing between peers
-- [ ] 9.4 Performance test: latency from sing to display
+- [x] 9.1 Wire voice input → tuning → pitch state (local only)
+- [ ] 9.2 End-to-end test: two peers, sing → detect → sync → display union - *needs P2P*
+- [ ] 9.3 Test collaborative SCL editing between peers - *needs P2P*
+- [ ] 9.4 Performance test: latency from sing to display - *pending browser test*
 
 ---
 
@@ -70,12 +71,15 @@
 - Core library with PitchDetector and RoomState traits
 - Full tuning system with 12-TET, SCL parser, and Hz quantization
 - yrs CRDT room state implementation with sync support
-- Dual-algorithm pitch detection (BCF + pYIN) with noise gate
+- Multi-algorithm pitch detection: BCF (fast), McLeod (noise-robust), pYIN (accurate, native-only)
+- ScriptProcessorNode audio capture (simpler alternative to AudioWorklet)
+- Pitch locking with 150ms linger and confidence accumulation for stable UX
 - Dominator web app with voice input, pitch grid, and tuning editor
+- Full voice input flow: hold button → capture audio → detect pitch → lock with confidence → release → commit vote winner
 - 22 passing unit tests
 - Both native and wasm32 targets build successfully
 
 **Remaining (deferred to P2P integration phase):**
-- AudioWorklet integration (requires pnpm for JS tooling)
+- Platform-specific signaller (iroh for native, websocket for web)
 - P2P sync wiring over matchbox reliable channel
 - End-to-end multi-peer testing

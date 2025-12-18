@@ -35,8 +35,9 @@ tracing = "0.1"
 # CRDT
 yrs = "0.21"
 
-# Pitch detection (pitch crate works on wasm, pyin is native-only)
-pitch = "0.2"
+# Pitch detection (all work on wasm)
+pitch = "0.2"  # BCF - fast, simple
+pitch-detection = "0.3"  # McLeod/YIN - robust in noise
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.pyin]
 version = "1.2"
@@ -53,8 +54,10 @@ wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
     "Window", "Location", "console",
     "Document", "Element", "HtmlElement", "HtmlButtonElement", "HtmlTextAreaElement",
-    "AudioContext", "AudioWorklet", "AudioWorkletNode", "AudioWorkletNodeOptions",
+    "AudioContext", "AudioContextState", "AudioWorklet", "AudioWorkletNode", "AudioWorkletNodeOptions",
     "MediaDevices", "MediaStream", "MediaStreamConstraints", "MediaStreamTrack",
+    "MediaStreamAudioSourceNode", "ScriptProcessorNode", "AudioProcessingEvent",
+    "AudioBuffer", "AudioNode", "AudioDestinationNode",
     "Navigator", "Blob", "BlobPropertyBag", "Url",
     "MessagePort", "MessageEvent", "EventTarget", "InputEvent"
 ] }

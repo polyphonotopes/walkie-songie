@@ -1,9 +1,9 @@
-//! Dual-algorithm pitch detector implementation.
+//! Multi-algorithm pitch detector implementation.
 //!
-//! Combines BCF (fast, ~15ms) and pYIN (accurate, ~50ms) for optimal
-//! real-time feedback and accurate pitch commitment.
-//!
-//! Note: pYIN is only available on native targets (not wasm).
+//! Combines multiple algorithms for robust pitch detection:
+//! - BCF (fast, ~15ms) - quick feedback
+//! - McLeod/MPM (robust) - handles noisy environments well (wasm-compatible)
+//! - pYIN (accurate, ~50ms) - highest accuracy (native only)
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,11 +11,22 @@ use std::sync::Arc;
 
 use futures::channel::mpsc;
 use futures::Stream;
+use pitch_detection::detector::mcleod::McLeodDetector;
+use pitch_detection::detector::PitchDetector as McLeodPitchDetector;
 
 use super::{PitchDetector, PitchDetectorConfig, PitchEvent, PitchSource};
 
 /// Buffer size for BCF detection (2048 samples at 48kHz = ~43ms window)
 const BCF_BUFFER_SIZE: usize = 2048;
+
+/// Buffer size for McLeod detection
+const MCLEOD_BUFFER_SIZE: usize = 2048;
+/// Padding for McLeod FFT
+const MCLEOD_PADDING: usize = MCLEOD_BUFFER_SIZE / 2;
+/// Power threshold for McLeod (signal must be above this to detect)
+const MCLEOD_POWER_THRESHOLD: f64 = 5.0;
+/// Clarity threshold for McLeod (confidence must be above this)
+const MCLEOD_CLARITY_THRESHOLD: f64 = 0.5;
 
 /// Frame length for pYIN (powers of 2 only)
 #[cfg(not(target_arch = "wasm32"))]
@@ -25,8 +36,8 @@ const PYIN_WIN_LENGTH: usize = 1024;
 #[cfg(not(target_arch = "wasm32"))]
 const PYIN_HOP_LENGTH: usize = 256;
 
-/// Dual-algorithm pitch detector using BCF and pYIN.
-/// On wasm, only BCF is available.
+/// Multi-algorithm pitch detector using BCF, McLeod, and pYIN.
+/// On wasm, BCF and McLeod are available. pYIN is native-only.
 pub struct DualPitchDetector {
     config: PitchDetectorConfig,
     running: Arc<AtomicBool>,
@@ -37,7 +48,7 @@ pub struct DualPitchDetector {
 }
 
 impl DualPitchDetector {
-    /// Create a new dual pitch detector with the given configuration.
+    /// Create a new multi-algorithm pitch detector with the given configuration.
     pub fn new(config: PitchDetectorConfig) -> Self {
         Self {
             config,
@@ -94,6 +105,42 @@ impl DualPitchDetector {
         // Filter by frequency range
         if hz >= min_freq && hz <= max_freq {
             Some((hz, amplitude))
+        } else {
+            None
+        }
+    }
+
+    /// Detect pitch using McLeod algorithm (robust in noisy environments).
+    fn detect_mcleod(
+        samples: &[f64],
+        sample_rate: u32,
+        min_freq: f64,
+        max_freq: f64,
+    ) -> Option<(f64, f64)> {
+        if samples.len() < MCLEOD_BUFFER_SIZE {
+            return None;
+        }
+
+        // Use the last MCLEOD_BUFFER_SIZE samples
+        let start = samples.len().saturating_sub(MCLEOD_BUFFER_SIZE);
+        let buffer = &samples[start..start + MCLEOD_BUFFER_SIZE];
+
+        // Create detector on demand (it uses Rc internally, not Send)
+        let mut detector = McLeodDetector::new(MCLEOD_BUFFER_SIZE, MCLEOD_PADDING);
+
+        let pitch = detector.get_pitch(
+            buffer,
+            sample_rate as usize,
+            MCLEOD_POWER_THRESHOLD,
+            MCLEOD_CLARITY_THRESHOLD,
+        )?;
+
+        let hz = pitch.frequency;
+        let clarity = pitch.clarity;
+
+        // Filter by frequency range
+        if hz >= min_freq && hz <= max_freq {
+            Some((hz, clarity))
         } else {
             None
         }
@@ -170,6 +217,28 @@ impl DualPitchDetector {
                 hz: bcf_result.map(|(hz, _)| hz),
                 confidence: bcf_result.map(|(_, amp)| amp).unwrap_or(0.0),
                 source: PitchSource::Fast,
+                gate_threshold_db,
+                signal_level_db,
+            });
+        }
+
+        // McLeod detection (robust in noise, works on wasm)
+        if self.sample_buffer.len() >= MCLEOD_BUFFER_SIZE {
+            let mcleod_result = if gate_open {
+                Self::detect_mcleod(
+                    &self.sample_buffer,
+                    self.config.sample_rate,
+                    self.config.min_frequency,
+                    self.config.max_frequency,
+                )
+            } else {
+                None
+            };
+
+            events.push(PitchEvent {
+                hz: mcleod_result.map(|(hz, _)| hz),
+                confidence: mcleod_result.map(|(_, clarity)| clarity).unwrap_or(0.0),
+                source: PitchSource::McLeod,
                 gate_threshold_db,
                 signal_level_db,
             });

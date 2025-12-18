@@ -5,6 +5,7 @@ use std::sync::Arc;
 use dominator::{clone, events, html, Dom};
 use futures_signals::signal::SignalExt;
 use wasm_bindgen::JsCast;
+use web_sys::HtmlTextAreaElement;
 
 use crate::room::RoomState;
 use crate::tuning::{parse_scl, PitchClass, Tuning};
@@ -203,7 +204,7 @@ pub fn tuning_editor(state: Arc<AppState>) -> Dom {
                         .class("scl-textarea")
                         .event(clone!(state => move |e: events::Input| {
                             if let Some(target) = e.target() {
-                                if let Ok(textarea) = target.dyn_into::<web_sys::HtmlTextAreaElement>() {
+                                if let Ok(textarea) = target.dyn_into::<HtmlTextAreaElement>() {
                                     let content = textarea.value();
                                     // Try to parse and update tuning
                                     match parse_scl(&content) {

@@ -31,7 +31,9 @@ pub struct PitchEvent {
 pub enum PitchSource {
     /// Fast BCF algorithm (~15ms latency)
     Fast,
-    /// Accurate pYIN algorithm (~50ms latency)
+    /// McLeod Pitch Method - robust in noisy environments (works on wasm)
+    McLeod,
+    /// Accurate pYIN algorithm (~50ms latency, native only)
     Accurate,
 }
 
