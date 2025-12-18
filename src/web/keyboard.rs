@@ -247,6 +247,22 @@ fn setup_piece_sync(state: Arc<AppState>, keyboard_el: web_sys::HtmlElement) {
 
         // Process each room_version change
         futures_signals::signal::SignalExt::for_each(signal, move |_version| {
+            // Sync piece_mode and pieces_locked from CRDT to AppState
+            {
+                let room = state_clone.room.lock_ref();
+                let crdt_piece_mode = room.piece_mode();
+                let crdt_pieces_locked = room.pieces_locked();
+                drop(room);
+
+                // Only update if different (avoid unnecessary signal triggers)
+                if state_clone.piece_mode.get() != crdt_piece_mode {
+                    state_clone.piece_mode.set(crdt_piece_mode);
+                }
+                if state_clone.pieces_locked.get() != crdt_pieces_locked {
+                    state_clone.pieces_locked.set(crdt_pieces_locked);
+                }
+            }
+
             // Get current pieces from room
             let (pieces, pitch_count, piece_mode) = {
                 let tuning = state_clone.tuning.lock_ref();
@@ -379,9 +395,18 @@ fn setup_piece_drag_handler(el: &web_sys::HtmlElement, piece_id: &str, _original
 /// Store the currently hovered key note (used during piece drag for visual feedback)
 static HOVERED_KEY_NOTE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+/// Store the last key that received a pointerup event (primary drop target)
+static POINTERUP_KEY_NOTE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
 /// Get the currently hovered key note (pitch class 0-11, or -1 if none)
 fn get_hovered_key_note() -> Option<i32> {
     let val = HOVERED_KEY_NOTE.load(std::sync::atomic::Ordering::Relaxed);
+    if val >= 0 { Some(val) } else { None }
+}
+
+/// Get and clear the last pointerup key note (primary drop target)
+fn take_pointerup_key_note() -> Option<i32> {
+    let val = POINTERUP_KEY_NOTE.swap(-1, std::sync::atomic::Ordering::Relaxed);
     if val >= 0 { Some(val) } else { None }
 }
 
@@ -494,20 +519,17 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
 
         // Otherwise handle as drag...
 
-        // Use getNoteAtPoint for reliable drop detection
-        let end_key = get_keyboard()
-            .and_then(|kb| {
-                // Call getNoteAtPoint(screenX, screenY) on the keyboard element
-                let result = Reflect::get(&kb, &JsValue::from_str("getNoteAtPoint")).ok()?;
-                let func = result.dyn_ref::<web_sys::js_sys::Function>()?;
-                let note_info = func.call2(&kb, &JsValue::from(e.x()), &JsValue::from(e.y())).ok()?;
-                if note_info.is_null() || note_info.is_undefined() {
-                    return None;
-                }
-                // Get the 'note' property from the result
-                let note = Reflect::get(&note_info, &JsValue::from_str("note")).ok()?;
-                note.as_f64().map(|n| n as i32)
-            });
+        // Primary: keypointerup event (fires on the key that received pointerup)
+        // Since piece has pointer-events: none, the key underneath gets the event
+        let pointerup_key = take_pointerup_key_note();
+
+        // Fallback: hover-based detection
+        let hover_key = piece_el.get_attribute("data-hover-key")
+            .and_then(|s| s.parse::<i32>().ok());
+        let global_hover = get_hovered_key_note();
+
+        // Use best available: pointerup > hover > element attribute
+        let end_key = pointerup_key.or(global_hover).or(hover_key);
 
         let tuning = state_up.tuning.lock_ref();
         let pc_count = tuning.pitch_class_count() as i32;
@@ -581,6 +603,20 @@ fn setup_keyboard_events(state: Arc<AppState>) {
         });
         let _ = kb.add_event_listener_with_callback("keyunhover", on_unhover.as_ref().unchecked_ref());
         on_unhover.forget();
+
+        // Listen for keypointerup - fires when pointerup happens on a key
+        // Since piece has pointer-events: none during drag, this is our primary drop target
+        let on_keypointerup = Closure::<dyn Fn(web_sys::Event)>::new(move |event: web_sys::Event| {
+            if let Ok(detail) = Reflect::get(&event, &JsValue::from_str("detail")) {
+                if let Ok(note_val) = Reflect::get(&detail, &JsValue::from_str("note")) {
+                    if let Some(note) = note_val.as_f64() {
+                        POINTERUP_KEY_NOTE.store(note as i32, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        });
+        let _ = kb.add_event_listener_with_callback("keypointerup", on_keypointerup.as_ref().unchecked_ref());
+        on_keypointerup.forget();
 
         // Listen for keyclick events (actual user clicks, not hover)
         let state_click = state.clone();
