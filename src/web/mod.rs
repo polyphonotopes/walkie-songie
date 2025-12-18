@@ -10,6 +10,8 @@ mod audio;
 mod components;
 #[cfg(target_arch = "wasm32")]
 mod keyboard;
+#[cfg(target_arch = "wasm32")]
+pub mod onnx_bridge;
 
 #[cfg(target_arch = "wasm32")]
 pub use app::run_app;

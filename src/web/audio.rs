@@ -1,4 +1,4 @@
-//! Web Audio API integration for microphone input and pitch detection.
+//! Web Audio API integration for microphone input.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -6,23 +6,19 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{
-    AudioContext, AudioProcessingEvent, MediaStream, MediaStreamAudioSourceNode,
-    MediaStreamConstraints, ScriptProcessorNode,
+    AudioContext, AudioProcessingEvent, MediaStream, MediaStreamConstraints,
+    ScriptProcessorNode,
 };
-
-use crate::pitch::{DualPitchDetector, PitchEvent};
 
 /// Buffer size for ScriptProcessorNode (power of 2, 256-16384).
 /// 2048 samples at 48kHz = ~42ms of audio per callback.
 const BUFFER_SIZE: u32 = 2048;
 
-/// Web audio input handler that processes microphone input through pitch detection.
+/// Web audio input handler that captures microphone input.
 pub struct WebAudioInput {
     context: AudioContext,
     stream: Option<MediaStream>,
-    source_node: Option<MediaStreamAudioSourceNode>,
     processor_node: Option<ScriptProcessorNode>,
-    // Store the closure to prevent it from being dropped
     _callback: Option<Closure<dyn FnMut(AudioProcessingEvent)>>,
     running: bool,
 }
@@ -34,19 +30,18 @@ impl WebAudioInput {
         Ok(Self {
             context,
             stream: None,
-            source_node: None,
             processor_node: None,
             _callback: None,
             running: false,
         })
     }
 
-    /// Request microphone access and start audio processing.
-    /// The callback receives pitch events as they are detected.
-    pub async fn start<F>(&mut self, detector: Rc<RefCell<DualPitchDetector>>, on_pitch: F) -> Result<(), JsValue>
-    where
-        F: Fn(PitchEvent) + 'static,
-    {
+    /// Request microphone access and start audio capture.
+    /// Raw samples are pushed to the provided buffer for ML processing.
+    pub async fn start(
+        &mut self,
+        sample_buffer: Rc<RefCell<Vec<f32>>>,
+    ) -> Result<(), JsValue> {
         if self.running {
             return Ok(());
         }
@@ -74,7 +69,6 @@ impl WebAudioInput {
         let source = self.context.create_media_stream_source(&stream)?;
 
         // ScriptProcessorNode: buffer_size, num_input_channels, num_output_channels
-        // Using 1 input channel (mono) for voice
         let processor = self.context.create_script_processor_with_buffer_size_and_number_of_input_channels_and_number_of_output_channels(
             BUFFER_SIZE,
             1,
@@ -84,16 +78,9 @@ impl WebAudioInput {
         // Set up the audio processing callback
         let callback = Closure::wrap(Box::new(move |event: AudioProcessingEvent| {
             if let Ok(input_buffer) = event.input_buffer() {
-                // Get the first channel's data
                 if let Ok(channel_data) = input_buffer.get_channel_data(0) {
-                    // Process through pitch detector
-                    let mut det = detector.borrow_mut();
-                    let events = det.process_samples(&channel_data);
-
-                    // Emit pitch events
-                    for pitch_event in events {
-                        on_pitch(pitch_event);
-                    }
+                    // Push raw samples to buffer for SwiftF0 ML processing
+                    sample_buffer.borrow_mut().extend_from_slice(&channel_data);
                 }
             }
         }) as Box<dyn FnMut(AudioProcessingEvent)>);
@@ -101,13 +88,10 @@ impl WebAudioInput {
         processor.set_onaudioprocess(Some(callback.as_ref().unchecked_ref()));
 
         // Connect: source -> processor -> destination
-        // We need to connect to destination for the processor to receive data,
-        // but we output silence (the processor doesn't modify the audio)
         source.connect_with_audio_node(&processor)?;
         processor.connect_with_audio_node(&self.context.destination())?;
 
         self.stream = Some(stream);
-        self.source_node = Some(source);
         self.processor_node = Some(processor);
         self._callback = Some(callback);
         self.running = true;
@@ -122,9 +106,6 @@ impl WebAudioInput {
             processor.set_onaudioprocess(None);
             let _ = processor.disconnect();
         }
-        if let Some(ref source) = self.source_node {
-            let _ = source.disconnect();
-        }
 
         // Stop media stream tracks
         if let Some(ref stream) = self.stream {
@@ -138,21 +119,11 @@ impl WebAudioInput {
         }
 
         self.stream = None;
-        self.source_node = None;
         self.processor_node = None;
         self._callback = None;
         self.running = false;
     }
 
-    /// Check if audio input is running.
-    pub fn is_running(&self) -> bool {
-        self.running
-    }
-
-    /// Get the audio context sample rate.
-    pub fn sample_rate(&self) -> f32 {
-        self.context.sample_rate()
-    }
 }
 
 impl Drop for WebAudioInput {

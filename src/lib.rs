@@ -1,7 +1,7 @@
 //! Walkie-Songie: P2P collaborative music application
 //!
 //! This library provides platform-agnostic abstractions for:
-//! - Pitch detection (via `PitchDetector` trait)
+//! - Pitch detection (via SwiftF0 ML model)
 //! - Room state management (via `RoomState` trait)
 //! - P2P transport (via existing matchbox/iroh signaller)
 //!
@@ -16,7 +16,7 @@ pub mod tuning;
 #[cfg(target_arch = "wasm32")]
 pub mod web;
 
-// Re-export core traits
-pub use pitch::PitchDetector;
+// Re-export core types
+pub use pitch::{PitchDetectorConfig, PitchEvent, SwiftF0Detector};
 pub use room::{CombinationMethod, RoomState};
 pub use tuning::{PitchClass, Tuning};

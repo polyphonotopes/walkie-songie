@@ -11,13 +11,13 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 use web_time::Instant;
 
-use crate::pitch::{DualPitchDetector, PitchDetectorConfig, PitchEvent, PitchSource};
+use crate::pitch::{PitchDetectorConfig, PitchEvent, SwiftF0Detector};
 use crate::room::{RoomState, YrsRoomState};
 use crate::tuning::{PitchClass, Tuning};
 
 use super::audio::WebAudioInput;
-use super::components::{pitch_display, tuning_editor, voice_button};
-use super::keyboard::{dim_all, notes_dim, notes_light, pitch_keyboard};
+use super::components::{clear_button, pitch_display, tuning_editor, voice_button};
+use super::keyboard::{pitch_keyboard, sync_active_pitches};
 
 /// How long a confident pitch "lingers" when confidence drops (in milliseconds).
 const PITCH_LINGER_MS: u64 = 500;
@@ -33,33 +33,36 @@ const HARMONIC_REJECTION_BOOST: f64 = 0.25;
 /// Application state.
 /// Uses Rc for wasm (single-threaded), Arc would work too but Rc is simpler.
 pub struct AppState {
-    /// Room state with CRDT synchronization.
+    /// Room state with CRDT synchronization (manual/clicked pitches).
     pub room: Mutable<YrsRoomState>,
     /// Current tuning system.
     pub tuning: Mutable<Tuning>,
     /// Whether voice input is active.
     pub voice_active: Mutable<bool>,
-    /// Current detected pitch from fast detector.
-    pub fast_pitch: Mutable<Option<PitchEvent>>,
-    /// Current detected pitch from accurate detector.
-    pub accurate_pitch: Mutable<Option<PitchEvent>>,
-    /// Committed pitch class (from accurate detection on release).
+    /// Current detected pitch from SwiftF0.
+    pub current_pitch: Mutable<Option<PitchEvent>>,
+    /// Committed pitch class (from detection on release) - shown during singing.
     pub committed_pitch: Mutable<Option<PitchClass>>,
+    /// Voice-committed pitch (single slot, separate from manual pitches).
+    pub voice_pitch: Mutable<Option<PitchClass>>,
     /// Rolling confidence accumulator per pitch class during voice input.
-    /// Maps pitch class index -> accumulated confidence score.
     pub pitch_votes: Rc<RefCell<HashMap<u8, f64>>>,
     /// Currently "locked" pitch (last high-confidence detection).
     pub locked_pitch: Rc<RefCell<Option<PitchClass>>>,
     /// When the locked pitch was last confirmed with high confidence.
     pub locked_at: Rc<RefCell<Option<Instant>>>,
-    /// Audio input handler (Rc for sharing with callbacks).
+    /// Audio input handler.
     pub audio: Rc<RefCell<Option<WebAudioInput>>>,
-    /// Pitch detector (Rc for sharing with audio callback).
-    pub detector: Rc<RefCell<DualPitchDetector>>,
+    /// SwiftF0 ML pitch detector (async via JS bridge).
+    pub swiftf0: Rc<RefCell<SwiftF0Detector>>,
+    /// Whether SwiftF0 is ready for inference.
+    pub swiftf0_ready: Mutable<bool>,
     /// SCL parse error message.
     pub scl_error: Mutable<Option<String>>,
     /// Previously lit note on the keyboard (for detected pitch visualization).
     pub prev_lit_note: Rc<RefCell<Option<u8>>>,
+    /// Buffer for SwiftF0 samples (accumulates between async calls).
+    pub swiftf0_buffer: Rc<RefCell<Vec<f32>>>,
 }
 
 impl AppState {
@@ -67,52 +70,33 @@ impl AppState {
     pub fn new(peer_id: String) -> Arc<Self> {
         let room = YrsRoomState::new(peer_id);
         let tuning = Tuning::twelve_tet();
-        let detector = DualPitchDetector::new(PitchDetectorConfig::default());
+        let config = PitchDetectorConfig::default();
+        let swiftf0 = SwiftF0Detector::new(config.sample_rate);
 
         Arc::new(Self {
             room: Mutable::new(room),
             tuning: Mutable::new(tuning),
             voice_active: Mutable::new(false),
-            fast_pitch: Mutable::new(None),
-            accurate_pitch: Mutable::new(None),
+            current_pitch: Mutable::new(None),
             committed_pitch: Mutable::new(None),
+            voice_pitch: Mutable::new(None),
             pitch_votes: Rc::new(RefCell::new(HashMap::new())),
             locked_pitch: Rc::new(RefCell::new(None)),
             locked_at: Rc::new(RefCell::new(None)),
             audio: Rc::new(RefCell::new(None)),
-            detector: Rc::new(RefCell::new(detector)),
+            swiftf0: Rc::new(RefCell::new(swiftf0)),
+            swiftf0_ready: Mutable::new(false),
             scl_error: Mutable::new(None),
             prev_lit_note: Rc::new(RefCell::new(None)),
+            swiftf0_buffer: Rc::new(RefCell::new(Vec::with_capacity(8192))),
         })
     }
 
-    /// Handle pitch detection event.
+    /// Handle pitch detection event from SwiftF0.
     pub fn on_pitch_event(self: &Arc<Self>, event: PitchEvent) {
-        match event.source {
-            PitchSource::Fast => {
-                // BCF - ignore, we use SwiftF0/YIN for everything
-            }
-            PitchSource::McLeod => {
-                // YIN fallback - only use if SwiftF0 not available
-                self.fast_pitch.set(Some(event.clone()));
-            }
-            PitchSource::Accurate => {
-                // pYIN on native - high accuracy fallback
-                self.fast_pitch.set(Some(event.clone()));
-                self.accurate_pitch.set(Some(event.clone()));
-                if self.voice_active.get() {
-                    self.process_pitch_for_locking(&event, 0.4, 1.5);
-                }
-            }
-            PitchSource::SwiftF0 => {
-                // SwiftF0 ML model - primary detector, best accuracy
-                self.fast_pitch.set(Some(event.clone()));
-                self.accurate_pitch.set(Some(event.clone()));
-                if self.voice_active.get() {
-                    // SwiftF0 is very accurate, use lower threshold
-                    self.process_pitch_for_locking(&event, 0.5, 2.0);
-                }
-            }
+        self.current_pitch.set(Some(event.clone()));
+        if self.voice_active.get() {
+            self.process_pitch_for_locking(&event, 0.5, 2.0);
         }
     }
 
@@ -178,16 +162,11 @@ impl AppState {
                 // Display shows current locked pitch directly
                 self.committed_pitch.set(Some(pc));
 
-                // Update keyboard lighting for detected pitch
-                let note = pc.index();
-                let mut prev = self.prev_lit_note.borrow_mut();
-                if *prev != Some(note) {
-                    if let Some(old) = prev.take() {
-                        notes_dim(&[old]);
-                    }
-                    notes_light(&[note]);
-                    *prev = Some(note);
-                }
+                // Set voice_pitch during singing (shows as lit/green on keyboard)
+                self.voice_pitch.set(Some(pc));
+
+                // Sync keyboard (voice pitch -> lit/green, manual -> pressed/red)
+                sync_active_pitches(self);
             } else {
                 // Low confidence - check if we should linger on previous pitch
                 self.maybe_linger(now);
@@ -214,14 +193,6 @@ impl AppState {
         }
     }
 
-    /// Update committed_pitch to show the current vote leader.
-    fn update_committed_from_votes(self: &Arc<Self>) {
-        let votes = self.pitch_votes.borrow();
-        if let Some((&pc_idx, _score)) = votes.iter().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()) {
-            self.committed_pitch.set(Some(PitchClass::new(pc_idx)));
-        }
-    }
-
     /// Start voice input.
     pub fn start_voice(self: &Arc<Self>) {
         if self.voice_active.get() {
@@ -235,6 +206,10 @@ impl AppState {
         self.pitch_votes.borrow_mut().clear();
         *self.locked_pitch.borrow_mut() = None;
         *self.locked_at.borrow_mut() = None;
+        self.swiftf0_buffer.borrow_mut().clear();
+
+        // Ensure active pitches are shown as lit during voice input
+        super::keyboard::sync_active_pitches(self);
 
         // Create audio input if needed (scope the borrow)
         {
@@ -253,7 +228,7 @@ impl AppState {
 
         // Clone what we need for the async block
         let audio_rc = self.audio.clone();
-        let detector_rc = self.detector.clone();
+        let swiftf0_buffer = self.swiftf0_buffer.clone();
         let state = self.clone();
 
         spawn_local(async move {
@@ -264,15 +239,33 @@ impl AppState {
             };
 
             if let Some(ref mut audio_input) = audio {
-                let state_for_callback = state.clone();
+                let state_for_swiftf0 = state.clone();
 
-                let result = audio_input.start(detector_rc, move |event| {
-                    state_for_callback.on_pitch_event(event);
-                }).await;
+                // Start audio capture - samples go to swiftf0_buffer
+                let result = audio_input.start(swiftf0_buffer.clone()).await;
 
                 if let Err(e) = result {
                     web_sys::console::error_1(&format!("Failed to start audio: {:?}", e).into());
                     state.voice_active.set(false);
+                } else {
+                    // Start SwiftF0 processing loop
+                    spawn_local(async move {
+                        loop {
+                            if !state_for_swiftf0.voice_active.get() {
+                                break;
+                            }
+                            state_for_swiftf0.process_swiftf0().await;
+                            // Small delay to batch samples (~50ms)
+                            let promise = js_sys::Promise::new(&mut |resolve, _| {
+                                let window = web_sys::window().unwrap();
+                                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                                    &resolve,
+                                    50,
+                                );
+                            });
+                            let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+                        }
+                    });
                 }
 
                 // Put the audio back
@@ -297,24 +290,66 @@ impl AppState {
             }
         }
 
-        // Dim the keyboard (detected pitch feedback)
-        dim_all();
+        // Clear prev_lit tracking
         *self.prev_lit_note.borrow_mut() = None;
 
-        // Commit the last accurate pitch to the room state
-        if let Some(pc) = self.committed_pitch.get() {
-            let is_active = self.room.lock_mut().toggle_pitch(pc);
-            // Update keyboard pressed state
-            let note = pc.index();
-            if is_active {
-                super::keyboard::keys_press(&[note]);
-            } else {
-                super::keyboard::keys_release(&[note]);
+        // Commit the detected pitch to the voice_pitch slot (single, replaces previous)
+        self.voice_pitch.set(self.committed_pitch.get());
+
+        // Re-sync keyboard (voice pitch -> lit/green, manual -> pressed/red)
+        sync_active_pitches(self);
+
+        self.current_pitch.set(None);
+    }
+
+    /// Initialize the SwiftF0 ML model (call once on startup).
+    pub async fn init_swiftf0(self: &Arc<Self>) {
+        web_sys::console::log_1(&"Initializing SwiftF0 ML model...".into());
+        let result = {
+            let mut swiftf0 = self.swiftf0.borrow_mut();
+            swiftf0.init().await
+        };
+        match result {
+            Ok(()) => {
+                self.swiftf0_ready.set(true);
+                web_sys::console::log_1(&"SwiftF0 ML model ready".into());
+            }
+            Err(e) => {
+                web_sys::console::error_1(&format!("SwiftF0 init failed: {}", e).into());
             }
         }
+    }
 
-        self.fast_pitch.set(None);
-        self.accurate_pitch.set(None);
+    /// Process accumulated samples through SwiftF0 (async).
+    /// Called from audio callback via spawn_local.
+    pub async fn process_swiftf0(self: &Arc<Self>) {
+        if !self.swiftf0_ready.get() || !self.voice_active.get() {
+            return;
+        }
+
+        // Take samples from the buffer
+        let samples: Vec<f32> = {
+            let mut buffer = self.swiftf0_buffer.borrow_mut();
+            if buffer.len() < 1024 {
+                return; // Not enough samples
+            }
+            std::mem::take(&mut *buffer)
+        };
+
+        // Run async inference
+        let result = {
+            let mut swiftf0 = self.swiftf0.borrow_mut();
+            swiftf0.detect(&samples).await
+        };
+
+        // Emit pitch event if we got a result
+        if let Some((hz, confidence)) = result {
+            let event = PitchEvent {
+                hz: Some(hz),
+                confidence,
+            };
+            self.on_pitch_event(event);
+        }
     }
 }
 
@@ -346,8 +381,14 @@ fn render_app(state: Arc<AppState>) -> Dom {
                         ])
                     }),
 
-                    // Voice button
-                    voice_button(state.clone()),
+                    // Voice and clear buttons
+                    html!("div", {
+                        .class("button-row")
+                        .children(&mut [
+                            voice_button(state.clone()),
+                            clear_button(state.clone()),
+                        ])
+                    }),
 
                     // Active pitches section
                     html!("section", {
@@ -374,20 +415,33 @@ fn active_pitches_list(state: Arc<AppState>) -> Dom {
     use dominator::clone;
     use futures_signals::signal::SignalExt;
 
+    // React to voice_pitch changes
     html!("div", {
         .class("active-pitches")
-        .child_signal(state.room.signal_ref(clone!(state => move |room| {
+        .child_signal(state.voice_pitch.signal().map(clone!(state => move |voice_pitch| {
+            let room = state.room.lock_ref();
             let sets = room.all_peer_sets();
             let peer_id = room.local_peer_id();
+            let tuning = state.tuning.lock_ref();
 
-            let active: Vec<String> = if let Some(set) = sets.get(peer_id) {
-                let tuning = state.tuning.lock_ref();
-                set.pitch_classes.iter()
-                    .map(|pc| tuning.note_name(*pc).to_string())
-                    .collect()
+            // Collect manual pitches (red), sorted by pitch index
+            let mut manual: Vec<_> = if let Some(set) = sets.get(peer_id) {
+                set.pitch_classes.iter().copied().collect()
             } else {
                 vec![]
             };
+            manual.sort_by_key(|pc| pc.index());
+
+            // Build list: voice pitch (green) + manual pitches (red), sorted
+            let mut active: Vec<(String, bool, u8)> = Vec::new();
+            if let Some(vpc) = voice_pitch {
+                active.push((tuning.note_name(vpc).to_string(), true, vpc.index()));
+            }
+            for pc in manual {
+                active.push((tuning.note_name(pc).to_string(), false, pc.index()));
+            }
+            // Sort by pitch index for consistent ordering
+            active.sort_by_key(|(_, _, idx)| *idx);
 
             if active.is_empty() {
                 Some(html!("span", {
@@ -397,9 +451,10 @@ fn active_pitches_list(state: Arc<AppState>) -> Dom {
             } else {
                 Some(html!("div", {
                     .class("pitch-tags")
-                    .children(active.iter().map(|name| {
+                    .children(active.iter().map(|(name, is_voice, _idx)| {
                         html!("span", {
                             .class("pitch-tag")
+                            .apply_if(*is_voice, |d| d.class("voice-pitch"))
                             .text(name)
                         })
                     }).collect::<Vec<_>>())
@@ -420,6 +475,12 @@ pub fn run_app() {
 
     // Create application state
     let state = AppState::new(peer_id);
+
+    // Initialize SwiftF0 ML model in background
+    let state_for_init = state.clone();
+    spawn_local(async move {
+        state_for_init.init_swiftf0().await;
+    });
 
     // Mount the app to the DOM
     dominator::append_dom(&dominator::body(), render_app(state));

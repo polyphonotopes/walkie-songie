@@ -35,15 +35,7 @@ tracing = "0.1"
 # CRDT
 yrs = "0.21"
 
-# Pitch detection (all work on wasm)
-pitch = "0.2"  # BCF - fast, simple
-pitch-detection = "0.3"  # McLeod/YIN - robust in noise
-
-# ML inference for SwiftF0
-tract-onnx = "0.21"
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies.pyin]
-version = "1.2"
+# Pitch detection: SwiftF0 ML model via onnxruntime-web JS bridge (no Rust ML deps needed)
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.32", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
@@ -66,6 +58,7 @@ web-sys = { version = "0.3", features = [
 ] }
 console_error_panic_hook = "0.1"
 getrandom = { version = "0.3", features = ["wasm_js"] }
+js-sys = "0.3"
 
 # UI framework
 dominator = "0.5"

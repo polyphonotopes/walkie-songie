@@ -1,45 +1,74 @@
 //! SwiftF0 ML-based pitch detector.
 //!
-//! Uses a small CNN model (~400KB) for accurate pitch detection.
-//! Much better at avoiding harmonic confusion than traditional algorithms.
+//! Uses onnxruntime-web via JavaScript bridge for full ONNX operator support.
 
-use tract_onnx::prelude::*;
+#[cfg(target_arch = "wasm32")]
+use crate::web::onnx_bridge;
 
 /// SwiftF0 model expects 16kHz audio
+#[cfg(target_arch = "wasm32")]
 const SWIFTF0_SAMPLE_RATE: u32 = 16000;
 
-/// Minimum samples needed for inference (about 64ms at 16kHz)
+/// Minimum samples needed for inference
+#[cfg(target_arch = "wasm32")]
 const MIN_SAMPLES: usize = 1024;
 
-/// Embedded ONNX model
-static SWIFTF0_MODEL: &[u8] = include_bytes!("../../assets/swiftf0.onnx");
-
-/// SwiftF0 pitch detector using tract ONNX runtime.
+/// SwiftF0 pitch detector using onnxruntime-web.
 pub struct SwiftF0Detector {
-    model: SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>,
+    #[cfg(target_arch = "wasm32")]
     buffer_16k: Vec<f32>,
+    #[allow(dead_code)] // Used in wasm builds
     input_sample_rate: u32,
+    #[allow(dead_code)] // Used in wasm builds
+    initialized: bool,
 }
 
 impl SwiftF0Detector {
     /// Create a new SwiftF0 detector.
-    /// input_sample_rate: the sample rate of audio you'll feed in (e.g., 48000)
-    pub fn new(input_sample_rate: u32) -> Result<Self, anyhow::Error> {
-        // Load and optimize the model
-        let model = tract_onnx::onnx()
-            .model_for_read(&mut std::io::Cursor::new(SWIFTF0_MODEL))?
-            .into_optimized()?
-            .into_runnable()?;
-
-        Ok(Self {
-            model,
+    pub fn new(input_sample_rate: u32) -> Self {
+        Self {
+            #[cfg(target_arch = "wasm32")]
             buffer_16k: Vec::with_capacity(MIN_SAMPLES * 4),
             input_sample_rate,
-        })
+            initialized: false,
+        }
+    }
+
+    /// Initialize the ONNX model (async, call once).
+    #[cfg(target_arch = "wasm32")]
+    pub async fn init(&mut self) -> Result<(), String> {
+        match onnx_bridge::init_swiftf0().await {
+            Ok(_) => {
+                self.initialized = true;
+                Ok(())
+            }
+            Err(e) => {
+                let msg = js_sys::JSON::stringify(&e)
+                    .map(|s| s.as_string().unwrap_or_default())
+                    .unwrap_or_else(|_| format!("{:?}", e));
+                Err(msg)
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn init(&mut self) -> Result<(), String> {
+        Err("SwiftF0 only available on wasm".to_string())
+    }
+
+    /// Check if ready.
+    #[cfg(target_arch = "wasm32")]
+    pub fn is_ready(&self) -> bool {
+        self.initialized && onnx_bridge::is_model_ready()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn is_ready(&self) -> bool {
+        false
     }
 
     /// Simple downsampling from input rate to 16kHz.
-    /// For 48kHz -> 16kHz, takes every 3rd sample.
+    #[cfg(target_arch = "wasm32")]
     fn downsample(&self, samples: &[f32]) -> Vec<f32> {
         let ratio = self.input_sample_rate / SWIFTF0_SAMPLE_RATE;
         if ratio <= 1 {
@@ -48,58 +77,47 @@ impl SwiftF0Detector {
         samples.iter().step_by(ratio as usize).copied().collect()
     }
 
-    /// Process audio samples and detect pitch.
-    /// Returns (hz, confidence) if pitch detected, None otherwise.
-    pub fn detect(&mut self, samples: &[f32]) -> Option<(f64, f64)> {
+    /// Process audio samples and detect pitch (async).
+    #[cfg(target_arch = "wasm32")]
+    pub async fn detect(&mut self, samples: &[f32]) -> Option<(f64, f64)> {
+        if !self.is_ready() {
+            return None;
+        }
+
         // Downsample to 16kHz
         let downsampled = self.downsample(samples);
         self.buffer_16k.extend_from_slice(&downsampled);
 
-        // Need enough samples for inference
+        // Need enough samples
         if self.buffer_16k.len() < MIN_SAMPLES {
             return None;
         }
 
-        // Prepare input tensor [1, audio_length]
-        let input: Tensor = tract_ndarray::Array2::from_shape_vec(
-            (1, self.buffer_16k.len()),
-            self.buffer_16k.clone(),
-        )
-        .ok()?
-        .into();
+        // Run inference via JS bridge
+        let result = onnx_bridge::detect_pitch(&self.buffer_16k).await;
+        let pitch_result = onnx_bridge::OnnxPitchResult::from_js(result);
 
-        // Run inference
-        let outputs = self.model.run(tvec!(input.into())).ok()?;
-
-        // Output 0: pitch_hz, Output 1: confidence
-        let pitch_hz = outputs[0].to_array_view::<f32>().ok()?;
-        let confidence = outputs[1].to_array_view::<f32>().ok()?;
-
-        // Get the last frame's pitch and confidence
-        let len = pitch_hz.len();
-        if len == 0 {
-            return None;
-        }
-
-        let hz = pitch_hz.as_slice()?[len - 1] as f64;
-        let conf = confidence.as_slice()?[len - 1] as f64;
-
-        // Trim buffer to prevent unbounded growth (keep last ~100ms)
-        let keep = SWIFTF0_SAMPLE_RATE as usize / 10; // ~1600 samples
+        // Trim buffer
+        let keep = SWIFTF0_SAMPLE_RATE as usize / 10;
         if self.buffer_16k.len() > keep * 2 {
             self.buffer_16k.drain(..self.buffer_16k.len() - keep);
         }
 
-        // Filter out invalid pitches
-        if hz > 46.0 && hz < 2100.0 && conf > 0.3 {
-            Some((hz, conf))
-        } else {
-            None
-        }
+        pitch_result.map(|r| (r.hz, r.confidence))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn detect(&mut self, _samples: &[f32]) -> Option<(f64, f64)> {
+        None
     }
 
     /// Reset the detector state.
+    #[cfg(target_arch = "wasm32")]
     pub fn reset(&mut self) {
         self.buffer_16k.clear();
     }
+
+    /// Reset the detector state (no-op on non-wasm).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn reset(&mut self) {}
 }

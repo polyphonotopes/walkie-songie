@@ -11,7 +11,7 @@ use crate::room::RoomState;
 use crate::tuning::{parse_scl, Tuning};
 
 use super::app::AppState;
-use super::keyboard::update_tuning;
+use super::keyboard::{sync_active_pitches, update_tuning};
 
 /// Voice input button component.
 /// Hold to record, release to commit the detected pitch.
@@ -20,7 +20,7 @@ pub fn voice_button(state: Arc<AppState>) -> Dom {
         .class("voice-button")
         .class_signal("active", state.voice_active.signal())
         .text_signal(state.voice_active.signal().map(|active| {
-            if active { "Singing..." } else { "Hold to Sing" }
+            if active { "🗣️ Singing..." } else { "🗣️ Hold to Sing" }
         }))
         .event(clone!(state => move |_: events::PointerDown| {
             state.start_voice();
@@ -37,15 +37,29 @@ pub fn voice_button(state: Arc<AppState>) -> Dom {
     })
 }
 
+/// Clear all active pitches button.
+pub fn clear_button(state: Arc<AppState>) -> Dom {
+    html!("button", {
+        .class("clear-button")
+        .text("🌊 Clear")
+        .event(clone!(state => move |_: events::Click| {
+            // Clear both manual pitches and voice pitch
+            state.room.lock_mut().clear_pitches();
+            state.voice_pitch.set(None);
+            sync_active_pitches(&state);
+        }))
+    })
+}
+
 /// Pitch display component showing current detected pitch.
 pub fn pitch_display(state: Arc<AppState>) -> Dom {
     html!("div", {
         .class("pitch-display")
         .children(&mut [
-            // Fast pitch indicator (real-time feedback)
+            // Current pitch indicator (real-time feedback from SwiftF0)
             html!("div", {
-                .class("fast-pitch")
-                .child_signal(state.fast_pitch.signal_cloned().map(clone!(state => move |event| {
+                .class("current-pitch")
+                .child_signal(state.current_pitch.signal_cloned().map(clone!(state => move |event| {
                     Some(html!("div", {
                         .children(&mut [
                             html!("span", {
@@ -101,26 +115,21 @@ pub fn pitch_display(state: Arc<AppState>) -> Dom {
                 })))
             }),
 
-            // Signal level indicator
+            // Confidence indicator
             html!("div", {
-                .class("signal-level")
-                .child_signal(state.fast_pitch.signal_cloned().map(|event| {
+                .class("confidence-level")
+                .child_signal(state.current_pitch.signal_cloned().map(|event| {
                     Some(html!("div", {
                         .children(&mut [
                             html!("span", {
                                 .class("level-label")
-                                .text("Level: ")
+                                .text("Confidence: ")
                             }),
                             html!("div", {
                                 .class("level-bar")
                                 .style_signal("width", futures_signals::signal::always(
                                     match event {
-                                        Some(e) => {
-                                            // Map dB to percentage (-60dB to 0dB -> 0% to 100%)
-                                            let level = ((e.signal_level_db + 60.0) / 60.0 * 100.0)
-                                                .clamp(0.0, 100.0);
-                                            format!("{}%", level)
-                                        }
+                                        Some(e) => format!("{}%", (e.confidence * 100.0).clamp(0.0, 100.0)),
                                         None => "0%".to_string(),
                                     }
                                 ))

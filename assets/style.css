@@ -1,14 +1,14 @@
 /* Walkie Songie - Voice Input UI Styles */
 
 :root {
-    --bg-primary: #1a1a2e;
-    --bg-secondary: #16213e;
-    --text-primary: #eee;
-    --text-secondary: #888;
-    --accent: #e94560;
-    --accent-hover: #ff6b6b;
-    --success: #0f3460;
-    --active: #4ade80;
+    --bg-primary: #0f172a;
+    --bg-secondary: #1e293b;
+    --text-primary: #f1f5f9;
+    --text-secondary: #94a3b8;
+    --voice: #10b981;
+    --voice-light: #34d399;
+    --manual: #fb7185;
+    --manual-light: #fda4af;
 }
 
 * {
@@ -77,6 +77,19 @@ body {
     display: block;
     width: min(95vw, 70vh);
     max-width: 800px;
+
+    /* Keyboard theming via CSS custom properties */
+    --key-lower-fill: #1e293b;
+    --key-lower-stroke: #475569;
+    --key-upper-fill: #0f172a;
+    --key-upper-stroke: #334155;
+    --key-pressed-fill: var(--manual);
+    --key-highlight-fill: var(--voice);
+    --key-highlight-stroke: var(--voice);
+    --key-highlight-stroke-width: 4px;
+    --key-highlight-lower-fill: var(--voice);
+    --key-highlight-upper-fill: var(--voice);
+    --key-hover-opacity: 0.85;
 }
 
 /* Keyboard Overlay (pitch info in center) */
@@ -141,16 +154,22 @@ body {
     display: none;
 }
 
+/* Button Row */
+.button-row {
+    display: flex;
+    gap: 0.75rem;
+}
+
 /* Voice Button */
 .voice-button {
     display: block;
-    width: 100%;
+    flex: 1;
     padding: 1rem;
     font-size: 1.25rem;
     font-weight: 600;
     border: none;
     border-radius: 12px;
-    background: var(--accent);
+    background: var(--voice);
     color: white;
     cursor: pointer;
     transition: all 0.2s ease;
@@ -159,12 +178,31 @@ body {
 }
 
 .voice-button:hover {
-    background: var(--accent-hover);
+    background: var(--voice-light);
 }
 
 .voice-button.active {
-    background: var(--active);
-    animation: pulse 1s ease-in-out infinite;
+    background: var(--voice-light);
+    box-shadow: 0 0 16px var(--voice);
+    animation: pulse 1.5s ease-in-out infinite;
+}
+
+/* Clear Button */
+.clear-button {
+    padding: 1rem 1.5rem;
+    font-size: 1.25rem;
+    font-weight: 600;
+    border: 2px solid var(--text-secondary);
+    border-radius: 12px;
+    background: transparent;
+    color: var(--text-primary);
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.clear-button:hover {
+    border-color: var(--manual);
+    background: rgba(251, 113, 133, 0.15);
 }
 
 @keyframes pulse {
@@ -195,12 +233,17 @@ body {
 }
 
 .pitch-tag {
-    background: var(--accent);
+    background: var(--manual);
     color: white;
     padding: 0.25rem 0.75rem;
     border-radius: 999px;
     font-weight: 600;
     font-size: 0.9rem;
+}
+
+.pitch-tag.voice-pitch {
+    background: var(--voice);
+    box-shadow: 0 0 8px var(--voice);
 }
 
 /* Tuning Section (collapsible) */

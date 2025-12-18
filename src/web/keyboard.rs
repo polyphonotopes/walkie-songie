@@ -1,12 +1,16 @@
 //! Bindings and wrapper for the all-around-keyboard web component.
+//!
+//! New declarative API:
+//! - State in via attributes: `pressed-notes`, `lit-notes`
+//! - Events out: `keyclick`, `keyhover`, `keyunhover`
 
 use std::sync::Arc;
 
 use dominator::{clone, html, Dom};
-use web_sys::js_sys::{Array, Reflect};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::HtmlElement;
+use web_sys::js_sys::Reflect;
 
 use crate::room::RoomState;
 use crate::tuning::{PitchClass, Tuning};
@@ -22,21 +26,6 @@ fn get_keyboard() -> Option<HtmlElement> {
         .map(|el| el.unchecked_into())
 }
 
-/// Call a method on the keyboard element with an array of indices.
-fn call_keyboard_method(method: &str, indices: &[u8]) {
-    if let Some(kb) = get_keyboard() {
-        let array = Array::new();
-        for &idx in indices {
-            array.push(&JsValue::from(idx));
-        }
-        if let Ok(func) = Reflect::get(&kb, &JsValue::from_str(method)) {
-            if let Some(func) = func.dyn_ref::<web_sys::js_sys::Function>() {
-                let _ = func.call1(&kb, &array);
-            }
-        }
-    }
-}
-
 /// Set an attribute on the keyboard element.
 fn set_keyboard_attr(attr: &str, value: &str) {
     if let Some(kb) = get_keyboard() {
@@ -44,50 +33,22 @@ fn set_keyboard_attr(attr: &str, value: &str) {
     }
 }
 
-/// Press keys on the keyboard (active/toggled state).
-pub fn keys_press(indices: &[u8]) {
-    call_keyboard_method("keysPress", indices);
+/// Format a slice of note indices as a JSON array string.
+fn notes_to_json(notes: &[u8]) -> String {
+    format!("[{}]", notes.iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(","))
 }
 
-/// Release keys on the keyboard.
-pub fn keys_release(indices: &[u8]) {
-    call_keyboard_method("keysRelease", indices);
+/// Set which notes are pressed (active pitches).
+pub fn set_pressed_notes(notes: &[u8]) {
+    set_keyboard_attr("pressed-notes", &notes_to_json(notes));
 }
 
-/// Light keys on the keyboard (detected pitch state).
-pub fn notes_light(notes: &[u8]) {
-    call_keyboard_method("notesLight", notes);
-}
-
-/// Dim keys on the keyboard.
-pub fn notes_dim(notes: &[u8]) {
-    call_keyboard_method("notesDim", notes);
-}
-
-
-/// Dim all lit keys.
-pub fn dim_all() {
-    if let Some(kb) = get_keyboard() {
-        if let Ok(func) = Reflect::get(&kb, &JsValue::from_str("dimAll")) {
-            if let Some(func) = func.dyn_ref::<web_sys::js_sys::Function>() {
-                let _ = func.call0(&kb);
-            }
-        }
-    }
-}
-
-/// Sync keyboard pressed state with active pitches in room.
-pub fn sync_active_pitches(state: &Arc<AppState>) {
-    let room = state.room.lock_ref();
-    let sets = room.all_peer_sets();
-    let peer_id = room.local_peer_id();
-
-    if let Some(set) = sets.get(peer_id) {
-        let active: Vec<u8> = set.pitch_classes.iter().map(|pc| pc.index()).collect();
-        if !active.is_empty() {
-            keys_press(&active);
-        }
-    }
+/// Set which notes are lit (detected pitch during singing).
+pub fn set_lit_notes(notes: &[u8]) {
+    set_keyboard_attr("lit-notes", &notes_to_json(notes));
 }
 
 /// Update keyboard to match tuning.
@@ -97,11 +58,7 @@ pub fn update_tuning(tuning: &Tuning) {
 
     // Compute raised notes pattern
     let raised = compute_raised_notes(tuning);
-    let raised_json = format!("[{}]", raised.iter()
-        .map(|n| n.to_string())
-        .collect::<Vec<_>>()
-        .join(","));
-    set_keyboard_attr("raised-notes", &raised_json);
+    set_keyboard_attr("raised-notes", &notes_to_json(&raised));
 
     // Use pie mode for non-12-TET (no raised keys looks better as pie)
     if raised.is_empty() {
@@ -122,8 +79,31 @@ pub fn compute_raised_notes(tuning: &Tuning) -> Vec<u8> {
         vec![1, 3, 6, 8, 10]
     } else {
         // For non-12-TET, no raised keys (pie mode handles this better)
-        // Could implement MOS pattern detection here in the future
         vec![]
+    }
+}
+
+/// Sync keyboard state with active pitches.
+/// - Manual pitches show as "pressed" (red)
+/// - Voice pitch shows as "lit" (green)
+pub fn sync_active_pitches(state: &Arc<AppState>) {
+    let room = state.room.lock_ref();
+    let sets = room.all_peer_sets();
+    let peer_id = room.local_peer_id();
+
+    // Manual pitches from room -> pressed (red)
+    let manual: Vec<u8> = if let Some(set) = sets.get(peer_id) {
+        set.pitch_classes.iter().map(|pc| pc.index()).collect()
+    } else {
+        vec![]
+    };
+    set_pressed_notes(&manual);
+
+    // Voice pitch -> lit (green)
+    if let Some(voice_pc) = state.voice_pitch.get() {
+        set_lit_notes(&[voice_pc.index()]);
+    } else {
+        set_lit_notes(&[]);
     }
 }
 
@@ -138,11 +118,9 @@ pub fn pitch_keyboard(state: Arc<AppState>) -> Dom {
             .attr("sweep", "360")
             .attr("width", "800")
             .attr("depth", "280")
-            // Match UI accent colors
-            .attr("pressed-fill", "#e94560")
-            .attr("lit-fill", "#4ade80")
+            .attr("pressed-notes", "[]")
+            .attr("lit-notes", "[]")
         }))
-        // Set up event listener for keypress events
         .after_inserted(clone!(state => move |_| {
             setup_keyboard_events(state.clone());
             // Initial sync with tuning
@@ -158,35 +136,49 @@ pub fn pitch_keyboard(state: Arc<AppState>) -> Dom {
 /// Set up keyboard event listeners.
 fn setup_keyboard_events(state: Arc<AppState>) {
     if let Some(kb) = get_keyboard() {
-        // Listen for keypress events to toggle pitch classes
-        let state_press = state.clone();
-        let on_keypress = Closure::<dyn Fn(web_sys::Event)>::new(move |event: web_sys::Event| {
-            // Get the key index from the event
-            if let Ok(index) = Reflect::get(&event, &JsValue::from_str("index")) {
-                if let Some(idx) = index.as_f64() {
-                    let tuning = state_press.tuning.lock_ref();
-                    let count = tuning.pitch_class_count() as u8;
-                    let note = (idx as u8) % count;
-                    let pc = PitchClass::new(note);
-                    drop(tuning);
+        // Listen for keyclick events (actual user clicks, not hover)
+        let state_click = state.clone();
+        let on_click = Closure::<dyn Fn(web_sys::Event)>::new(move |event: web_sys::Event| {
+            // Skip if voice input is active
+            if state_click.voice_active.get() {
+                return;
+            }
 
-                    // Toggle the pitch in room state
-                    let is_active = state_press.room.lock_mut().toggle_pitch(pc);
+            // Get note from event detail
+            if let Ok(detail) = Reflect::get(&event, &JsValue::from_str("detail")) {
+                if let Ok(note_val) = Reflect::get(&detail, &JsValue::from_str("note")) {
+                    if let Some(note) = note_val.as_f64() {
+                        let tuning = state_click.tuning.lock_ref();
+                        let count = tuning.pitch_class_count() as u8;
+                        let note = (note as u8) % count;
+                        let pc = PitchClass::new(note);
+                        drop(tuning);
 
-                    // Update keyboard visual state
-                    if is_active {
-                        keys_press(&[note]);
-                    } else {
-                        keys_release(&[note]);
+                        // Check if this is the voice pitch
+                        let is_voice_pitch = state_click.voice_pitch.get() == Some(pc);
+
+                        if is_voice_pitch {
+                            // Clicking voice pitch clears it
+                            state_click.voice_pitch.set(None);
+                        } else {
+                            // Toggle the pitch in room state (manual pitches)
+                            state_click.room.lock_mut().toggle_pitch(pc);
+                            // Touch voice_pitch to trigger list update
+                            let vp = state_click.voice_pitch.get();
+                            state_click.voice_pitch.set(vp);
+                        }
+
+                        // Re-sync keyboard to reflect new state
+                        sync_active_pitches(&state_click);
                     }
                 }
             }
         });
 
         let _ = kb.add_event_listener_with_callback(
-            "keypress",
-            on_keypress.as_ref().unchecked_ref(),
+            "keyclick",
+            on_click.as_ref().unchecked_ref(),
         );
-        on_keypress.forget(); // Leak the closure to keep it alive
+        on_click.forget();
     }
 }
