@@ -64,6 +64,12 @@ pub enum NetEvent {
     RemotePitchClassChange { peer_id: String, pitch_class: u8, on: bool },
     /// Remote peer changed their voice pitch
     RemoteVoicePitchChange { peer_id: String, pitch: Option<i32> },
+    /// Piece added or moved (absolute MIDI pitch)
+    PieceChange { piece_id: String, pitch: i32 },
+    /// Piece removed
+    PieceRemoved { piece_id: String },
+    /// Full state sync (when joining room) - pieces as (id, pitch) pairs
+    FullStateSync { pieces: Vec<(String, i32)> },
     /// Error occurred
     Error(String),
 }
@@ -71,6 +77,7 @@ pub enum NetEvent {
 /// MIDI channels for output
 const CHANNEL_ROOM_PCS: u8 = 0;    // Channel 1 in DAW (0-indexed)
 const CHANNEL_VOICE: u8 = 1;       // Channel 2 in DAW
+const CHANNEL_PIECES: u8 = 2;      // Channel 3 in DAW (pieces as absolute MIDI notes)
 
 /// The walkie-songie plugin.
 pub struct WalkieSongiePlugin {

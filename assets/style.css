@@ -74,11 +74,14 @@ body {
     align-items: center;
 }
 
+/* Pieces are now slotted children of all-around-keyboard, positioned by its indicator system */
+
 .keyboard-container all-around-keyboard,
 all-around-keyboard.keyboard {
     display: block;
     width: min(95vw, 70vh);
     max-width: 800px;
+    position: relative;
 
     /* Keyboard theming via CSS custom properties */
     --key-lower-fill: #1e293b;
@@ -92,6 +95,11 @@ all-around-keyboard.keyboard {
     --key-highlight-lower-fill: var(--voice);
     --key-highlight-upper-fill: var(--voice);
     --key-hover-opacity: 0.85;
+}
+
+/* Force SVG in keyboard to be below indicators */
+all-around-keyboard svg {
+    z-index: 1;
 }
 
 /* Pitch Indicator - positioned by all-around-keyboard via CSS custom properties */
@@ -252,7 +260,7 @@ all-around-keyboard.keyboard {
     color: white;
 }
 
-/* Piece Indicator (on keyboard) */
+/* Piece Indicator (on keyboard) - positioned by all-around-keyboard via CSS custom properties */
 .piece-indicator {
     position: absolute;
     left: var(--indicator-x, 50%);
@@ -260,7 +268,6 @@ all-around-keyboard.keyboard {
     transform: translate(-50%, -50%);
     border-radius: 50%;
     pointer-events: auto;
-    transition: left 0.05s ease-out, top 0.05s ease-out;
     z-index: 100;
 }
 

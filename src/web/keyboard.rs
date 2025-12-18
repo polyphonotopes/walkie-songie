@@ -100,10 +100,6 @@ pub fn sync_active_pitches(state: &Arc<AppState>) {
     let pc_count = tuning.pitch_class_count() as i32;
     drop(tuning);
 
-    // Get all peer sets for debugging
-    let peer_sets = room.all_peer_sets();
-    let peer_ids: Vec<_> = peer_sets.keys().collect();
-
     // Get combined pitch result from all peers (uses combination method)
     let room_result = room.compute_room_result();
 
@@ -118,14 +114,6 @@ pub fn sync_active_pitches(state: &Arc<AppState>) {
             combined.push(pc);
         }
     }
-
-    web_sys::console::log_1(&format!(
-        "[keyboard] sync_active_pitches: combined={:?}, peer_count={}, pieces={}, peer_ids={:?}",
-        combined,
-        peer_sets.len(),
-        pieces.len(),
-        peer_ids
-    ).into());
 
     set_pressed_notes(&combined);
 
@@ -159,44 +147,50 @@ fn hz_to_pitch_position(hz: f64, pitch_count: usize) -> f64 {
 /// Maximum allowed drag distance in semitones before snapping back.
 const MAX_DRAG_SEMITONES: i32 = 4;
 
-/// Create a piece indicator DOM element for a single piece.
-fn piece_indicator(state: Arc<AppState>, piece: Piece) -> Dom {
-    let piece_id = piece.id.clone();
-    let piece_id_for_move = piece.id.clone();
-    let piece_id_for_up = piece.id.clone();
-    let original_pitch = piece.pitch;
-    let tuning = state.tuning.lock_ref();
-    let pitch_count = tuning.pitch_class_count();
-    drop(tuning);
+/// Leftmost key index for the keyboard (C3 = MIDI 36)
+const LEFTMOST_KEY: i32 = 36;
 
-    // Convert absolute pitch to pitch class position (0-N)
-    let pitch_class = piece.pitch.rem_euclid(pitch_count as i32) as u8;
+/// Create a piece indicator DOM element for a single piece.
+fn piece_indicator(piece: Piece, pitch_count: usize) -> Dom {
+    let piece_id = piece.id.clone();
+    let original_pitch = piece.pitch;
+
+    // Convert absolute pitch to pitch class, then to keyboard key index
+    let pitch_class = piece.pitch.rem_euclid(pitch_count as i32);
+    let key_index = LEFTMOST_KEY + pitch_class;
 
     html!("div", {
         .class("piece-indicator")
         .attr("data-piece-id", &piece_id)
-        .attr("data-key", &format!("{}", pitch_class)) // Snap to key position
-        .attr("data-radius", "0.6") // Fixed radius for pieces
+        .attr("data-key", &key_index.to_string()) // Key index for all-around-keyboard slotting
+        // No data-radius - let keyboard calculate from key's actual geometry
         .attr("data-original-pitch", &original_pitch.to_string())
+        // Inline styles for piece (slotted children need explicit sizing)
         .style("width", "32px")
         .style("height", "32px")
-        .style("background", "var(--manual)")
+        .style("background", "#8b5cf6") // Purple to match piece-pitch chip
         .style("border-radius", "50%")
         .style("cursor", "grab")
         .style("user-select", "none")
-        .style("box-shadow", "0 0 12px var(--manual)")
-        .style("transition", "none") // Disable transition during potential drag
-        .style("z-index", "100") // Above keyboard elements
-        // Start drag on pointer down
-        .event(move |e: events::PointerDown| {
+        .style("box-shadow", "0 0 12px rgba(139, 92, 246, 0.6), 0 2px 8px rgba(0, 0, 0, 0.3)")
+        .style("pointer-events", "auto") // Enable interaction through indicator-container
+        // Start drag on pointer down - document-level handlers take over from here
+        .event(clone!(piece_id => move |e: events::PointerDown| {
             if let Some(target) = e.target() {
                 if let Ok(el) = target.dyn_into::<HtmlElement>() {
-                    el.set_pointer_capture(e.pointer_id()).ok();
+                    // Store drag info on document body for document-level handlers
+                    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                        let body = doc.body().unwrap();
+                        body.set_attribute("data-dragging-piece", &piece_id).ok();
+                        body.set_attribute("data-drag-start-pitch", &original_pitch.to_string()).ok();
+                    }
+
                     el.set_attribute("data-dragging", "true").ok();
-                    el.set_attribute("data-drag-start-pitch", &original_pitch.to_string()).ok();
                     // Switch to fixed positioning for smooth drag
                     el.style().set_property("position", "fixed").ok();
                     el.style().set_property("z-index", "1000").ok();
+                    // IMPORTANT: pointer-events: none so events pass through to keyboard
+                    // Document-level handlers will handle movement and drop
                     el.style().set_property("pointer-events", "none").ok();
                     // Position at cursor
                     let x = e.x() as f64 - 16.0; // Center the 32px element
@@ -205,106 +199,6 @@ fn piece_indicator(state: Arc<AppState>, piece: Piece) -> Dom {
                     el.style().set_property("top", &format!("{}px", y)).ok();
                     // Remove data-key so it doesn't snap back during drag
                     el.remove_attribute("data-key").ok();
-                }
-            }
-        })
-        // Handle drag movement - piece follows cursor
-        .event_with_options(
-            &dominator::EventOptions { bubbles: true, preventable: true },
-            clone!(state => move |e: events::PointerMove| {
-                if let Some(target) = e.target() {
-                    if let Ok(el) = target.dyn_into::<HtmlElement>() {
-                        if el.get_attribute("data-dragging").as_deref() != Some("true") {
-                            return;
-                        }
-                        // Move piece to follow cursor
-                        let x = e.x() as f64 - 16.0;
-                        let y = e.y() as f64 - 16.0;
-                        el.style().set_property("left", &format!("{}px", x)).ok();
-                        el.style().set_property("top", &format!("{}px", y)).ok();
-
-                        // Calculate current key position for visual feedback
-                        if let Some(kb) = get_keyboard() {
-                            if let Some((current_key, _)) = get_key_at_position(&kb, e.x() as f64, e.y() as f64) {
-                                // Store current hover key for constraint checking
-                                el.set_attribute("data-hover-key", &current_key.to_string()).ok();
-
-                                // Visual feedback: change color if out of range
-                                if let Some(start_str) = el.get_attribute("data-drag-start-pitch") {
-                                    if let Ok(start_pitch) = start_str.parse::<i32>() {
-                                        let tuning = state.tuning.lock_ref();
-                                        let pc_count = tuning.pitch_class_count() as i32;
-                                        drop(tuning);
-
-                                        let start_pc = start_pitch.rem_euclid(pc_count);
-                                        let delta = shortest_delta(start_pc, current_key, pc_count);
-
-                                        if delta.abs() > MAX_DRAG_SEMITONES {
-                                            // Out of range - show warning color
-                                            el.style().set_property("background", "#666").ok();
-                                            el.style().set_property("box-shadow", "0 0 12px #666").ok();
-                                        } else {
-                                            // In range - show normal color
-                                            el.style().set_property("background", "var(--manual)").ok();
-                                            el.style().set_property("box-shadow", "0 0 12px var(--manual)").ok();
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            })
-        )
-        // End drag on pointer up - check constraints and commit or revert
-        .event(clone!(state, piece_id_for_up => move |e: events::PointerUp| {
-            if let Some(target) = e.target() {
-                if let Ok(el) = target.dyn_into::<HtmlElement>() {
-                    el.release_pointer_capture(e.pointer_id()).ok();
-
-                    let was_dragging = el.get_attribute("data-dragging").as_deref() == Some("true");
-                    el.remove_attribute("data-dragging").ok();
-
-                    if was_dragging {
-                        // Get start pitch and current hover key
-                        let start_pitch = el.get_attribute("data-drag-start-pitch")
-                            .and_then(|s| s.parse::<i32>().ok())
-                            .unwrap_or(original_pitch);
-
-                        let hover_key = el.get_attribute("data-hover-key")
-                            .and_then(|s| s.parse::<i32>().ok());
-
-                        // Reset element styling
-                        el.style().remove_property("position").ok();
-                        el.style().remove_property("z-index").ok();
-                        el.style().remove_property("pointer-events").ok();
-                        el.style().remove_property("left").ok();
-                        el.style().remove_property("top").ok();
-                        el.style().set_property("background", "var(--manual)").ok();
-                        el.style().set_property("box-shadow", "0 0 12px var(--manual)").ok();
-                        el.remove_attribute("data-drag-start-pitch").ok();
-                        el.remove_attribute("data-hover-key").ok();
-
-                        // Check if we have a valid drop target
-                        if let Some(end_key) = hover_key {
-                            let tuning = state.tuning.lock_ref();
-                            let pc_count = tuning.pitch_class_count() as i32;
-                            drop(tuning);
-
-                            let start_pc = start_pitch.rem_euclid(pc_count);
-                            let delta = shortest_delta(start_pc, end_key, pc_count);
-
-                            if delta.abs() <= MAX_DRAG_SEMITONES && delta != 0 {
-                                // Valid move - update CRDT
-                                let new_pitch = start_pitch + delta;
-                                state.room.lock_mut().move_piece(&piece_id_for_up, new_pitch);
-                            }
-                            // If delta == 0 or out of range, piece stays at original position
-                        }
-
-                        state.room_version.set(state.room_version.get() + 1);
-                        sync_active_pitches(&state);
-                    }
                 }
             }
         }))
@@ -322,45 +216,7 @@ fn shortest_delta(from_pc: i32, to_pc: i32, pc_count: i32) -> i32 {
     delta
 }
 
-/// Get the key index at a given screen position relative to the keyboard.
-/// Returns (key_index, distance_from_center) or None if outside keyboard.
-fn get_key_at_position(kb: &HtmlElement, client_x: f64, client_y: f64) -> Option<(i32, f64)> {
-    let kb_rect = js_sys::Reflect::get(kb, &"getBoundingClientRect".into())
-        .ok()
-        .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
-        .and_then(|f| f.call0(kb).ok())?;
-
-    let left = js_sys::Reflect::get(&kb_rect, &"left".into())
-        .ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let top = js_sys::Reflect::get(&kb_rect, &"top".into())
-        .ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let width = js_sys::Reflect::get(&kb_rect, &"width".into())
-        .ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let height = js_sys::Reflect::get(&kb_rect, &"height".into())
-        .ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
-
-    let center_x = left + width / 2.0;
-    let center_y = top + height / 2.0;
-
-    let dx = client_x - center_x;
-    let dy = client_y - center_y;
-    let distance = (dx * dx + dy * dy).sqrt();
-
-    // Calculate angle (0 at top, clockwise)
-    let angle = dy.atan2(dx);
-    let normalized = (angle + std::f64::consts::FRAC_PI_2) / (2.0 * std::f64::consts::PI);
-
-    // Get pitch class count from keyboard attribute
-    let notes_attr = kb.get_attribute("notes-in-octave")
-        .and_then(|s| s.parse::<i32>().ok())
-        .unwrap_or(12);
-
-    let key = ((normalized * notes_attr as f64) % notes_attr as f64 + notes_attr as f64) as i32 % notes_attr;
-
-    Some((key, distance))
-}
-
-/// Create the all-around-keyboard component with indicator child.
+/// Create the all-around-keyboard component with voice indicator and pieces as slotted children.
 pub fn pitch_keyboard(state: Arc<AppState>) -> Dom {
     html!("all-around-keyboard", {
         .class("keyboard")
@@ -413,17 +269,20 @@ pub fn pitch_keyboard(state: Arc<AppState>) -> Dom {
             }))
         }))
 
-        // Piece indicators - rendered dynamically based on room state
+        // Piece indicators as slotted children - positioned via data-key attribute
         .children_signal_vec(
             state.room_version.signal().map(clone!(state => move |_| {
                 // Only show pieces in piece mode
                 if !state.piece_mode.get() {
                     return vec![];
                 }
+                let tuning = state.tuning.lock_ref();
+                let pitch_count = tuning.pitch_class_count();
+                drop(tuning);
                 let room = state.room.lock_ref();
                 let pieces = room.all_pieces();
                 pieces.into_iter().map(|piece| {
-                    piece_indicator(state.clone(), piece)
+                    piece_indicator(piece, pitch_count)
                 }).collect::<Vec<_>>()
             })).to_signal_vec()
         )
@@ -440,9 +299,201 @@ pub fn pitch_keyboard(state: Arc<AppState>) -> Dom {
     })
 }
 
+/// Store the currently hovered key note (used during piece drag)
+static HOVERED_KEY_NOTE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Store the last key that received a pointerup (for drop detection)
+static POINTERUP_KEY_NOTE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Get the currently hovered key note (pitch class 0-11, or -1 if none)
+pub fn get_hovered_key_note() -> Option<i32> {
+    let val = HOVERED_KEY_NOTE.load(std::sync::atomic::Ordering::Relaxed);
+    if val >= 0 { Some(val) } else { None }
+}
+
+/// Get and clear the last pointerup key note (pitch class 0-11, or -1 if none)
+pub fn take_pointerup_key_note() -> Option<i32> {
+    let val = POINTERUP_KEY_NOTE.swap(-1, std::sync::atomic::Ordering::Relaxed);
+    if val >= 0 { Some(val) } else { None }
+}
+
+/// Set up document-level drag handlers for piece dragging.
+/// This is needed because the piece has pointer-events: none during drag,
+/// so we handle movement and drop at the document level.
+fn setup_document_drag_handlers(state: Arc<AppState>) {
+    let Some(window) = web_sys::window() else { return };
+    let Some(document) = window.document() else { return };
+
+    // Document-level pointermove handler for dragging pieces
+    let state_move = state.clone();
+    let on_move = Closure::<dyn Fn(web_sys::PointerEvent)>::new(move |e: web_sys::PointerEvent| {
+        let Some(body) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.body()) else { return };
+
+        // Check if we're dragging a piece
+        let Some(piece_id) = body.get_attribute("data-dragging-piece") else { return };
+
+        // Find the piece element
+        let Some(doc) = web_sys::window().and_then(|w| w.document()) else { return };
+        let Some(piece_el) = doc.query_selector(&format!("[data-piece-id='{}']", piece_id)).ok().flatten() else { return };
+        let Ok(piece_el) = piece_el.dyn_into::<HtmlElement>() else { return };
+
+        // Move piece to follow cursor
+        let x = e.x() as f64 - 16.0;
+        let y = e.y() as f64 - 16.0;
+        piece_el.style().set_property("left", &format!("{}px", x)).ok();
+        piece_el.style().set_property("top", &format!("{}px", y)).ok();
+
+        // Update hover key tracking for visual feedback
+        if let Some(current_pc) = get_hovered_key_note() {
+            piece_el.set_attribute("data-hover-key", &current_pc.to_string()).ok();
+
+            // Visual feedback: change color if out of range
+            if let Some(start_str) = body.get_attribute("data-drag-start-pitch") {
+                if let Ok(start_pitch) = start_str.parse::<i32>() {
+                    let tuning = state_move.tuning.lock_ref();
+                    let pc_count = tuning.pitch_class_count() as i32;
+                    drop(tuning);
+
+                    let start_pc = start_pitch.rem_euclid(pc_count);
+                    let delta = shortest_delta(start_pc, current_pc, pc_count);
+
+                    if delta.abs() > MAX_DRAG_SEMITONES {
+                        // Out of range - show warning color (dimmed)
+                        piece_el.style().set_property("background", "#666").ok();
+                        piece_el.style().set_property("box-shadow", "0 0 8px rgba(102, 102, 102, 0.5)").ok();
+                    } else {
+                        // In range - show normal purple
+                        piece_el.style().set_property("background", "#8b5cf6").ok();
+                        piece_el.style().set_property("box-shadow", "0 0 12px rgba(139, 92, 246, 0.6), 0 2px 8px rgba(0, 0, 0, 0.3)").ok();
+                    }
+                }
+            }
+        }
+    });
+    let _ = document.add_event_listener_with_callback("pointermove", on_move.as_ref().unchecked_ref());
+    on_move.forget();
+
+    // Document-level pointerup handler for dropping pieces
+    let state_up = state.clone();
+    let on_up = Closure::<dyn Fn(web_sys::PointerEvent)>::new(move |_e: web_sys::PointerEvent| {
+        let Some(body) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.body()) else { return };
+
+        // Check if we're dragging a piece
+        let Some(piece_id) = body.get_attribute("data-dragging-piece") else { return };
+        let start_pitch = body.get_attribute("data-drag-start-pitch")
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(0);
+
+        // Clear drag state from body
+        body.remove_attribute("data-dragging-piece").ok();
+        body.remove_attribute("data-drag-start-pitch").ok();
+
+        // Find the piece element
+        let Some(doc) = web_sys::window().and_then(|w| w.document()) else { return };
+        let Some(piece_el) = doc.query_selector(&format!("[data-piece-id='{}']", piece_id)).ok().flatten() else { return };
+        let Ok(piece_el) = piece_el.dyn_into::<HtmlElement>() else { return };
+
+        // Get hover key from piece element (set during move)
+        let hover_key = piece_el.get_attribute("data-hover-key")
+            .and_then(|s| s.parse::<i32>().ok());
+
+        // Check for keypointerup event (fires when pointer up happens over a key)
+        let pointerup_key = take_pointerup_key_note();
+
+        // Also check the global hovered key from keyhover events
+        let global_hover = get_hovered_key_note();
+
+        // Use best available drop target: pointerup > global_hover > hover_key
+        let end_key = pointerup_key
+            .or(global_hover)
+            .or(hover_key);
+
+        let tuning = state_up.tuning.lock_ref();
+        let pc_count = tuning.pitch_class_count() as i32;
+        drop(tuning);
+
+        // Check if we have a valid drop target and compute new pitch
+        let new_pitch = if let Some(end_key) = end_key {
+            let start_pc = start_pitch.rem_euclid(pc_count);
+            let delta = shortest_delta(start_pc, end_key, pc_count);
+
+            if delta.abs() <= MAX_DRAG_SEMITONES && delta != 0 {
+                // Valid move - update CRDT
+                let new_pitch = start_pitch + delta;
+                state_up.room.lock_mut().move_piece(&piece_id, new_pitch);
+                new_pitch
+            } else {
+                start_pitch // No change
+            }
+        } else {
+            start_pitch // No drop target
+        };
+
+        // Set data-key FIRST to avoid flash - compute from new pitch
+        let pitch_class = new_pitch.rem_euclid(pc_count);
+        let key_index = LEFTMOST_KEY + pitch_class;
+        piece_el.set_attribute("data-key", &key_index.to_string()).ok();
+
+        // Then reset element styling
+        piece_el.remove_attribute("data-dragging").ok();
+        piece_el.style().remove_property("position").ok();
+        piece_el.style().remove_property("z-index").ok();
+        piece_el.style().remove_property("pointer-events").ok();
+        piece_el.style().remove_property("left").ok();
+        piece_el.style().remove_property("top").ok();
+        piece_el.style().set_property("background", "#8b5cf6").ok();
+        piece_el.style().set_property("box-shadow", "0 0 12px rgba(139, 92, 246, 0.6), 0 2px 8px rgba(0, 0, 0, 0.3)").ok();
+        piece_el.remove_attribute("data-hover-key").ok();
+
+        state_up.room_version.set(state_up.room_version.get() + 1);
+        sync_active_pitches(&state_up);
+        // Sync MIDI output for piece changes
+        state_up.sync_midi_toggle_output();
+    });
+    let _ = document.add_event_listener_with_callback("pointerup", on_up.as_ref().unchecked_ref());
+    on_up.forget();
+}
+
 /// Set up keyboard event listeners.
 fn setup_keyboard_events(state: Arc<AppState>) {
+    // Set up document-level drag handlers for piece dragging
+    // (piece has pointer-events: none during drag, so we handle it at document level)
+    setup_document_drag_handlers(state.clone());
+
     if let Some(kb) = get_keyboard() {
+        // Listen for keyhover events to track hovered key (used during drag)
+        let on_hover = Closure::<dyn Fn(web_sys::Event)>::new(move |event: web_sys::Event| {
+            if let Ok(detail) = Reflect::get(&event, &JsValue::from_str("detail")) {
+                if let Ok(note_val) = Reflect::get(&detail, &JsValue::from_str("note")) {
+                    if let Some(note) = note_val.as_f64() {
+                        HOVERED_KEY_NOTE.store(note as i32, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        });
+        let _ = kb.add_event_listener_with_callback("keyhover", on_hover.as_ref().unchecked_ref());
+        on_hover.forget();
+
+        // Listen for keyunhover to clear hovered key
+        let on_unhover = Closure::<dyn Fn(web_sys::Event)>::new(move |_event: web_sys::Event| {
+            HOVERED_KEY_NOTE.store(-1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let _ = kb.add_event_listener_with_callback("keyunhover", on_unhover.as_ref().unchecked_ref());
+        on_unhover.forget();
+
+        // Listen for keypointerup to detect drop targets
+        let on_pointerup = Closure::<dyn Fn(web_sys::Event)>::new(move |event: web_sys::Event| {
+            if let Ok(detail) = Reflect::get(&event, &JsValue::from_str("detail")) {
+                if let Ok(note_val) = Reflect::get(&detail, &JsValue::from_str("note")) {
+                    if let Some(note) = note_val.as_f64() {
+                        POINTERUP_KEY_NOTE.store(note as i32, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        });
+        let _ = kb.add_event_listener_with_callback("keypointerup", on_pointerup.as_ref().unchecked_ref());
+        on_pointerup.forget();
+
         // Listen for keyclick events (actual user clicks, not hover)
         let state_click = state.clone();
         let on_click = Closure::<dyn Fn(web_sys::Event)>::new(move |event: web_sys::Event| {
@@ -466,6 +517,8 @@ fn setup_keyboard_events(state: Arc<AppState>) {
                             // Piece mode: add a piece at this pitch class (default octave 4 = middle C range)
                             let absolute_pitch = 60 + note as i32; // MIDI note 60 = C4
                             state_click.room.lock_mut().add_piece(absolute_pitch);
+                            // Sync MIDI output for piece changes
+                            state_click.sync_midi_toggle_output();
                         } else {
                             // Toggle mode: existing behavior
                             // Check if this is the voice pitch
