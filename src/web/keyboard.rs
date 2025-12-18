@@ -97,11 +97,23 @@ pub fn compute_raised_notes(tuning: &Tuning) -> Vec<u8> {
 pub fn sync_active_pitches(state: &Arc<AppState>) {
     let room = state.room.lock_ref();
 
+    // Get all peer sets for debugging
+    let peer_sets = room.all_peer_sets();
+    let peer_ids: Vec<_> = peer_sets.keys().collect();
+
     // Get combined pitch result from all peers (uses combination method)
     let room_result = room.compute_room_result();
 
     // All pitches from all peers -> pressed (red)
     let combined: Vec<u8> = room_result.pitch_classes.iter().map(|pc| pc.index()).collect();
+
+    web_sys::console::log_1(&format!(
+        "[keyboard] sync_active_pitches: combined={:?}, peer_count={}, peer_ids={:?}",
+        combined,
+        peer_sets.len(),
+        peer_ids
+    ).into());
+
     set_pressed_notes(&combined);
 
     // Local voice pitch from CRDT -> lit (green)

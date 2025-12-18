@@ -37,8 +37,8 @@ use crate::words::generate_room_name;
 pub use editor::WalkieSongieEditor;
 pub use params::WalkieSongieParams;
 
-/// Matchbox signaling server (same as web app)
-const SIGNALING_SERVER: &str = "wss://matchbox.wondering.xyz";
+/// libp2p relay server (same as web app)
+const RELAY_ADDR: &str = "/dns4/libp2p.wondering.xyz/tcp/443/wss";
 
 /// Messages from the plugin to the networking thread.
 #[derive(Debug, Clone)]
@@ -397,15 +397,21 @@ fn run_networking_thread(
     });
 }
 
-/// Main networking loop using matchbox + yrs (same as web app).
+/// Main networking loop using libp2p + yrs (same protocol as web app).
 async fn run_networking_loop(
     cmd_rx: Receiver<NetCommand>,
     evt_tx: Sender<NetEvent>,
     initial_channel: String,
 ) -> anyhow::Result<()> {
-    use matchbox_socket::{PeerState, WebRtcSocket};
+    use libp2p::{
+        gossipsub::{self, IdentTopic, MessageAuthenticity},
+        identify,
+        swarm::{SwarmEvent, NetworkBehaviour},
+        Multiaddr, SwarmBuilder,
+    };
+    use futures::StreamExt;
 
-    plog!("=== Networking loop starting ===");
+    plog!("=== Networking loop starting (libp2p) ===");
 
     let initial_channel = if initial_channel.is_empty() {
         plog!("No channel provided, generating room name");
@@ -416,209 +422,247 @@ async fn run_networking_loop(
 
     // Extract just the room name (strip any existing @peer-id suffix)
     let room_name = initial_channel.split('@').next().unwrap_or(&initial_channel);
+    let topic = IdentTopic::new(format!("walkie-songie/{}", room_name));
 
-    plog!("Room name: {}", room_name);
-    nih_log!("Initializing matchbox connection to room: {}", room_name);
+    plog!("Room name: {}, topic: {}", room_name, topic);
+    nih_log!("Initializing libp2p connection to room: {}", room_name);
 
-    // Build WebRTC socket with matchbox signaling (same server as web)
-    let signaling_url = format!("{}/{}", SIGNALING_SERVER, room_name);
-    plog!("Signaling URL: {}", signaling_url);
-    plog!("Building WebRTC socket...");
+    // Build libp2p swarm with gossipsub
+    #[derive(NetworkBehaviour)]
+    struct Behaviour {
+        gossipsub: gossipsub::Behaviour,
+        identify: identify::Behaviour,
+    }
 
-    let build_start = std::time::Instant::now();
-    let (mut socket, loop_fut) = WebRtcSocket::builder(&signaling_url)
-        .add_reliable_channel()
+    let mut swarm = SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_websocket(
+            (libp2p::tls::Config::new, libp2p::noise::Config::new),
+            libp2p::yamux::Config::default,
+        )
+        .await?
+        .with_behaviour(|key| {
+            let gossipsub_config = gossipsub::ConfigBuilder::default()
+                .heartbeat_interval(std::time::Duration::from_secs(1))
+                .validation_mode(gossipsub::ValidationMode::Permissive)
+                .build()
+                .expect("valid gossipsub config");
+
+            let gossipsub = gossipsub::Behaviour::new(
+                MessageAuthenticity::Signed(key.clone()),
+                gossipsub_config,
+            )
+            .expect("valid gossipsub behaviour");
+
+            let identify = identify::Behaviour::new(identify::Config::new(
+                "/walkie-songie/1.0.0".to_string(),
+                key.public(),
+            ));
+
+            Behaviour { gossipsub, identify }
+        })?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(std::time::Duration::from_secs(60)))
         .build();
-    plog!("WebRTC socket built in {:?}", build_start.elapsed());
 
-    // Spawn the socket message loop
-    plog!("Spawning socket message loop...");
-    let loop_handle = tokio::spawn(loop_fut);
-    plog!("Socket loop spawned");
+    let local_peer_id = *swarm.local_peer_id();
+    plog!("Local peer ID: {}", local_peer_id);
+    nih_log!("Local peer ID: {}", local_peer_id);
 
-    // Create our peer ID and room state
-    let peer_id = uuid::Uuid::new_v4().to_string();
-    plog!("Our peer ID: {}", peer_id);
-    nih_log!("Our peer ID: {}", peer_id);
-    let _ = evt_tx.send(NetEvent::PeerIdAssigned(format!("{}@{}", room_name, &peer_id[..8])));
+    // Subscribe to topic
+    swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
+    plog!("Subscribed to topic: {}", topic);
 
-    // Create yrs room state (same CRDT as web app)
-    plog!("Creating YrsRoomState...");
-    let mut room = YrsRoomState::new(peer_id.clone());
-    plog!("YrsRoomState created");
+    // Connect to relay
+    let relay_addr: Multiaddr = RELAY_ADDR.parse()?;
+    plog!("Dialing relay: {}", relay_addr);
+    swarm.dial(relay_addr.clone())?;
 
-    // Track connected peers
-    let mut peers: Vec<matchbox_socket::PeerId> = Vec::new();
+    // Create CRDT peer ID and room state
+    let crdt_peer_id = format!("peer-{}", uuid::Uuid::new_v4());
+    let _ = evt_tx.send(NetEvent::PeerIdAssigned(format!("{}@{}", room_name, &crdt_peer_id[5..13])));
+
+    plog!("Creating YrsRoomState with peer_id: {}", crdt_peer_id);
+    let mut room = YrsRoomState::new(crdt_peer_id.clone());
+
+    // Track state
     let mut last_broadcast_sv = room.state_vector();
+    let mut last_known_peer_count = room.all_peer_sets().len();
+    let mut has_local_changes = false;
+    let mut connected_to_relay = false;
 
-    plog!("Entering main loop, waiting for peers...");
-
-    // Track previous state for diffing
+    // Track previous state for MIDI event diffing
     let mut prev_peer_sets: HashMap<String, Vec<u8>> = HashMap::new();
     let mut prev_voice_states: HashMap<String, (Option<i32>, Option<PitchClass>)> = HashMap::new();
 
     let mut loop_count: u64 = 0;
     let loop_start = std::time::Instant::now();
 
+    plog!("Entering main loop...");
+
     loop {
         loop_count += 1;
-        // Log heartbeat every ~5 seconds (5000ms / 16ms = ~312 iterations)
         if loop_count % 312 == 0 {
-            plog!("Heartbeat: {} loops, {} peers, uptime {:?}",
-                loop_count, peers.len(), loop_start.elapsed());
+            plog!("Heartbeat: {} loops, {} crdt_peers, connected={}, uptime {:?}",
+                loop_count, room.all_peer_sets().len(), connected_to_relay, loop_start.elapsed());
         }
-        // Check for shutdown
+
+        // Process commands from plugin (non-blocking)
         match cmd_rx.try_recv() {
             Ok(NetCommand::Shutdown) => {
-                nih_log!("Networking thread shutting down");
-                loop_handle.abort();
+                plog!("Shutdown requested");
                 return Ok(());
             }
             Ok(NetCommand::JoinChannel(new_channel)) => {
-                // For now, log and ignore - would need to rebuild socket
-                nih_log!("Channel switch requested to {} (not implemented yet)", new_channel);
+                plog!("Channel switch requested to {} (not implemented)", new_channel);
             }
             Ok(NetCommand::SetPitchClass { pitch_class, on }) => {
+                plog!("Local change: SetPitchClass {} = {}", pitch_class, on);
                 if on {
                     room.add_pitch(PitchClass(pitch_class));
                 } else {
                     room.remove_pitch(PitchClass(pitch_class));
                 }
+                has_local_changes = true;
             }
             Ok(NetCommand::SetVoicePitch(pitch)) => {
+                plog!("Local change: SetVoicePitch {:?}", pitch);
                 room.set_voice_pitch(pitch);
                 if let Some(p) = pitch {
-                    // Also set pitch class (mod 12 for standard tuning)
                     room.set_voice_pitchclass(Some(PitchClass((p % 12) as u8)));
                 } else {
                     room.set_voice_pitchclass(None);
                 }
+                has_local_changes = true;
             }
             Err(crossbeam_channel::TryRecvError::Empty) => {}
             Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                loop_handle.abort();
+                plog!("Command channel disconnected");
                 return Ok(());
             }
         }
 
-        // Check for peer updates
-        let peer_updates = socket.update_peers();
-        if !peer_updates.is_empty() {
-            plog!("Got {} peer update(s)", peer_updates.len());
-        }
-        for (peer_id, state) in peer_updates {
-            match state {
-                PeerState::Connected => {
-                    plog!("*** PEER CONNECTED: {} ***", peer_id);
-                    nih_log!("Peer connected: {}", peer_id);
-                    peers.push(peer_id);
-                    let _ = evt_tx.send(NetEvent::ConnectionStatus { connected_peers: peers.len() });
+        // Process swarm events with timeout
+        let timeout = tokio::time::sleep(std::time::Duration::from_millis(16));
+        tokio::pin!(timeout);
 
-                    // Send our current state to the new peer
-                    plog!("Sending state update to new peer...");
-                    let state_update = room.encode_state_as_update();
-                    plog!("State update size: {} bytes", state_update.len());
-                    socket.channel_mut(0).send(state_update.into_boxed_slice(), peer_id);
-                    plog!("State update sent");
-                }
-                PeerState::Disconnected => {
-                    plog!("*** PEER DISCONNECTED: {} ***", peer_id);
-                    nih_log!("Peer disconnected: {}", peer_id);
-                    peers.retain(|p| *p != peer_id);
-                    let _ = evt_tx.send(NetEvent::ConnectionStatus { connected_peers: peers.len() });
-
-                    // Remove peer from room state
-                    room.remove_peer(&peer_id.0.to_string());
-                }
-            }
-        }
-
-        // Handle incoming messages (yrs updates)
-        let mut received_remote = false;
-        let messages = socket.channel_mut(0).receive();
-        if !messages.is_empty() {
-            plog!("Received {} message(s)", messages.len());
-        }
-        for (peer_id, data) in messages {
-            plog!("Received update from {} ({} bytes)", peer_id, data.len());
-            nih_log!("Received update from {} ({} bytes)", peer_id, data.len());
-            if let Err(e) = room.apply_update(&data) {
-                plog!("Failed to apply update from {}: {}", peer_id, e);
-                nih_warn!("Failed to apply update from {}: {}", peer_id, e);
-            } else {
-                received_remote = true;
-                last_broadcast_sv = room.state_vector();
-            }
-        }
-
-        // If we received remote updates, compute diffs and send events
-        if received_remote {
-            // Check for pitch class changes
-            let peer_sets = room.all_peer_sets();
-            for (remote_peer_id, peer_set) in &peer_sets {
-                if remote_peer_id == &peer_id {
-                    continue; // Skip our own changes
-                }
-
-                let current_pcs: Vec<u8> = peer_set.pitch_classes.iter().map(|pc| pc.0).collect();
-                let prev_pcs = prev_peer_sets.get(remote_peer_id).cloned().unwrap_or_default();
-
-                // Find added pitch classes
-                for &pc in &current_pcs {
-                    if !prev_pcs.contains(&pc) {
-                        let _ = evt_tx.send(NetEvent::RemotePitchClassChange {
-                            peer_id: remote_peer_id.clone(),
-                            pitch_class: pc,
-                            on: true,
-                        });
+        tokio::select! {
+            event = swarm.select_next_some() => {
+                match event {
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        plog!("Connected to peer: {}", peer_id);
+                        if !connected_to_relay {
+                            connected_to_relay = true;
+                            let _ = evt_tx.send(NetEvent::ConnectionStatus { connected_peers: 1 });
+                        }
                     }
-                }
-
-                // Find removed pitch classes
-                for &pc in &prev_pcs {
-                    if !current_pcs.contains(&pc) {
-                        let _ = evt_tx.send(NetEvent::RemotePitchClassChange {
-                            peer_id: remote_peer_id.clone(),
-                            pitch_class: pc,
-                            on: false,
-                        });
+                    SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                        plog!("Disconnected from peer: {}", peer_id);
                     }
-                }
+                    SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                        propagation_source,
+                        message,
+                        ..
+                    })) => {
+                        plog!("Received gossipsub message from {} ({} bytes)",
+                            propagation_source, message.data.len());
 
-                prev_peer_sets.insert(remote_peer_id.clone(), current_pcs);
+                        if let Err(e) = room.apply_update(&message.data) {
+                            plog!("Failed to apply update: {}", e);
+                        } else {
+                            last_broadcast_sv = room.state_vector();
+
+                            // Notify plugin of remote changes
+                            let peer_sets = room.all_peer_sets();
+                            for (remote_peer_id, peer_set) in &peer_sets {
+                                if remote_peer_id == &crdt_peer_id {
+                                    continue;
+                                }
+
+                                let current_pcs: Vec<u8> = peer_set.pitch_classes.iter().map(|pc| pc.0).collect();
+                                let prev_pcs = prev_peer_sets.get(remote_peer_id).cloned().unwrap_or_default();
+
+                                for &pc in &current_pcs {
+                                    if !prev_pcs.contains(&pc) {
+                                        let _ = evt_tx.send(NetEvent::RemotePitchClassChange {
+                                            peer_id: remote_peer_id.clone(),
+                                            pitch_class: pc,
+                                            on: true,
+                                        });
+                                    }
+                                }
+                                for &pc in &prev_pcs {
+                                    if !current_pcs.contains(&pc) {
+                                        let _ = evt_tx.send(NetEvent::RemotePitchClassChange {
+                                            peer_id: remote_peer_id.clone(),
+                                            pitch_class: pc,
+                                            on: false,
+                                        });
+                                    }
+                                }
+                                prev_peer_sets.insert(remote_peer_id.clone(), current_pcs);
+                            }
+
+                            // Check voice state changes
+                            let voice_states = room.all_voice_states();
+                            for (remote_peer_id, (pitch, pc)) in &voice_states {
+                                if remote_peer_id == &crdt_peer_id {
+                                    continue;
+                                }
+                                let prev = prev_voice_states.get(remote_peer_id).cloned();
+                                if prev.map(|(p, _)| p) != Some(*pitch) {
+                                    let _ = evt_tx.send(NetEvent::RemoteVoicePitchChange {
+                                        peer_id: remote_peer_id.clone(),
+                                        pitch: *pitch,
+                                    });
+                                }
+                                prev_voice_states.insert(remote_peer_id.clone(), (*pitch, *pc));
+                            }
+                        }
+                    }
+                    SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Subscribed {
+                        peer_id,
+                        topic: t,
+                    })) => {
+                        plog!("Peer {} subscribed to {}", peer_id, t);
+                        // Send full state to new subscriber
+                        let state_update = room.encode_state_as_update();
+                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), state_update) {
+                            plog!("Failed to send state to subscriber: {:?}", e);
+                        }
+                    }
+                    _ => {}
+                }
             }
-
-            // Check for voice state changes
-            let voice_states = room.all_voice_states();
-            for (remote_peer_id, (pitch, _pc)) in &voice_states {
-                if remote_peer_id == &peer_id {
-                    continue;
+            _ = &mut timeout => {
+                // Check for new peers and broadcast local changes
+                let current_peer_count = room.all_peer_sets().len();
+                let new_peer_joined = current_peer_count > last_known_peer_count;
+                if new_peer_joined {
+                    plog!("New peer detected ({} -> {})", last_known_peer_count, current_peer_count);
+                    last_known_peer_count = current_peer_count;
                 }
 
-                let prev = prev_voice_states.get(remote_peer_id).cloned();
-                if prev.map(|(p, _)| p) != Some(*pitch) {
-                    let _ = evt_tx.send(NetEvent::RemoteVoicePitchChange {
-                        peer_id: remote_peer_id.clone(),
-                        pitch: *pitch,
-                    });
-                }
+                if has_local_changes && connected_to_relay {
+                    let update = if new_peer_joined {
+                        plog!("Broadcasting FULL state for new peer");
+                        room.encode_state_as_update()
+                    } else {
+                        room.encode_diff(&last_broadcast_sv).unwrap_or_default()
+                    };
 
-                prev_voice_states.insert(remote_peer_id.clone(), (*pitch, *_pc));
+                    if !update.is_empty() {
+                        plog!("Broadcasting {} ({} bytes)",
+                            if new_peer_joined { "FULL state" } else { "diff" },
+                            update.len());
+                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), update) {
+                            plog!("Failed to publish: {:?}", e);
+                        }
+                        last_broadcast_sv = room.state_vector();
+                    }
+                    has_local_changes = false;
+                }
             }
         }
-
-        // Check for local changes and broadcast them
-        if let Ok(update) = room.encode_diff(&last_broadcast_sv) {
-            if !update.is_empty() && !peers.is_empty() {
-                for peer in &peers {
-                    socket.channel_mut(0).send(update.clone().into_boxed_slice(), *peer);
-                }
-                last_broadcast_sv = room.state_vector();
-            }
-        }
-
-        // Yield to other tasks
-        tokio::time::sleep(std::time::Duration::from_millis(16)).await;
     }
 }
 

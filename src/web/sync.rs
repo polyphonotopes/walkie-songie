@@ -108,7 +108,9 @@ impl RoomSync {
             }
 
             // Handle incoming messages (yrs updates)
-            let mut received_remote = false;
+            // NOTE: apply_update() does NOT trigger notify(), so we won't
+            // accidentally rebroadcast remote changes. This is handled in
+            // YrsRoomState::apply_update() which intentionally skips notify().
             for (peer_id, data) in self.socket.channel_mut(0).receive() {
                 web_sys::console::log_1(&format!(
                     "Received update from {peer_id} ({} bytes)",
@@ -124,19 +126,14 @@ impl RoomSync {
                     ).into());
                     // Update our state vector after applying remote changes
                     last_broadcast_sv = self.room.lock_ref().state_vector();
-                    received_remote = true;
                     // Increment room version to trigger UI updates
                     self.room_version.set(self.room_version.get() + 1);
                 }
             }
 
-            // If we received remote updates, clear the notify flag so we don't re-broadcast them
-            if received_remote {
-                // borrow() marks the current value as "seen", clearing has_changed()
-                let _ = notify_rx.borrow_and_update();
-            }
-
             // Check for local changes and broadcast them
+            // NOTE: Only local changes trigger has_changed() because apply_update()
+            // intentionally does NOT call notify(). This prevents feedback loops.
             if notify_rx.has_changed().unwrap_or(false) {
                 web_sys::console::log_1(&"[Sync] Detected local change via notify".into());
                 let _ = notify_rx.borrow_and_update(); // Clear the flag

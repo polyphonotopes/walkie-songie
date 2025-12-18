@@ -194,6 +194,9 @@ async fn run_sync(
     let mut notify_rx = room.lock_ref().subscribe();
     let mut last_broadcast_sv = room.lock_ref().state_vector();
 
+    // Track known peer count - when it increases, send full state
+    let mut last_known_peer_count = room.lock_ref().all_peer_sets().len();
+
     // Event loop
     loop {
         let timeout = gloo_timers::future::TimeoutFuture::new(50);
@@ -204,25 +207,70 @@ async fn run_sync(
             }
 
             _ = timeout.fuse() => {
-                // Check for local changes
-                if notify_rx.has_changed().unwrap_or(false) {
+                // Check if new peers joined (peer count increased)
+                // This happens when we RECEIVE state from a new peer
+                let current_peer_count = room.lock_ref().all_peer_sets().len();
+                let new_peer_joined = current_peer_count > last_known_peer_count;
+                if new_peer_joined {
+                    web_sys::console::log_1(&format!(
+                        "[libp2p] New peer detected ({} -> {}), sending full state",
+                        last_known_peer_count, current_peer_count
+                    ).into());
+                    last_known_peer_count = current_peer_count;
+
+                    // Send full state to new peer immediately
+                    let state_update = room.lock_ref().encode_state_as_update();
+                    if !state_update.is_empty() {
+                        let mesh_peers: Vec<_> = swarm.behaviour().gossipsub.mesh_peers(&topic.hash()).collect();
+                        web_sys::console::log_1(&format!(
+                            "[libp2p] Broadcasting FULL state ({} bytes), mesh_peers={}",
+                            state_update.len(),
+                            mesh_peers.len()
+                        ).into());
+
+                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), state_update) {
+                            web_sys::console::warn_1(&format!(
+                                "[libp2p] Failed to publish: {e:?}"
+                            ).into());
+                        }
+                        last_broadcast_sv = room.lock_ref().state_vector();
+                    }
+                }
+
+                // Check for local changes (notify_rx only fires for LOCAL changes,
+                // not remote - because apply_update() doesn't call notify())
+                let has_local_changes = notify_rx.has_changed().unwrap_or(false);
+                if has_local_changes {
                     let _ = notify_rx.borrow_and_update();
 
-                    if let Ok(update) = room.lock_ref().encode_diff(&last_broadcast_sv) {
-                        if !update.is_empty() {
-                            web_sys::console::log_1(&format!(
-                                "[libp2p] Broadcasting update ({} bytes)",
-                                update.len()
+                    // Log current room state for debugging
+                    let peer_sets = room.lock_ref().all_peer_sets();
+                    let peer_ids: Vec<_> = peer_sets.keys().cloned().collect();
+                    web_sys::console::log_1(&format!(
+                        "[libp2p] Local change detected, peer_sets: {:?}",
+                        peer_ids
+                    ).into());
+
+                    // Send diff for local changes
+                    let update = room.lock_ref().encode_diff(&last_broadcast_sv).unwrap_or_default();
+
+                    if !update.is_empty() {
+                        let mesh_peers: Vec<_> = swarm.behaviour().gossipsub.mesh_peers(&topic.hash()).collect();
+                        web_sys::console::log_1(&format!(
+                            "[libp2p] Broadcasting diff ({} bytes), mesh_peers={}",
+                            update.len(),
+                            mesh_peers.len()
+                        ).into());
+
+                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), update) {
+                            web_sys::console::warn_1(&format!(
+                                "[libp2p] Failed to publish: {e:?}"
                             ).into());
-
-                            if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), update) {
-                                web_sys::console::warn_1(&format!(
-                                    "[libp2p] Failed to publish: {e:?}"
-                                ).into());
-                            }
-
-                            last_broadcast_sv = room.lock_ref().state_vector();
                         }
+
+                        last_broadcast_sv = room.lock_ref().state_vector();
+                    } else {
+                        web_sys::console::log_1(&"[libp2p] Diff was empty, nothing to broadcast".into());
                     }
                 }
             }
@@ -290,16 +338,7 @@ fn handle_swarm_event(
                     "[libp2p] Connected to: {peer_id} via {addr}"
                 ).into());
             }
-
-            // Send current state to new peer
-            let state_update = room.lock_ref().encode_state_as_update();
-            if !state_update.is_empty() {
-                if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), state_update) {
-                    web_sys::console::warn_1(&format!(
-                        "[libp2p] Failed to send state: {e:?}"
-                    ).into());
-                }
-            }
+            // NOTE: Don't publish here - wait for Subscribed event for our topic
         }
 
         SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
@@ -318,13 +357,28 @@ fn handle_swarm_event(
                 message.data.len()
             ).into());
 
+            // Log state before apply
+            let before_peers: Vec<_> = room.lock_ref().all_peer_sets().keys().cloned().collect();
+
             if let Err(e) = room.lock_mut().apply_update(&message.data) {
                 web_sys::console::warn_1(&format!(
                     "[libp2p] Failed to apply update: {e}"
                 ).into());
             } else {
                 *last_broadcast_sv = room.lock_ref().state_vector();
-                room_version.set(room_version.get() + 1);
+                let old_version = room_version.get();
+                let new_version = old_version + 1;
+                room_version.set(new_version);
+
+                // Log state after apply
+                let after_peers = room.lock_ref().all_peer_sets();
+                let after_peer_ids: Vec<_> = after_peers.keys().cloned().collect();
+                let combined: Vec<u8> = room.lock_ref().compute_room_result().pitch_classes.iter().map(|pc| pc.index()).collect();
+
+                web_sys::console::log_1(&format!(
+                    "[libp2p] Applied update: peers {} -> {}, combined_pitches={:?}",
+                    before_peers.len(), after_peer_ids.len(), combined
+                ).into());
             }
         }
 
@@ -336,17 +390,21 @@ fn handle_swarm_event(
                 "[libp2p] Peer {peer_id} subscribed to {t}"
             ).into());
 
-            // Send state to newly subscribed peer
-            let state_update = room.lock_ref().encode_state_as_update();
-            if !state_update.is_empty() {
-                web_sys::console::log_1(&format!(
-                    "[libp2p] Sending state to new subscriber ({} bytes)",
-                    state_update.len()
-                ).into());
-                if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), state_update) {
-                    web_sys::console::warn_1(&format!(
-                        "[libp2p] Failed to send to subscriber: {e:?}"
+            // Send full state when peer subscribes to OUR topic
+            // Note: There's a race where the message might be dropped if mesh isn't ready,
+            // but the reciprocal exchange (when we receive their state) will retry.
+            if t == topic.hash() {
+                let state_update = room.lock_ref().encode_state_as_update();
+                if !state_update.is_empty() {
+                    web_sys::console::log_1(&format!(
+                        "[libp2p] Sending full state to new subscriber ({} bytes)",
+                        state_update.len()
                     ).into());
+                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), state_update) {
+                        web_sys::console::warn_1(&format!(
+                            "[libp2p] Failed to send to subscriber: {e:?}"
+                        ).into());
+                    }
                 }
             }
         }

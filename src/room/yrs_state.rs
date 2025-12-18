@@ -83,6 +83,8 @@ impl YrsRoomState {
     }
 
     /// Apply an update from another peer.
+    /// NOTE: This does NOT call notify() because it's a remote change.
+    /// Only local changes should trigger notify() to avoid feedback loops.
     pub fn apply_update(&mut self, update: &[u8]) -> anyhow::Result<()> {
         let update = Update::decode_v1(update)?;
         self.doc.transact_mut().apply_update(update)?;
@@ -98,7 +100,10 @@ impl YrsRoomState {
             );
         }
 
-        self.notify();
+        // NOTE: We intentionally do NOT call notify() here!
+        // apply_update() is for REMOTE changes, and notify() signals that
+        // LOCAL changes need to be broadcast. Calling notify() here would
+        // cause feedback loops where we rebroadcast remote updates.
         Ok(())
     }
 
@@ -250,6 +255,9 @@ impl RoomState for YrsRoomState {
 
         // Get manual pitch toggles from KEY_PITCH_SETS
         if let Some(pitch_sets) = txn.get_map(KEY_PITCH_SETS) {
+            let peer_keys: Vec<_> = pitch_sets.iter(&txn).map(|(k, _)| k.to_string()).collect();
+            debug!("[CRDT] all_peer_sets: pitch_sets keys = {:?}", peer_keys);
+
             for (peer_key, value) in pitch_sets.iter(&txn) {
                 let peer_id = peer_key.to_string();
                 let peer_set = result.entry(peer_id).or_insert_with(PeerPitchSet::new);
@@ -263,6 +271,8 @@ impl RoomState for YrsRoomState {
                     }
                 }
             }
+        } else {
+            debug!("[CRDT] all_peer_sets: pitch_sets map not found!");
         }
 
         // Also include voice pitches from KEY_VOICE_STATE
