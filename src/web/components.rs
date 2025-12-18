@@ -8,9 +8,10 @@ use wasm_bindgen::JsCast;
 use web_sys::HtmlTextAreaElement;
 
 use crate::room::RoomState;
-use crate::tuning::{parse_scl, PitchClass, Tuning};
+use crate::tuning::{parse_scl, Tuning};
 
 use super::app::AppState;
+use super::keyboard::update_tuning;
 
 /// Voice input button component.
 /// Hold to record, release to commit the detected pitch.
@@ -132,48 +133,6 @@ pub fn pitch_display(state: Arc<AppState>) -> Dom {
     })
 }
 
-/// Pitch class grid showing active pitches.
-pub fn pitch_grid(state: Arc<AppState>) -> Dom {
-    let tuning = state.tuning.lock_ref().clone();
-    let count = tuning.pitch_class_count();
-
-    html!("div", {
-        .class("pitch-grid")
-        .children((0..count).map(|i| {
-            let pc = PitchClass::new(i as u8);
-            let note_name = tuning.note_name(pc).to_string();
-
-            pitch_cell(state.clone(), pc, note_name)
-        }).collect::<Vec<_>>())
-    })
-}
-
-/// Individual pitch class cell in the grid.
-fn pitch_cell(state: Arc<AppState>, pc: PitchClass, note_name: String) -> Dom {
-    html!("button", {
-        .class("pitch-cell")
-        // Highlight if this pitch is in the local peer's set
-        .class_signal("active", {
-            let state = state.clone();
-            state.room.signal_ref(move |room| {
-                let sets = room.all_peer_sets();
-                let peer_id = room.local_peer_id();
-                sets.get(peer_id)
-                    .map(|s| s.contains(pc))
-                    .unwrap_or(false)
-            })
-        })
-        // Highlight if this is the committed pitch
-        .class_signal("committed", state.committed_pitch.signal().map(move |committed| {
-            committed == Some(pc)
-        }))
-        .text(&note_name)
-        .event(clone!(state => move |_: events::Click| {
-            state.room.lock_mut().toggle_pitch(pc);
-        }))
-    })
-}
-
 /// Tuning editor component.
 pub fn tuning_editor(state: Arc<AppState>) -> Dom {
     html!("div", {
@@ -210,10 +169,12 @@ pub fn tuning_editor(state: Arc<AppState>) -> Dom {
                                     match parse_scl(&content) {
                                         Ok(cents) => {
                                             let tuning = Tuning::from_scl("Custom".to_string(), cents);
-                                            state.tuning.set(tuning);
+                                            state.tuning.set(tuning.clone());
                                             state.scl_error.set(None);
                                             // Update room SCL
                                             state.room.lock_mut().set_tuning_scl(&content);
+                                            // Update keyboard display
+                                            update_tuning(&tuning);
                                         }
                                         Err(e) => {
                                             state.scl_error.set(Some(format!("{}", e)));
@@ -243,8 +204,10 @@ pub fn tuning_editor(state: Arc<AppState>) -> Dom {
                         .class("preset-btn")
                         .text("12-TET")
                         .event(clone!(state => move |_: events::Click| {
-                            state.tuning.set(Tuning::twelve_tet());
+                            let tuning = Tuning::twelve_tet();
+                            state.tuning.set(tuning.clone());
                             state.scl_error.set(None);
+                            update_tuning(&tuning);
                         }))
                     }),
                 ])

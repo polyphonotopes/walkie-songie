@@ -8,6 +8,8 @@ mod app;
 mod audio;
 #[cfg(target_arch = "wasm32")]
 mod components;
+#[cfg(target_arch = "wasm32")]
+mod keyboard;
 
 #[cfg(target_arch = "wasm32")]
 pub use app::run_app;

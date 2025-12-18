@@ -1,17 +1,19 @@
 ## 1. Setup
-- [ ] 1.1 Vendor all-around-keyboard.esm.min.js (18KB) to assets/
-- [ ] 1.2 Configure trunk to copy assets/ to dist
+- [x] 1.1 Vendor all-around-keyboard.esm.min.js (18KB) to assets/
+- [x] 1.2 Configure trunk to copy assets/ to dist
 
 ## 2. Integration
-- [ ] 2.1 Add ESM script tag to index.html (type="module")
-- [ ] 2.2 Create wasm-bindgen bindings for all-around-keyboard DOM API
-- [ ] 2.3 Replace pitch_grid with all_around_keyboard component wrapper
+- [x] 2.1 Add ESM script tag to index.html (type="module")
+- [x] 2.2 Create wasm-bindgen bindings for all-around-keyboard DOM API
+- [x] 2.3 Replace pitch_grid with all_around_keyboard component wrapper
 
 ## 3. Features
-- [ ] 3.1 Wire click events from keyboard to toggle_pitch
-- [ ] 3.2 Reflect active pitch classes via keysPress/keysRelease
-- [ ] 3.3 Update notes-in-octave when tuning changes
-- [ ] 3.4 Style the keyboard to fit the app theme
+- [x] 3.1 Wire click/tap events from keyboard to toggle_pitch
+- [x] 3.2 Reflect active pitch classes via keysPress/keysRelease (pressed state)
+- [x] 3.3 Reflect detected pitch via notesLight/notesDim (lit state)
+- [x] 3.4 Update notes-in-octave and raised-notes when tuning changes
+- [x] 3.5 Implement raised-notes heuristic (12-TET standard, others pie mode)
+- [x] 3.6 Style keyboard with compact layout, overlay pitch info, active pitches list
 
 ## 4. Verification
 - [ ] 4.1 Manual test: click keys toggles pitch state

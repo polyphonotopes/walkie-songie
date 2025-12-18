@@ -16,10 +16,19 @@ use crate::room::{RoomState, YrsRoomState};
 use crate::tuning::{PitchClass, Tuning};
 
 use super::audio::WebAudioInput;
-use super::components::{pitch_display, pitch_grid, tuning_editor, voice_button};
+use super::components::{pitch_display, tuning_editor, voice_button};
+use super::keyboard::{dim_all, notes_dim, notes_light, pitch_keyboard};
 
 /// How long a confident pitch "lingers" when confidence drops (in milliseconds).
-const PITCH_LINGER_MS: u64 = 150;
+const PITCH_LINGER_MS: u64 = 500;
+
+/// Decay factor for old votes (applied each detection cycle).
+/// This gives recency bias - newer confident pitches catch up faster.
+const VOTE_DECAY: f64 = 0.95;
+
+/// Extra confidence required to switch to a pitch that's a fifth away (harmonic rejection).
+/// Fifths are the most common harmonic confusion (3:2 ratio).
+const HARMONIC_REJECTION_BOOST: f64 = 0.25;
 
 /// Application state.
 /// Uses Rc for wasm (single-threaded), Arc would work too but Rc is simpler.
@@ -49,6 +58,8 @@ pub struct AppState {
     pub detector: Rc<RefCell<DualPitchDetector>>,
     /// SCL parse error message.
     pub scl_error: Mutable<Option<String>>,
+    /// Previously lit note on the keyboard (for detected pitch visualization).
+    pub prev_lit_note: Rc<RefCell<Option<u8>>>,
 }
 
 impl AppState {
@@ -71,6 +82,7 @@ impl AppState {
             audio: Rc::new(RefCell::new(None)),
             detector: Rc::new(RefCell::new(detector)),
             scl_error: Mutable::new(None),
+            prev_lit_note: Rc::new(RefCell::new(None)),
         })
     }
 
@@ -78,20 +90,27 @@ impl AppState {
     pub fn on_pitch_event(self: &Arc<Self>, event: PitchEvent) {
         match event.source {
             PitchSource::Fast => {
-                // BCF is fastest but least robust - use for immediate visual feedback only
-                self.fast_pitch.set(Some(event));
+                // BCF - ignore, we use SwiftF0/YIN for everything
             }
             PitchSource::McLeod => {
-                self.accurate_pitch.set(Some(event.clone()));
-                if self.voice_active.get() {
-                    self.process_pitch_for_locking(&event, 0.6, 1.0);
-                }
+                // YIN fallback - only use if SwiftF0 not available
+                self.fast_pitch.set(Some(event.clone()));
             }
             PitchSource::Accurate => {
+                // pYIN on native - high accuracy fallback
+                self.fast_pitch.set(Some(event.clone()));
                 self.accurate_pitch.set(Some(event.clone()));
                 if self.voice_active.get() {
-                    // pYIN gets extra weight since it's more accurate
-                    self.process_pitch_for_locking(&event, 0.7, 1.5);
+                    self.process_pitch_for_locking(&event, 0.4, 1.5);
+                }
+            }
+            PitchSource::SwiftF0 => {
+                // SwiftF0 ML model - primary detector, best accuracy
+                self.fast_pitch.set(Some(event.clone()));
+                self.accurate_pitch.set(Some(event.clone()));
+                if self.voice_active.get() {
+                    // SwiftF0 is very accurate, use lower threshold
+                    self.process_pitch_for_locking(&event, 0.5, 2.0);
                 }
             }
         }
@@ -108,26 +127,67 @@ impl AppState {
     ) {
         let now = Instant::now();
 
-        if let Some(hz) = event.hz {
-            if event.confidence >= confidence_threshold {
-                // High confidence - lock onto this pitch
-                let tuning = self.tuning.lock_ref();
-                let result = tuning.quantize(hz);
-                let pc = result.pitch_class;
-                drop(tuning);
+        // Apply decay to all existing votes (recency bias)
+        {
+            let mut votes = self.pitch_votes.borrow_mut();
+            for score in votes.values_mut() {
+                *score *= VOTE_DECAY;
+            }
+        }
 
+        if let Some(hz) = event.hz {
+            // Quantize the detected pitch
+            let tuning = self.tuning.lock_ref();
+            let result = tuning.quantize(hz);
+            let pc = result.pitch_class;
+            let pitch_count = tuning.pitch_class_count() as i16;
+            drop(tuning);
+
+            // Check if this pitch is a fifth away from locked pitch (harmonic rejection)
+            let effective_threshold = if let Some(locked) = *self.locked_pitch.borrow() {
+                let diff = (pc.index() as i16 - locked.index() as i16).abs();
+                // In 12-TET: fifth = 7 semitones, fourth = 5 semitones
+                // Generalize: fifth ≈ 7/12 of pitch count, fourth ≈ 5/12
+                let fifth_interval = (pitch_count * 7 / 12) as i16;
+                let fourth_interval = (pitch_count * 5 / 12) as i16;
+
+                if diff == fifth_interval || diff == fourth_interval ||
+                   diff == pitch_count - fifth_interval || diff == pitch_count - fourth_interval {
+                    // Likely harmonic confusion - require higher confidence
+                    confidence_threshold + HARMONIC_REJECTION_BOOST
+                } else {
+                    confidence_threshold
+                }
+            } else {
+                confidence_threshold
+            };
+
+            if event.confidence >= effective_threshold {
+                // High confidence - lock onto this pitch
                 // Update the lock
                 *self.locked_pitch.borrow_mut() = Some(pc);
                 *self.locked_at.borrow_mut() = Some(now);
 
-                // Accumulate vote
-                let mut votes = self.pitch_votes.borrow_mut();
-                let entry = votes.entry(pc.index()).or_insert(0.0);
-                *entry += event.confidence * vote_weight;
-                drop(votes);
+                // Accumulate vote (with decay already applied, new votes catch up fast)
+                {
+                    let mut votes = self.pitch_votes.borrow_mut();
+                    let entry = votes.entry(pc.index()).or_insert(0.0);
+                    *entry += event.confidence * vote_weight;
+                }
 
-                // Update display
-                self.update_committed_from_votes();
+                // Display shows current locked pitch directly
+                self.committed_pitch.set(Some(pc));
+
+                // Update keyboard lighting for detected pitch
+                let note = pc.index();
+                let mut prev = self.prev_lit_note.borrow_mut();
+                if *prev != Some(note) {
+                    if let Some(old) = prev.take() {
+                        notes_dim(&[old]);
+                    }
+                    notes_light(&[note]);
+                    *prev = Some(note);
+                }
             } else {
                 // Low confidence - check if we should linger on previous pitch
                 self.maybe_linger(now);
@@ -237,9 +297,20 @@ impl AppState {
             }
         }
 
+        // Dim the keyboard (detected pitch feedback)
+        dim_all();
+        *self.prev_lit_note.borrow_mut() = None;
+
         // Commit the last accurate pitch to the room state
         if let Some(pc) = self.committed_pitch.get() {
-            self.room.lock_mut().toggle_pitch(pc);
+            let is_active = self.room.lock_mut().toggle_pitch(pc);
+            // Update keyboard pressed state
+            let note = pc.index();
+            if is_active {
+                super::keyboard::keys_press(&[note]);
+            } else {
+                super::keyboard::keys_release(&[note]);
+            }
         }
 
         self.fast_pitch.set(None);
@@ -252,60 +323,89 @@ fn render_app(state: Arc<AppState>) -> Dom {
     html!("div", {
         .class("app")
         .children(&mut [
-            // Header
+            // Compact header
             html!("header", {
                 .class("header")
-                .children(&mut [
-                    html!("h1", {
-                        .text("Walkie Songie")
-                    }),
-                    html!("p", {
-                        .class("subtitle")
-                        .text("Collaborative pitch space")
-                    }),
-                ])
+                .child(html!("h1", { .text("Walkie Songie") }))
             }),
 
             // Main content
             html!("main", {
                 .class("main")
                 .children(&mut [
-                    // Voice input section
-                    html!("section", {
-                        .class("voice-section")
+                    // Keyboard with pitch info overlay
+                    html!("div", {
+                        .class("keyboard-section")
                         .children(&mut [
-                            html!("h2", {
-                                .text("Voice Input")
+                            pitch_keyboard(state.clone()),
+                            // Overlay pitch info in center
+                            html!("div", {
+                                .class("keyboard-overlay")
+                                .child(pitch_display(state.clone()))
                             }),
-                            voice_button(state.clone()),
-                            pitch_display(state.clone()),
                         ])
                     }),
 
-                    // Pitch grid section
+                    // Voice button
+                    voice_button(state.clone()),
+
+                    // Active pitches section
                     html!("section", {
-                        .class("pitch-section")
-                        .children(&mut [
-                            html!("h2", {
-                                .text("Pitch Classes")
-                            }),
-                            pitch_grid(state.clone()),
-                        ])
+                        .class("active-pitches-section")
+                        .child(active_pitches_list(state.clone()))
                     }),
 
-                    // Tuning section
-                    html!("section", {
+                    // Tuning section (collapsible)
+                    html!("details", {
                         .class("tuning-section")
                         .children(&mut [
-                            html!("h2", {
-                                .text("Tuning")
-                            }),
+                            html!("summary", { .text("Tuning") }),
                             tuning_editor(state.clone()),
                         ])
                     }),
                 ])
             }),
         ])
+    })
+}
+
+/// List of currently active pitch classes.
+fn active_pitches_list(state: Arc<AppState>) -> Dom {
+    use dominator::clone;
+    use futures_signals::signal::SignalExt;
+
+    html!("div", {
+        .class("active-pitches")
+        .child_signal(state.room.signal_ref(clone!(state => move |room| {
+            let sets = room.all_peer_sets();
+            let peer_id = room.local_peer_id();
+
+            let active: Vec<String> = if let Some(set) = sets.get(peer_id) {
+                let tuning = state.tuning.lock_ref();
+                set.pitch_classes.iter()
+                    .map(|pc| tuning.note_name(*pc).to_string())
+                    .collect()
+            } else {
+                vec![]
+            };
+
+            if active.is_empty() {
+                Some(html!("span", {
+                    .class("no-pitches")
+                    .text("No active pitches")
+                }))
+            } else {
+                Some(html!("div", {
+                    .class("pitch-tags")
+                    .children(active.iter().map(|name| {
+                        html!("span", {
+                            .class("pitch-tag")
+                            .text(name)
+                        })
+                    }).collect::<Vec<_>>())
+                }))
+            }
+        })))
     })
 }
 

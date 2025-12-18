@@ -12,8 +12,10 @@ use std::sync::Arc;
 use futures::channel::mpsc;
 use futures::Stream;
 use pitch_detection::detector::mcleod::McLeodDetector;
-use pitch_detection::detector::PitchDetector as McLeodPitchDetector;
+use pitch_detection::detector::yin::YINDetector;
+use pitch_detection::detector::PitchDetector as PitchDetectorTrait;
 
+use super::swiftf0::SwiftF0Detector;
 use super::{PitchDetector, PitchDetectorConfig, PitchEvent, PitchSource};
 
 /// Buffer size for BCF detection (2048 samples at 48kHz = ~43ms window)
@@ -28,6 +30,15 @@ const MCLEOD_POWER_THRESHOLD: f64 = 5.0;
 /// Clarity threshold for McLeod (confidence must be above this)
 const MCLEOD_CLARITY_THRESHOLD: f64 = 0.5;
 
+/// Buffer size for YIN detection
+const YIN_BUFFER_SIZE: usize = 2048;
+/// Padding for YIN
+const YIN_PADDING: usize = YIN_BUFFER_SIZE / 2;
+/// Power threshold for YIN
+const YIN_POWER_THRESHOLD: f64 = 3.0;
+/// Clarity threshold for YIN (higher = more permissive)
+const YIN_CLARITY_THRESHOLD: f64 = 0.5;
+
 /// Frame length for pYIN (powers of 2 only)
 #[cfg(not(target_arch = "wasm32"))]
 const PYIN_FRAME_LENGTH: usize = 2048;
@@ -36,26 +47,36 @@ const PYIN_WIN_LENGTH: usize = 1024;
 #[cfg(not(target_arch = "wasm32"))]
 const PYIN_HOP_LENGTH: usize = 256;
 
-/// Multi-algorithm pitch detector using BCF, McLeod, and pYIN.
-/// On wasm, BCF and McLeod are available. pYIN is native-only.
+/// Multi-algorithm pitch detector using BCF, YIN, SwiftF0, and pYIN.
+/// SwiftF0 (ML) is the primary detector for accuracy.
 pub struct DualPitchDetector {
     config: PitchDetectorConfig,
     running: Arc<AtomicBool>,
     sample_buffer: Vec<f64>,
+    sample_buffer_f32: Vec<f32>,
     #[cfg(not(target_arch = "wasm32"))]
     pyin_executor: Option<pyin::PYINExecutor<f64>>,
+    swiftf0: Option<SwiftF0Detector>,
     noise_floor_db: f64,
 }
 
 impl DualPitchDetector {
     /// Create a new multi-algorithm pitch detector with the given configuration.
     pub fn new(config: PitchDetectorConfig) -> Self {
+        // Try to initialize SwiftF0 (may fail on some platforms)
+        let swiftf0 = SwiftF0Detector::new(config.sample_rate).ok();
+        if swiftf0.is_some() {
+            web_sys::console::log_1(&"SwiftF0 ML detector initialized".into());
+        }
+
         Self {
             config,
             running: Arc::new(AtomicBool::new(false)),
             sample_buffer: Vec::with_capacity(BCF_BUFFER_SIZE * 2),
+            sample_buffer_f32: Vec::with_capacity(BCF_BUFFER_SIZE * 2),
             #[cfg(not(target_arch = "wasm32"))]
             pyin_executor: None,
+            swiftf0,
             noise_floor_db: -60.0, // Initial noise floor estimate
         }
     }
@@ -146,6 +167,43 @@ impl DualPitchDetector {
         }
     }
 
+    /// Detect pitch using YIN algorithm (better harmonic handling than McLeod).
+    fn detect_yin(
+        samples: &[f64],
+        sample_rate: u32,
+        min_freq: f64,
+        max_freq: f64,
+    ) -> Option<(f64, f64)> {
+        if samples.len() < YIN_BUFFER_SIZE {
+            return None;
+        }
+
+        // Use the last YIN_BUFFER_SIZE samples
+        let start = samples.len().saturating_sub(YIN_BUFFER_SIZE);
+        let buffer = &samples[start..start + YIN_BUFFER_SIZE];
+
+        // Create detector on demand
+        let mut detector = YINDetector::new(YIN_BUFFER_SIZE, YIN_PADDING);
+
+        let pitch = detector.get_pitch(
+            buffer,
+            sample_rate as usize,
+            YIN_POWER_THRESHOLD,
+            YIN_CLARITY_THRESHOLD,
+        )?;
+
+        let hz = pitch.frequency;
+        // YIN clarity is aperiodicity (lower = better), invert for confidence display
+        let confidence = 1.0 - pitch.clarity.min(1.0);
+
+        // Filter by frequency range
+        if hz >= min_freq && hz <= max_freq {
+            Some((hz, confidence))
+        } else {
+            None
+        }
+    }
+
     /// Detect pitch using pYIN algorithm (accurate path).
     /// Only available on native targets.
     #[cfg(not(target_arch = "wasm32"))]
@@ -222,10 +280,10 @@ impl DualPitchDetector {
             });
         }
 
-        // McLeod detection (robust in noise, works on wasm)
-        if self.sample_buffer.len() >= MCLEOD_BUFFER_SIZE {
-            let mcleod_result = if gate_open {
-                Self::detect_mcleod(
+        // YIN detection (better harmonic handling than McLeod, works on wasm)
+        if self.sample_buffer.len() >= YIN_BUFFER_SIZE {
+            let yin_result = if gate_open {
+                Self::detect_yin(
                     &self.sample_buffer,
                     self.config.sample_rate,
                     self.config.min_frequency,
@@ -236,9 +294,9 @@ impl DualPitchDetector {
             };
 
             events.push(PitchEvent {
-                hz: mcleod_result.map(|(hz, _)| hz),
-                confidence: mcleod_result.map(|(_, clarity)| clarity).unwrap_or(0.0),
-                source: PitchSource::McLeod,
+                hz: yin_result.map(|(hz, _)| hz),
+                confidence: yin_result.map(|(_, clarity)| clarity).unwrap_or(0.0),
+                source: PitchSource::McLeod, // Using McLeod source label for now
                 gate_threshold_db,
                 signal_level_db,
             });
@@ -279,11 +337,34 @@ impl DualPitchDetector {
             }
         }
 
-        // On wasm, we use BCF for both fast and accurate detection
-        // (just emit the BCF result as the accurate one too after a delay)
-        #[cfg(target_arch = "wasm32")]
+        // SwiftF0 ML detection (most accurate, handles harmonics well)
+        if let Some(ref mut swiftf0) = self.swiftf0 {
+            // Keep f32 buffer for SwiftF0
+            self.sample_buffer_f32.extend_from_slice(samples);
+
+            let swiftf0_result = if gate_open {
+                swiftf0.detect(&self.sample_buffer_f32)
+            } else {
+                None
+            };
+
+            events.push(PitchEvent {
+                hz: swiftf0_result.map(|(hz, _)| hz),
+                confidence: swiftf0_result.map(|(_, conf)| conf).unwrap_or(0.0),
+                source: PitchSource::SwiftF0,
+                gate_threshold_db,
+                signal_level_db,
+            });
+
+            // Trim f32 buffer
+            let keep = 4096;
+            if self.sample_buffer_f32.len() > keep * 2 {
+                self.sample_buffer_f32.drain(..self.sample_buffer_f32.len() - keep);
+            }
+        }
+
+        // Trim f64 buffer to prevent unbounded growth
         {
-            // Trim buffer to prevent unbounded growth
             let keep = BCF_BUFFER_SIZE * 2;
             if self.sample_buffer.len() > keep * 2 {
                 self.sample_buffer.drain(..self.sample_buffer.len() - keep);
@@ -296,6 +377,10 @@ impl DualPitchDetector {
     /// Reset the detector state.
     pub fn reset(&mut self) {
         self.sample_buffer.clear();
+        self.sample_buffer_f32.clear();
+        if let Some(ref mut swiftf0) = self.swiftf0 {
+            swiftf0.reset();
+        }
         self.noise_floor_db = -60.0;
     }
 }

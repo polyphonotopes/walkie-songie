@@ -4,12 +4,14 @@
 //! with implementations for web (AudioWorklet) and native (cpal) targets.
 
 mod detector;
+mod swiftf0;
 
 use std::pin::Pin;
 
 use futures::Stream;
 
 pub use detector::DualPitchDetector;
+pub use swiftf0::SwiftF0Detector;
 
 /// A detected pitch event from the pitch detector.
 #[derive(Debug, Clone)]
@@ -35,6 +37,8 @@ pub enum PitchSource {
     McLeod,
     /// Accurate pYIN algorithm (~50ms latency, native only)
     Accurate,
+    /// SwiftF0 ML model - best accuracy, handles harmonics well
+    SwiftF0,
 }
 
 /// Configuration for pitch detection.

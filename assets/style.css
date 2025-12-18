@@ -25,53 +25,128 @@ body {
 }
 
 .app {
-    max-width: 800px;
+    max-width: 100%;
+    width: 100%;
     margin: 0 auto;
-    padding: 2rem;
+    padding: 1rem;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
 }
 
-/* Header */
+/* Compact Header */
 .header {
     text-align: center;
-    margin-bottom: 2rem;
+    padding: 0.5rem 0;
 }
 
 .header h1 {
-    font-size: 2.5rem;
-    font-weight: 700;
-    margin-bottom: 0.5rem;
-}
-
-.subtitle {
+    font-size: 1.5rem;
+    font-weight: 600;
     color: var(--text-secondary);
-    font-size: 1.1rem;
 }
 
 /* Main content */
 .main {
     display: flex;
     flex-direction: column;
-    gap: 2rem;
+    gap: 1rem;
+    flex: 1;
 }
 
-section {
-    background: var(--bg-secondary);
-    border-radius: 12px;
-    padding: 1.5rem;
+/* Keyboard Section */
+.keyboard-section {
+    position: relative;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    flex: 1;
+    min-height: 200px;
 }
 
-section h2 {
+.keyboard-container {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+.keyboard-container all-around-keyboard {
+    display: block;
+    width: min(95vw, 70vh);
+    max-width: 800px;
+}
+
+/* Keyboard Overlay (pitch info in center) */
+.keyboard-overlay {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    text-align: center;
+    pointer-events: none;
+    z-index: 10;
+}
+
+.pitch-display {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+.fast-pitch, .committed-pitch {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+.pitch-label {
+    display: none; /* Hide labels in overlay mode */
+}
+
+.pitch-value {
     font-size: 1.25rem;
-    margin-bottom: 1rem;
+    font-weight: 700;
+    font-family: 'SF Mono', 'Consolas', monospace;
     color: var(--text-secondary);
+    text-shadow:
+        -1px -1px 0 var(--bg-primary),
+        1px -1px 0 var(--bg-primary),
+        -1px 1px 0 var(--bg-primary),
+        1px 1px 0 var(--bg-primary),
+        0 0 8px var(--bg-primary);
+}
+
+.pitch-value.has-value {
+    color: var(--text-primary);
+}
+
+.committed-pitch .pitch-value {
+    font-size: 2.5rem;
+    font-weight: 700;
+    color: var(--active);
+    text-shadow:
+        -2px -2px 0 var(--bg-primary),
+        2px -2px 0 var(--bg-primary),
+        -2px 2px 0 var(--bg-primary),
+        2px 2px 0 var(--bg-primary),
+        0 0 12px var(--bg-primary);
+}
+
+/* Hide signal level in compact mode */
+.signal-level {
+    display: none;
 }
 
 /* Voice Button */
 .voice-button {
     display: block;
     width: 100%;
-    padding: 2rem;
-    font-size: 1.5rem;
+    padding: 1rem;
+    font-size: 1.25rem;
     font-weight: 600;
     border: none;
     border-radius: 12px;
@@ -85,7 +160,6 @@ section h2 {
 
 .voice-button:hover {
     background: var(--accent-hover);
-    transform: scale(1.02);
 }
 
 .voice-button.active {
@@ -98,92 +172,55 @@ section h2 {
     50% { opacity: 0.8; }
 }
 
-/* Pitch Display */
-.pitch-display {
-    margin-top: 1rem;
-    display: flex;
-    flex-direction: column;
-    gap: 0.75rem;
+/* Active Pitches Section */
+.active-pitches-section {
+    background: var(--bg-secondary);
+    border-radius: 12px;
+    padding: 1rem;
 }
 
-.fast-pitch, .committed-pitch {
+.active-pitches {
+    min-height: 2rem;
+}
+
+.no-pitches {
+    color: var(--text-secondary);
+    font-style: italic;
+}
+
+.pitch-tags {
     display: flex;
-    align-items: center;
+    flex-wrap: wrap;
     gap: 0.5rem;
 }
 
-.pitch-label {
-    color: var(--text-secondary);
-    font-size: 0.9rem;
-}
-
-.pitch-value {
-    font-size: 1.25rem;
-    font-weight: 600;
-    font-family: 'SF Mono', 'Consolas', monospace;
-}
-
-.pitch-value.has-value {
-    color: var(--active);
-}
-
-/* Signal Level */
-.signal-level {
-    margin-top: 0.5rem;
-}
-
-.level-label {
-    color: var(--text-secondary);
-    font-size: 0.9rem;
-}
-
-.level-bar {
-    height: 8px;
+.pitch-tag {
     background: var(--accent);
-    border-radius: 4px;
-    transition: width 0.05s ease-out;
-    max-width: 100%;
-}
-
-/* Pitch Grid */
-.pitch-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(60px, 1fr));
-    gap: 0.5rem;
-}
-
-.pitch-cell {
-    aspect-ratio: 1;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 1.1rem;
-    font-weight: 600;
-    border: 2px solid var(--text-secondary);
-    border-radius: 8px;
-    background: transparent;
-    color: var(--text-primary);
-    cursor: pointer;
-    transition: all 0.15s ease;
-}
-
-.pitch-cell:hover {
-    border-color: var(--accent);
-    background: rgba(233, 69, 96, 0.1);
-}
-
-.pitch-cell.active {
-    background: var(--accent);
-    border-color: var(--accent);
     color: white;
+    padding: 0.25rem 0.75rem;
+    border-radius: 999px;
+    font-weight: 600;
+    font-size: 0.9rem;
 }
 
-.pitch-cell.committed {
-    border-color: var(--active);
-    box-shadow: 0 0 0 2px var(--active);
+/* Tuning Section (collapsible) */
+.tuning-section {
+    background: var(--bg-secondary);
+    border-radius: 12px;
+    padding: 1rem;
 }
 
-/* Tuning Editor */
+.tuning-section summary {
+    cursor: pointer;
+    font-weight: 600;
+    color: var(--text-secondary);
+    user-select: none;
+}
+
+.tuning-section[open] summary {
+    margin-bottom: 1rem;
+}
+
 .tuning-editor {
     display: flex;
     flex-direction: column;
@@ -191,7 +228,7 @@ section h2 {
 }
 
 .tuning-info {
-    font-size: 1.1rem;
+    font-size: 0.9rem;
     color: var(--text-secondary);
 }
 
@@ -202,16 +239,16 @@ section h2 {
 }
 
 .scl-editor label {
-    font-size: 0.9rem;
+    font-size: 0.85rem;
     color: var(--text-secondary);
 }
 
 .scl-textarea {
     width: 100%;
-    min-height: 120px;
+    min-height: 100px;
     padding: 0.75rem;
     font-family: 'SF Mono', 'Consolas', monospace;
-    font-size: 0.9rem;
+    font-size: 0.85rem;
     background: var(--bg-primary);
     color: var(--text-primary);
     border: 2px solid var(--text-secondary);
@@ -227,7 +264,7 @@ section h2 {
 .scl-error {
     display: none;
     color: var(--accent);
-    font-size: 0.9rem;
+    font-size: 0.85rem;
     padding: 0.5rem;
     background: rgba(233, 69, 96, 0.1);
     border-radius: 4px;
@@ -244,8 +281,8 @@ section h2 {
 }
 
 .preset-btn {
-    padding: 0.5rem 1rem;
-    font-size: 0.9rem;
+    padding: 0.4rem 0.8rem;
+    font-size: 0.85rem;
     border: 2px solid var(--text-secondary);
     border-radius: 6px;
     background: transparent;
@@ -260,21 +297,17 @@ section h2 {
 }
 
 /* Responsive */
-@media (max-width: 480px) {
+@media (max-width: 400px) {
     .app {
-        padding: 1rem;
+        padding: 0.75rem;
     }
 
     .header h1 {
-        font-size: 1.75rem;
-    }
-
-    .voice-button {
-        padding: 1.5rem;
         font-size: 1.25rem;
     }
 
-    .pitch-grid {
-        grid-template-columns: repeat(4, 1fr);
+    .voice-button {
+        padding: 0.75rem;
+        font-size: 1rem;
     }
 }

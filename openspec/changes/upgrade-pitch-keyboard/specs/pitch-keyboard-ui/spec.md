@@ -11,6 +11,10 @@ The system SHALL display pitch classes using the all-around-keyboard web compone
 - **WHEN** the user changes to a microtonal tuning (e.g., 19-TET)
 - **THEN** the keyboard re-renders with the new number of keys
 
+#### Scenario: Raised keys adapt to tuning
+- **WHEN** the tuning changes
+- **THEN** the raised-notes pattern updates using a heuristic (e.g., 12-TET uses standard piano, other scales derive from interval sizes or use flat/pie mode)
+
 ### Requirement: Keyboard Interaction
 The system SHALL allow users to toggle pitch classes by clicking keyboard keys.
 
@@ -22,13 +26,17 @@ The system SHALL allow users to toggle pitch classes by clicking keyboard keys.
 - **WHEN** a user clicks an active key
 - **THEN** that pitch class is removed from the local peer's set
 
-### Requirement: Active Pitch Visualization
-The system SHALL visually highlight active pitch classes on the keyboard.
+### Requirement: Dual Visual Feedback
+The system SHALL use two distinct visual states: "lit" for detected pitches and "pressed" for active pitch classes.
 
-#### Scenario: Show local active pitches
+#### Scenario: Show detected pitch in real-time
+- **WHEN** the voice detector identifies a pitch
+- **THEN** the corresponding key is lit (highlight state) as real-time feedback
+
+#### Scenario: Show active pitch classes
 - **WHEN** the local peer has pitch classes in their set
-- **THEN** those keys are visually pressed/highlighted on the keyboard
+- **THEN** those keys are pressed (active state)
 
-#### Scenario: Voice commit highlights key
-- **WHEN** a pitch is committed via voice input
-- **THEN** the corresponding key is highlighted before being toggled
+#### Scenario: Detected pitch dims when voice stops
+- **WHEN** voice input stops or pitch changes
+- **THEN** the previously lit key dims and the new pitch lights up
