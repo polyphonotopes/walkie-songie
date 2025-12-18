@@ -639,6 +639,30 @@ impl YrsRoomState {
         drop(txn);
         self.notify();
     }
+
+    /// Find a piece by pitch class (returns first match).
+    pub fn find_piece_by_pitch_class(&self, target_pc: u8, notes_per_octave: u8) -> Option<Piece> {
+        self.all_pieces()
+            .into_iter()
+            .find(|p| p.pitch_class(notes_per_octave) == target_pc)
+    }
+
+    /// Toggle a piece at the given pitch class.
+    /// If a piece exists at that pitch class, remove it.
+    /// If no piece exists, add one at the default octave (middle C range).
+    /// Returns true if a piece was added, false if removed.
+    pub fn toggle_piece_at_pitch_class(&mut self, pitch_class: u8, notes_per_octave: u8) -> bool {
+        if let Some(piece) = self.find_piece_by_pitch_class(pitch_class, notes_per_octave) {
+            self.remove_piece(&piece.id);
+            false
+        } else {
+            // Add piece at middle C octave (60 + pitch_class for 12-TET)
+            let base_pitch = 60i32 - (60i32 % notes_per_octave as i32);
+            let pitch = base_pitch + pitch_class as i32;
+            self.add_piece(pitch);
+            true
+        }
+    }
 }
 
 #[cfg(test)]

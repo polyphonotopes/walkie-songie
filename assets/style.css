@@ -260,6 +260,34 @@ all-around-keyboard svg {
     color: white;
 }
 
+/* Piece mode container - holds mode button and lock button */
+.piece-mode-container {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+}
+
+/* Piece lock button */
+.piece-lock-button {
+    padding: 0.75rem 1rem;
+    font-size: 1.2rem;
+    border: 2px solid var(--text-secondary);
+    border-radius: 12px;
+    background: transparent;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.piece-lock-button:hover {
+    border-color: #8b5cf6;
+    background: rgba(139, 92, 246, 0.15);
+}
+
+.piece-lock-button.locked {
+    border-color: #f59e0b;
+    background: rgba(245, 158, 11, 0.2);
+}
+
 /* Piece Indicator (on keyboard) - positioned by all-around-keyboard via CSS custom properties */
 .piece-indicator {
     position: absolute;

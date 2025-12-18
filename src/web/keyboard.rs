@@ -352,6 +352,9 @@ fn setup_piece_drag_handler(el: &web_sys::HtmlElement, piece_id: &str, _original
             let body = doc.body().unwrap();
             body.set_attribute("data-dragging-piece", &piece_id).ok();
             body.set_attribute("data-drag-start-pitch", &current_pitch.to_string()).ok();
+            // Track start position for click detection
+            body.set_attribute("data-drag-start-x", &e.x().to_string()).ok();
+            body.set_attribute("data-drag-start-y", &e.y().to_string()).ok();
         }
 
         el_clone.set_attribute("data-dragging", "true").ok();
@@ -449,7 +452,7 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
 
     // Document-level pointerup handler for dropping pieces
     let state_up = state.clone();
-    let on_up = Closure::<dyn Fn(web_sys::PointerEvent)>::new(move |_e: web_sys::PointerEvent| {
+    let on_up = Closure::<dyn Fn(web_sys::PointerEvent)>::new(move |e: web_sys::PointerEvent| {
         let Some(body) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.body()) else { return };
 
         // Check if we're dragging a piece
@@ -458,14 +461,47 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
             .and_then(|s| s.parse::<i32>().ok())
             .unwrap_or(0);
 
+        // Get start position for click detection
+        let start_x = body.get_attribute("data-drag-start-x")
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(0);
+        let start_y = body.get_attribute("data-drag-start-y")
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(0);
+
         // Clear drag state from body
         body.remove_attribute("data-dragging-piece").ok();
         body.remove_attribute("data-drag-start-pitch").ok();
+        body.remove_attribute("data-drag-start-x").ok();
+        body.remove_attribute("data-drag-start-y").ok();
 
         // Find the piece element
         let Some(doc) = web_sys::window().and_then(|w| w.document()) else { return };
         let Some(piece_el) = doc.query_selector(&format!("[data-piece-id='{}']", piece_id)).ok().flatten() else { return };
         let Ok(piece_el) = piece_el.dyn_into::<HtmlElement>() else { return };
+
+        // Check if this was a click (minimal movement) vs a drag
+        let dx = (e.x() - start_x).abs();
+        let dy = (e.y() - start_y).abs();
+        let is_click = dx < 5 && dy < 5;
+
+        // If click and pieces not locked, remove the piece
+        if is_click && !state_up.pieces_locked.get() {
+            state_up.room.lock_mut().remove_piece(&piece_id);
+            // Reset styling before removal triggers UI update
+            piece_el.remove_attribute("data-dragging").ok();
+            piece_el.style().remove_property("position").ok();
+            piece_el.style().remove_property("z-index").ok();
+            piece_el.style().remove_property("pointer-events").ok();
+            piece_el.style().remove_property("left").ok();
+            piece_el.style().remove_property("top").ok();
+            state_up.room_version.set(state_up.room_version.get() + 1);
+            sync_active_pitches(&state_up);
+            state_up.sync_midi_toggle_output();
+            return;
+        }
+
+        // Otherwise handle as drag...
 
         // Get hover key from piece element (set during move)
         let hover_key = piece_el.get_attribute("data-hover-key")
@@ -588,11 +624,13 @@ fn setup_keyboard_events(state: Arc<AppState>) {
 
                         // Handle piece mode vs toggle mode
                         if state_click.piece_mode.get() {
-                            // Piece mode: add a piece at this pitch class (default octave 4 = middle C range)
-                            let absolute_pitch = 60 + note as i32; // MIDI note 60 = C4
-                            state_click.room.lock_mut().add_piece(absolute_pitch);
-                            // Sync MIDI output for piece changes
-                            state_click.sync_midi_toggle_output();
+                            // Piece mode: toggle a piece at this pitch class (one per key)
+                            // Skip if pieces are locked
+                            if !state_click.pieces_locked.get() {
+                                state_click.room.lock_mut().toggle_piece_at_pitch_class(note, count);
+                                // Sync MIDI output for piece changes
+                                state_click.sync_midi_toggle_output();
+                            }
                         } else {
                             // Toggle mode: existing behavior
                             // Check if this is the voice pitch

@@ -102,6 +102,8 @@ pub struct AppState {
     pub room_version: Mutable<u64>,
     /// Whether piece mode is active (shows draggable pieces instead of toggle mode).
     pub piece_mode: Mutable<bool>,
+    /// Whether pieces are locked (can't add/remove, only drag to move).
+    pub pieces_locked: Mutable<bool>,
 }
 
 impl AppState {
@@ -144,6 +146,7 @@ impl AppState {
             midi_output_id: Mutable::new(None),
             room_version: Mutable::new(0),
             piece_mode: Mutable::new(false), // Start in toggle mode
+            pieces_locked: Mutable::new(false), // Pieces can be added/removed
         })
     }
 

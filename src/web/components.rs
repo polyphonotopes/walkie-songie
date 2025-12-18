@@ -85,18 +85,38 @@ pub fn clear_button(state: Arc<AppState>) -> Dom {
 /// Piece mode toggle button.
 /// Switches between toggle mode (click to toggle notes) and piece mode (click to add pieces).
 pub fn piece_mode_button(state: Arc<AppState>) -> Dom {
-    html!("button", {
-        .class("piece-mode-button")
-        .class_signal("active", state.piece_mode.signal())
-        .text_signal(state.piece_mode.signal().map(|piece_mode| {
-            if piece_mode { "Piece Mode" } else { "Toggle Mode" }
-        }))
-        .event(clone!(state => move |_: events::Click| {
-            let current = state.piece_mode.get();
-            state.piece_mode.set(!current);
-            // Trigger UI update
-            state.room_version.set(state.room_version.get() + 1);
-        }))
+    html!("div", {
+        .class("piece-mode-container")
+        .children(&mut [
+            // Main mode toggle button
+            html!("button", {
+                .class("piece-mode-button")
+                .class_signal("active", state.piece_mode.signal())
+                .text_signal(state.piece_mode.signal().map(|piece_mode| {
+                    if piece_mode { "Piece" } else { "Toggle" }
+                }))
+                .event(clone!(state => move |_: events::Click| {
+                    let current = state.piece_mode.get();
+                    state.piece_mode.set(!current);
+                    // Trigger UI update
+                    state.room_version.set(state.room_version.get() + 1);
+                }))
+            }),
+            // Lock button (only visible in piece mode)
+            html!("button", {
+                .class("piece-lock-button")
+                .class_signal("hidden", state.piece_mode.signal().map(|pm| !pm))
+                .class_signal("locked", state.pieces_locked.signal())
+                .text_signal(state.pieces_locked.signal().map(|locked| {
+                    if locked { "🔒" } else { "🔓" }
+                }))
+                .attr("title", "Lock/unlock piece editing")
+                .event(clone!(state => move |_: events::Click| {
+                    let current = state.pieces_locked.get();
+                    state.pieces_locked.set(!current);
+                }))
+            }),
+        ])
     })
 }
 
