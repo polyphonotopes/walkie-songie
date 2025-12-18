@@ -4,9 +4,10 @@ use std::sync::Arc;
 
 use dominator::{clone, events, html, Dom};
 use futures_signals::signal::SignalExt;
+use wasm_bindgen::JsCast;
 
 use crate::room::RoomState;
-use crate::tuning::PitchClass;
+use crate::tuning::{parse_scl, PitchClass, Tuning};
 
 use super::app::AppState;
 
@@ -169,5 +170,84 @@ fn pitch_cell(state: Arc<AppState>, pc: PitchClass, note_name: String) -> Dom {
         .event(clone!(state => move |_: events::Click| {
             state.room.lock_mut().toggle_pitch(pc);
         }))
+    })
+}
+
+/// Tuning editor component.
+pub fn tuning_editor(state: Arc<AppState>) -> Dom {
+    html!("div", {
+        .class("tuning-editor")
+        .children(&mut [
+            // Current tuning display
+            html!("div", {
+                .class("tuning-info")
+                .child_signal(state.tuning.signal_cloned().map(|tuning| {
+                    Some(html!("span", {
+                        .text(&format!("{} ({} notes)", tuning.name, tuning.pitch_class_count()))
+                    }))
+                }))
+            }),
+
+            // SCL editor
+            html!("div", {
+                .class("scl-editor")
+                .children(&mut [
+                    html!("label", {
+                        .attr("for", "scl-input")
+                        .text("SCL Tuning (Scala format):")
+                    }),
+                    html!("textarea", {
+                        .attr("id", "scl-input")
+                        .attr("rows", "8")
+                        .attr("placeholder", "! Comment\nTuning Name\n12\n100.0\n200.0\n...")
+                        .class("scl-textarea")
+                        .event(clone!(state => move |e: events::Input| {
+                            if let Some(target) = e.target() {
+                                if let Ok(textarea) = target.dyn_into::<web_sys::HtmlTextAreaElement>() {
+                                    let content = textarea.value();
+                                    // Try to parse and update tuning
+                                    match parse_scl(&content) {
+                                        Ok(cents) => {
+                                            let tuning = Tuning::from_scl("Custom".to_string(), cents);
+                                            state.tuning.set(tuning);
+                                            state.scl_error.set(None);
+                                            // Update room SCL
+                                            state.room.lock_mut().set_tuning_scl(&content);
+                                        }
+                                        Err(e) => {
+                                            state.scl_error.set(Some(format!("{}", e)));
+                                        }
+                                    }
+                                }
+                            }
+                        }))
+                    }),
+                ])
+            }),
+
+            // Error display
+            html!("div", {
+                .class("scl-error")
+                .class_signal("visible", state.scl_error.signal_cloned().map(|e| e.is_some()))
+                .child_signal(state.scl_error.signal_cloned().map(|error| {
+                    error.map(|e| html!("span", { .text(&e) }))
+                }))
+            }),
+
+            // Preset buttons
+            html!("div", {
+                .class("tuning-presets")
+                .children(&mut [
+                    html!("button", {
+                        .class("preset-btn")
+                        .text("12-TET")
+                        .event(clone!(state => move |_: events::Click| {
+                            state.tuning.set(Tuning::twelve_tet());
+                            state.scl_error.set(None);
+                        }))
+                    }),
+                ])
+            }),
+        ])
     })
 }

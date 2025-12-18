@@ -37,7 +37,7 @@ impl WebAudioInput {
             .media_devices()
             .map_err(|_| "No media devices")?;
 
-        let mut constraints = MediaStreamConstraints::new();
+        let constraints = MediaStreamConstraints::new();
         constraints.set_audio(&JsValue::TRUE);
         constraints.set_video(&JsValue::FALSE);
 

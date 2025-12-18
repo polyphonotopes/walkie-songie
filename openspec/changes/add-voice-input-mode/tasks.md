@@ -51,10 +51,10 @@
 - [x] 7.4 React to yrs document changes (signal updates on CRDT change)
 
 ## 8. Room Tuning UI (dominator)
-- [ ] 8.1 Display current tuning name/summary
-- [ ] 8.2 Add SCL content editor (textarea bound to YText via signal)
-- [ ] 8.3 Show parse errors inline when SCL is invalid
-- [ ] 8.4 Re-quantize active pitches when tuning changes
+- [x] 8.1 Display current tuning name/summary
+- [x] 8.2 Add SCL content editor (textarea bound to YText via signal)
+- [x] 8.3 Show parse errors inline when SCL is invalid
+- [ ] 8.4 Re-quantize active pitches when tuning changes - *deferred*
 
 ## 9. Integration & Testing
 - [ ] 9.1 Wire voice input → tuning → pitch state → sync
@@ -66,16 +66,16 @@
 
 ## Summary
 
-**Completed (22 items):**
+**Completed:**
 - Core library with PitchDetector and RoomState traits
 - Full tuning system with 12-TET, SCL parser, and Hz quantization
 - yrs CRDT room state implementation with sync support
 - Dual-algorithm pitch detection (BCF + pYIN) with noise gate
-- Dominator web app structure with voice input and pitch grid components
+- Dominator web app with voice input, pitch grid, and tuning editor
 - 22 passing unit tests
+- Both native and wasm32 targets build successfully
 
-**Remaining:**
+**Remaining (deferred to P2P integration phase):**
 - AudioWorklet integration (requires pnpm for JS tooling)
-- Room Tuning UI editor
-- P2P sync wiring (uses existing matchbox/iroh infrastructure)
-- End-to-end integration testing
+- P2P sync wiring over matchbox reliable channel
+- End-to-end multi-peer testing

@@ -11,7 +11,7 @@ use crate::room::{RoomState, YrsRoomState};
 use crate::tuning::{PitchClass, Tuning};
 
 use super::audio::WebAudioInput;
-use super::components::{pitch_display, pitch_grid, voice_button};
+use super::components::{pitch_display, pitch_grid, tuning_editor, voice_button};
 
 /// Application state.
 pub struct AppState {
@@ -31,6 +31,8 @@ pub struct AppState {
     pub audio: Mutable<Option<WebAudioInput>>,
     /// Pitch detector.
     pub detector: Mutable<DualPitchDetector>,
+    /// SCL parse error message.
+    pub scl_error: Mutable<Option<String>>,
 }
 
 impl AppState {
@@ -49,6 +51,7 @@ impl AppState {
             committed_pitch: Mutable::new(None),
             audio: Mutable::new(None),
             detector: Mutable::new(detector),
+            scl_error: Mutable::new(None),
         })
     }
 
@@ -138,6 +141,17 @@ fn render_app(state: Arc<AppState>) -> Dom {
                                 .text("Pitch Classes")
                             }),
                             pitch_grid(state.clone()),
+                        ])
+                    }),
+
+                    // Tuning section
+                    html!("section", {
+                        .class("tuning-section")
+                        .children(&mut [
+                            html!("h2", {
+                                .text("Tuning")
+                            }),
+                            tuning_editor(state.clone()),
                         ])
                     }),
                 ])
