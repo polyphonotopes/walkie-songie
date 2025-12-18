@@ -69,6 +69,7 @@ pub fn clear_button(state: Arc<AppState>) -> Dom {
                 let mut room = state.room.lock_mut();
                 room.clear_pitches();
                 room.clear_voice();
+                room.clear_pieces();
             }
             state.voice_pitch.set(None);
             // Increment room_version to trigger UI updates
@@ -81,10 +82,30 @@ pub fn clear_button(state: Arc<AppState>) -> Dom {
     })
 }
 
+/// Piece mode toggle button.
+/// Switches between toggle mode (click to toggle notes) and piece mode (click to add pieces).
+pub fn piece_mode_button(state: Arc<AppState>) -> Dom {
+    html!("button", {
+        .class("piece-mode-button")
+        .class_signal("active", state.piece_mode.signal())
+        .text_signal(state.piece_mode.signal().map(|piece_mode| {
+            if piece_mode { "Piece Mode" } else { "Toggle Mode" }
+        }))
+        .event(clone!(state => move |_: events::Click| {
+            let current = state.piece_mode.get();
+            state.piece_mode.set(!current);
+            // Trigger UI update
+            state.room_version.set(state.room_version.get() + 1);
+        }))
+    })
+}
+
 /// Pitch display component showing current detected pitch.
+/// Only visible when voice is active (user is holding sing button).
 pub fn pitch_display(state: Arc<AppState>) -> Dom {
     html!("div", {
         .class("pitch-display")
+        .class_signal("hidden", state.voice_active.signal().map(|active| !active))
         .children(&mut [
             // Current pitch indicator (real-time feedback from SwiftF0)
             html!("div", {
@@ -111,7 +132,7 @@ pub fn pitch_display(state: Arc<AppState>) -> Dom {
                                             result.cents_deviation
                                         )
                                     }
-                                    _ => "---".to_string(),
+                                    _ => "".to_string(),
                                 })
                             }),
                         ])
@@ -137,36 +158,12 @@ pub fn pitch_display(state: Arc<AppState>) -> Dom {
                                         let tuning = state.tuning.lock_ref();
                                         tuning.note_name(pc).to_string()
                                     }
-                                    None => "---".to_string(),
+                                    None => "".to_string(),
                                 })
                             }),
                         ])
                     }))
                 })))
-            }),
-
-            // Confidence indicator
-            html!("div", {
-                .class("confidence-level")
-                .child_signal(state.current_pitch.signal_cloned().map(|event| {
-                    Some(html!("div", {
-                        .children(&mut [
-                            html!("span", {
-                                .class("level-label")
-                                .text("Confidence: ")
-                            }),
-                            html!("div", {
-                                .class("level-bar")
-                                .style_signal("width", futures_signals::signal::always(
-                                    match event {
-                                        Some(e) => format!("{}%", (e.confidence * 100.0).clamp(0.0, 100.0)),
-                                        None => "0%".to_string(),
-                                    }
-                                ))
-                            }),
-                        ])
-                    }))
-                }))
             }),
         ])
     })

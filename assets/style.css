@@ -128,6 +128,10 @@ all-around-keyboard.keyboard {
     gap: 0.25rem;
 }
 
+.pitch-display.hidden {
+    display: none;
+}
+
 .fast-pitch, .committed-pitch {
     display: flex;
     align-items: center;
@@ -221,6 +225,41 @@ all-around-keyboard.keyboard {
 .clear-button:hover {
     border-color: var(--manual);
     background: rgba(251, 113, 133, 0.15);
+}
+
+/* Piece Mode Button */
+.piece-mode-button {
+    padding: 1rem 1.5rem;
+    font-size: 1rem;
+    font-weight: 600;
+    border: 2px solid var(--text-secondary);
+    border-radius: 12px;
+    background: transparent;
+    color: var(--text-primary);
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.piece-mode-button:hover {
+    border-color: #8b5cf6;
+    background: rgba(139, 92, 246, 0.15);
+}
+
+.piece-mode-button.active {
+    border-color: #8b5cf6;
+    background: #8b5cf6;
+    color: white;
+}
+
+/* Piece Indicator (on keyboard) */
+.piece-indicator {
+    position: absolute;
+    left: var(--indicator-x, 50%);
+    top: var(--indicator-y, 50%);
+    transform: translate(-50%, -50%);
+    border-radius: 50%;
+    pointer-events: auto;
+    transition: left 0.05s ease-out, top 0.05s ease-out;
 }
 
 @keyframes pulse {

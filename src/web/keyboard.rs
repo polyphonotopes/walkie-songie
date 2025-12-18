@@ -7,14 +7,14 @@
 
 use std::sync::Arc;
 
-use dominator::{clone, html, Dom};
+use dominator::{clone, events, html, Dom};
 use futures_signals::signal::SignalExt;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::HtmlElement;
 use web_sys::js_sys::Reflect;
 
-use crate::room::RoomState;
+use crate::room::{Piece, RoomState};
 use crate::tuning::{PitchClass, Tuning};
 
 use super::app::AppState;
@@ -143,6 +143,46 @@ fn hz_to_pitch_position(hz: f64, pitch_count: usize) -> f64 {
     }
 }
 
+/// Create a piece indicator DOM element for a single piece.
+fn piece_indicator(state: Arc<AppState>, piece: Piece) -> Dom {
+    let piece_id = piece.id.clone();
+    let piece_id_for_click = piece.id.clone();
+    let tuning = state.tuning.lock_ref();
+    let pitch_count = tuning.pitch_class_count();
+    drop(tuning);
+
+    // Convert absolute pitch to pitch class position (0-N)
+    let pitch_class = piece.pitch.rem_euclid(pitch_count as i32) as f64;
+    let octave = piece.octave();
+
+    html!("div", {
+        .class("piece-indicator")
+        .attr("data-piece-id", &piece_id)
+        .attr("data-pitch", &format!("{:.2}", pitch_class))
+        .attr("data-radius", "0.6") // Fixed radius for pieces
+        .attr("style", &format!(
+            "width: 20px; height: 20px; \
+             background: var(--manual); \
+             border-radius: 50%; \
+             display: flex; align-items: center; justify-content: center; \
+             font-size: 10px; font-weight: bold; color: white; \
+             cursor: grab; user-select: none; \
+             box-shadow: 0 0 8px var(--manual);"
+        ))
+        // Show octave number inside the piece
+        .text(&format!("{}", octave))
+        // Click to remove piece
+        .event(clone!(state, piece_id_for_click => move |_: events::Click| {
+            {
+                let mut room = state.room.lock_mut();
+                room.remove_piece(&piece_id_for_click);
+            }
+            state.room_version.set(state.room_version.get() + 1);
+            sync_active_pitches(&state);
+        }))
+    })
+}
+
 /// Create the all-around-keyboard component with indicator child.
 pub fn pitch_keyboard(state: Arc<AppState>) -> Dom {
     html!("all-around-keyboard", {
@@ -196,6 +236,21 @@ pub fn pitch_keyboard(state: Arc<AppState>) -> Dom {
             }))
         }))
 
+        // Piece indicators - rendered dynamically based on room state
+        .children_signal_vec(
+            state.room_version.signal().map(clone!(state => move |_| {
+                // Only show pieces in piece mode
+                if !state.piece_mode.get() {
+                    return vec![];
+                }
+                let room = state.room.lock_ref();
+                let pieces = room.all_pieces();
+                pieces.into_iter().map(|piece| {
+                    piece_indicator(state.clone(), piece)
+                }).collect::<Vec<_>>()
+            })).to_signal_vec()
+        )
+
         .after_inserted(clone!(state => move |_| {
             setup_keyboard_events(state.clone());
             // Initial sync with tuning
@@ -229,19 +284,27 @@ fn setup_keyboard_events(state: Arc<AppState>) {
                         let pc = PitchClass::new(note);
                         drop(tuning);
 
-                        // Check if this is the voice pitch
-                        let is_voice_pitch = state_click.voice_pitch.get() == Some(pc);
-
-                        if is_voice_pitch {
-                            // Clicking voice pitch clears it
-                            state_click.voice_pitch.set(None);
-                            state_click.room.lock_mut().set_voice_pitchclass(None);
-                            state_click.sync_midi_voice_output();
+                        // Handle piece mode vs toggle mode
+                        if state_click.piece_mode.get() {
+                            // Piece mode: add a piece at this pitch class (default octave 4 = middle C range)
+                            let absolute_pitch = 60 + note as i32; // MIDI note 60 = C4
+                            state_click.room.lock_mut().add_piece(absolute_pitch);
                         } else {
-                            // Toggle the pitch in room state (manual pitches)
-                            state_click.room.lock_mut().toggle_pitch(pc);
-                            // Sync MIDI toggle output
-                            state_click.sync_midi_toggle_output();
+                            // Toggle mode: existing behavior
+                            // Check if this is the voice pitch
+                            let is_voice_pitch = state_click.voice_pitch.get() == Some(pc);
+
+                            if is_voice_pitch {
+                                // Clicking voice pitch clears it
+                                state_click.voice_pitch.set(None);
+                                state_click.room.lock_mut().set_voice_pitchclass(None);
+                                state_click.sync_midi_voice_output();
+                            } else {
+                                // Toggle the pitch in room state (manual pitches)
+                                state_click.room.lock_mut().toggle_pitch(pc);
+                                // Sync MIDI toggle output
+                                state_click.sync_midi_toggle_output();
+                            }
                         }
 
                         // Increment room_version to trigger UI updates

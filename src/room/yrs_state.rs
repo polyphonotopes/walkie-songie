@@ -28,10 +28,30 @@ const KEY_PITCH_SETS: &str = "pitch_sets";  // Legacy per-peer sets (unused now)
 const KEY_SHARED_PITCHES: &str = "shared_pitches";  // Shared pitch set (anyone can add/remove)
 const KEY_COMBINATION_METHOD: &str = "combination_method";
 const KEY_VOICE_STATE: &str = "voice_state";
+const KEY_PIECES: &str = "pieces";  // Draggable pieces with absolute pitch (YMap<piece_id, pitch>)
 
 /// Keys within each peer's voice state map.
 const VOICE_PITCH: &str = "pitch";        // i32 - absolute pitch number (like MIDI note, no modulus)
 const VOICE_PITCHCLASS: &str = "pitchclass";  // u8 - the quantized pitch class (pitch % scale_size)
+
+/// A draggable piece with an absolute pitch (includes octave).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Piece {
+    pub id: String,
+    pub pitch: i32,  // Absolute pitch like MIDI note (60 = C4)
+}
+
+impl Piece {
+    /// Get the pitch class (0-11 for 12-TET).
+    pub fn pitch_class(&self, notes_per_octave: u8) -> u8 {
+        self.pitch.rem_euclid(notes_per_octave as i32) as u8
+    }
+
+    /// Get the octave (assuming middle C = octave 4, pitch 60).
+    pub fn octave(&self) -> i32 {
+        (self.pitch - 60).div_euclid(12) + 4
+    }
+}
 
 /// yrs-based room state that syncs with peers.
 pub struct YrsRoomState {
@@ -65,6 +85,9 @@ impl YrsRoomState {
             let voice_state: MapRef = txn.get_or_insert_map(KEY_VOICE_STATE);
             // Create our peer's voice state map
             voice_state.insert(&mut txn, peer_id.clone(), MapPrelim::default());
+
+            // Create pieces map (draggable pieces with absolute pitch)
+            let _pieces: MapRef = txn.get_or_insert_map(KEY_PIECES);
         }
 
         Self {
@@ -525,6 +548,97 @@ impl YrsRoomState {
     pub fn local_voice(&self) -> (Option<i32>, Option<PitchClass>) {
         self.get_peer_voice(&self.peer_id)
     }
+
+    // ========== Piece Methods (draggable pieces with absolute pitch) ==========
+
+    /// Add a new piece at the given absolute pitch. Returns the piece ID.
+    pub fn add_piece(&mut self, pitch: i32) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        debug!("[CRDT] add_piece(pitch={}) -> id={}", pitch, id);
+
+        let mut txn = self.doc.transact_mut();
+        let pieces: MapRef = txn.get_or_insert_map(KEY_PIECES);
+        pieces.insert(&mut txn, id.clone(), pitch as i64);
+        drop(txn);
+        self.notify();
+
+        id
+    }
+
+    /// Remove a piece by ID.
+    pub fn remove_piece(&mut self, piece_id: &str) {
+        debug!("[CRDT] remove_piece(id={})", piece_id);
+
+        let mut txn = self.doc.transact_mut();
+        let pieces: MapRef = txn.get_or_insert_map(KEY_PIECES);
+        pieces.remove(&mut txn, piece_id);
+        drop(txn);
+        self.notify();
+    }
+
+    /// Move a piece to a new pitch (for drag operations).
+    pub fn move_piece(&mut self, piece_id: &str, new_pitch: i32) {
+        debug!("[CRDT] move_piece(id={}, new_pitch={})", piece_id, new_pitch);
+
+        let mut txn = self.doc.transact_mut();
+        let pieces: MapRef = txn.get_or_insert_map(KEY_PIECES);
+
+        // Only move if piece exists
+        if pieces.get(&txn, piece_id).is_some() {
+            pieces.insert(&mut txn, piece_id, new_pitch as i64);
+        }
+        drop(txn);
+        self.notify();
+    }
+
+    /// Get all pieces.
+    pub fn all_pieces(&self) -> Vec<Piece> {
+        let txn = self.doc.transact();
+        let pieces: MapRef = match txn.get_map(KEY_PIECES) {
+            Some(m) => m,
+            None => return Vec::new(),
+        };
+
+        pieces
+            .iter(&txn)
+            .filter_map(|(id, value)| {
+                let pitch = value.cast::<i64>().ok()? as i32;
+                Some(Piece {
+                    id: id.to_string(),
+                    pitch,
+                })
+            })
+            .collect()
+    }
+
+    /// Get a specific piece by ID.
+    pub fn get_piece(&self, piece_id: &str) -> Option<Piece> {
+        let txn = self.doc.transact();
+        let pieces: MapRef = txn.get_map(KEY_PIECES)?;
+
+        let pitch = pieces.get(&txn, piece_id)?.cast::<i64>().ok()? as i32;
+        Some(Piece {
+            id: piece_id.to_string(),
+            pitch,
+        })
+    }
+
+    /// Clear all pieces.
+    pub fn clear_pieces(&mut self) {
+        let mut txn = self.doc.transact_mut();
+        let pieces: MapRef = txn.get_or_insert_map(KEY_PIECES);
+
+        let ids_to_remove: Vec<String> = pieces
+            .keys(&txn)
+            .map(|k| k.to_string())
+            .collect();
+
+        for id in ids_to_remove {
+            pieces.remove(&mut txn, &id);
+        }
+        drop(txn);
+        self.notify();
+    }
 }
 
 #[cfg(test)]
@@ -679,5 +793,105 @@ mod tests {
         let (pitch2, pc2) = state2.get_peer_voice("peer1");
         assert_eq!(pitch2, Some(69));
         assert_eq!(pc2, Some(PitchClass(9)));
+    }
+
+    #[test]
+    fn test_piece_helpers() {
+        let piece = Piece {
+            id: "test".to_string(),
+            pitch: 60, // Middle C
+        };
+        assert_eq!(piece.pitch_class(12), 0); // C is pitch class 0
+        assert_eq!(piece.octave(), 4); // Middle C is octave 4
+
+        let piece_high = Piece {
+            id: "test2".to_string(),
+            pitch: 72, // C5
+        };
+        assert_eq!(piece_high.pitch_class(12), 0);
+        assert_eq!(piece_high.octave(), 5);
+
+        let piece_low = Piece {
+            id: "test3".to_string(),
+            pitch: 48, // C3
+        };
+        assert_eq!(piece_low.pitch_class(12), 0);
+        assert_eq!(piece_low.octave(), 3);
+    }
+
+    #[test]
+    fn test_yrs_pieces() {
+        let mut state = YrsRoomState::new("peer1".to_string());
+
+        // Initially empty
+        assert!(state.all_pieces().is_empty());
+
+        // Add a piece at middle C (60)
+        let id = state.add_piece(60);
+
+        // Should have one piece
+        let pieces = state.all_pieces();
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].id, id);
+        assert_eq!(pieces[0].pitch, 60);
+
+        // Get specific piece
+        let piece = state.get_piece(&id).unwrap();
+        assert_eq!(piece.pitch, 60);
+
+        // Move the piece to D (62)
+        state.move_piece(&id, 62);
+        let piece = state.get_piece(&id).unwrap();
+        assert_eq!(piece.pitch, 62);
+
+        // Remove the piece
+        state.remove_piece(&id);
+        assert!(state.all_pieces().is_empty());
+        assert!(state.get_piece(&id).is_none());
+    }
+
+    #[test]
+    fn test_yrs_pieces_sync() {
+        let mut state1 = YrsRoomState::new("peer1".to_string());
+        let mut state2 = YrsRoomState::new("peer2".to_string());
+
+        // Peer 1 adds a piece
+        let id = state1.add_piece(60);
+
+        // Sync state1 -> state2
+        let update = state1.encode_state_as_update();
+        state2.apply_update(&update).unwrap();
+
+        // Peer 2 should see the piece
+        let pieces = state2.all_pieces();
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].id, id);
+        assert_eq!(pieces[0].pitch, 60);
+
+        // Peer 2 moves the piece
+        state2.move_piece(&id, 72);
+
+        // Sync state2 -> state1
+        let update = state2.encode_state_as_update();
+        state1.apply_update(&update).unwrap();
+
+        // Peer 1 should see the updated pitch
+        let piece = state1.get_piece(&id).unwrap();
+        assert_eq!(piece.pitch, 72);
+    }
+
+    #[test]
+    fn test_yrs_clear_pieces() {
+        let mut state = YrsRoomState::new("peer1".to_string());
+
+        // Add multiple pieces
+        state.add_piece(60);
+        state.add_piece(64);
+        state.add_piece(67);
+        assert_eq!(state.all_pieces().len(), 3);
+
+        // Clear all
+        state.clear_pieces();
+        assert!(state.all_pieces().is_empty());
     }
 }
