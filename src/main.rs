@@ -1,10 +1,9 @@
-mod net;
-
 use std::sync::Arc;
 
 use anyhow::Result;
 use matchbox_socket::{PeerState, WebRtcSocket};
 use tracing::info;
+use walkie_songie::net;
 
 #[tokio::main]
 async fn main() -> Result<()> {

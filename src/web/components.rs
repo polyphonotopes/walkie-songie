@@ -1,0 +1,173 @@
+//! Dominator UI components for the voice input application.
+
+use std::sync::Arc;
+
+use dominator::{clone, events, html, Dom};
+use futures_signals::signal::SignalExt;
+
+use crate::room::RoomState;
+use crate::tuning::PitchClass;
+
+use super::app::AppState;
+
+/// Voice input button component.
+/// Hold to record, release to commit the detected pitch.
+pub fn voice_button(state: Arc<AppState>) -> Dom {
+    html!("button", {
+        .class("voice-button")
+        .class_signal("active", state.voice_active.signal())
+        .text_signal(state.voice_active.signal().map(|active| {
+            if active { "Singing..." } else { "Hold to Sing" }
+        }))
+        .event(clone!(state => move |_: events::PointerDown| {
+            state.start_voice();
+        }))
+        .event(clone!(state => move |_: events::PointerUp| {
+            state.stop_voice();
+        }))
+        .event(clone!(state => move |_: events::PointerLeave| {
+            // Also stop if pointer leaves the button while held
+            if state.voice_active.get() {
+                state.stop_voice();
+            }
+        }))
+    })
+}
+
+/// Pitch display component showing current detected pitch.
+pub fn pitch_display(state: Arc<AppState>) -> Dom {
+    html!("div", {
+        .class("pitch-display")
+        .children(&mut [
+            // Fast pitch indicator (real-time feedback)
+            html!("div", {
+                .class("fast-pitch")
+                .child_signal(state.fast_pitch.signal_cloned().map(clone!(state => move |event| {
+                    Some(html!("div", {
+                        .children(&mut [
+                            html!("span", {
+                                .class("pitch-label")
+                                .text("Detected: ")
+                            }),
+                            html!("span", {
+                                .class("pitch-value")
+                                .text(&match event {
+                                    Some(e) if e.hz.is_some() => {
+                                        let hz = e.hz.unwrap();
+                                        let tuning = state.tuning.lock_ref();
+                                        let result = tuning.quantize(hz);
+                                        format!(
+                                            "{} ({:.1} Hz, {}{:.0}¢)",
+                                            tuning.note_name(result.pitch_class),
+                                            hz,
+                                            if result.cents_deviation >= 0.0 { "+" } else { "" },
+                                            result.cents_deviation
+                                        )
+                                    }
+                                    _ => "---".to_string(),
+                                })
+                            }),
+                        ])
+                    }))
+                })))
+            }),
+
+            // Committed pitch (what will be toggled)
+            html!("div", {
+                .class("committed-pitch")
+                .child_signal(state.committed_pitch.signal().map(clone!(state => move |pc| {
+                    Some(html!("div", {
+                        .children(&mut [
+                            html!("span", {
+                                .class("pitch-label")
+                                .text("Commit: ")
+                            }),
+                            html!("span", {
+                                .class("pitch-value")
+                                .class_signal("has-value", state.committed_pitch.signal().map(|p| p.is_some()))
+                                .text(&match pc {
+                                    Some(pc) => {
+                                        let tuning = state.tuning.lock_ref();
+                                        tuning.note_name(pc).to_string()
+                                    }
+                                    None => "---".to_string(),
+                                })
+                            }),
+                        ])
+                    }))
+                })))
+            }),
+
+            // Signal level indicator
+            html!("div", {
+                .class("signal-level")
+                .child_signal(state.fast_pitch.signal_cloned().map(|event| {
+                    Some(html!("div", {
+                        .children(&mut [
+                            html!("span", {
+                                .class("level-label")
+                                .text("Level: ")
+                            }),
+                            html!("div", {
+                                .class("level-bar")
+                                .style_signal("width", futures_signals::signal::always(
+                                    match event {
+                                        Some(e) => {
+                                            // Map dB to percentage (-60dB to 0dB -> 0% to 100%)
+                                            let level = ((e.signal_level_db + 60.0) / 60.0 * 100.0)
+                                                .clamp(0.0, 100.0);
+                                            format!("{}%", level)
+                                        }
+                                        None => "0%".to_string(),
+                                    }
+                                ))
+                            }),
+                        ])
+                    }))
+                }))
+            }),
+        ])
+    })
+}
+
+/// Pitch class grid showing active pitches.
+pub fn pitch_grid(state: Arc<AppState>) -> Dom {
+    let tuning = state.tuning.lock_ref().clone();
+    let count = tuning.pitch_class_count();
+
+    html!("div", {
+        .class("pitch-grid")
+        .children((0..count).map(|i| {
+            let pc = PitchClass::new(i as u8);
+            let note_name = tuning.note_name(pc).to_string();
+
+            pitch_cell(state.clone(), pc, note_name)
+        }).collect::<Vec<_>>())
+    })
+}
+
+/// Individual pitch class cell in the grid.
+fn pitch_cell(state: Arc<AppState>, pc: PitchClass, note_name: String) -> Dom {
+    html!("button", {
+        .class("pitch-cell")
+        // Highlight if this pitch is in the local peer's set
+        .class_signal("active", {
+            let state = state.clone();
+            state.room.signal_ref(move |room| {
+                let sets = room.all_peer_sets();
+                let peer_id = room.local_peer_id();
+                sets.get(peer_id)
+                    .map(|s| s.contains(pc))
+                    .unwrap_or(false)
+            })
+        })
+        // Highlight if this is the committed pitch
+        .class_signal("committed", state.committed_pitch.signal().map(move |committed| {
+            committed == Some(pc)
+        }))
+        .text(&note_name)
+        .event(clone!(state => move |_: events::Click| {
+            state.room.lock_mut().toggle_pitch(pc);
+        }))
+    })
+}

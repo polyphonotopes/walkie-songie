@@ -3,6 +3,13 @@ name = "walkie-songie"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "walkie-songie"
+path = "src/main.rs"
+
 [dependencies]
 # P2P networking (versions from matchbox custom_signaller example)
 iroh = { version = "0.35", default-features = false }
@@ -25,6 +32,15 @@ anyhow = "1.0"
 thiserror = "2.0"
 tracing = "0.1"
 
+# CRDT
+yrs = "0.21"
+
+# Pitch detection (pitch crate works on wasm, pyin is native-only)
+pitch = "0.2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.pyin]
+version = "1.2"
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.32", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 futures = "0.3"
@@ -34,6 +50,17 @@ tracing-subscriber = "0.3"
 tokio = { version = "1.32", default-features = false, features = ["time", "sync"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["Window", "Location", "console"] }
+web-sys = { version = "0.3", features = [
+    "Window", "Location", "console",
+    "Document", "Element", "HtmlElement", "HtmlButtonElement",
+    "AudioContext", "AudioWorklet", "AudioWorkletNode", "AudioWorkletNodeOptions",
+    "MediaDevices", "MediaStream", "MediaStreamConstraints", "MediaStreamTrack",
+    "Navigator", "Blob", "BlobPropertyBag", "Url",
+    "MessagePort", "MessageEvent"
+] }
 console_error_panic_hook = "0.1"
 getrandom = { version = "0.3", features = ["wasm_js"] }
+
+# UI framework
+dominator = "0.5"
+futures-signals = "0.3"
