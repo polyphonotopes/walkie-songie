@@ -18,6 +18,7 @@ use crate::tuning::{PitchClass, Tuning};
 use super::audio::WebAudioInput;
 use super::components::{clear_button, pitch_display, tuning_editor, voice_button};
 use super::keyboard::{pitch_keyboard, sync_active_pitches};
+use super::voice_conditioner::{VoiceConditioner, ConditionerOutput};
 
 /// How long a confident pitch "lingers" when confidence drops (in milliseconds).
 const PITCH_LINGER_MS: u64 = 500;
@@ -29,6 +30,9 @@ const VOTE_DECAY: f64 = 0.95;
 /// Extra confidence required to switch to a pitch that's a fifth away (harmonic rejection).
 /// Fifths are the most common harmonic confusion (3:2 ratio).
 const HARMONIC_REJECTION_BOOST: f64 = 0.25;
+
+/// How long a pitch must stay above threshold before committing (milliseconds).
+const STABILITY_DURATION_MS: u64 = 100;
 
 /// Application state.
 /// Uses Rc for wasm (single-threaded), Arc would work too but Rc is simpler.
@@ -63,6 +67,18 @@ pub struct AppState {
     pub prev_lit_note: Rc<RefCell<Option<u8>>>,
     /// Buffer for SwiftF0 samples (accumulates between async calls).
     pub swiftf0_buffer: Rc<RefCell<Vec<f32>>>,
+    /// Voice conditioner for noise gating and AGC.
+    pub conditioner: Rc<RefCell<VoiceConditioner>>,
+    /// Continuous detected pitch in Hz (for dot indicator, not quantized).
+    pub continuous_hz: Mutable<Option<f64>>,
+    /// Final confidence after conditioner modifier (for dot indicator).
+    pub final_confidence: Mutable<f64>,
+    /// Whether the voice conditioner gate is open.
+    pub gate_open: Mutable<bool>,
+    /// Pitch being tracked for stability (must stay above threshold for duration).
+    pub stable_pitch: Rc<RefCell<Option<PitchClass>>>,
+    /// When the stable pitch first went above threshold.
+    pub stable_since: Rc<RefCell<Option<Instant>>>,
 }
 
 impl AppState {
@@ -72,6 +88,7 @@ impl AppState {
         let tuning = Tuning::twelve_tet();
         let config = PitchDetectorConfig::default();
         let swiftf0 = SwiftF0Detector::new(config.sample_rate);
+        let conditioner = VoiceConditioner::new(config.sample_rate as f32);
 
         Arc::new(Self {
             room: Mutable::new(room),
@@ -89,14 +106,41 @@ impl AppState {
             scl_error: Mutable::new(None),
             prev_lit_note: Rc::new(RefCell::new(None)),
             swiftf0_buffer: Rc::new(RefCell::new(Vec::with_capacity(8192))),
+            conditioner: Rc::new(RefCell::new(conditioner)),
+            continuous_hz: Mutable::new(None),
+            final_confidence: Mutable::new(0.0),
+            gate_open: Mutable::new(false),
+            stable_pitch: Rc::new(RefCell::new(None)),
+            stable_since: Rc::new(RefCell::new(None)),
         })
     }
 
-    /// Handle pitch detection event from SwiftF0.
-    pub fn on_pitch_event(self: &Arc<Self>, event: PitchEvent) {
-        self.current_pitch.set(Some(event.clone()));
-        if self.voice_active.get() {
-            self.process_pitch_for_locking(&event, 0.5, 2.0);
+    /// Handle pitch detection event from SwiftF0, applying conditioner modifier.
+    pub fn on_pitch_event(self: &Arc<Self>, event: PitchEvent, conditioner_output: &ConditionerOutput) {
+        // Apply confidence modifier from conditioner
+        let modified_confidence = event.confidence * conditioner_output.confidence_modifier as f64;
+        let modified_event = PitchEvent {
+            hz: event.hz,
+            confidence: modified_confidence,
+        };
+
+        self.current_pitch.set(Some(modified_event.clone()));
+
+        // Update continuous Hz for dot indicator
+        self.continuous_hz.set(event.hz);
+        self.final_confidence.set(modified_confidence);
+        self.gate_open.set(conditioner_output.gate_open);
+
+        // Calibrate reference level if we have a confident pitch
+        if event.hz.is_some() && event.confidence > 0.6 {
+            self.conditioner.borrow_mut().calibrate_reference(
+                conditioner_output.rms_db,
+                event.confidence,
+            );
+        }
+
+        if self.voice_active.get() && conditioner_output.gate_open {
+            self.process_pitch_for_locking(&modified_event, 0.5, 2.0);
         }
     }
 
@@ -147,28 +191,54 @@ impl AppState {
             };
 
             if event.confidence >= effective_threshold {
-                // High confidence - lock onto this pitch
-                // Update the lock
-                *self.locked_pitch.borrow_mut() = Some(pc);
-                *self.locked_at.borrow_mut() = Some(now);
+                // Above threshold - check stability before committing
+                let mut stable_pitch = self.stable_pitch.borrow_mut();
+                let mut stable_since = self.stable_since.borrow_mut();
 
-                // Accumulate vote (with decay already applied, new votes catch up fast)
-                {
-                    let mut votes = self.pitch_votes.borrow_mut();
-                    let entry = votes.entry(pc.index()).or_insert(0.0);
-                    *entry += event.confidence * vote_weight;
+                let is_stable = if *stable_pitch == Some(pc) {
+                    // Same pitch as we've been tracking
+                    if let Some(since) = *stable_since {
+                        let elapsed_ms = now.duration_since(since).as_millis() as u64;
+                        elapsed_ms >= STABILITY_DURATION_MS
+                    } else {
+                        false
+                    }
+                } else {
+                    // Different pitch - start tracking this one
+                    *stable_pitch = Some(pc);
+                    *stable_since = Some(now);
+                    false
+                };
+
+                drop(stable_pitch);
+                drop(stable_since);
+
+                if is_stable {
+                    // Pitch has been stable long enough - commit it
+                    *self.locked_pitch.borrow_mut() = Some(pc);
+                    *self.locked_at.borrow_mut() = Some(now);
+
+                    // Accumulate vote (with decay already applied, new votes catch up fast)
+                    {
+                        let mut votes = self.pitch_votes.borrow_mut();
+                        let entry = votes.entry(pc.index()).or_insert(0.0);
+                        *entry += event.confidence * vote_weight;
+                    }
+
+                    // Display shows current locked pitch directly
+                    self.committed_pitch.set(Some(pc));
+
+                    // Set voice_pitch during singing (shows as lit/green on keyboard)
+                    self.voice_pitch.set(Some(pc));
+
+                    // Sync keyboard (voice pitch -> lit/green, manual -> pressed/red)
+                    sync_active_pitches(self);
                 }
-
-                // Display shows current locked pitch directly
-                self.committed_pitch.set(Some(pc));
-
-                // Set voice_pitch during singing (shows as lit/green on keyboard)
-                self.voice_pitch.set(Some(pc));
-
-                // Sync keyboard (voice pitch -> lit/green, manual -> pressed/red)
-                sync_active_pitches(self);
+                // If not stable yet, just wait (indicator still shows the pitch)
             } else {
-                // Low confidence - check if we should linger on previous pitch
+                // Low confidence - reset stability tracking and check linger
+                *self.stable_pitch.borrow_mut() = None;
+                *self.stable_since.borrow_mut() = None;
                 self.maybe_linger(now);
             }
         } else {
@@ -206,7 +276,15 @@ impl AppState {
         self.pitch_votes.borrow_mut().clear();
         *self.locked_pitch.borrow_mut() = None;
         *self.locked_at.borrow_mut() = None;
+        *self.stable_pitch.borrow_mut() = None;
+        *self.stable_since.borrow_mut() = None;
         self.swiftf0_buffer.borrow_mut().clear();
+
+        // Reset voice conditioner for new session
+        self.conditioner.borrow_mut().reset();
+        self.continuous_hz.set(None);
+        self.final_confidence.set(0.0);
+        self.gate_open.set(false);
 
         // Ensure active pitches are shown as lit during voice input
         super::keyboard::sync_active_pitches(self);
@@ -283,6 +361,10 @@ impl AppState {
 
         self.voice_active.set(false);
 
+        // Clear indicator state immediately
+        self.gate_open.set(false);
+        self.continuous_hz.set(None);
+
         // Stop audio input - use try_borrow_mut in case start is still pending
         if let Ok(mut audio_ref) = self.audio.try_borrow_mut() {
             if let Some(ref mut audio) = *audio_ref {
@@ -336,10 +418,28 @@ impl AppState {
             std::mem::take(&mut *buffer)
         };
 
-        // Run async inference
+        // Run voice conditioner
+        let conditioner_output = {
+            let mut conditioner = self.conditioner.borrow_mut();
+            conditioner.decay_reference(); // Slow decay each frame
+            conditioner.process(&samples)
+        };
+
+        // Update gate state for UI
+        self.gate_open.set(conditioner_output.gate_open);
+
+        // Only run pitch detection if gate is open
+        if !conditioner_output.gate_open {
+            // Gate closed - clear continuous pitch display
+            self.continuous_hz.set(None);
+            self.final_confidence.set(0.0);
+            return;
+        }
+
+        // Run async inference on conditioned samples
         let result = {
             let mut swiftf0 = self.swiftf0.borrow_mut();
-            swiftf0.detect(&samples).await
+            swiftf0.detect(&conditioner_output.samples).await
         };
 
         // Emit pitch event if we got a result
@@ -348,7 +448,11 @@ impl AppState {
                 hz: Some(hz),
                 confidence,
             };
-            self.on_pitch_event(event);
+            self.on_pitch_event(event, &conditioner_output);
+        } else {
+            // No pitch detected even though gate is open
+            self.continuous_hz.set(None);
+            self.final_confidence.set(0.0);
         }
     }
 }

@@ -53,12 +53,33 @@ The existing Dynamic Noise Gate spec is underspecified for this use case. We nee
 **Decision**: Open threshold at noise_floor + 9dB, close threshold at noise_floor + 3dB
 **Rationale**: 6dB hysteresis prevents rapid flutter when signal hovers near threshold
 
+### 6. Reference Level Calibration (Trust Anchor)
+**Decision**: Capture RMS level on first confident pitch detection as "reference level", use it to modulate confidence scoring
+**How it works**:
+- When user starts singing and first confident pitch is detected, capture that RMS as reference
+- Subsequent signals within ~3dB of reference get confidence boost (likely intentional close-mic singing)
+- Signals >12dB below reference get confidence attenuation (likely ambient bleed)
+- Reference adapts upward slowly when louder confident signals detected (user moved closer)
+- Reference decays downward very slowly (prevents ambient from lowering the bar)
+**Alternatives considered**:
+- Fixed reference: Doesn't adapt to user distance from mic
+- Pure AGC without reference: Normalizes everything equally, loses "close singing" discrimination
+**Rationale**: The first confident signal establishes what "real singing" sounds like for this session. This creates a trust anchor that discriminates against quieter ambient sounds even if they have some pitch content (like background music).
+
 ## Architecture
 
 ```
-[Mic] → [Bandpass Filter] → [RMS Energy] → [VAD Decision]
-                                 ↓              ↓
-                         [Noise Estimator] → [Gate] → [AGC] → [Pitch Detector]
+[Mic] → [Bandpass Filter] → [RMS Energy] ──→ [VAD Decision]
+                                 │                  │
+                                 ↓                  ↓
+                         [Noise Estimator] ──→ [Gate] → [AGC] → [Pitch Detector]
+                                 │                              ↓
+                                 │                        [Confidence]
+                                 ↓                              │
+                         [Reference Level] ←── (first confident) ←┘
+                                 │
+                                 ↓
+                         [Confidence Modifier] → Final confidence for UI
 ```
 
 ## Risks / Trade-offs

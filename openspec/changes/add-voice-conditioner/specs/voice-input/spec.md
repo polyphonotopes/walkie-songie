@@ -37,6 +37,33 @@ The system SHALL implement a voice conditioner that combines adaptive noise esti
 
 ## ADDED Requirements
 
+### Requirement: Reference Level Calibration
+The system SHALL calibrate a "reference loudness" when the user begins singing, using this as a trust anchor for confidence scoring.
+
+#### Scenario: Capture reference level on voice start
+- **WHEN** voice input starts and the first confident pitch is detected (clear voice, high confidence)
+- **THEN** the system captures that RMS level as the "reference level" for this session
+
+#### Scenario: Boost confidence for signals near reference
+- **WHEN** subsequent audio has RMS within ~3dB of the reference level
+- **THEN** the confidence score receives a boost (signal likely from intended close-mic singing)
+
+#### Scenario: Reduce confidence for quiet signals
+- **WHEN** subsequent audio has RMS more than 12dB below the reference level
+- **THEN** the confidence score is attenuated (signal may be ambient bleed, not intentional singing)
+
+#### Scenario: Reference level adapts upward
+- **WHEN** a louder signal is detected with high pitch confidence
+- **THEN** the reference level slowly adapts upward (user moved closer to mic)
+
+#### Scenario: Reference level does not adapt downward quickly
+- **WHEN** signal level drops
+- **THEN** the reference level decays very slowly (prevents ambient noise from lowering the bar)
+
+#### Scenario: Reference resets on new session
+- **WHEN** voice input stops and restarts
+- **THEN** the reference level is cleared and recalibrated from the new first confident detection
+
 ### Requirement: Voice Conditioner Configuration
 The system SHALL allow optional configuration of voice conditioner parameters for different environments.
 

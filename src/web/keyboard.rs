@@ -1,12 +1,14 @@
 //! Bindings and wrapper for the all-around-keyboard web component.
 //!
-//! New declarative API:
+//! Declarative API:
 //! - State in via attributes: `pressed-notes`, `lit-notes`
+//! - Indicator children: `data-pitch`, `data-key`, `data-radius`
 //! - Events out: `keyclick`, `keyhover`, `keyunhover`
 
 use std::sync::Arc;
 
 use dominator::{clone, html, Dom};
+use futures_signals::signal::SignalExt;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::HtmlElement;
@@ -16,6 +18,12 @@ use crate::room::RoomState;
 use crate::tuning::{PitchClass, Tuning};
 
 use super::app::AppState;
+
+/// Reference frequency for A4 (standard tuning).
+const A4_HZ: f64 = 440.0;
+
+/// MIDI note number for A4.
+const A4_MIDI: f64 = 69.0;
 
 /// Get the keyboard element from the DOM.
 fn get_keyboard() -> Option<HtmlElement> {
@@ -107,20 +115,77 @@ pub fn sync_active_pitches(state: &Arc<AppState>) {
     }
 }
 
-/// Create the all-around-keyboard component wrapper.
+/// Convert Hz to a continuous pitch position (0.0 to N where N is pitch count).
+fn hz_to_pitch_position(hz: f64, pitch_count: usize) -> f64 {
+    // Convert Hz to MIDI note number (continuous)
+    let midi = A4_MIDI + 12.0 * (hz / A4_HZ).log2();
+
+    // For 12-TET, MIDI note 0 is C, so we can use midi % 12 directly
+    // For other tunings, we need to scale
+    let scale_factor = pitch_count as f64 / 12.0;
+    let position = (midi * scale_factor) % pitch_count as f64;
+
+    // Ensure positive
+    if position < 0.0 {
+        position + pitch_count as f64
+    } else {
+        position
+    }
+}
+
+/// Create the all-around-keyboard component with indicator child.
 pub fn pitch_keyboard(state: Arc<AppState>) -> Dom {
-    html!("div", {
-        .class("keyboard-container")
-        .child(html!("all-around-keyboard", {
-            .attr("notes-in-octave", "12")
-            .attr("raised-notes", "[1,3,6,8,10]")
-            .attr("octaves", "1")
-            .attr("sweep", "360")
-            .attr("width", "800")
-            .attr("depth", "280")
-            .attr("pressed-notes", "[]")
-            .attr("lit-notes", "[]")
+    html!("all-around-keyboard", {
+        .class("keyboard")
+        .attr("notes-in-octave", "12")
+        .attr("raised-notes", "[1,3,6,8,10]")
+        .attr("octaves", "1")
+        .attr("sweep", "360")
+        .attr("width", "800")
+        .attr("depth", "280")
+        .attr("pressed-notes", "[]")
+        .attr("lit-notes", "[]")
+
+        // Pitch indicator child - stable element, attributes updated reactively
+        .child(html!("div", {
+            .class("pitch-indicator")
+            // Update data-radius reactively based on confidence (0.4 to 0.8)
+            .attr_signal("data-radius", state.final_confidence.signal().map(|confidence| {
+                let radius = 0.4 + confidence as f64 * 0.4;
+                format!("{:.2}", radius)
+            }))
+            // Update data-pitch reactively
+            .attr_signal("data-pitch", state.continuous_hz.signal().map(clone!(state => move |hz_opt| {
+                let gate_open = state.gate_open.get();
+                if !gate_open || hz_opt.is_none() {
+                    return "0".to_string();
+                }
+                let hz = hz_opt.unwrap();
+                let tuning = state.tuning.lock_ref();
+                let pitch_count = tuning.pitch_class_count();
+                drop(tuning);
+                let pitch_position = hz_to_pitch_position(hz, pitch_count);
+                format!("{:.2}", pitch_position)
+            })))
+            // Update visibility reactively - hide when voice button released OR gate closed
+            .class_signal("hidden", state.continuous_hz.signal().map(clone!(state => move |_| {
+                !state.voice_active.get() || !state.gate_open.get()
+            })))
+            // Update style reactively based on confidence
+            .attr_signal("style", state.final_confidence.signal().map(|confidence| {
+                let size = 12.0 + confidence * 12.0;
+                let opacity = 0.6 + confidence * 0.4;
+                let glow = (6.0 + confidence * 10.0) as i32;
+                let brightness = (120.0 + confidence * 135.0) as u8;
+                format!(
+                    "width: {s}px; height: {s}px; opacity: {o:.2}; \
+                     background: rgb({b}, 255, {b}); \
+                     filter: drop-shadow(0 0 {g}px rgb({b}, 255, {b}));",
+                    s = size, o = opacity, g = glow, b = brightness
+                )
+            }))
         }))
+
         .after_inserted(clone!(state => move |_| {
             setup_keyboard_events(state.clone());
             // Initial sync with tuning

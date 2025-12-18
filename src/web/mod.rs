@@ -12,6 +12,8 @@ mod components;
 mod keyboard;
 #[cfg(target_arch = "wasm32")]
 pub mod onnx_bridge;
+#[cfg(target_arch = "wasm32")]
+mod voice_conditioner;
 
 #[cfg(target_arch = "wasm32")]
 pub use app::run_app;

@@ -73,7 +73,8 @@ body {
     align-items: center;
 }
 
-.keyboard-container all-around-keyboard {
+.keyboard-container all-around-keyboard,
+all-around-keyboard.keyboard {
     display: block;
     width: min(95vw, 70vh);
     max-width: 800px;
@@ -90,6 +91,23 @@ body {
     --key-highlight-lower-fill: var(--voice);
     --key-highlight-upper-fill: var(--voice);
     --key-hover-opacity: 0.85;
+}
+
+/* Pitch Indicator - positioned by all-around-keyboard via CSS custom properties */
+.pitch-indicator {
+    position: absolute;
+    left: var(--indicator-x, 50%);
+    top: var(--indicator-y, 50%);
+    transform: translate(-50%, -50%);
+    border-radius: 50%;
+    pointer-events: none;
+    transition: left 0.05s ease-out, top 0.05s ease-out, opacity 0.1s, width 0.1s, height 0.1s;
+}
+
+.pitch-indicator.hidden {
+    opacity: 0 !important;
+    width: 0 !important;
+    height: 0 !important;
 }
 
 /* Keyboard Overlay (pitch info in center) */
