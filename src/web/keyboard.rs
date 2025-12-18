@@ -92,10 +92,13 @@ pub fn compute_raised_notes(tuning: &Tuning) -> Vec<u8> {
 }
 
 /// Sync keyboard state with active pitches from ALL peers.
-/// - Combined pitches from all peers show as "pressed" (red)
+/// - Combined pitches from all peers + pieces show as "pressed" (red)
 /// - Local voice pitch shows as "lit" (green)
 pub fn sync_active_pitches(state: &Arc<AppState>) {
     let room = state.room.lock_ref();
+    let tuning = state.tuning.lock_ref();
+    let pc_count = tuning.pitch_class_count() as i32;
+    drop(tuning);
 
     // Get all peer sets for debugging
     let peer_sets = room.all_peer_sets();
@@ -104,13 +107,23 @@ pub fn sync_active_pitches(state: &Arc<AppState>) {
     // Get combined pitch result from all peers (uses combination method)
     let room_result = room.compute_room_result();
 
-    // All pitches from all peers -> pressed (red)
-    let combined: Vec<u8> = room_result.pitch_classes.iter().map(|pc| pc.index()).collect();
+    // Start with pitches from peers
+    let mut combined: Vec<u8> = room_result.pitch_classes.iter().map(|pc| pc.index()).collect();
+
+    // Add piece pitch classes
+    let pieces = room.all_pieces();
+    for piece in &pieces {
+        let pc = piece.pitch.rem_euclid(pc_count) as u8;
+        if !combined.contains(&pc) {
+            combined.push(pc);
+        }
+    }
 
     web_sys::console::log_1(&format!(
-        "[keyboard] sync_active_pitches: combined={:?}, peer_count={}, peer_ids={:?}",
+        "[keyboard] sync_active_pitches: combined={:?}, peer_count={}, pieces={}, peer_ids={:?}",
         combined,
         peer_sets.len(),
+        pieces.len(),
         peer_ids
     ).into());
 
@@ -173,6 +186,7 @@ fn piece_indicator(state: Arc<AppState>, piece: Piece) -> Dom {
         .style("user-select", "none")
         .style("box-shadow", "0 0 12px var(--manual)")
         .style("transition", "none") // Disable transition during potential drag
+        .style("z-index", "100") // Above keyboard elements
         // Start drag on pointer down
         .event(move |e: events::PointerDown| {
             if let Some(target) = e.target() {

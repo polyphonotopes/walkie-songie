@@ -63,6 +63,7 @@ body {
     align-items: center;
     flex: 1;
     min-height: 200px;
+    z-index: 1; /* Create stacking context for pieces */
 }
 
 .keyboard-container {
@@ -260,6 +261,7 @@ all-around-keyboard.keyboard {
     border-radius: 50%;
     pointer-events: auto;
     transition: left 0.05s ease-out, top 0.05s ease-out;
+    z-index: 100;
 }
 
 @keyframes pulse {
@@ -301,6 +303,11 @@ all-around-keyboard.keyboard {
 .pitch-tag.voice-pitch {
     background: var(--voice);
     box-shadow: 0 0 8px var(--voice);
+}
+
+.pitch-tag.piece-pitch {
+    background: #8b5cf6;
+    box-shadow: 0 0 8px #8b5cf6;
 }
 
 /* Tuning Section (collapsible) */

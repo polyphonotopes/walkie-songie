@@ -494,7 +494,7 @@ impl AppState {
     }
 
     /// Update MIDI output for toggle set changes.
-    /// Call this whenever the toggle set changes.
+    /// Call this whenever the toggle set or pieces change.
     pub fn sync_midi_toggle_output(self: &Arc<Self>) {
         // Skip if MIDI output is disabled
         if !self.midi_output_enabled() {
@@ -506,7 +506,7 @@ impl AppState {
         let pitch_count = self.tuning.lock_ref().pitch_class_count() as u8;
 
         // Get current pitch classes from local peer's set
-        let current_notes: std::collections::HashSet<u8> =
+        let mut current_notes: std::collections::HashSet<u8> =
             if let Some(set) = room.all_peer_sets().get(local_peer) {
                 set.pitch_classes
                     .iter()
@@ -515,6 +515,13 @@ impl AppState {
             } else {
                 std::collections::HashSet::new()
             };
+
+        // Add piece absolute pitches as MIDI notes
+        for piece in room.all_pieces() {
+            // Pieces have absolute pitch, use directly as MIDI note (clamped to valid range)
+            let midi_note = piece.pitch.clamp(0, 127) as u8;
+            current_notes.insert(midi_note);
+        }
 
         drop(room);
 
@@ -699,6 +706,7 @@ fn active_pitches_list(state: Arc<AppState>) -> Dom {
         .child_signal(state.room_version.signal().map(clone!(state => move |_version| {
             let room = state.room.lock_ref();
             let tuning = state.tuning.lock_ref();
+            let pc_count = tuning.pitch_class_count() as i32;
 
             // Get combined pitches from ALL peers via CRDT
             let room_result = room.compute_room_result();
@@ -706,19 +714,26 @@ fn active_pitches_list(state: Arc<AppState>) -> Dom {
             // Get local voice pitch from CRDT (shows as green)
             let (_, local_voice_pc) = room.local_voice();
 
-            // Build list of active pitches
-            let mut active: Vec<(String, bool, u8)> = Vec::new();
+            // Build list of active pitches: (name, is_voice, is_piece, sort_key)
+            let mut active: Vec<(String, bool, bool, i32)> = Vec::new();
 
-            // Add all pitches from room result
+            // Add all pitches from room result (toggle mode pitches)
             for pc in &room_result.pitch_classes {
                 let is_voice = local_voice_pc == Some(*pc);
-                active.push((tuning.note_name(*pc).to_string(), is_voice, pc.index()));
+                active.push((tuning.note_name(*pc).to_string(), is_voice, false, pc.index() as i32));
             }
 
-            // Sort by pitch index for consistent ordering
-            active.sort_by_key(|(_, _, idx)| *idx);
-            // Deduplicate (voice pitch might be in both)
-            active.dedup_by_key(|(_, _, idx)| *idx);
+            // Add pieces with octave info
+            for piece in room.all_pieces() {
+                let pc_idx = piece.pitch.rem_euclid(pc_count) as u8;
+                let pc = crate::tuning::PitchClass::new(pc_idx);
+                let octave = piece.octave();
+                let name = format!("{}{}", tuning.note_name(pc), octave);
+                active.push((name, false, true, piece.pitch));
+            }
+
+            // Sort by sort key for consistent ordering
+            active.sort_by_key(|(_, _, _, key)| *key);
 
             if active.is_empty() {
                 Some(html!("span", {
@@ -728,10 +743,11 @@ fn active_pitches_list(state: Arc<AppState>) -> Dom {
             } else {
                 Some(html!("div", {
                     .class("pitch-tags")
-                    .children(active.iter().map(|(name, is_voice, _idx)| {
+                    .children(active.iter().map(|(name, is_voice, is_piece, _)| {
                         html!("span", {
                             .class("pitch-tag")
                             .apply_if(*is_voice, |d| d.class("voice-pitch"))
+                            .apply_if(*is_piece, |d| d.class("piece-pitch"))
                             .text(name)
                         })
                     }).collect::<Vec<_>>())
