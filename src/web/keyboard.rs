@@ -376,21 +376,12 @@ fn setup_piece_drag_handler(el: &web_sys::HtmlElement, piece_id: &str, _original
     on_down.forget();
 }
 
-/// Store the currently hovered key note (used during piece drag)
+/// Store the currently hovered key note (used during piece drag for visual feedback)
 static HOVERED_KEY_NOTE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
-/// Store the last key that received a pointerup (for drop detection)
-static POINTERUP_KEY_NOTE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
-
 /// Get the currently hovered key note (pitch class 0-11, or -1 if none)
-pub fn get_hovered_key_note() -> Option<i32> {
+fn get_hovered_key_note() -> Option<i32> {
     let val = HOVERED_KEY_NOTE.load(std::sync::atomic::Ordering::Relaxed);
-    if val >= 0 { Some(val) } else { None }
-}
-
-/// Get and clear the last pointerup key note (pitch class 0-11, or -1 if none)
-pub fn take_pointerup_key_note() -> Option<i32> {
-    let val = POINTERUP_KEY_NOTE.swap(-1, std::sync::atomic::Ordering::Relaxed);
     if val >= 0 { Some(val) } else { None }
 }
 
@@ -503,20 +494,20 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
 
         // Otherwise handle as drag...
 
-        // Get hover key from piece element (set during move)
-        let hover_key = piece_el.get_attribute("data-hover-key")
-            .and_then(|s| s.parse::<i32>().ok());
-
-        // Check for keypointerup event (fires when pointer up happens over a key)
-        let pointerup_key = take_pointerup_key_note();
-
-        // Also check the global hovered key from keyhover events
-        let global_hover = get_hovered_key_note();
-
-        // Use best available drop target: pointerup > global_hover > hover_key
-        let end_key = pointerup_key
-            .or(global_hover)
-            .or(hover_key);
+        // Use getNoteAtPoint for reliable drop detection
+        let end_key = get_keyboard()
+            .and_then(|kb| {
+                // Call getNoteAtPoint(screenX, screenY) on the keyboard element
+                let result = Reflect::get(&kb, &JsValue::from_str("getNoteAtPoint")).ok()?;
+                let func = result.dyn_ref::<web_sys::js_sys::Function>()?;
+                let note_info = func.call2(&kb, &JsValue::from(e.x()), &JsValue::from(e.y())).ok()?;
+                if note_info.is_null() || note_info.is_undefined() {
+                    return None;
+                }
+                // Get the 'note' property from the result
+                let note = Reflect::get(&note_info, &JsValue::from_str("note")).ok()?;
+                note.as_f64().map(|n| n as i32)
+            });
 
         let tuning = state_up.tuning.lock_ref();
         let pc_count = tuning.pitch_class_count() as i32;
@@ -591,19 +582,6 @@ fn setup_keyboard_events(state: Arc<AppState>) {
         let _ = kb.add_event_listener_with_callback("keyunhover", on_unhover.as_ref().unchecked_ref());
         on_unhover.forget();
 
-        // Listen for keypointerup to detect drop targets
-        let on_pointerup = Closure::<dyn Fn(web_sys::Event)>::new(move |event: web_sys::Event| {
-            if let Ok(detail) = Reflect::get(&event, &JsValue::from_str("detail")) {
-                if let Ok(note_val) = Reflect::get(&detail, &JsValue::from_str("note")) {
-                    if let Some(note) = note_val.as_f64() {
-                        POINTERUP_KEY_NOTE.store(note as i32, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-            }
-        });
-        let _ = kb.add_event_listener_with_callback("keypointerup", on_pointerup.as_ref().unchecked_ref());
-        on_pointerup.forget();
-
         // Listen for keyclick events (actual user clicks, not hover)
         let state_click = state.clone();
         let on_click = Closure::<dyn Fn(web_sys::Event)>::new(move |event: web_sys::Event| {
@@ -622,15 +600,17 @@ fn setup_keyboard_events(state: Arc<AppState>) {
                         let pc = PitchClass::new(note);
                         drop(tuning);
 
+                        // Skip if locked (applies to both piece and toggle mode)
+                        if state_click.pieces_locked.get() {
+                            return;
+                        }
+
                         // Handle piece mode vs toggle mode
                         if state_click.piece_mode.get() {
                             // Piece mode: toggle a piece at this pitch class (one per key)
-                            // Skip if pieces are locked
-                            if !state_click.pieces_locked.get() {
-                                state_click.room.lock_mut().toggle_piece_at_pitch_class(note, count);
-                                // Sync MIDI output for piece changes
-                                state_click.sync_midi_toggle_output();
-                            }
+                            state_click.room.lock_mut().toggle_piece_at_pitch_class(note, count);
+                            // Sync MIDI output for piece changes
+                            state_click.sync_midi_toggle_output();
                         } else {
                             // Toggle mode: existing behavior
                             // Check if this is the voice pitch

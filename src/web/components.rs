@@ -102,18 +102,19 @@ pub fn piece_mode_button(state: Arc<AppState>) -> Dom {
                     state.room_version.set(state.room_version.get() + 1);
                 }))
             }),
-            // Lock button (only visible in piece mode)
+            // Lock button (prevents toggling in both modes)
             html!("button", {
                 .class("piece-lock-button")
-                .class_signal("hidden", state.piece_mode.signal().map(|pm| !pm))
                 .class_signal("locked", state.pieces_locked.signal())
                 .text_signal(state.pieces_locked.signal().map(|locked| {
                     if locked { "🔒" } else { "🔓" }
                 }))
                 .attr("title", "Lock/unlock piece editing")
                 .event(clone!(state => move |_: events::Click| {
-                    let current = state.pieces_locked.get();
-                    state.pieces_locked.set(!current);
+                    let new_locked = !state.pieces_locked.get();
+                    state.pieces_locked.set(new_locked);
+                    // Persist to CRDT
+                    state.room.lock_mut().set_pieces_locked(new_locked);
                 }))
             }),
         ])
