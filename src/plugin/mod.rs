@@ -573,6 +573,8 @@ async fn run_networking_loop(
 
                             // Notify plugin of remote changes
                             let peer_sets = room.all_peer_sets();
+
+                            // Check for new/changed pitch classes in current peers
                             for (remote_peer_id, peer_set) in &peer_sets {
                                 if remote_peer_id == &crdt_peer_id {
                                     continue;
@@ -581,8 +583,10 @@ async fn run_networking_loop(
                                 let current_pcs: Vec<u8> = peer_set.pitch_classes.iter().map(|pc| pc.0).collect();
                                 let prev_pcs = prev_peer_sets.get(remote_peer_id).cloned().unwrap_or_default();
 
+                                // Send note ON for new pitch classes
                                 for &pc in &current_pcs {
                                     if !prev_pcs.contains(&pc) {
+                                        plog!("Sending note ON for pc {} from peer {}", pc, remote_peer_id);
                                         let _ = evt_tx.send(NetEvent::RemotePitchClassChange {
                                             peer_id: remote_peer_id.clone(),
                                             pitch_class: pc,
@@ -590,8 +594,10 @@ async fn run_networking_loop(
                                         });
                                     }
                                 }
+                                // Send note OFF for removed pitch classes
                                 for &pc in &prev_pcs {
                                     if !current_pcs.contains(&pc) {
+                                        plog!("Sending note OFF for pc {} from peer {}", pc, remote_peer_id);
                                         let _ = evt_tx.send(NetEvent::RemotePitchClassChange {
                                             peer_id: remote_peer_id.clone(),
                                             pitch_class: pc,
@@ -602,20 +608,58 @@ async fn run_networking_loop(
                                 prev_peer_sets.insert(remote_peer_id.clone(), current_pcs);
                             }
 
+                            // Check for peers that disappeared entirely - send note OFF for all their notes
+                            let current_peer_ids: std::collections::HashSet<_> = peer_sets.keys().collect();
+                            let disappeared_peers: Vec<_> = prev_peer_sets.keys()
+                                .filter(|k| !current_peer_ids.contains(k) && *k != &crdt_peer_id)
+                                .cloned()
+                                .collect();
+                            for peer_id in disappeared_peers {
+                                if let Some(prev_pcs) = prev_peer_sets.remove(&peer_id) {
+                                    for pc in prev_pcs {
+                                        plog!("Sending note OFF for pc {} (peer {} disappeared)", pc, peer_id);
+                                        let _ = evt_tx.send(NetEvent::RemotePitchClassChange {
+                                            peer_id: peer_id.clone(),
+                                            pitch_class: pc,
+                                            on: false,
+                                        });
+                                    }
+                                }
+                            }
+
                             // Check voice state changes
                             let voice_states = room.all_voice_states();
-                            for (remote_peer_id, (pitch, pc)) in &voice_states {
+                            for (remote_peer_id, (pitch, _pc)) in &voice_states {
                                 if remote_peer_id == &crdt_peer_id {
                                     continue;
                                 }
                                 let prev = prev_voice_states.get(remote_peer_id).cloned();
                                 if prev.map(|(p, _)| p) != Some(*pitch) {
+                                    plog!("Voice pitch change for peer {}: {:?} -> {:?}", remote_peer_id, prev.map(|(p, _)| p), pitch);
                                     let _ = evt_tx.send(NetEvent::RemoteVoicePitchChange {
                                         peer_id: remote_peer_id.clone(),
                                         pitch: *pitch,
                                     });
                                 }
-                                prev_voice_states.insert(remote_peer_id.clone(), (*pitch, *pc));
+                                prev_voice_states.insert(remote_peer_id.clone(), (*pitch, *_pc));
+                            }
+
+                            // Check for peers whose voice state disappeared - send None
+                            let current_voice_peer_ids: std::collections::HashSet<_> = voice_states.keys().collect();
+                            let disappeared_voice_peers: Vec<_> = prev_voice_states.keys()
+                                .filter(|k| !current_voice_peer_ids.contains(k) && *k != &crdt_peer_id)
+                                .cloned()
+                                .collect();
+                            for peer_id in disappeared_voice_peers {
+                                if let Some((prev_pitch, _)) = prev_voice_states.remove(&peer_id) {
+                                    if prev_pitch.is_some() {
+                                        plog!("Voice pitch OFF for peer {} (disappeared)", peer_id);
+                                        let _ = evt_tx.send(NetEvent::RemoteVoicePitchChange {
+                                            peer_id: peer_id.clone(),
+                                            pitch: None,
+                                        });
+                                    }
+                                }
                             }
                         }
                     }
