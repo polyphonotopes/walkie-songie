@@ -81,7 +81,8 @@ web-sys = { version = "0.3", features = [
     "Navigator", "Clipboard", "Blob", "BlobPropertyBag", "Url",
     "MessagePort", "MessageEvent", "EventTarget", "InputEvent",
     "MidiAccess", "MidiInput", "MidiInputMap", "MidiOutput", "MidiOutputMap", "MidiMessageEvent", "MidiOptions",
-    "KeyboardEvent", "FocusEvent", "PointerEvent", "DomRect"
+    "KeyboardEvent", "FocusEvent", "PointerEvent", "DomRect",
+    "MutationObserver", "MutationObserverInit", "MutationRecord"
 ] }
 console_error_panic_hook = "0.1"
 tracing-wasm = "0.2"

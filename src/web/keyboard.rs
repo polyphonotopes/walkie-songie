@@ -307,6 +307,8 @@ fn setup_piece_sync(state: Arc<AppState>, keyboard_el: web_sys::HtmlElement) {
                             .and_then(|s| s.parse::<i32>().ok())
                             .unwrap_or(-1);
                         if current_key != key_index {
+                            // Ensure no data-pitch (pieces use data-key for discrete positioning)
+                            el.remove_attribute("data-pitch").ok();
                             el.set_attribute("data-key", &key_index.to_string()).ok();
                             el.set_attribute("data-original-pitch", &piece.pitch.to_string()).ok();
                         }
@@ -334,6 +336,37 @@ fn create_piece_element(piece_id: &str, original_pitch: i32, key_index: i32) -> 
     el.set_attribute("data-piece-id", piece_id).ok();
     el.set_attribute("data-key", &key_index.to_string()).ok();
     el.set_attribute("data-original-pitch", &original_pitch.to_string()).ok();
+    // Explicitly ensure no data-pitch (pieces use data-key for discrete positioning)
+    el.remove_attribute("data-pitch").ok();
+
+    // DEBUG: Add MutationObserver to catch any code that sets data-pitch on this piece
+    {
+        use wasm_bindgen::prelude::*;
+        let piece_id_debug = piece_id.to_string();
+        let el_debug = el.clone();
+        let callback = Closure::<dyn Fn(js_sys::Array)>::new(move |mutations: js_sys::Array| {
+            for i in 0..mutations.length() {
+                if let Ok(mutation) = mutations.get(i).dyn_into::<web_sys::MutationRecord>() {
+                    if let Some(attr) = mutation.attribute_name() {
+                        if attr == "data-pitch" {
+                            let has_it = el_debug.has_attribute("data-pitch");
+                            let val = el_debug.get_attribute("data-pitch").unwrap_or_default();
+                            web_sys::console::error_1(&format!(
+                                "[DEBUG] data-pitch MUTATED on piece {}: has={}, val='{}'",
+                                piece_id_debug, has_it, val
+                            ).into());
+                        }
+                    }
+                }
+            }
+        });
+        let observer = web_sys::MutationObserver::new(callback.as_ref().unchecked_ref()).unwrap();
+        let mut options = web_sys::MutationObserverInit::new();
+        options.attributes(true);
+        options.attribute_filter(&js_sys::Array::of1(&JsValue::from_str("data-pitch")));
+        observer.observe_with_options(&el, &options).ok();
+        callback.forget();
+    }
 
     // Inline styles
     let style = el.style();
@@ -586,22 +619,36 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
             start_pitch // No drop target
         };
 
-        // Set data-key and data-original-pitch to new position
+        // Update the piece position
         let pitch_class = new_pitch.rem_euclid(pc_count);
         let key_index = LEFTMOST_KEY + pitch_class;
+
+        // Reset some styling immediately
+        piece_el.remove_attribute("data-dragging").ok();
+        piece_el.style().remove_property("z-index").ok();
+        piece_el.style().remove_property("pointer-events").ok();
+        piece_el.remove_attribute("data-hover-key").ok();
+
+        // Remove data-positioned so keyboard will re-set it after positioning
+        piece_el.remove_attribute("data-positioned").ok();
+
+        // Update data-key - this triggers the keyboard's MutationObserver
+        // Ensure no data-pitch (pieces use data-key for discrete positioning)
+        piece_el.remove_attribute("data-pitch").ok();
         piece_el.set_attribute("data-key", &key_index.to_string()).ok();
         piece_el.set_attribute("data-original-pitch", &new_pitch.to_string()).ok();
 
-        // Then reset element styling
-        piece_el.remove_attribute("data-dragging").ok();
-        piece_el.style().remove_property("position").ok();
-        piece_el.style().remove_property("z-index").ok();
-        piece_el.style().remove_property("pointer-events").ok();
-        piece_el.style().remove_property("left").ok();
-        piece_el.style().remove_property("top").ok();
-        piece_el.style().set_property("background", "#8b5cf6").ok();
-        piece_el.style().set_property("box-shadow", "0 0 12px rgba(139, 92, 246, 0.6), 0 2px 8px rgba(0, 0, 0, 0.3)").ok();
-        piece_el.remove_attribute("data-hover-key").ok();
+        // Defer removing fixed positioning until after MutationObserver runs
+        let piece_el_defer = piece_el.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            // Wait a frame for MutationObserver to fire and keyboard to reposition
+            gloo_timers::future::TimeoutFuture::new(0).await;
+            piece_el_defer.style().remove_property("position").ok();
+            piece_el_defer.style().remove_property("left").ok();
+            piece_el_defer.style().remove_property("top").ok();
+            piece_el_defer.style().set_property("background", "#8b5cf6").ok();
+            piece_el_defer.style().set_property("box-shadow", "0 0 12px rgba(139, 92, 246, 0.6), 0 2px 8px rgba(0, 0, 0, 0.3)").ok();
+        });
 
         state_up.room_version.set(state_up.room_version.get() + 1);
         sync_active_pitches(&state_up);
