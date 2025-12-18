@@ -624,36 +624,45 @@ async fn run_networking_loop(
                         topic: t,
                     })) => {
                         plog!("Peer {} subscribed to {}", peer_id, t);
-                        // Send full state to new subscriber
-                        let state_update = room.encode_state_as_update();
-                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), state_update) {
-                            plog!("Failed to send state to subscriber: {:?}", e);
+                        // Send full state when peer subscribes to OUR topic
+                        if t == topic.hash() {
+                            let state_update = room.encode_state_as_update();
+                            plog!("Sending full state to new subscriber ({} bytes)", state_update.len());
+                            if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), state_update) {
+                                plog!("Failed to send state to subscriber: {:?}", e);
+                            }
                         }
                     }
                     _ => {}
                 }
             }
             _ = &mut timeout => {
-                // Check for new peers and broadcast local changes
+                // Check for new peers (triggered by receiving their state)
                 let current_peer_count = room.all_peer_sets().len();
                 let new_peer_joined = current_peer_count > last_known_peer_count;
                 if new_peer_joined {
-                    plog!("New peer detected ({} -> {})", last_known_peer_count, current_peer_count);
+                    plog!("New peer detected ({} -> {}), sending full state", last_known_peer_count, current_peer_count);
                     last_known_peer_count = current_peer_count;
+
+                    // Send full state to new peer immediately
+                    if connected_to_relay {
+                        let state_update = room.encode_state_as_update();
+                        if !state_update.is_empty() {
+                            plog!("Broadcasting FULL state ({} bytes)", state_update.len());
+                            if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), state_update) {
+                                plog!("Failed to publish full state: {:?}", e);
+                            }
+                            last_broadcast_sv = room.state_vector();
+                        }
+                    }
                 }
 
+                // Send diff for local changes
                 if has_local_changes && connected_to_relay {
-                    let update = if new_peer_joined {
-                        plog!("Broadcasting FULL state for new peer");
-                        room.encode_state_as_update()
-                    } else {
-                        room.encode_diff(&last_broadcast_sv).unwrap_or_default()
-                    };
+                    let update = room.encode_diff(&last_broadcast_sv).unwrap_or_default();
 
                     if !update.is_empty() {
-                        plog!("Broadcasting {} ({} bytes)",
-                            if new_peer_joined { "FULL state" } else { "diff" },
-                            update.len());
+                        plog!("Broadcasting diff ({} bytes)", update.len());
                         if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), update) {
                             plog!("Failed to publish: {:?}", e);
                         }
