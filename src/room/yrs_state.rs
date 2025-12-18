@@ -30,6 +30,7 @@ const KEY_COMBINATION_METHOD: &str = "combination_method";
 const KEY_VOICE_STATE: &str = "voice_state";
 const KEY_PIECES: &str = "pieces";  // Draggable pieces with absolute pitch (YMap<piece_id, pitch>)
 const KEY_PIECES_LOCKED: &str = "pieces_locked";  // Boolean - whether pieces can be added/removed
+const KEY_PIECE_MODE: &str = "piece_mode";  // Boolean - true for piece mode, false for toggle mode
 
 /// Keys within each peer's voice state map.
 const VOICE_PITCH: &str = "pitch";        // i32 - absolute pitch number (like MIDI note, no modulus)
@@ -684,6 +685,27 @@ impl YrsRoomState {
         let mut txn = self.doc.transact_mut();
         let meta: MapRef = txn.get_or_insert_map(KEY_COMBINATION_METHOD);
         meta.insert(&mut txn, KEY_PIECES_LOCKED, locked);
+        drop(txn);
+        self.notify();
+    }
+
+    /// Get whether piece mode is active (vs toggle mode).
+    pub fn piece_mode(&self) -> bool {
+        let txn = self.doc.transact();
+        let meta: MapRef = match txn.get_map(KEY_COMBINATION_METHOD) {
+            Some(m) => m,
+            None => return false,
+        };
+        meta.get(&txn, KEY_PIECE_MODE)
+            .and_then(|v| v.cast::<bool>().ok())
+            .unwrap_or(false)
+    }
+
+    /// Set whether piece mode is active.
+    pub fn set_piece_mode(&mut self, piece_mode: bool) {
+        let mut txn = self.doc.transact_mut();
+        let meta: MapRef = txn.get_or_insert_map(KEY_COMBINATION_METHOD);
+        meta.insert(&mut txn, KEY_PIECE_MODE, piece_mode);
         drop(txn);
         self.notify();
     }

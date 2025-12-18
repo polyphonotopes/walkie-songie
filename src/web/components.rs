@@ -96,8 +96,10 @@ pub fn piece_mode_button(state: Arc<AppState>) -> Dom {
                     if piece_mode { "Piece" } else { "Toggle" }
                 }))
                 .event(clone!(state => move |_: events::Click| {
-                    let current = state.piece_mode.get();
-                    state.piece_mode.set(!current);
+                    let new_mode = !state.piece_mode.get();
+                    state.piece_mode.set(new_mode);
+                    // Persist to CRDT
+                    state.room.lock_mut().set_piece_mode(new_mode);
                     // Trigger UI update
                     state.room_version.set(state.room_version.get() + 1);
                 }))
