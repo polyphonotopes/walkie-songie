@@ -357,29 +357,36 @@ fn handle_swarm_event(
                 message.data.len()
             ).into());
 
-            // Log state before apply
-            let before_peers: Vec<_> = room.lock_ref().all_peer_sets().keys().cloned().collect();
+            // Apply update and collect all data with lock held, then release lock before updating signals
+            let (before_count, after_count, combined, new_sv) = {
+                let before_count = room.lock_ref().all_peer_sets().len();
 
-            if let Err(e) = room.lock_mut().apply_update(&message.data) {
-                web_sys::console::warn_1(&format!(
-                    "[libp2p] Failed to apply update: {e}"
-                ).into());
-            } else {
-                *last_broadcast_sv = room.lock_ref().state_vector();
-                let old_version = room_version.get();
-                let new_version = old_version + 1;
-                room_version.set(new_version);
+                if let Err(e) = room.lock_mut().apply_update(&message.data) {
+                    web_sys::console::warn_1(&format!(
+                        "[libp2p] Failed to apply update: {e}"
+                    ).into());
+                    return;
+                }
 
-                // Log state after apply
-                let after_peers = room.lock_ref().all_peer_sets();
-                let after_peer_ids: Vec<_> = after_peers.keys().cloned().collect();
-                let combined: Vec<u8> = room.lock_ref().compute_room_result().pitch_classes.iter().map(|pc| pc.index()).collect();
+                // Collect all data while holding the lock
+                let room_ref = room.lock_ref();
+                let after_count = room_ref.all_peer_sets().len();
+                let combined: Vec<u8> = room_ref.compute_room_result().pitch_classes.iter().map(|pc| pc.index()).collect();
+                let new_sv = room_ref.state_vector();
+                (before_count, after_count, combined, new_sv)
+            };
+            // Lock is now released - safe to update signals
 
-                web_sys::console::log_1(&format!(
-                    "[libp2p] Applied update: peers {} -> {}, combined_pitches={:?}",
-                    before_peers.len(), after_peer_ids.len(), combined
-                ).into());
-            }
+            *last_broadcast_sv = new_sv;
+
+            web_sys::console::log_1(&format!(
+                "[libp2p] Applied update: peers {} -> {}, combined_pitches={:?}",
+                before_count, after_count, combined
+            ).into());
+
+            // Update room_version AFTER releasing all locks (triggers signal callbacks)
+            let new_version = room_version.get() + 1;
+            room_version.set(new_version);
         }
 
         SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Subscribed {

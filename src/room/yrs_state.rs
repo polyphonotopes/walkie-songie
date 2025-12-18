@@ -24,7 +24,8 @@ use super::{CombinationMethod, PeerPitchSet, RoomState};
 
 /// Document keys for the room state.
 const KEY_TUNING: &str = "tuning";
-const KEY_PITCH_SETS: &str = "pitch_sets";
+const KEY_PITCH_SETS: &str = "pitch_sets";  // Legacy per-peer sets (unused now)
+const KEY_SHARED_PITCHES: &str = "shared_pitches";  // Shared pitch set (anyone can add/remove)
 const KEY_COMBINATION_METHOD: &str = "combination_method";
 const KEY_VOICE_STATE: &str = "voice_state";
 
@@ -53,11 +54,8 @@ impl YrsRoomState {
             // Create tuning text
             let _tuning: TextRef = txn.get_or_insert_text(KEY_TUNING);
 
-            // Create pitch_sets map (will hold nested maps per peer)
-            let pitch_sets: MapRef = txn.get_or_insert_map(KEY_PITCH_SETS);
-
-            // Create our peer's pitch map (empty map, keys are pitch classes)
-            pitch_sets.insert(&mut txn, peer_id.clone(), MapPrelim::default());
+            // Create shared_pitches map (single shared set, anyone can add/remove)
+            let _shared_pitches: MapRef = txn.get_or_insert_map(KEY_SHARED_PITCHES);
 
             // Create combination_method with default
             let meta: MapRef = txn.get_or_insert_map(KEY_COMBINATION_METHOD);
@@ -151,36 +149,24 @@ impl RoomState for YrsRoomState {
         debug!("[CRDT] add_pitch({}) for peer {}", pc.0, self.peer_id);
 
         let mut txn = self.doc.transact_mut();
-        let pitch_sets: MapRef = txn.get_or_insert_map(KEY_PITCH_SETS);
-
-        // Get or create our peer's pitch map
-        let peer_map: MapRef = pitch_sets
-            .get(&txn, &self.peer_id)
-            .and_then(|v| v.cast().ok())
-            .unwrap_or_else(|| {
-                pitch_sets.insert(&mut txn, self.peer_id.clone(), MapPrelim::default());
-                pitch_sets.get(&txn, &self.peer_id).unwrap().cast().unwrap()
-            });
+        let shared_pitches: MapRef = txn.get_or_insert_map(KEY_SHARED_PITCHES);
 
         // Insert pitch as key (idempotent - inserting same key twice is fine)
         let key = pc.0.to_string();
-        peer_map.insert(&mut txn, key, true);
+        shared_pitches.insert(&mut txn, key, true);
         drop(txn);
         self.notify();
     }
 
     fn remove_pitch(&mut self, pc: PitchClass) {
+        debug!("[CRDT] remove_pitch({}) for peer {}", pc.0, self.peer_id);
+
         let mut txn = self.doc.transact_mut();
-        let pitch_sets: MapRef = txn.get_or_insert_map(KEY_PITCH_SETS);
+        let shared_pitches: MapRef = txn.get_or_insert_map(KEY_SHARED_PITCHES);
 
-        let peer_map: MapRef = match pitch_sets.get(&txn, &self.peer_id).and_then(|v| v.cast().ok()) {
-            Some(m) => m,
-            None => return,
-        };
-
-        // Remove pitch key
+        // Remove pitch key from shared map
         let key = pc.0.to_string();
-        peer_map.remove(&mut txn, &key);
+        shared_pitches.remove(&mut txn, &key);
         drop(txn);
         self.notify();
     }
@@ -197,53 +183,39 @@ impl RoomState for YrsRoomState {
 
     fn set_single_pitch(&mut self, pc: PitchClass) {
         let mut txn = self.doc.transact_mut();
-        let pitch_sets: MapRef = txn.get_or_insert_map(KEY_PITCH_SETS);
-
-        // Get or create our peer's pitch map
-        let peer_map: MapRef = pitch_sets
-            .get(&txn, &self.peer_id)
-            .and_then(|v| v.cast().ok())
-            .unwrap_or_else(|| {
-                pitch_sets.insert(&mut txn, self.peer_id.clone(), MapPrelim::default());
-                pitch_sets.get(&txn, &self.peer_id).unwrap().cast().unwrap()
-            });
+        let shared_pitches: MapRef = txn.get_or_insert_map(KEY_SHARED_PITCHES);
 
         // Collect existing keys to remove
-        let keys_to_remove: Vec<String> = peer_map
+        let keys_to_remove: Vec<String> = shared_pitches
             .keys(&txn)
             .map(|k| k.to_string())
             .collect();
 
         // Remove all existing pitches
         for key in keys_to_remove {
-            peer_map.remove(&mut txn, &key);
+            shared_pitches.remove(&mut txn, &key);
         }
 
         // Add the single pitch
         let key = pc.0.to_string();
-        peer_map.insert(&mut txn, key, true);
+        shared_pitches.insert(&mut txn, key, true);
         drop(txn);
         self.notify();
     }
 
     fn clear_pitches(&mut self) {
         let mut txn = self.doc.transact_mut();
-        let pitch_sets: MapRef = txn.get_or_insert_map(KEY_PITCH_SETS);
-
-        let peer_map: MapRef = match pitch_sets.get(&txn, &self.peer_id).and_then(|v| v.cast().ok()) {
-            Some(m) => m,
-            None => return,
-        };
+        let shared_pitches: MapRef = txn.get_or_insert_map(KEY_SHARED_PITCHES);
 
         // Collect keys to remove
-        let keys_to_remove: Vec<String> = peer_map
+        let keys_to_remove: Vec<String> = shared_pitches
             .keys(&txn)
             .map(|k| k.to_string())
             .collect();
 
         // Remove all pitches
         for key in keys_to_remove {
-            peer_map.remove(&mut txn, &key);
+            shared_pitches.remove(&mut txn, &key);
         }
         drop(txn);
         self.notify();
@@ -253,29 +225,21 @@ impl RoomState for YrsRoomState {
         let txn = self.doc.transact();
         let mut result = HashMap::new();
 
-        // Get manual pitch toggles from KEY_PITCH_SETS
-        if let Some(pitch_sets) = txn.get_map(KEY_PITCH_SETS) {
-            let peer_keys: Vec<_> = pitch_sets.iter(&txn).map(|(k, _)| k.to_string()).collect();
-            debug!("[CRDT] all_peer_sets: pitch_sets keys = {:?}", peer_keys);
+        // Get shared pitch toggles (manually clicked pitches that anyone can add/remove)
+        if let Some(shared_pitches) = txn.get_map(KEY_SHARED_PITCHES) {
+            let shared_set = result.entry("shared".to_string()).or_insert_with(PeerPitchSet::new);
 
-            for (peer_key, value) in pitch_sets.iter(&txn) {
-                let peer_id = peer_key.to_string();
-                let peer_set = result.entry(peer_id).or_insert_with(PeerPitchSet::new);
-
-                if let Ok(peer_map) = value.cast::<MapRef>() {
-                    // Each key in the peer's map is a pitch class
-                    for (pitch_key, _) in peer_map.iter(&txn) {
-                        if let Ok(pitch_num) = pitch_key.parse::<u8>() {
-                            peer_set.add(PitchClass(pitch_num));
-                        }
-                    }
+            for (pitch_key, _) in shared_pitches.iter(&txn) {
+                if let Ok(pitch_num) = pitch_key.parse::<u8>() {
+                    shared_set.add(PitchClass(pitch_num));
                 }
             }
-        } else {
-            debug!("[CRDT] all_peer_sets: pitch_sets map not found!");
+
+            debug!("[CRDT] all_peer_sets: shared_pitches = {:?}",
+                shared_set.pitch_classes.iter().map(|pc| pc.0).collect::<Vec<_>>());
         }
 
-        // Also include voice pitches from KEY_VOICE_STATE
+        // Include voice pitches from KEY_VOICE_STATE (per-peer voice input)
         if let Some(voice_state) = txn.get_map(KEY_VOICE_STATE) {
             for (peer_key, value) in voice_state.iter(&txn) {
                 let peer_id = peer_key.to_string();
@@ -338,37 +302,27 @@ impl RoomState for YrsRoomState {
 
 // Additional methods for getting values that can't be returned as references
 impl YrsRoomState {
-    /// Check if a pitch is in the local peer's set (O(1) lookup).
+    /// Check if a pitch is in the shared pitch set (O(1) lookup).
     pub fn contains_pitch(&self, pc: PitchClass) -> bool {
         let txn = self.doc.transact();
-        let pitch_sets: MapRef = match txn.get_map(KEY_PITCH_SETS) {
-            Some(m) => m,
-            None => return false,
-        };
-
-        let peer_map: MapRef = match pitch_sets.get(&txn, &self.peer_id).and_then(|v| v.cast().ok()) {
+        let shared_pitches: MapRef = match txn.get_map(KEY_SHARED_PITCHES) {
             Some(m) => m,
             None => return false,
         };
 
         let key = pc.0.to_string();
-        peer_map.get(&txn, &key).is_some()
+        shared_pitches.get(&txn, &key).is_some()
     }
 
-    /// Get the local peer's pitches as a set (without building full HashMap).
-    pub fn local_pitches(&self) -> HashSet<PitchClass> {
+    /// Get all shared pitches as a set.
+    pub fn shared_pitches(&self) -> HashSet<PitchClass> {
         let txn = self.doc.transact();
-        let pitch_sets: MapRef = match txn.get_map(KEY_PITCH_SETS) {
+        let shared_pitches: MapRef = match txn.get_map(KEY_SHARED_PITCHES) {
             Some(m) => m,
             None => return HashSet::new(),
         };
 
-        let peer_map: MapRef = match pitch_sets.get(&txn, &self.peer_id).and_then(|v| v.cast().ok()) {
-            Some(m) => m,
-            None => return HashSet::new(),
-        };
-
-        peer_map
+        shared_pitches
             .keys(&txn)
             .filter_map(|k| k.parse::<u8>().ok())
             .map(PitchClass)
@@ -583,11 +537,12 @@ mod tests {
 
         state.add_pitch(PitchClass(5));
         let sets = state.all_peer_sets();
-        assert!(sets["peer1"].contains(PitchClass(5)));
+        // Pitches are now shared, not per-peer
+        assert!(sets["shared"].contains(PitchClass(5)));
 
         state.remove_pitch(PitchClass(5));
         let sets = state.all_peer_sets();
-        assert!(!sets["peer1"].contains(PitchClass(5)));
+        assert!(!sets["shared"].contains(PitchClass(5)));
     }
 
     #[test]
@@ -596,11 +551,12 @@ mod tests {
 
         assert!(state.toggle_pitch(PitchClass(7))); // Added
         let sets = state.all_peer_sets();
-        assert!(sets["peer1"].contains(PitchClass(7)));
+        // Pitches are now shared, not per-peer
+        assert!(sets["shared"].contains(PitchClass(7)));
 
         assert!(!state.toggle_pitch(PitchClass(7))); // Removed
         let sets = state.all_peer_sets();
-        assert!(!sets["peer1"].contains(PitchClass(7)));
+        assert!(!sets["shared"].contains(PitchClass(7)));
     }
 
     #[test]
@@ -610,12 +566,13 @@ mod tests {
         state.add_pitch(PitchClass(1));
         state.add_pitch(PitchClass(2));
         let sets = state.all_peer_sets();
-        assert_eq!(sets["peer1"].pitch_classes.len(), 2);
+        // Pitches are now shared, not per-peer
+        assert_eq!(sets["shared"].pitch_classes.len(), 2);
 
         state.set_single_pitch(PitchClass(5));
         let sets = state.all_peer_sets();
-        assert_eq!(sets["peer1"].pitch_classes.len(), 1);
-        assert!(sets["peer1"].contains(PitchClass(5)));
+        assert_eq!(sets["shared"].pitch_classes.len(), 1);
+        assert!(sets["shared"].contains(PitchClass(5)));
     }
 
     #[test]
@@ -632,6 +589,23 @@ mod tests {
         let mut state1 = YrsRoomState::new("peer1".to_string());
         let mut state2 = YrsRoomState::new("peer2".to_string());
 
+        // Peer 1 adds a pitch (goes to shared set)
+        state1.add_pitch(PitchClass(5));
+
+        // Sync state1 -> state2
+        let update = state1.encode_state_as_update();
+        state2.apply_update(&update).unwrap();
+
+        // Peer 2 should see the shared pitch
+        let sets = state2.all_peer_sets();
+        assert!(sets.get("shared").map(|s| s.contains(PitchClass(5))).unwrap_or(false));
+    }
+
+    #[test]
+    fn test_yrs_sync_shared_removal() {
+        let mut state1 = YrsRoomState::new("peer1".to_string());
+        let mut state2 = YrsRoomState::new("peer2".to_string());
+
         // Peer 1 adds a pitch
         state1.add_pitch(PitchClass(5));
 
@@ -639,9 +613,18 @@ mod tests {
         let update = state1.encode_state_as_update();
         state2.apply_update(&update).unwrap();
 
-        // Peer 2 should see peer 1's pitch
-        let sets = state2.all_peer_sets();
-        assert!(sets.get("peer1").map(|s| s.contains(PitchClass(5))).unwrap_or(false));
+        // Peer 2 removes the pitch (this is the bug we fixed!)
+        state2.remove_pitch(PitchClass(5));
+
+        // Sync state2 -> state1
+        let update = state2.encode_state_as_update();
+        state1.apply_update(&update).unwrap();
+
+        // Both should see the pitch removed
+        let sets1 = state1.all_peer_sets();
+        let sets2 = state2.all_peer_sets();
+        assert!(!sets1.get("shared").map(|s| s.contains(PitchClass(5))).unwrap_or(true));
+        assert!(!sets2.get("shared").map(|s| s.contains(PitchClass(5))).unwrap_or(true));
     }
 
     #[test]

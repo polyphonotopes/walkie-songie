@@ -3,12 +3,10 @@
 //! This library provides platform-agnostic abstractions for:
 //! - Pitch detection (via SwiftF0 ML model)
 //! - Room state management (via `RoomState` trait)
-//! - P2P transport (via existing matchbox/iroh signaller)
+//! - P2P transport (via libp2p with gossipsub)
 //!
 //! The core library has no UI dependencies and can be used from
 //! web (dominator), native (Bevy), or CLI applications.
-
-pub mod net;
 pub mod pitch;
 pub mod room;
 pub mod tuning;
