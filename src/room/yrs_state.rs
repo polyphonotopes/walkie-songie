@@ -2,15 +2,21 @@
 //!
 //! Uses Y-CRDT for synchronizing room state across peers:
 //! - YText for SCL tuning content
-//! - YMap for per-peer pitch class sets
+//! - YMap<peer_id, YMap<pitch, true>> for per-peer pitch class sets (set semantics via map keys)
 //! - YMap entry for combination method
+//!
+//! Using nested YMaps instead of YArrays gives us:
+//! - O(1) add/remove/contains operations
+//! - Automatic deduplication on concurrent adds
+//! - Proper set semantics under CRDT merge
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tokio::sync::watch;
+use tracing::debug;
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
-use yrs::{Array, ArrayRef, Doc, GetString, Map, MapRef, ReadTxn, Text, TextRef, Transact, Update, WriteTxn};
+use yrs::{Doc, GetString, Map, MapPrelim, MapRef, ReadTxn, Text, TextRef, Transact, Update, WriteTxn};
 
 use crate::tuning::PitchClass;
 
@@ -20,6 +26,11 @@ use super::{CombinationMethod, PeerPitchSet, RoomState};
 const KEY_TUNING: &str = "tuning";
 const KEY_PITCH_SETS: &str = "pitch_sets";
 const KEY_COMBINATION_METHOD: &str = "combination_method";
+const KEY_VOICE_STATE: &str = "voice_state";
+
+/// Keys within each peer's voice state map.
+const VOICE_PITCH: &str = "pitch";        // i32 - absolute pitch number (like MIDI note, no modulus)
+const VOICE_PITCHCLASS: &str = "pitchclass";  // u8 - the quantized pitch class (pitch % scale_size)
 
 /// yrs-based room state that syncs with peers.
 pub struct YrsRoomState {
@@ -42,15 +53,20 @@ impl YrsRoomState {
             // Create tuning text
             let _tuning: TextRef = txn.get_or_insert_text(KEY_TUNING);
 
-            // Create pitch_sets map
+            // Create pitch_sets map (will hold nested maps per peer)
             let pitch_sets: MapRef = txn.get_or_insert_map(KEY_PITCH_SETS);
 
-            // Create our peer's array in pitch_sets
-            pitch_sets.insert(&mut txn, peer_id.clone(), yrs::ArrayPrelim::default());
+            // Create our peer's pitch map (empty map, keys are pitch classes)
+            pitch_sets.insert(&mut txn, peer_id.clone(), MapPrelim::default());
 
             // Create combination_method with default
             let meta: MapRef = txn.get_or_insert_map(KEY_COMBINATION_METHOD);
             meta.insert(&mut txn, "method", "union");
+
+            // Create voice_state map (will hold per-peer voice pitch data)
+            let voice_state: MapRef = txn.get_or_insert_map(KEY_VOICE_STATE);
+            // Create our peer's voice state map
+            voice_state.insert(&mut txn, peer_id.clone(), MapPrelim::default());
         }
 
         Self {
@@ -70,6 +86,18 @@ impl YrsRoomState {
     pub fn apply_update(&mut self, update: &[u8]) -> anyhow::Result<()> {
         let update = Update::decode_v1(update)?;
         self.doc.transact_mut().apply_update(update)?;
+
+        // Log the state after applying
+        let peer_sets = self.all_peer_sets();
+        debug!("[CRDT] After apply_update: {} peer sets", peer_sets.len());
+        for (peer_id, set) in &peer_sets {
+            debug!(
+                "[CRDT]   peer {}: {:?}",
+                peer_id,
+                set.pitch_classes.iter().map(|pc| pc.0).collect::<Vec<_>>()
+            );
+        }
+
         self.notify();
         Ok(())
     }
@@ -115,29 +143,23 @@ impl RoomState for YrsRoomState {
     }
 
     fn add_pitch(&mut self, pc: PitchClass) {
+        debug!("[CRDT] add_pitch({}) for peer {}", pc.0, self.peer_id);
+
         let mut txn = self.doc.transact_mut();
         let pitch_sets: MapRef = txn.get_or_insert_map(KEY_PITCH_SETS);
-        let array: ArrayRef = pitch_sets
+
+        // Get or create our peer's pitch map
+        let peer_map: MapRef = pitch_sets
             .get(&txn, &self.peer_id)
             .and_then(|v| v.cast().ok())
             .unwrap_or_else(|| {
-                pitch_sets.insert(&mut txn, self.peer_id.clone(), yrs::ArrayPrelim::default());
+                pitch_sets.insert(&mut txn, self.peer_id.clone(), MapPrelim::default());
                 pitch_sets.get(&txn, &self.peer_id).unwrap().cast().unwrap()
             });
 
-        // Check if already present
-        let len = array.len(&txn);
-        for i in 0..len {
-            if let Some(val) = array.get(&txn, i) {
-                if let Ok(n) = val.cast::<i64>() {
-                    if n as u8 == pc.0 {
-                        return; // Already present
-                    }
-                }
-            }
-        }
-
-        array.push_back(&mut txn, pc.0 as i64);
+        // Insert pitch as key (idempotent - inserting same key twice is fine)
+        let key = pc.0.to_string();
+        peer_map.insert(&mut txn, key, true);
         drop(txn);
         self.notify();
     }
@@ -145,83 +167,56 @@ impl RoomState for YrsRoomState {
     fn remove_pitch(&mut self, pc: PitchClass) {
         let mut txn = self.doc.transact_mut();
         let pitch_sets: MapRef = txn.get_or_insert_map(KEY_PITCH_SETS);
-        let array: ArrayRef = match pitch_sets.get(&txn, &self.peer_id).and_then(|v| v.cast().ok()) {
-            Some(a) => a,
+
+        let peer_map: MapRef = match pitch_sets.get(&txn, &self.peer_id).and_then(|v| v.cast().ok()) {
+            Some(m) => m,
             None => return,
         };
 
-        // Find and remove the pitch class
-        let len = array.len(&txn);
-        for i in 0..len {
-            if let Some(val) = array.get(&txn, i) {
-                if let Ok(n) = val.cast::<i64>() {
-                    if n as u8 == pc.0 {
-                        array.remove(&mut txn, i);
-                        drop(txn);
-                        self.notify();
-                        return;
-                    }
-                }
-            }
-        }
+        // Remove pitch key
+        let key = pc.0.to_string();
+        peer_map.remove(&mut txn, &key);
+        drop(txn);
+        self.notify();
     }
 
     fn toggle_pitch(&mut self, pc: PitchClass) -> bool {
-        let txn = self.doc.transact();
-        let pitch_sets: MapRef = match txn.get_map(KEY_PITCH_SETS) {
-            Some(m) => m,
-            None => {
-                drop(txn);
-                self.add_pitch(pc);
-                return true;
-            }
-        };
-        let array: ArrayRef = match pitch_sets.get(&txn, &self.peer_id).and_then(|v| v.cast().ok()) {
-            Some(a) => a,
-            None => {
-                drop(txn);
-                self.add_pitch(pc);
-                return true;
-            }
-        };
-
-        // Check if present
-        let len = array.len(&txn);
-        for i in 0..len {
-            if let Some(val) = array.get(&txn, i) {
-                if let Ok(n) = val.cast::<i64>() {
-                    if n as u8 == pc.0 {
-                        drop(txn);
-                        self.remove_pitch(pc);
-                        return false;
-                    }
-                }
-            }
+        if self.contains_pitch(pc) {
+            self.remove_pitch(pc);
+            false
+        } else {
+            self.add_pitch(pc);
+            true
         }
-        drop(txn);
-        self.add_pitch(pc);
-        true
     }
 
     fn set_single_pitch(&mut self, pc: PitchClass) {
         let mut txn = self.doc.transact_mut();
         let pitch_sets: MapRef = txn.get_or_insert_map(KEY_PITCH_SETS);
-        let array: ArrayRef = pitch_sets
+
+        // Get or create our peer's pitch map
+        let peer_map: MapRef = pitch_sets
             .get(&txn, &self.peer_id)
             .and_then(|v| v.cast().ok())
             .unwrap_or_else(|| {
-                pitch_sets.insert(&mut txn, self.peer_id.clone(), yrs::ArrayPrelim::default());
+                pitch_sets.insert(&mut txn, self.peer_id.clone(), MapPrelim::default());
                 pitch_sets.get(&txn, &self.peer_id).unwrap().cast().unwrap()
             });
 
-        // Clear existing
-        let len = array.len(&txn);
-        if len > 0 {
-            array.remove_range(&mut txn, 0, len);
+        // Collect existing keys to remove
+        let keys_to_remove: Vec<String> = peer_map
+            .keys(&txn)
+            .map(|k| k.to_string())
+            .collect();
+
+        // Remove all existing pitches
+        for key in keys_to_remove {
+            peer_map.remove(&mut txn, &key);
         }
 
         // Add the single pitch
-        array.push_back(&mut txn, pc.0 as i64);
+        let key = pc.0.to_string();
+        peer_map.insert(&mut txn, key, true);
         drop(txn);
         self.notify();
     }
@@ -229,14 +224,21 @@ impl RoomState for YrsRoomState {
     fn clear_pitches(&mut self) {
         let mut txn = self.doc.transact_mut();
         let pitch_sets: MapRef = txn.get_or_insert_map(KEY_PITCH_SETS);
-        let array: ArrayRef = match pitch_sets.get(&txn, &self.peer_id).and_then(|v| v.cast().ok()) {
-            Some(a) => a,
+
+        let peer_map: MapRef = match pitch_sets.get(&txn, &self.peer_id).and_then(|v| v.cast().ok()) {
+            Some(m) => m,
             None => return,
         };
 
-        let len = array.len(&txn);
-        if len > 0 {
-            array.remove_range(&mut txn, 0, len);
+        // Collect keys to remove
+        let keys_to_remove: Vec<String> = peer_map
+            .keys(&txn)
+            .map(|k| k.to_string())
+            .collect();
+
+        // Remove all pitches
+        for key in keys_to_remove {
+            peer_map.remove(&mut txn, &key);
         }
         drop(txn);
         self.notify();
@@ -244,29 +246,40 @@ impl RoomState for YrsRoomState {
 
     fn all_peer_sets(&self) -> HashMap<String, PeerPitchSet> {
         let txn = self.doc.transact();
-        let pitch_sets: MapRef = match txn.get_map(KEY_PITCH_SETS) {
-            Some(m) => m,
-            None => return HashMap::new(),
-        };
-
         let mut result = HashMap::new();
 
-        for (key, value) in pitch_sets.iter(&txn) {
-            let peer_id = key.to_string();
-            let mut peer_set = PeerPitchSet::new();
+        // Get manual pitch toggles from KEY_PITCH_SETS
+        if let Some(pitch_sets) = txn.get_map(KEY_PITCH_SETS) {
+            for (peer_key, value) in pitch_sets.iter(&txn) {
+                let peer_id = peer_key.to_string();
+                let peer_set = result.entry(peer_id).or_insert_with(PeerPitchSet::new);
 
-            if let Ok(array) = value.cast::<ArrayRef>() {
-                let len = array.len(&txn);
-                for i in 0..len {
-                    if let Some(val) = array.get(&txn, i) {
-                        if let Ok(n) = val.cast::<i64>() {
-                            peer_set.add(PitchClass(n as u8));
+                if let Ok(peer_map) = value.cast::<MapRef>() {
+                    // Each key in the peer's map is a pitch class
+                    for (pitch_key, _) in peer_map.iter(&txn) {
+                        if let Ok(pitch_num) = pitch_key.parse::<u8>() {
+                            peer_set.add(PitchClass(pitch_num));
                         }
                     }
                 }
             }
+        }
 
-            result.insert(peer_id, peer_set);
+        // Also include voice pitches from KEY_VOICE_STATE
+        if let Some(voice_state) = txn.get_map(KEY_VOICE_STATE) {
+            for (peer_key, value) in voice_state.iter(&txn) {
+                let peer_id = peer_key.to_string();
+                let peer_set = result.entry(peer_id).or_insert_with(PeerPitchSet::new);
+
+                if let Ok(peer_map) = value.cast::<MapRef>() {
+                    // Get voice pitch class if present
+                    if let Some(pc_val) = peer_map.get(&txn, VOICE_PITCHCLASS) {
+                        if let Some(pc_num) = pc_val.cast::<i64>().ok() {
+                            peer_set.add(PitchClass(pc_num as u8));
+                        }
+                    }
+                }
+            }
         }
 
         result
@@ -315,6 +328,43 @@ impl RoomState for YrsRoomState {
 
 // Additional methods for getting values that can't be returned as references
 impl YrsRoomState {
+    /// Check if a pitch is in the local peer's set (O(1) lookup).
+    pub fn contains_pitch(&self, pc: PitchClass) -> bool {
+        let txn = self.doc.transact();
+        let pitch_sets: MapRef = match txn.get_map(KEY_PITCH_SETS) {
+            Some(m) => m,
+            None => return false,
+        };
+
+        let peer_map: MapRef = match pitch_sets.get(&txn, &self.peer_id).and_then(|v| v.cast().ok()) {
+            Some(m) => m,
+            None => return false,
+        };
+
+        let key = pc.0.to_string();
+        peer_map.get(&txn, &key).is_some()
+    }
+
+    /// Get the local peer's pitches as a set (without building full HashMap).
+    pub fn local_pitches(&self) -> HashSet<PitchClass> {
+        let txn = self.doc.transact();
+        let pitch_sets: MapRef = match txn.get_map(KEY_PITCH_SETS) {
+            Some(m) => m,
+            None => return HashSet::new(),
+        };
+
+        let peer_map: MapRef = match pitch_sets.get(&txn, &self.peer_id).and_then(|v| v.cast().ok()) {
+            Some(m) => m,
+            None => return HashSet::new(),
+        };
+
+        peer_map
+            .keys(&txn)
+            .filter_map(|k| k.parse::<u8>().ok())
+            .map(PitchClass)
+            .collect()
+    }
+
     /// Get the combination method as an owned value.
     pub fn get_combination_method(&self) -> CombinationMethod {
         let txn = self.doc.transact();
@@ -349,7 +399,7 @@ impl YrsRoomState {
         let mut txn = self.doc.transact_mut();
         let pitch_sets: MapRef = txn.get_or_insert_map(KEY_PITCH_SETS);
         if pitch_sets.get(&txn, peer_id).is_none() {
-            pitch_sets.insert(&mut txn, peer_id, yrs::ArrayPrelim::default());
+            pitch_sets.insert(&mut txn, peer_id, MapPrelim::default());
         }
     }
 
@@ -358,8 +408,158 @@ impl YrsRoomState {
         let mut txn = self.doc.transact_mut();
         let pitch_sets: MapRef = txn.get_or_insert_map(KEY_PITCH_SETS);
         pitch_sets.remove(&mut txn, peer_id);
+
+        // Also remove voice state
+        let voice_state: MapRef = txn.get_or_insert_map(KEY_VOICE_STATE);
+        voice_state.remove(&mut txn, peer_id);
+
         drop(txn);
         self.notify();
+    }
+
+    /// Set the local peer's voice pitch (absolute pitch number, like MIDI note).
+    pub fn set_voice_pitch(&mut self, pitch: Option<i32>) {
+        let mut txn = self.doc.transact_mut();
+        let voice_state: MapRef = txn.get_or_insert_map(KEY_VOICE_STATE);
+
+        let peer_map: MapRef = voice_state
+            .get(&txn, &self.peer_id)
+            .and_then(|v| v.cast().ok())
+            .unwrap_or_else(|| {
+                voice_state.insert(&mut txn, self.peer_id.clone(), MapPrelim::default());
+                voice_state.get(&txn, &self.peer_id).unwrap().cast().unwrap()
+            });
+
+        if let Some(p) = pitch {
+            peer_map.insert(&mut txn, VOICE_PITCH, p as i64);
+        } else {
+            peer_map.remove(&mut txn, VOICE_PITCH);
+        }
+
+        drop(txn);
+        self.notify();
+    }
+
+    /// Set the local peer's voice pitch class.
+    pub fn set_voice_pitchclass(&mut self, pc: Option<PitchClass>) {
+        debug!("[CRDT] set_voice_pitchclass({:?}) for peer {}", pc.map(|p| p.0), self.peer_id);
+
+        let mut txn = self.doc.transact_mut();
+        let voice_state: MapRef = txn.get_or_insert_map(KEY_VOICE_STATE);
+
+        let peer_map: MapRef = voice_state
+            .get(&txn, &self.peer_id)
+            .and_then(|v| v.cast().ok())
+            .unwrap_or_else(|| {
+                voice_state.insert(&mut txn, self.peer_id.clone(), MapPrelim::default());
+                voice_state.get(&txn, &self.peer_id).unwrap().cast().unwrap()
+            });
+
+        if let Some(p) = pc {
+            peer_map.insert(&mut txn, VOICE_PITCHCLASS, p.0 as i64);
+        } else {
+            peer_map.remove(&mut txn, VOICE_PITCHCLASS);
+        }
+
+        drop(txn);
+        debug!("[CRDT] Calling notify() after voice change");
+        self.notify();
+    }
+
+    /// Set both voice pitch and pitch class atomically.
+    pub fn set_voice(&mut self, pitch: Option<i32>, pc: Option<PitchClass>) {
+        let mut txn = self.doc.transact_mut();
+        let voice_state: MapRef = txn.get_or_insert_map(KEY_VOICE_STATE);
+
+        let peer_map: MapRef = voice_state
+            .get(&txn, &self.peer_id)
+            .and_then(|v| v.cast().ok())
+            .unwrap_or_else(|| {
+                voice_state.insert(&mut txn, self.peer_id.clone(), MapPrelim::default());
+                voice_state.get(&txn, &self.peer_id).unwrap().cast().unwrap()
+            });
+
+        if let Some(p) = pitch {
+            peer_map.insert(&mut txn, VOICE_PITCH, p as i64);
+        } else {
+            peer_map.remove(&mut txn, VOICE_PITCH);
+        }
+
+        if let Some(p) = pc {
+            peer_map.insert(&mut txn, VOICE_PITCHCLASS, p.0 as i64);
+        } else {
+            peer_map.remove(&mut txn, VOICE_PITCHCLASS);
+        }
+
+        drop(txn);
+        self.notify();
+    }
+
+    /// Clear the local peer's voice state.
+    pub fn clear_voice(&mut self) {
+        self.set_voice(None, None);
+    }
+
+    /// Get all peers' voice states.
+    pub fn all_voice_states(&self) -> HashMap<String, (Option<i32>, Option<PitchClass>)> {
+        let txn = self.doc.transact();
+        let voice_state: MapRef = match txn.get_map(KEY_VOICE_STATE) {
+            Some(m) => m,
+            None => return HashMap::new(),
+        };
+
+        let mut result = HashMap::new();
+
+        for (peer_key, value) in voice_state.iter(&txn) {
+            let peer_id = peer_key.to_string();
+
+            if let Ok(peer_map) = value.cast::<MapRef>() {
+                let pitch = peer_map
+                    .get(&txn, VOICE_PITCH)
+                    .and_then(|v| v.cast::<i64>().ok())
+                    .map(|i| i as i32);
+
+                let pitch_class = peer_map
+                    .get(&txn, VOICE_PITCHCLASS)
+                    .and_then(|v| v.cast::<i64>().ok())
+                    .map(|i| PitchClass(i as u8));
+
+                result.insert(peer_id, (pitch, pitch_class));
+            }
+        }
+
+        result
+    }
+
+    /// Get a specific peer's voice state.
+    pub fn get_peer_voice(&self, peer_id: &str) -> (Option<i32>, Option<PitchClass>) {
+        let txn = self.doc.transact();
+        let voice_state: MapRef = match txn.get_map(KEY_VOICE_STATE) {
+            Some(m) => m,
+            None => return (None, None),
+        };
+
+        let peer_map: MapRef = match voice_state.get(&txn, peer_id).and_then(|v| v.cast().ok()) {
+            Some(m) => m,
+            None => return (None, None),
+        };
+
+        let pitch = peer_map
+            .get(&txn, VOICE_PITCH)
+            .and_then(|v| v.cast::<i64>().ok())
+            .map(|i| i as i32);
+
+        let pitch_class = peer_map
+            .get(&txn, VOICE_PITCHCLASS)
+            .and_then(|v| v.cast::<i64>().ok())
+            .map(|i| PitchClass(i as u8));
+
+        (pitch, pitch_class)
+    }
+
+    /// Get the local peer's voice state.
+    pub fn local_voice(&self) -> (Option<i32>, Option<PitchClass>) {
+        self.get_peer_voice(&self.peer_id)
     }
 }
 
@@ -432,5 +632,59 @@ mod tests {
         // Peer 2 should see peer 1's pitch
         let sets = state2.all_peer_sets();
         assert!(sets.get("peer1").map(|s| s.contains(PitchClass(5))).unwrap_or(false));
+    }
+
+    #[test]
+    fn test_yrs_voice_state() {
+        let mut state = YrsRoomState::new("peer1".to_string());
+
+        // Initially empty
+        assert_eq!(state.local_voice(), (None, None));
+
+        // Set voice pitch (absolute pitch number, like MIDI note 69 = A4)
+        state.set_voice_pitch(Some(69));
+        let (pitch, pc) = state.local_voice();
+        assert_eq!(pitch, Some(69));
+        assert_eq!(pc, None);
+
+        // Set voice pitch class
+        state.set_voice_pitchclass(Some(PitchClass(9)));
+        let (pitch, pc) = state.local_voice();
+        assert_eq!(pitch, Some(69));
+        assert_eq!(pc, Some(PitchClass(9)));
+
+        // Set both atomically
+        state.set_voice(Some(81), Some(PitchClass(0)));
+        let (pitch, pc) = state.local_voice();
+        assert_eq!(pitch, Some(81));
+        assert_eq!(pc, Some(PitchClass(0)));
+
+        // Clear voice
+        state.clear_voice();
+        assert_eq!(state.local_voice(), (None, None));
+    }
+
+    #[test]
+    fn test_yrs_voice_state_sync() {
+        let mut state1 = YrsRoomState::new("peer1".to_string());
+        let mut state2 = YrsRoomState::new("peer2".to_string());
+
+        // Peer 1 sets voice (pitch 69 = A4, pitch class 9 = A)
+        state1.set_voice(Some(69), Some(PitchClass(9)));
+
+        // Sync state1 -> state2
+        let update = state1.encode_state_as_update();
+        state2.apply_update(&update).unwrap();
+
+        // Peer 2 should see peer 1's voice state
+        let voice_states = state2.all_voice_states();
+        let (pitch, pc) = voice_states.get("peer1").cloned().unwrap_or((None, None));
+        assert_eq!(pitch, Some(69));
+        assert_eq!(pc, Some(PitchClass(9)));
+
+        // Query specific peer
+        let (pitch2, pc2) = state2.get_peer_voice("peer1");
+        assert_eq!(pitch2, Some(69));
+        assert_eq!(pc2, Some(PitchClass(9)));
     }
 }

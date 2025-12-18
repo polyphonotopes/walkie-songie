@@ -1,0 +1,28 @@
+[package]
+name = "walkie-songie-relay"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+libp2p = { git = "https://github.com/elijahhampton/rust-libp2p.git", branch = "feat(webrtc)-implement-webrtc-protocol-for-browser-to-browser-communication", features = [
+    "dns",
+    "ed25519",
+    "gossipsub",
+    "identify",
+    "macros",
+    "noise",
+    "ping",
+    "relay",
+    "tcp",
+    "tokio",
+    "websocket",
+    "yamux",
+] }

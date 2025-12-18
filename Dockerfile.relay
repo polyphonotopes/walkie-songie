@@ -1,0 +1,22 @@
+# Build custom relay-server with gossipsub support
+FROM rust:1.83-bookworm AS builder
+
+WORKDIR /app
+
+# Copy our custom relay server
+COPY relay-server/ ./
+
+# Build the relay server
+RUN cargo build --release
+
+# Runtime stage
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/walkie-songie-relay /usr/local/bin/relay-server
+
+EXPOSE 9000 9091
+
+# Defaults: seed=42 for deterministic peer ID, TCP on 9000, WebSocket on 9091
+CMD ["relay-server", "--secret-key-seed", "42", "--port", "9000", "--ws-port", "9091"]

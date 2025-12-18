@@ -11,7 +11,13 @@ mod components;
 #[cfg(target_arch = "wasm32")]
 mod keyboard;
 #[cfg(target_arch = "wasm32")]
+pub mod midi;
+#[cfg(target_arch = "wasm32")]
 pub mod onnx_bridge;
+#[cfg(target_arch = "wasm32")]
+mod sync;
+#[cfg(target_arch = "wasm32")]
+mod libp2p_sync;
 #[cfg(target_arch = "wasm32")]
 mod voice_conditioner;
 

@@ -357,6 +357,326 @@ all-around-keyboard.keyboard {
     background: rgba(233, 69, 96, 0.1);
 }
 
+/* Room Header Button */
+.header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.room-header-button {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.4rem 0.8rem;
+    font-size: 0.85rem;
+    border: 2px solid var(--text-secondary);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--text-primary);
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.room-header-button:hover {
+    border-color: var(--voice);
+    background: rgba(16, 185, 129, 0.1);
+}
+
+.room-header-button .qr-icon {
+    font-size: 1rem;
+}
+
+.room-header-button .room-name {
+    font-family: 'SF Mono', 'Consolas', monospace;
+    font-size: 0.8rem;
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Room Overlay */
+.room-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 100;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease;
+}
+
+.room-overlay.visible {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+.room-overlay-backdrop {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.75);
+}
+
+.room-overlay-panel {
+    position: relative;
+    background: var(--bg-secondary);
+    border-radius: 16px;
+    padding: 1.5rem;
+    max-width: 90%;
+    width: 500px;
+    max-height: 90vh;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 1.25rem;
+}
+
+.room-overlay-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.room-overlay-header h2 {
+    font-size: 1.25rem;
+    color: var(--text-primary);
+}
+
+.room-overlay-header .close-btn {
+    width: 32px;
+    height: 32px;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 1.25rem;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.room-overlay-header .close-btn:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: var(--text-primary);
+}
+
+.current-room-display {
+    text-align: center;
+}
+
+.room-name-large {
+    font-family: 'SF Mono', 'Consolas', monospace;
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: var(--voice);
+}
+
+/* Shareable link section */
+.shareable-link-section {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.shareable-link-section .link-label {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+.shareable-link-section .link-row {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.shareable-link-section .link-input {
+    flex: 1;
+    padding: 0.5rem 0.6rem;
+    font-family: 'SF Mono', 'Consolas', monospace;
+    font-size: 0.75rem;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 2px solid var(--text-secondary);
+    border-radius: 8px;
+    min-width: 0; /* Allow shrinking */
+}
+
+.shareable-link-section .copy-btn {
+    padding: 0.5rem 0.75rem;
+    font-size: 0.85rem;
+    font-weight: 600;
+    border: 2px solid var(--voice);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--voice);
+    cursor: pointer;
+    transition: all 0.15s ease;
+    white-space: nowrap;
+}
+
+.shareable-link-section .copy-btn:hover {
+    background: var(--voice);
+    color: white;
+}
+
+.peer-status {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    padding: 0.25rem 0;
+}
+
+.peer-status.connected {
+    color: #4ade80; /* green */
+}
+
+.qr-container {
+    display: flex;
+    justify-content: center;
+    padding: 1rem;
+    background: var(--bg-primary);
+    border-radius: 12px;
+}
+
+.qr-code {
+    width: 200px;
+    height: 200px;
+}
+
+.qr-code svg {
+    width: 100%;
+    height: 100%;
+}
+
+.shuffle-btn {
+    width: 100%;
+    padding: 0.75rem 1rem;
+    font-size: 1rem;
+    font-weight: 600;
+    border: none;
+    border-radius: 10px;
+    background: var(--voice);
+    color: white;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.shuffle-btn:hover {
+    background: var(--voice-light);
+}
+
+.room-input-section {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.room-input-section label {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+.room-input-row {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.room-input {
+    flex: 1;
+    padding: 0.6rem 0.8rem;
+    font-family: 'SF Mono', 'Consolas', monospace;
+    font-size: 0.9rem;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 2px solid var(--text-secondary);
+    border-radius: 8px;
+    transition: border-color 0.15s ease;
+}
+
+.room-input:focus {
+    outline: none;
+    border-color: var(--voice);
+}
+
+.room-input::placeholder {
+    color: var(--text-secondary);
+    opacity: 0.6;
+}
+
+.join-btn {
+    padding: 0.6rem 1rem;
+    font-size: 0.9rem;
+    font-weight: 600;
+    border: 2px solid var(--voice);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--voice);
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.join-btn:hover {
+    background: rgba(16, 185, 129, 0.15);
+}
+
+.room-input-hint {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+}
+
+.room-input-hint.error {
+    color: var(--manual);
+}
+
+/* MIDI Settings */
+.midi-settings {
+    padding: 0.75rem;
+    background: var(--bg-primary);
+    border-radius: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.midi-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.midi-row label {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    min-width: 70px;
+}
+
+.midi-select {
+    flex: 1;
+    padding: 0.4rem 0.6rem;
+    font-size: 0.85rem;
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    border: 2px solid var(--text-secondary);
+    border-radius: 6px;
+    cursor: pointer;
+}
+
+.midi-select:focus {
+    outline: none;
+    border-color: var(--voice);
+}
+
+.midi-select option {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+}
+
 /* Responsive */
 @media (max-width: 400px) {
     .app {
@@ -370,5 +690,18 @@ all-around-keyboard.keyboard {
     .voice-button {
         padding: 0.75rem;
         font-size: 1rem;
+    }
+
+    .room-header-button .room-name {
+        display: none;
+    }
+
+    .room-overlay-panel {
+        padding: 1rem;
+        width: 95%;
+    }
+
+    .room-name-large {
+        font-size: 1.25rem;
     }
 }

@@ -91,25 +91,23 @@ pub fn compute_raised_notes(tuning: &Tuning) -> Vec<u8> {
     }
 }
 
-/// Sync keyboard state with active pitches.
-/// - Manual pitches show as "pressed" (red)
-/// - Voice pitch shows as "lit" (green)
+/// Sync keyboard state with active pitches from ALL peers.
+/// - Combined pitches from all peers show as "pressed" (red)
+/// - Local voice pitch shows as "lit" (green)
 pub fn sync_active_pitches(state: &Arc<AppState>) {
     let room = state.room.lock_ref();
-    let sets = room.all_peer_sets();
-    let peer_id = room.local_peer_id();
 
-    // Manual pitches from room -> pressed (red)
-    let manual: Vec<u8> = if let Some(set) = sets.get(peer_id) {
-        set.pitch_classes.iter().map(|pc| pc.index()).collect()
-    } else {
-        vec![]
-    };
-    set_pressed_notes(&manual);
+    // Get combined pitch result from all peers (uses combination method)
+    let room_result = room.compute_room_result();
 
-    // Voice pitch -> lit (green)
-    if let Some(voice_pc) = state.voice_pitch.get() {
-        set_lit_notes(&[voice_pc.index()]);
+    // All pitches from all peers -> pressed (red)
+    let combined: Vec<u8> = room_result.pitch_classes.iter().map(|pc| pc.index()).collect();
+    set_pressed_notes(&combined);
+
+    // Local voice pitch from CRDT -> lit (green)
+    let (_, local_voice_pc) = room.local_voice();
+    if let Some(pc) = local_voice_pc {
+        set_lit_notes(&[pc.index()]);
     } else {
         set_lit_notes(&[]);
     }
@@ -225,14 +223,17 @@ fn setup_keyboard_events(state: Arc<AppState>) {
                         if is_voice_pitch {
                             // Clicking voice pitch clears it
                             state_click.voice_pitch.set(None);
+                            state_click.room.lock_mut().set_voice_pitchclass(None);
+                            state_click.sync_midi_voice_output();
                         } else {
                             // Toggle the pitch in room state (manual pitches)
                             state_click.room.lock_mut().toggle_pitch(pc);
-                            // Touch voice_pitch to trigger list update
-                            let vp = state_click.voice_pitch.get();
-                            state_click.voice_pitch.set(vp);
+                            // Sync MIDI toggle output
+                            state_click.sync_midi_toggle_output();
                         }
 
+                        // Increment room_version to trigger UI updates
+                        state_click.room_version.set(state_click.room_version.get() + 1);
                         // Re-sync keyboard to reflect new state
                         sync_active_pitches(&state_click);
                     }

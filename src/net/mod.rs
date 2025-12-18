@@ -1,6 +1,7 @@
-//! P2P networking layer using iroh-gossip for signalling and matchbox for WebRTC.
+//! P2P networking layer - y-webrtc compatible signalling for matchbox.
 
-mod direct_message;
-mod signaller;
+#[cfg(target_arch = "wasm32")]
+mod yjs_signaller;
 
-pub use signaller::create_signaller;
+#[cfg(target_arch = "wasm32")]
+pub use yjs_signaller::YjsSignallerBuilder;

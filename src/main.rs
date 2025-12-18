@@ -3,39 +3,35 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
-    use std::sync::Arc;
-
     use anyhow::Result;
     use matchbox_socket::{PeerState, WebRtcSocket};
     use tracing::info;
-    use walkie_songie::net;
+
+    use walkie_songie::words::generate_room_name;
+
+    /// Matchbox signaling server (same as web and plugin)
+    const SIGNALING_SERVER: &str = "wss://matchbox.wondering.xyz";
 
     pub async fn run() -> Result<()> {
         tracing_subscriber::fmt::init();
 
-        let bootstrap_peer = std::env::args().nth(1).unwrap_or_default();
+        // Get room name from args or generate one
+        let room_name = std::env::args().nth(1).unwrap_or_else(generate_room_name);
 
-        info!("Creating iroh signaller...");
-        let signaller = net::create_signaller().await?;
+        info!("Creating matchbox connection to room: {}", room_name);
 
-        info!("Iroh node ID: {}", signaller.iroh_id());
-        info!("Matchbox peer ID: {}", signaller.matchbox_id());
-
-        println!("\n=== Walkie Songie ===");
-        println!("Share this ID to connect: {}", signaller.iroh_id());
-        if !bootstrap_peer.is_empty() {
-            println!("Connecting to bootstrap peer: {bootstrap_peer}");
-        }
-        println!("\nWaiting for peers...\n");
-
-        // Create matchbox socket with our custom signaller
-        let (socket, loop_fut) = WebRtcSocket::builder(&bootstrap_peer)
-            .signaller_builder(Arc::new(signaller))
+        // Build WebRTC socket with matchbox signaling
+        let signaling_url = format!("{}/{}", SIGNALING_SERVER, room_name);
+        let (socket, loop_fut) = WebRtcSocket::builder(&signaling_url)
             .add_reliable_channel()
             .build();
 
         // Spawn the socket event loop
         let loop_handle = tokio::spawn(loop_fut);
+
+        println!("\n=== Walkie Songie ===");
+        println!("Room: {}", room_name);
+        println!("\nWaiting for peers...\n");
 
         // Monitor peer connections
         let mut socket = socket;

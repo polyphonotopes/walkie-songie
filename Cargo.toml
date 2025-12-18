@@ -10,16 +10,25 @@ crate-type = ["cdylib", "rlib"]
 name = "walkie-songie"
 path = "src/main.rs"
 
+[[bin]]
+name = "walkie-songie-plugin"
+path = "src/plugin_main.rs"
+required-features = ["plugin"]
+
+[features]
+default = ["plugin"]
+plugin = ["dep:nih_plug", "dep:nih_plug_egui", "dep:crossbeam-channel", "dep:egui_extras", "dep:image"]
+
+[workspace]
+members = ["xtask"]
+
 [dependencies]
-# P2P networking (versions from matchbox custom_signaller example)
-iroh = { version = "0.35", default-features = false }
-iroh-gossip = { version = "0.35", default-features = false, features = ["net"] }
+# P2P networking (matchbox - legacy, keeping for now)
 matchbox_socket = "0.13"
+async-channel = "2.3"
 
 # Async
 futures = "0.3"
-n0-future = "0.2"
-async-broadcast = "0.7"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -31,6 +40,8 @@ web-time = "1.1"
 anyhow = "1.0"
 thiserror = "2.0"
 tracing = "0.1"
+rand = "0.9"
+qrcode = "0.14"
 
 # CRDT
 yrs = "0.21"
@@ -42,23 +53,46 @@ tokio = { version = "1.32", features = ["rt-multi-thread", "macros", "sync", "ti
 futures = "0.3"
 tracing-subscriber = "0.3"
 
+# libp2p for native (tcp + websocket)
+libp2p = { git = "https://github.com/elijahhampton/rust-libp2p.git", branch = "feat(webrtc)-implement-webrtc-protocol-for-browser-to-browser-communication", features = ["dns", "ed25519", "gossipsub", "identify", "macros", "noise", "tcp", "tls", "tokio", "yamux", "websocket"] }
+
+# Plugin dependencies (native only, feature-gated)
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }
+crossbeam-channel = { version = "0.5", optional = true }
+egui_extras = { version = "0.30", optional = true, features = ["image"] }
+image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokio = { version = "1.32", default-features = false, features = ["time", "sync"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
+
+# libp2p for browser (with browser-to-browser WebRTC)
+libp2p = { git = "https://github.com/elijahhampton/rust-libp2p.git", branch = "feat(webrtc)-implement-webrtc-protocol-for-browser-to-browser-communication", features = ["ed25519", "gossipsub", "identify", "macros", "noise", "relay", "wasm-bindgen", "yamux"] }
+libp2p-core = { git = "https://github.com/elijahhampton/rust-libp2p.git", branch = "feat(webrtc)-implement-webrtc-protocol-for-browser-to-browser-communication" }
+libp2p-relay = { git = "https://github.com/elijahhampton/rust-libp2p.git", branch = "feat(webrtc)-implement-webrtc-protocol-for-browser-to-browser-communication" }
+libp2p-swarm = { git = "https://github.com/elijahhampton/rust-libp2p.git", branch = "feat(webrtc)-implement-webrtc-protocol-for-browser-to-browser-communication" }
+libp2p-webrtc-websys = { git = "https://github.com/elijahhampton/rust-libp2p.git", branch = "feat(webrtc)-implement-webrtc-protocol-for-browser-to-browser-communication" }
+libp2p-websocket-websys = { git = "https://github.com/elijahhampton/rust-libp2p.git", branch = "feat(webrtc)-implement-webrtc-protocol-for-browser-to-browser-communication" }
+gloo-timers = { version = "0.3", features = ["futures"] }
 web-sys = { version = "0.3", features = [
     "Window", "Location", "console",
-    "Document", "Element", "HtmlElement", "HtmlButtonElement", "HtmlTextAreaElement",
+    "Document", "Element", "HtmlElement", "HtmlButtonElement", "HtmlTextAreaElement", "HtmlInputElement", "HtmlSelectElement",
     "AudioContext", "AudioContextState", "AudioWorklet", "AudioWorkletNode", "AudioWorkletNodeOptions",
     "MediaDevices", "MediaStream", "MediaStreamConstraints", "MediaStreamTrack",
     "MediaStreamAudioSourceNode", "ScriptProcessorNode", "AudioProcessingEvent",
     "AudioBuffer", "AudioNode", "AudioDestinationNode",
-    "Navigator", "Blob", "BlobPropertyBag", "Url",
-    "MessagePort", "MessageEvent", "EventTarget", "InputEvent"
+    "Navigator", "Clipboard", "Blob", "BlobPropertyBag", "Url",
+    "MessagePort", "MessageEvent", "EventTarget", "InputEvent",
+    "MidiAccess", "MidiInput", "MidiInputMap", "MidiOutput", "MidiOutputMap", "MidiMessageEvent", "MidiOptions",
+    "KeyboardEvent", "FocusEvent"
 ] }
 console_error_panic_hook = "0.1"
+tracing-wasm = "0.2"
 getrandom = { version = "0.3", features = ["wasm_js"] }
 js-sys = "0.3"
+gloo-net = { version = "0.6", features = ["websocket"] }
 
 # UI framework
 dominator = "0.5"

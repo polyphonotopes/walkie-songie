@@ -15,9 +15,13 @@ use crate::pitch::{PitchDetectorConfig, PitchEvent, SwiftF0Detector};
 use crate::room::{RoomState, YrsRoomState};
 use crate::tuning::{PitchClass, Tuning};
 
+use crate::words::generate_room_name;
+
 use super::audio::WebAudioInput;
-use super::components::{clear_button, pitch_display, tuning_editor, voice_button};
+use super::components::{clear_button, pitch_display, room_header_button, room_overlay, tuning_editor, voice_button};
 use super::keyboard::{pitch_keyboard, sync_active_pitches};
+use super::midi::{init_midi, MidiManager, pitch_class_to_midi_note, midi_note_to_pitch_class};
+use super::libp2p_sync::start_libp2p_room_sync;
 use super::voice_conditioner::{VoiceConditioner, ConditionerOutput};
 
 /// How long a confident pitch "lingers" when confidence drops (in milliseconds).
@@ -79,6 +83,23 @@ pub struct AppState {
     pub stable_pitch: Rc<RefCell<Option<PitchClass>>>,
     /// When the stable pitch first went above threshold.
     pub stable_since: Rc<RefCell<Option<Instant>>>,
+    /// Current room name (wholesome words format).
+    pub room_name: Mutable<String>,
+    /// Whether the room overlay is visible.
+    pub room_overlay_visible: Mutable<bool>,
+    /// Text input for joining a room by name.
+    pub room_input: Mutable<String>,
+    /// Our iroh endpoint ID for P2P connections (set when sync starts).
+    pub iroh_peer_id: Mutable<Option<String>>,
+    /// MIDI manager for input/output.
+    pub midi: Rc<RefCell<MidiManager>>,
+    /// Selected MIDI input device ID (None = disabled).
+    pub midi_input_id: Mutable<Option<String>>,
+    /// Selected MIDI output device ID (None = disabled).
+    pub midi_output_id: Mutable<Option<String>>,
+    /// Room state version - incremented on every change (local or remote).
+    /// UI components subscribe to this to know when to refresh.
+    pub room_version: Mutable<u64>,
 }
 
 impl AppState {
@@ -112,6 +133,14 @@ impl AppState {
             gate_open: Mutable::new(false),
             stable_pitch: Rc::new(RefCell::new(None)),
             stable_since: Rc::new(RefCell::new(None)),
+            room_name: Mutable::new(String::new()), // Will be set in run_app
+            room_overlay_visible: Mutable::new(false),
+            room_input: Mutable::new(String::new()),
+            iroh_peer_id: Mutable::new(None), // Set when P2P sync starts
+            midi: init_midi(),
+            midi_input_id: Mutable::new(None),
+            midi_output_id: Mutable::new(None),
+            room_version: Mutable::new(0),
         })
     }
 
@@ -231,8 +260,17 @@ impl AppState {
                     // Set voice_pitch during singing (shows as lit/green on keyboard)
                     self.voice_pitch.set(Some(pc));
 
+                    // Sync to CRDT for P2P
+                    self.room.lock_mut().set_voice_pitchclass(Some(pc));
+
+                    // Increment room_version to trigger UI updates
+                    self.room_version.set(self.room_version.get() + 1);
+
                     // Sync keyboard (voice pitch -> lit/green, manual -> pressed/red)
                     sync_active_pitches(self);
+
+                    // Update MIDI voice output in real-time
+                    self.sync_midi_voice_output();
                 }
                 // If not stable yet, just wait (indicator still shows the pitch)
             } else {
@@ -381,7 +419,133 @@ impl AppState {
         // Re-sync keyboard (voice pitch -> lit/green, manual -> pressed/red)
         sync_active_pitches(self);
 
+        // Update MIDI voice output
+        self.sync_midi_voice_output();
+
         self.current_pitch.set(None);
+    }
+
+    /// Set the selected MIDI input device.
+    pub fn set_midi_input(self: &Arc<Self>, device_id: Option<String>) {
+        if let Ok(mut midi) = self.midi.try_borrow_mut() {
+            if let Err(e) = midi.select_input(device_id.clone()) {
+                web_sys::console::warn_1(&format!("Failed to select MIDI input: {}", e).into());
+                return;
+            }
+        }
+        self.midi_input_id.set(device_id);
+    }
+
+    /// Set the selected MIDI output device.
+    pub fn set_midi_output(self: &Arc<Self>, device_id: Option<String>) {
+        if let Ok(mut midi) = self.midi.try_borrow_mut() {
+            if let Err(e) = midi.select_output(device_id.clone()) {
+                web_sys::console::warn_1(&format!("Failed to select MIDI output: {}", e).into());
+                return;
+            }
+        }
+        self.midi_output_id.set(device_id.clone());
+
+        // If output was enabled, sync current state
+        if device_id.is_some() {
+            self.sync_midi_toggle_output();
+            self.sync_midi_voice_output();
+        }
+    }
+
+    /// Check if MIDI output is enabled.
+    pub fn midi_output_enabled(&self) -> bool {
+        self.midi_output_id.get_cloned().is_some()
+    }
+
+    /// Set the room name and update the URL hash.
+    pub fn set_room_name(&self, name: String) {
+        set_url_hash(&name);
+        self.room_name.set(name.clone());
+        self.room_input.set(name);
+    }
+
+    /// Poll MIDI input and route note events to toggle set.
+    pub fn poll_midi_input(self: &Arc<Self>) {
+        let pitch_count = self.tuning.lock_ref().pitch_class_count() as u8;
+
+        while let Some(event) = MidiManager::poll_input() {
+            // Convert MIDI note to pitch class
+            let pc = midi_note_to_pitch_class(event.note, pitch_count);
+            let pitch_class = PitchClass::new(pc);
+
+            // Route to toggle set: note-on adds, note-off removes
+            {
+                let mut room = self.room.lock_mut();
+                if event.is_note_on {
+                    room.add_pitch(pitch_class);
+                } else {
+                    room.remove_pitch(pitch_class);
+                }
+            }
+
+            // Sync MIDI output and keyboard display
+            self.sync_midi_toggle_output();
+            sync_active_pitches(self);
+        }
+    }
+
+    /// Update MIDI output for toggle set changes.
+    /// Call this whenever the toggle set changes.
+    pub fn sync_midi_toggle_output(self: &Arc<Self>) {
+        // Skip if MIDI output is disabled
+        if !self.midi_output_enabled() {
+            return;
+        }
+
+        let room = self.room.lock_ref();
+        let local_peer = room.local_peer_id();
+        let pitch_count = self.tuning.lock_ref().pitch_class_count() as u8;
+
+        // Get current pitch classes from local peer's set
+        let current_notes: std::collections::HashSet<u8> =
+            if let Some(set) = room.all_peer_sets().get(local_peer) {
+                set.pitch_classes
+                    .iter()
+                    .map(|pc| pitch_class_to_midi_note(pc.index(), pitch_count))
+                    .collect()
+            } else {
+                std::collections::HashSet::new()
+            };
+
+        drop(room);
+
+        // Sync with MIDI output
+        if let Ok(midi) = self.midi.try_borrow() {
+            midi.output.borrow_mut().sync_toggle_notes(&current_notes);
+        }
+    }
+
+    /// Update MIDI output for voice pitch changes.
+    /// Call this whenever the voice pitch changes.
+    pub fn sync_midi_voice_output(self: &Arc<Self>) {
+        // Skip if MIDI output is disabled
+        if !self.midi_output_enabled() {
+            return;
+        }
+
+        let voice_pitch = self.voice_pitch.get();
+        let pitch_count = self.tuning.lock_ref().pitch_class_count() as u8;
+
+        if let Ok(midi) = self.midi.try_borrow() {
+            let mut output = midi.output.borrow_mut();
+
+            if let Some(pc) = voice_pitch {
+                // Convert pitch class to MIDI note (with octave info)
+                // For voice, we use the actual detected pitch if available
+                // Otherwise fall back to middle octave
+                let note = pitch_class_to_midi_note(pc.index(), pitch_count);
+                output.voice_note_on(note);
+            } else {
+                // No voice pitch - clear voice notes
+                output.clear_voice_notes();
+            }
+        }
     }
 
     /// Initialize the SwiftF0 ML model (call once on startup).
@@ -462,11 +626,17 @@ fn render_app(state: Arc<AppState>) -> Dom {
     html!("div", {
         .class("app")
         .children(&mut [
-            // Compact header
+            // Compact header with room button
             html!("header", {
                 .class("header")
-                .child(html!("h1", { .text("Walkie Songie") }))
+                .children(&mut [
+                    html!("h1", { .text("Walkie Songie") }),
+                    room_header_button(state.clone()),
+                ])
             }),
+
+            // Room overlay (hidden by default)
+            room_overlay(state.clone()),
 
             // Main content
             html!("main", {
@@ -519,33 +689,32 @@ fn active_pitches_list(state: Arc<AppState>) -> Dom {
     use dominator::clone;
     use futures_signals::signal::SignalExt;
 
-    // React to voice_pitch changes
+    // React to room_version changes (triggers on both local and remote CRDT updates)
     html!("div", {
         .class("active-pitches")
-        .child_signal(state.voice_pitch.signal().map(clone!(state => move |voice_pitch| {
+        .child_signal(state.room_version.signal().map(clone!(state => move |_version| {
             let room = state.room.lock_ref();
-            let sets = room.all_peer_sets();
-            let peer_id = room.local_peer_id();
             let tuning = state.tuning.lock_ref();
 
-            // Collect manual pitches (red), sorted by pitch index
-            let mut manual: Vec<_> = if let Some(set) = sets.get(peer_id) {
-                set.pitch_classes.iter().copied().collect()
-            } else {
-                vec![]
-            };
-            manual.sort_by_key(|pc| pc.index());
+            // Get combined pitches from ALL peers via CRDT
+            let room_result = room.compute_room_result();
 
-            // Build list: voice pitch (green) + manual pitches (red), sorted
+            // Get local voice pitch from CRDT (shows as green)
+            let (_, local_voice_pc) = room.local_voice();
+
+            // Build list of active pitches
             let mut active: Vec<(String, bool, u8)> = Vec::new();
-            if let Some(vpc) = voice_pitch {
-                active.push((tuning.note_name(vpc).to_string(), true, vpc.index()));
+
+            // Add all pitches from room result
+            for pc in &room_result.pitch_classes {
+                let is_voice = local_voice_pc == Some(*pc);
+                active.push((tuning.note_name(*pc).to_string(), is_voice, pc.index()));
             }
-            for pc in manual {
-                active.push((tuning.note_name(pc).to_string(), false, pc.index()));
-            }
+
             // Sort by pitch index for consistent ordering
             active.sort_by_key(|(_, _, idx)| *idx);
+            // Deduplicate (voice pitch might be in both)
+            active.dedup_by_key(|(_, _, idx)| *idx);
 
             if active.is_empty() {
                 Some(html!("span", {
@@ -568,11 +737,63 @@ fn active_pitches_list(state: Arc<AppState>) -> Dom {
     })
 }
 
+/// Get room topic from URL hash or query param, or generate a new one.
+/// Returns the full topic string which may include @peer-id for bootstrapping.
+fn get_or_generate_room_name() -> String {
+    if let Some(window) = web_sys::window() {
+        // First, try hash: #room-name or #room-name@peer-id
+        if let Ok(hash) = window.location().hash() {
+            let full = hash.trim_start_matches('#');
+            if !full.is_empty() {
+                // Split on @ to separate room name from optional peer ID
+                let room_part = full.split('@').next().unwrap_or(full);
+                if crate::words::is_valid_room_name(room_part) {
+                    // Return the FULL string including @peer-id if present
+                    return full.to_string();
+                }
+            }
+        }
+
+        // Fallback: try query param ?room=name
+        if let Ok(search) = window.location().search() {
+            if search.starts_with("?room=") {
+                let name = search.trim_start_matches("?room=");
+                if crate::words::is_valid_room_name(name) {
+                    return name.to_string();
+                }
+            }
+            if let Some(pos) = search.find("room=") {
+                let rest = &search[pos + 5..];
+                let name = rest.split('&').next().unwrap_or("");
+                if crate::words::is_valid_room_name(name) {
+                    return name.to_string();
+                }
+            }
+        }
+    }
+    // Generate a new room name
+    generate_room_name()
+}
+
+/// Update the URL hash to reflect the current room.
+fn set_url_hash(room_name: &str) {
+    if let Some(window) = web_sys::window() {
+        let _ = window.location().set_hash(room_name);
+    }
+}
+
 /// Run the web application.
 #[wasm_bindgen(start)]
 pub fn run_app() {
     // Set up panic hook for better error messages
     console_error_panic_hook::set_once();
+
+    // Set up tracing to output to browser console (INFO level only to reduce noise)
+    tracing_wasm::set_as_global_default_with_config(
+        tracing_wasm::WASMLayerConfigBuilder::new()
+            .set_max_level(tracing::Level::INFO)
+            .build()
+    );
 
     // Generate a peer ID
     let peer_id = format!("peer-{}", uuid::Uuid::new_v4());
@@ -580,10 +801,62 @@ pub fn run_app() {
     // Create application state
     let state = AppState::new(peer_id);
 
+    // Initialize room name (from URL or generate new) and sync to hash
+    // room_topic may include @peer-id for bootstrapping
+    let room_topic = get_or_generate_room_name();
+    // Extract just the room name for display/state (strip @peer-id if present)
+    let room_name = room_topic.split('@').next().unwrap_or(&room_topic).to_string();
+    state.set_room_name(room_name);
+
+    // Start P2P sync for the room
+    // Pass full room_topic (including @peer-id if present) to signaller
+    let room_for_sync = state.room.clone();
+    let iroh_peer_id = state.iroh_peer_id.clone();
+    let room_version = state.room_version.clone();
+
+    // Start libp2p sync (WebRTC + gossipsub via circuit relay)
+    start_libp2p_room_sync(
+        room_for_sync,
+        room_topic,
+        iroh_peer_id,
+        room_version,
+    );
+
     // Initialize SwiftF0 ML model in background
     let state_for_init = state.clone();
     spawn_local(async move {
         state_for_init.init_swiftf0().await;
+    });
+
+    // Start MIDI input polling loop
+    let state_for_midi = state.clone();
+    spawn_local(async move {
+        loop {
+            state_for_midi.poll_midi_input();
+
+            // Poll at ~60Hz
+            let promise = js_sys::Promise::new(&mut |resolve, _| {
+                let window = web_sys::window().unwrap();
+                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                    &resolve,
+                    16,
+                );
+            });
+            let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+        }
+    });
+
+    // Subscribe to room_version changes to update UI when remote peers change
+    use futures_signals::signal::SignalExt;
+    let state_for_version = state.clone();
+    spawn_local(async move {
+        state_for_version.room_version.signal()
+            .for_each(|_version| {
+                // Refresh keyboard display when room state changes
+                sync_active_pitches(&state_for_version);
+                async {}
+            })
+            .await;
     });
 
     // Mount the app to the DOM

@@ -1,4 +1,4 @@
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: Dynamic Noise Gate
 The system SHALL implement a voice conditioner that combines adaptive noise estimation, voice activity detection (VAD), automatic gain control (AGC), and hysteresis gating to isolate singing voice in noisy environments with musical feedback.
@@ -34,8 +34,6 @@ The system SHALL implement a voice conditioner that combines adaptive noise esti
 #### Scenario: Threshold decay
 - **WHEN** ambient noise decreases over time
 - **THEN** the noise floor estimate slowly decays to match, lowering the gate thresholds
-
-## ADDED Requirements
 
 ### Requirement: Reference Level Calibration
 The system SHALL calibrate a "reference loudness" when the user begins singing, using this as a trust anchor for confidence scoring.
