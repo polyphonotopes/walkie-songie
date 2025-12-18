@@ -561,22 +561,36 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
         let new_pitch = if let Some(end_key) = end_key {
             let delta = shortest_delta(start_pc, end_key, pc_count);
 
+            web_sys::console::log_1(&format!(
+                "[drop] start_pc={} end_key={} delta={} MAX={}",
+                start_pc, end_key, delta, MAX_DRAG_SEMITONES
+            ).into());
+
             if delta.abs() <= MAX_DRAG_SEMITONES && delta != 0 {
                 // Valid move - update CRDT
                 let new_pitch = start_pitch + delta;
+                web_sys::console::log_1(&format!(
+                    "[drop] Moving piece {} from {} to {}",
+                    piece_id, start_pitch, new_pitch
+                ).into());
                 state_up.room.lock_mut().move_piece(&piece_id, new_pitch);
                 new_pitch
             } else {
+                web_sys::console::log_1(&format!(
+                    "[drop] REJECTED: delta={} (must be 1-{})",
+                    delta, MAX_DRAG_SEMITONES
+                ).into());
                 start_pitch // No change
             }
         } else {
             start_pitch // No drop target
         };
 
-        // Set data-key FIRST to avoid flash - compute from new pitch
+        // Set data-key and data-original-pitch to new position
         let pitch_class = new_pitch.rem_euclid(pc_count);
         let key_index = LEFTMOST_KEY + pitch_class;
         piece_el.set_attribute("data-key", &key_index.to_string()).ok();
+        piece_el.set_attribute("data-original-pitch", &new_pitch.to_string()).ok();
 
         // Then reset element styling
         piece_el.remove_attribute("data-dragging").ok();
