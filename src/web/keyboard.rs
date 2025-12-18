@@ -145,7 +145,7 @@ fn hz_to_pitch_position(hz: f64, pitch_count: usize) -> f64 {
 }
 
 /// Maximum allowed drag distance in semitones before snapping back.
-const MAX_DRAG_SEMITONES: i32 = 4;
+const MAX_DRAG_SEMITONES: i32 = 5;
 
 /// Leftmost key index for the keyboard (C3 = MIDI 36)
 const LEFTMOST_KEY: i32 = 36;
@@ -337,16 +337,21 @@ fn create_piece_element(piece_id: &str, original_pitch: i32, key_index: i32) -> 
 }
 
 /// Set up drag handling for a piece element
-fn setup_piece_drag_handler(el: &web_sys::HtmlElement, piece_id: &str, original_pitch: i32, _key_index: i32) {
+fn setup_piece_drag_handler(el: &web_sys::HtmlElement, piece_id: &str, _original_pitch: i32, _key_index: i32) {
     let piece_id = piece_id.to_string();
     let el_clone = el.clone();
 
     let on_down = Closure::<dyn Fn(web_sys::PointerEvent)>::new(move |e: web_sys::PointerEvent| {
+        // Read current pitch from element (may have been updated since creation)
+        let current_pitch = el_clone.get_attribute("data-original-pitch")
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(0);
+
         // Store drag info on document body for document-level handlers
         if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
             let body = doc.body().unwrap();
             body.set_attribute("data-dragging-piece", &piece_id).ok();
-            body.set_attribute("data-drag-start-pitch", &original_pitch.to_string()).ok();
+            body.set_attribute("data-drag-start-pitch", &current_pitch.to_string()).ok();
         }
 
         el_clone.set_attribute("data-dragging", "true").ok();
