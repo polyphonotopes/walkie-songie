@@ -107,6 +107,10 @@ pub struct WalkieSongiePlugin {
     room_pcs_output: [bool; 128],
     /// Currently active voice notes (for diffing)
     voice_output: [bool; 128],
+    /// Currently active piece notes (for diffing) - maps piece_id to MIDI note
+    piece_notes: HashMap<String, i32>,
+    /// Currently active piece MIDI output (for diffing)
+    pieces_output: [bool; 128],
 }
 
 impl Default for WalkieSongiePlugin {
@@ -123,6 +127,8 @@ impl Default for WalkieSongiePlugin {
             peer_voice_pitches: HashMap::new(),
             room_pcs_output: [false; 128],
             voice_output: [false; 128],
+            piece_notes: HashMap::new(),
+            pieces_output: [false; 128],
         }
     }
 }
@@ -264,6 +270,22 @@ impl Plugin for WalkieSongiePlugin {
                         // Update peer's voice pitch
                         self.peer_voice_pitches.insert(peer_id, pitch);
                     }
+                    NetEvent::PieceChange { piece_id, pitch } => {
+                        // Update piece note
+                        nih_log!("PieceChange event: {} -> {}", piece_id, pitch);
+                        self.piece_notes.insert(piece_id, pitch);
+                    }
+                    NetEvent::PieceRemoved { piece_id } => {
+                        // Remove piece note
+                        self.piece_notes.remove(&piece_id);
+                    }
+                    NetEvent::FullStateSync { pieces } => {
+                        // Full state sync - replace all pieces
+                        self.piece_notes.clear();
+                        for (id, pitch) in pieces {
+                            self.piece_notes.insert(id, pitch);
+                        }
+                    }
                     NetEvent::Error(msg) => {
                         nih_warn!("Network error: {}", msg);
                     }
@@ -346,6 +368,39 @@ impl Plugin for WalkieSongiePlugin {
             }
         }
         self.voice_output = voice_pitches;
+
+        // Compute all piece pitches
+        let mut piece_pitches = [false; 128];
+        for &pitch in self.piece_notes.values() {
+            if pitch >= 0 && pitch < 128 {
+                piece_pitches[pitch as usize] = true;
+            }
+        }
+
+        // Output piece pitch changes on channel 3
+        for note in 0..128u8 {
+            let is_on = piece_pitches[note as usize];
+            let was_on = self.pieces_output[note as usize];
+            if is_on && !was_on {
+                nih_log!("MIDI piece ON: note={} channel={}", note, CHANNEL_PIECES);
+                context.send_event(NoteEvent::NoteOn {
+                    timing: 0,
+                    voice_id: None,
+                    channel: CHANNEL_PIECES,
+                    note,
+                    velocity: 0.8,
+                });
+            } else if !is_on && was_on {
+                context.send_event(NoteEvent::NoteOff {
+                    timing: 0,
+                    voice_id: None,
+                    channel: CHANNEL_PIECES,
+                    note,
+                    velocity: 0.0,
+                });
+            }
+        }
+        self.pieces_output = piece_pitches;
 
         ProcessStatus::Normal
     }
@@ -500,6 +555,7 @@ async fn run_networking_loop(
     // Track previous state for MIDI event diffing
     let mut prev_peer_sets: HashMap<String, Vec<u8>> = HashMap::new();
     let mut prev_voice_states: HashMap<String, (Option<i32>, Option<PitchClass>)> = HashMap::new();
+    let mut prev_pieces: HashMap<String, i32> = HashMap::new(); // piece_id -> pitch
 
     let mut loop_count: u64 = 0;
     let loop_start = std::time::Instant::now();
@@ -668,6 +724,38 @@ async fn run_networking_loop(
                                     }
                                 }
                             }
+
+                            // Check piece changes
+                            let all_pieces = room.all_pieces();
+                            plog!("Checking pieces: {} pieces in room", all_pieces.len());
+                            let current_pieces: HashMap<String, i32> = all_pieces
+                                .into_iter()
+                                .map(|p| (p.id, p.pitch))
+                                .collect();
+
+                            // Send events for new/changed pieces
+                            for (piece_id, &pitch) in &current_pieces {
+                                let prev_pitch = prev_pieces.get(piece_id);
+                                if prev_pitch != Some(&pitch) {
+                                    plog!("Piece change: {} -> {}", piece_id, pitch);
+                                    let _ = evt_tx.send(NetEvent::PieceChange {
+                                        piece_id: piece_id.clone(),
+                                        pitch,
+                                    });
+                                }
+                            }
+
+                            // Send events for removed pieces
+                            for piece_id in prev_pieces.keys() {
+                                if !current_pieces.contains_key(piece_id) {
+                                    plog!("Piece removed: {}", piece_id);
+                                    let _ = evt_tx.send(NetEvent::PieceRemoved {
+                                        piece_id: piece_id.clone(),
+                                    });
+                                }
+                            }
+
+                            prev_pieces = current_pieces;
                         }
                     }
                     SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Subscribed {

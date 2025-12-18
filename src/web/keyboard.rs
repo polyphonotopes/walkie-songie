@@ -7,14 +7,14 @@
 
 use std::sync::Arc;
 
-use dominator::{clone, events, html, Dom};
-use futures_signals::signal::SignalExt;
+use dominator::{clone, html, Dom};
+use futures_signals::signal::SignalExt as _;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::HtmlElement;
 use web_sys::js_sys::Reflect;
 
-use crate::room::{Piece, RoomState};
+use crate::room::RoomState;
 use crate::tuning::{PitchClass, Tuning};
 
 use super::app::AppState;
@@ -150,61 +150,6 @@ const MAX_DRAG_SEMITONES: i32 = 4;
 /// Leftmost key index for the keyboard (C3 = MIDI 36)
 const LEFTMOST_KEY: i32 = 36;
 
-/// Create a piece indicator DOM element for a single piece.
-fn piece_indicator(piece: Piece, pitch_count: usize) -> Dom {
-    let piece_id = piece.id.clone();
-    let original_pitch = piece.pitch;
-
-    // Convert absolute pitch to pitch class, then to keyboard key index
-    let pitch_class = piece.pitch.rem_euclid(pitch_count as i32);
-    let key_index = LEFTMOST_KEY + pitch_class;
-
-    html!("div", {
-        .class("piece-indicator")
-        .attr("data-piece-id", &piece_id)
-        .attr("data-key", &key_index.to_string()) // Key index for all-around-keyboard slotting
-        // No data-radius - let keyboard calculate from key's actual geometry
-        .attr("data-original-pitch", &original_pitch.to_string())
-        // Inline styles for piece (slotted children need explicit sizing)
-        .style("width", "32px")
-        .style("height", "32px")
-        .style("background", "#8b5cf6") // Purple to match piece-pitch chip
-        .style("border-radius", "50%")
-        .style("cursor", "grab")
-        .style("user-select", "none")
-        .style("box-shadow", "0 0 12px rgba(139, 92, 246, 0.6), 0 2px 8px rgba(0, 0, 0, 0.3)")
-        .style("pointer-events", "auto") // Enable interaction through indicator-container
-        // Start drag on pointer down - document-level handlers take over from here
-        .event(clone!(piece_id => move |e: events::PointerDown| {
-            if let Some(target) = e.target() {
-                if let Ok(el) = target.dyn_into::<HtmlElement>() {
-                    // Store drag info on document body for document-level handlers
-                    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-                        let body = doc.body().unwrap();
-                        body.set_attribute("data-dragging-piece", &piece_id).ok();
-                        body.set_attribute("data-drag-start-pitch", &original_pitch.to_string()).ok();
-                    }
-
-                    el.set_attribute("data-dragging", "true").ok();
-                    // Switch to fixed positioning for smooth drag
-                    el.style().set_property("position", "fixed").ok();
-                    el.style().set_property("z-index", "1000").ok();
-                    // IMPORTANT: pointer-events: none so events pass through to keyboard
-                    // Document-level handlers will handle movement and drop
-                    el.style().set_property("pointer-events", "none").ok();
-                    // Position at cursor
-                    let x = e.x() as f64 - 16.0; // Center the 32px element
-                    let y = e.y() as f64 - 16.0;
-                    el.style().set_property("left", &format!("{}px", x)).ok();
-                    el.style().set_property("top", &format!("{}px", y)).ok();
-                    // Remove data-key so it doesn't snap back during drag
-                    el.remove_attribute("data-key").ok();
-                }
-            }
-        }))
-    })
-}
-
 /// Calculate the shortest delta between two pitch classes around the circle.
 fn shortest_delta(from_pc: i32, to_pc: i32, pc_count: i32) -> i32 {
     let mut delta = to_pc - from_pc;
@@ -269,25 +214,7 @@ pub fn pitch_keyboard(state: Arc<AppState>) -> Dom {
             }))
         }))
 
-        // Piece indicators as slotted children - positioned via data-key attribute
-        .children_signal_vec(
-            state.room_version.signal().map(clone!(state => move |_| {
-                // Only show pieces in piece mode
-                if !state.piece_mode.get() {
-                    return vec![];
-                }
-                let tuning = state.tuning.lock_ref();
-                let pitch_count = tuning.pitch_class_count();
-                drop(tuning);
-                let room = state.room.lock_ref();
-                let pieces = room.all_pieces();
-                pieces.into_iter().map(|piece| {
-                    piece_indicator(piece, pitch_count)
-                }).collect::<Vec<_>>()
-            })).to_signal_vec()
-        )
-
-        .after_inserted(clone!(state => move |_| {
+        .after_inserted(clone!(state => move |el| {
             setup_keyboard_events(state.clone());
             // Initial sync with tuning
             let tuning = state.tuning.lock_ref();
@@ -295,8 +222,150 @@ pub fn pitch_keyboard(state: Arc<AppState>) -> Dom {
             drop(tuning);
             // Initial sync of active pitches
             sync_active_pitches(&state);
+            // Set up efficient piece management
+            setup_piece_sync(state.clone(), el);
         }))
     })
+}
+
+/// Set up efficient piece synchronization that only updates changed pieces.
+fn setup_piece_sync(state: Arc<AppState>, keyboard_el: web_sys::HtmlElement) {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    // Track existing piece elements by ID
+    let piece_elements: Rc<RefCell<HashMap<String, web_sys::HtmlElement>>> = Rc::new(RefCell::new(HashMap::new()));
+
+    // Spawn a future that watches room_version and syncs pieces
+    let piece_elements_clone = piece_elements.clone();
+    let state_clone = state.clone();
+    let keyboard_el_clone = keyboard_el.clone();
+
+    wasm_bindgen_futures::spawn_local(async move {
+        let signal = state_clone.room_version.signal();
+
+        // Process each room_version change
+        futures_signals::signal::SignalExt::for_each(signal, move |_version| {
+            // Get current pieces from room
+            let (pieces, pitch_count, piece_mode) = {
+                let tuning = state_clone.tuning.lock_ref();
+                let pitch_count = tuning.pitch_class_count();
+                drop(tuning);
+                let room = state_clone.room.lock_ref();
+                let pieces = room.all_pieces();
+                let piece_mode = state_clone.piece_mode.get();
+                (pieces, pitch_count, piece_mode)
+            };
+
+            let mut elements = piece_elements_clone.borrow_mut();
+
+            if !piece_mode {
+                // Not in piece mode - remove all piece elements
+                for (_, el) in elements.drain() {
+                    el.remove();
+                }
+            } else {
+                // Build set of current piece IDs
+                let current_ids: std::collections::HashSet<String> = pieces.iter().map(|p| p.id.clone()).collect();
+
+                // Remove pieces that no longer exist
+                let to_remove: Vec<String> = elements.keys()
+                    .filter(|id| !current_ids.contains(*id))
+                    .cloned()
+                    .collect();
+                for id in to_remove {
+                    if let Some(el) = elements.remove(&id) {
+                        el.remove();
+                    }
+                }
+
+                // Add or update pieces
+                for piece in pieces {
+                    let pitch_class = piece.pitch.rem_euclid(pitch_count as i32);
+                    let key_index = LEFTMOST_KEY + pitch_class;
+
+                    if let Some(el) = elements.get(&piece.id) {
+                        // Piece exists - just update data-key if pitch changed
+                        let current_key = el.get_attribute("data-key")
+                            .and_then(|s| s.parse::<i32>().ok())
+                            .unwrap_or(-1);
+                        if current_key != key_index {
+                            el.set_attribute("data-key", &key_index.to_string()).ok();
+                            el.set_attribute("data-original-pitch", &piece.pitch.to_string()).ok();
+                        }
+                    } else {
+                        // New piece - create element
+                        let el = create_piece_element(&piece.id, piece.pitch, key_index);
+                        keyboard_el_clone.append_child(&el).ok();
+                        elements.insert(piece.id.clone(), el);
+                    }
+                }
+            }
+
+            // Return a ready future (for_each needs FnMut -> Future)
+            async {}
+        }).await;
+    });
+}
+
+/// Create a piece indicator DOM element (raw web_sys version for efficient updates)
+fn create_piece_element(piece_id: &str, original_pitch: i32, key_index: i32) -> web_sys::HtmlElement {
+    let document = web_sys::window().unwrap().document().unwrap();
+    let el: web_sys::HtmlElement = document.create_element("div").unwrap().unchecked_into();
+
+    el.set_class_name("piece-indicator");
+    el.set_attribute("data-piece-id", piece_id).ok();
+    el.set_attribute("data-key", &key_index.to_string()).ok();
+    el.set_attribute("data-original-pitch", &original_pitch.to_string()).ok();
+
+    // Inline styles
+    let style = el.style();
+    style.set_property("width", "32px").ok();
+    style.set_property("height", "32px").ok();
+    style.set_property("background", "#8b5cf6").ok();
+    style.set_property("border-radius", "50%").ok();
+    style.set_property("cursor", "grab").ok();
+    style.set_property("user-select", "none").ok();
+    style.set_property("box-shadow", "0 0 12px rgba(139, 92, 246, 0.6), 0 2px 8px rgba(0, 0, 0, 0.3)").ok();
+    style.set_property("pointer-events", "auto").ok();
+
+    // Set up drag handler
+    setup_piece_drag_handler(&el, piece_id, original_pitch, key_index);
+
+    el
+}
+
+/// Set up drag handling for a piece element
+fn setup_piece_drag_handler(el: &web_sys::HtmlElement, piece_id: &str, original_pitch: i32, _key_index: i32) {
+    let piece_id = piece_id.to_string();
+    let el_clone = el.clone();
+
+    let on_down = Closure::<dyn Fn(web_sys::PointerEvent)>::new(move |e: web_sys::PointerEvent| {
+        // Store drag info on document body for document-level handlers
+        if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+            let body = doc.body().unwrap();
+            body.set_attribute("data-dragging-piece", &piece_id).ok();
+            body.set_attribute("data-drag-start-pitch", &original_pitch.to_string()).ok();
+        }
+
+        el_clone.set_attribute("data-dragging", "true").ok();
+        // Switch to fixed positioning for smooth drag
+        el_clone.style().set_property("position", "fixed").ok();
+        el_clone.style().set_property("z-index", "1000").ok();
+        // pointer-events: none so events pass through to keyboard
+        el_clone.style().set_property("pointer-events", "none").ok();
+        // Position at cursor
+        let x = e.x() as f64 - 16.0;
+        let y = e.y() as f64 - 16.0;
+        el_clone.style().set_property("left", &format!("{}px", x)).ok();
+        el_clone.style().set_property("top", &format!("{}px", y)).ok();
+        // Remove data-key so it doesn't snap back during drag
+        el_clone.remove_attribute("data-key").ok();
+    });
+
+    el.add_event_listener_with_callback("pointerdown", on_down.as_ref().unchecked_ref()).ok();
+    on_down.forget();
 }
 
 /// Store the currently hovered key note (used during piece drag)
