@@ -519,25 +519,46 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
 
         // Otherwise handle as drag...
 
-        // Primary: keypointerup event (fires on the key that received pointerup)
-        // Since piece has pointer-events: none, the key underneath gets the event
-        let pointerup_key = take_pointerup_key_note();
-
-        // Fallback: hover-based detection
+        // Gather all possible drop targets
         let hover_key = piece_el.get_attribute("data-hover-key")
             .and_then(|s| s.parse::<i32>().ok());
         let global_hover = get_hovered_key_note();
+        let pointerup_key = take_pointerup_key_note();
 
-        // Use best available: pointerup > hover > element attribute
-        let end_key = pointerup_key.or(global_hover).or(hover_key);
-
+        // Heuristic fallback: infer from drag vector
+        // For a radial keyboard, horizontal movement maps to key changes
         let tuning = state_up.tuning.lock_ref();
         let pc_count = tuning.pitch_class_count() as i32;
         drop(tuning);
 
+        let drag_dx = e.client_x() - start_x;
+        let drag_dy = e.client_y() - start_y;
+
+        // Estimate key offset from horizontal drag distance
+        // Roughly 30-40px per key on a typical keyboard display
+        let estimated_offset = if drag_dx.abs() > 20 {
+            (drag_dx as f32 / 35.0).round() as i32
+        } else {
+            0
+        };
+
+        let start_pc = start_pitch.rem_euclid(pc_count);
+        let vector_key = if estimated_offset != 0 && estimated_offset.abs() <= MAX_DRAG_SEMITONES {
+            Some((start_pc + estimated_offset).rem_euclid(pc_count))
+        } else {
+            None
+        };
+
+        // Use best available: hover > pointerup > vector heuristic
+        let end_key = global_hover.or(pointerup_key).or(hover_key).or(vector_key);
+
+        web_sys::console::log_1(&format!(
+            "[drop] hover={:?} pointerup={:?} vector={:?} (dx={}) -> end_key={:?}",
+            global_hover, pointerup_key, vector_key, drag_dx, end_key
+        ).into());
+
         // Check if we have a valid drop target and compute new pitch
         let new_pitch = if let Some(end_key) = end_key {
-            let start_pc = start_pitch.rem_euclid(pc_count);
             let delta = shortest_delta(start_pc, end_key, pc_count);
 
             if delta.abs() <= MAX_DRAG_SEMITONES && delta != 0 {
