@@ -831,8 +831,16 @@ pub fn run_app() {
             .build()
     );
 
-    // Generate a peer ID
-    let peer_id = format!("peer-{}", uuid::Uuid::new_v4());
+    // Initialize app asynchronously (to load peer ID from IndexedDB)
+    spawn_local(async {
+        init_app().await;
+    });
+}
+
+/// Initialize the application (async to support IndexedDB).
+async fn init_app() {
+    // Load or generate peer ID from IndexedDB
+    let peer_id = super::storage::get_or_create_peer_id().await;
 
     // Create application state
     let state = AppState::new(peer_id);
@@ -842,7 +850,18 @@ pub fn run_app() {
     let room_topic = get_or_generate_room_name();
     // Extract just the room name for display/state (strip @peer-id if present)
     let room_name = room_topic.split('@').next().unwrap_or(&room_topic).to_string();
-    state.set_room_name(room_name);
+    state.set_room_name(room_name.clone());
+
+    // Load saved room state from IndexedDB (before P2P sync)
+    if let Some(saved_state) = super::storage::get_room_state(&room_name).await {
+        web_sys::console::log_1(&format!("Loading saved room state ({} bytes)", saved_state.len()).into());
+        if let Err(e) = state.room.lock_mut().load_state(&saved_state) {
+            web_sys::console::warn_1(&format!("Failed to load saved state: {}", e).into());
+        } else {
+            // Trigger UI update after loading state
+            state.room_version.set(state.room_version.get() + 1);
+        }
+    }
 
     // Start P2P sync for the room
     // Pass full room_topic (including @peer-id if present) to signaller
@@ -882,14 +901,29 @@ pub fn run_app() {
         }
     });
 
-    // Subscribe to room_version changes to update UI when remote peers change
+    // Subscribe to room_version changes to update UI and persist state
     use futures_signals::signal::SignalExt;
     let state_for_version = state.clone();
+    let room_name_for_save = state.room_name.get_cloned();
     spawn_local(async move {
+        let mut last_save_version = 0u64;
         state_for_version.room_version.signal()
-            .for_each(|_version| {
+            .for_each(|version| {
                 // Refresh keyboard display when room state changes
                 sync_active_pitches(&state_for_version);
+
+                // Save state to IndexedDB (debounced - only if version changed)
+                if version > last_save_version {
+                    last_save_version = version;
+                    let state_bytes = state_for_version.room.lock_ref().encode_state_as_update();
+                    let room_name = room_name_for_save.clone();
+                    spawn_local(async move {
+                        if let Err(e) = super::storage::set_room_state(&room_name, &state_bytes).await {
+                            web_sys::console::warn_1(&format!("Failed to save room state: {}", e).into());
+                        }
+                    });
+                }
+
                 async {}
             })
             .await;

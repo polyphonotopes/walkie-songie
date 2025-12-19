@@ -140,6 +140,15 @@ impl YrsRoomState {
         txn.encode_state_as_update_v1(&yrs::StateVector::default())
     }
 
+    /// Load state from a previously saved update (for persistence).
+    /// This should be called before starting P2P sync.
+    pub fn load_state(&mut self, state: &[u8]) -> anyhow::Result<()> {
+        let update = Update::decode_v1(state)?;
+        self.doc.transact_mut().apply_update(update)?;
+        debug!("[CRDT] Loaded persisted state ({} bytes)", state.len());
+        Ok(())
+    }
+
     /// Encode a diff from a given state vector.
     pub fn encode_diff(&self, state_vector: &[u8]) -> anyhow::Result<Vec<u8>> {
         let sv = yrs::StateVector::decode_v1(state_vector)?;

@@ -162,6 +162,9 @@ pub fn emoji_picker(state: Arc<AppState>) -> Dom {
                         .after_inserted(move |el| {
                             let emoji_for_drag = emoji_drag.clone();
                             let on_down = wasm_bindgen::closure::Closure::<dyn Fn(web_sys::PointerEvent)>::new(move |e: web_sys::PointerEvent| {
+                                // Prevent browser from capturing touch for scroll/gestures
+                                e.prevent_default();
+                                e.stop_propagation();
                                 start_emoji_drag(
                                     emoji_for_drag.clone(),
                                     e.pointer_id(),

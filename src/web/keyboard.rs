@@ -1116,6 +1116,9 @@ fn setup_emoji_drag_handlers(state: Arc<AppState>) {
             return;
         }
 
+        // Prevent browser from scrolling/cancelling the drag
+        e.prevent_default();
+
         // Update ghost position
         if let Some(ghost) = web_sys::window()
             .and_then(|w| w.document())

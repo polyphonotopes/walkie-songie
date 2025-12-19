@@ -307,6 +307,7 @@ all-around-keyboard svg {
     border: none;
     cursor: grab;
     user-select: none;
+    touch-action: none;
     transition: all 0.15s ease;
 }
 

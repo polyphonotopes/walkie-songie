@@ -17,6 +17,8 @@ pub mod onnx_bridge;
 #[cfg(target_arch = "wasm32")]
 mod libp2p_sync;
 #[cfg(target_arch = "wasm32")]
+mod storage;
+#[cfg(target_arch = "wasm32")]
 mod voice_conditioner;
 
 #[cfg(target_arch = "wasm32")]
