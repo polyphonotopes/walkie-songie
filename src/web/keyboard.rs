@@ -1051,9 +1051,8 @@ fn setup_keyboard_drop_handlers(state: Arc<AppState>) {
             return;
         };
 
-        // Convert key index to pitch (key 0 = pitch 0 = C, etc.)
-        // The keyboard uses key indices starting from 0
-        let pitch = key_index;
+        // Convert key index to absolute MIDI pitch (key 0 = middle C = 60)
+        let pitch = key_index + 60;
 
         // Add the piece to the CRDT
         state_drop.room.lock_mut().add_piece(pitch, &emoji);
@@ -1159,8 +1158,8 @@ fn setup_emoji_drag_handlers(state: Arc<AppState>) {
             return;
         };
 
-        // Add piece
-        state_up.room.lock_mut().add_piece(key_index, &drag.emoji);
+        // Add piece at absolute MIDI pitch (key 0 = middle C = 60)
+        state_up.room.lock_mut().add_piece(key_index + 60, &drag.emoji);
         state_up.room_version.set(state_up.room_version.get() + 1);
         sync_active_pitches(&state_up);
         state_up.sync_midi_toggle_output();
