@@ -7,9 +7,8 @@ use futures_signals::signal::SignalExt;
 use wasm_bindgen::JsCast;
 use web_sys::{HtmlTextAreaElement, HtmlInputElement};
 
-use crate::room::RoomState;
 use crate::tuning::{parse_scl, Tuning};
-use crate::words::{generate_room_name, generate_room_qr_svg, is_valid_room_name, is_valid_room_input, parse_room_input};
+use crate::words::{generate_room_name, generate_room_qr_svg, is_valid_room_input, parse_room_input};
 
 use super::app::AppState;
 use super::keyboard::{start_emoji_drag, sync_active_pitches, update_tuning};
@@ -137,7 +136,7 @@ pub fn emoji_picker(state: Arc<AppState>) -> Dom {
             // Current emoji (draggable)
             html!("div", {
                 .class("emoji-picker-current")
-                .child_signal(emoji_signal.map(clone!(state => move |(emojis, idx, _count): (Vec<String>, usize, usize)| {
+                .child_signal(emoji_signal.map(move |(emojis, idx, _count): (Vec<String>, usize, usize)| {
                     if emojis.is_empty() {
                         return Some(html!("span", { .text("—") }));
                     }
@@ -177,7 +176,7 @@ pub fn emoji_picker(state: Arc<AppState>) -> Dom {
                             on_down.forget();
                         })
                     }))
-                })))
+                }))
             }),
             // Next button
             html!("button", {

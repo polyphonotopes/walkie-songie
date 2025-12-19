@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::{channel::mpsc, task::AtomicWaker, FutureExt, StreamExt};
+use futures::{task::AtomicWaker, FutureExt, StreamExt};
 use futures_signals::signal::Mutable;
 use libp2p::{
     gossipsub::{self, IdentTopic, MessageAuthenticity},

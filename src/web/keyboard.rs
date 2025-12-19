@@ -16,7 +16,6 @@ use wasm_bindgen::JsCast;
 use web_sys::js_sys::Reflect;
 use web_sys::HtmlElement;
 
-use crate::room::RoomState;
 use crate::tuning::{PitchClass, Tuning};
 
 use super::app::AppState;
@@ -27,15 +26,12 @@ struct DragState {
     piece_id: String,
     start_pitch: i32,
     start_x: i32,
-    start_y: i32,
 }
 
 /// State for dragging a new emoji from the picker
 #[derive(Clone)]
 struct EmojiDragState {
     emoji: String,
-    start_x: i32,
-    start_y: i32,
 }
 
 thread_local! {
@@ -700,9 +696,9 @@ fn create_piece_element(
             }
         });
         let observer = web_sys::MutationObserver::new(callback.as_ref().unchecked_ref()).unwrap();
-        let mut options = web_sys::MutationObserverInit::new();
-        options.attributes(true);
-        options.attribute_filter(&js_sys::Array::of1(&JsValue::from_str("data-pitch")));
+        let options = web_sys::MutationObserverInit::new();
+        options.set_attributes(true);
+        options.set_attribute_filter(&js_sys::Array::of1(&JsValue::from_str("data-pitch")));
         observer.observe_with_options(&el, &options).ok();
         callback.forget();
     }
@@ -745,7 +741,6 @@ fn setup_piece_drag_handler(
                     piece_id: piece_id_down.clone(),
                     start_pitch: current_pitch,
                     start_x: e.client_x(),
-                    start_y: e.client_y(),
                 },
             );
         });
@@ -848,7 +843,6 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
         let piece_id = drag.piece_id;
         let start_pitch = drag.start_pitch;
         let start_x = drag.start_x;
-        let start_y = drag.start_y;
 
         // Find the piece element
         let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
@@ -868,11 +862,6 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
         // Release pointer capture
         piece_el.release_pointer_capture(pointer_id).ok();
         piece_el.remove_attribute("data-pointer-id").ok();
-
-        // Check if this was a click (minimal movement) vs a drag
-        let dx = (e.client_x() - start_x).abs();
-        let dy = (e.client_y() - start_y).abs();
-        let is_click = dx < 5 && dy < 5;
 
         // Check if dropped on delete hole
         let dropped_on_hole = is_over_delete_hole(e.client_x(), e.client_y());
@@ -1079,11 +1068,7 @@ pub fn start_emoji_drag(emoji: String, pointer_id: i32, x: i32, y: i32) {
     EMOJI_DRAGS.with(|drags| {
         drags.borrow_mut().insert(
             pointer_id,
-            EmojiDragState {
-                emoji,
-                start_x: x,
-                start_y: y,
-            },
+            EmojiDragState { emoji },
         );
     });
 

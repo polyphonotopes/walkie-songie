@@ -454,6 +454,7 @@ impl MidiManager {
     }
 
     /// Connect to all available MIDI input devices.
+    #[allow(dead_code)]
     fn connect_inputs(&mut self, midi_access: &MidiAccess) -> Result<(), String> {
         let inputs = midi_access.inputs();
         let input_iterator = js_sys::try_iter(&inputs)
@@ -516,6 +517,7 @@ impl MidiManager {
     }
 
     /// Connect to the first available MIDI output device.
+    #[allow(dead_code)]
     fn connect_first_output(&mut self, midi_access: &MidiAccess) -> Result<(), String> {
         let outputs = midi_access.outputs();
         let output_iterator = js_sys::try_iter(&outputs)

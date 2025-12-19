@@ -373,16 +373,19 @@ impl VoiceConditioner {
     }
 
     /// Get current noise floor estimate.
+    #[allow(dead_code)]
     pub fn noise_floor_db(&self) -> f32 {
         self.noise_floor_db
     }
 
     /// Get current reference level (if calibrated).
+    #[allow(dead_code)]
     pub fn reference_level_db(&self) -> Option<f32> {
         self.reference_level_db
     }
 
     /// Check if gate is currently open.
+    #[allow(dead_code)]
     pub fn is_gate_open(&self) -> bool {
         self.gate_open
     }
