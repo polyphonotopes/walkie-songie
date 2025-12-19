@@ -867,8 +867,8 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
         // Check if dropped on delete hole
         let dropped_on_hole = is_over_delete_hole(e.client_x(), e.client_y());
 
-        // If dropped on hole OR click (and not locked), remove the piece
-        if (dropped_on_hole || is_click) && !state_up.pieces_locked.get() {
+        // Only remove piece if dropped on hole (not on click)
+        if dropped_on_hole && !state_up.pieces_locked.get() {
             state_up.room.lock_mut().remove_piece(&piece_id);
             // Reset styling before removal triggers UI update
             piece_el.remove_attribute("data-dragging").ok();

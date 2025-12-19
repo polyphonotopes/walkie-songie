@@ -605,8 +605,20 @@ impl YrsRoomState {
 
     // ========== Piece Methods (draggable emoji pieces with absolute pitch) ==========
 
+    /// Check if there's already a piece at the given pitch.
+    pub fn has_piece_at(&self, pitch: i32) -> bool {
+        self.all_pieces().iter().any(|p| p.pitch == pitch)
+    }
+
     /// Add a new emoji piece at the given absolute pitch. Returns the piece ID.
-    pub fn add_piece(&mut self, pitch: i32, emoji: &str) -> String {
+    /// Returns None if there's already a piece at that pitch (first dibs).
+    pub fn add_piece(&mut self, pitch: i32, emoji: &str) -> Option<String> {
+        // Check for existing piece at this pitch (first dibs)
+        if self.has_piece_at(pitch) {
+            debug!("[CRDT] add_piece(pitch={}) - blocked, pitch occupied", pitch);
+            return None;
+        }
+
         let id = uuid::Uuid::new_v4().to_string();
         debug!("[CRDT] add_piece(pitch={}, emoji={}) -> id={}", pitch, emoji, id);
 
@@ -621,7 +633,7 @@ impl YrsRoomState {
         drop(txn);
         self.notify();
 
-        id
+        Some(id)
     }
 
     /// Remove a piece by ID.

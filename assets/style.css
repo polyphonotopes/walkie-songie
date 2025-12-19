@@ -51,6 +51,7 @@ body {
     display: flex;
     flex-direction: column;
     padding: 1rem;
+    padding-bottom: calc(1rem + env(safe-area-inset-bottom, 0px));
     box-sizing: border-box;
 }
 
@@ -438,9 +439,17 @@ all-around-keyboard svg {
     width: 48px;
     height: 48px;
     border-radius: 50%;
-    background: var(--bg-primary);
-    border: 3px solid var(--piece);
-    box-shadow: 0 0 12px color-mix(in oklch, var(--piece) 60%, transparent), 0 2px 8px rgba(0, 0, 0, 0.3);
+    background: transparent;
+    border: none;
+    /* Hard outline effect (stacked drop-shadows) */
+    filter: drop-shadow(1px 0 0 white)
+            drop-shadow(-1px 0 0 white)
+            drop-shadow(0 1px 0 white)
+            drop-shadow(0 -1px 0 white)
+            drop-shadow(2px 0 0 white)
+            drop-shadow(-2px 0 0 white)
+            drop-shadow(0 2px 0 white)
+            drop-shadow(0 -2px 0 white);
     cursor: grab;
     user-select: none;
     touch-action: none;
@@ -450,7 +459,7 @@ all-around-keyboard svg {
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 1.8rem;
+    font-size: 2rem;
     line-height: 1;
 }
 
