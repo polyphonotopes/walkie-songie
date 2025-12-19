@@ -23,17 +23,89 @@ body {
     max-width: 100%;
     width: 100%;
     margin: 0 auto;
-    padding: 1rem;
     display: flex;
     flex-direction: column;
     height: 100vh;
     overflow: hidden;
 }
 
-/* Compact Header */
+/* Scroll-snap page container */
+.pages {
+    flex: 1;
+    overflow-y: auto;
+    scroll-snap-type: y mandatory;
+    scroll-behavior: smooth;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none; /* Firefox */
+    -ms-overflow-style: none; /* IE/Edge */
+}
+
+.pages::-webkit-scrollbar {
+    display: none; /* Chrome/Safari/Opera */
+}
+
+.page {
+    min-height: 100%;
+    scroll-snap-align: start;
+    scroll-snap-stop: always;
+    display: flex;
+    flex-direction: column;
+    padding: 1rem;
+    box-sizing: border-box;
+}
+
+/* Page indicator dots */
+.page-dots {
+    position: fixed;
+    right: 0.5rem;
+    top: 50%;
+    transform: translateY(-50%);
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    z-index: 50;
+}
+
+.page-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-secondary);
+    opacity: 0.4;
+    transition: opacity 0.2s, transform 0.2s;
+}
+
+.page-dot.active {
+    opacity: 1;
+    transform: scale(1.3);
+}
+
+/* Graph page */
+.graph-page {
+    justify-content: flex-start;
+    gap: 1rem;
+}
+
+.graph-container {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg-secondary);
+    border-radius: 12px;
+    min-height: 200px;
+}
+
+.graph-placeholder {
+    color: var(--text-secondary);
+    font-style: italic;
+}
+
+/* Compact Header - sticky at top */
 .header {
     text-align: center;
-    padding: 0.5rem 0;
+    padding: 0.5rem 1rem;
+    flex-shrink: 0;
 }
 
 .header h1 {
@@ -42,12 +114,10 @@ body {
     color: var(--text-secondary);
 }
 
-/* Main content */
-.main {
-    display: flex;
-    flex-direction: column;
+/* Keyboard page - fill height, distribute space */
+.keyboard-page {
+    justify-content: center;
     gap: 1rem;
-    flex: 1;
 }
 
 /* Keyboard Section */
@@ -401,13 +471,13 @@ all-around-keyboard svg {
     justify-content: center;
     z-index: 200;
     pointer-events: auto;
-    animation: hole-fade-in 0.4s ease-out forwards;
+    animation: hole-fade-in 0.8s ease-out forwards;
     opacity: 0;
 }
 
 @keyframes hole-fade-in {
-    from { opacity: 0; }
-    to { opacity: 0.85; }
+    0% { opacity: 0; }
+    100% { opacity: 0.8; }
 }
 
 /* Voice Indicator (shout emoji on keyboard) */

@@ -639,7 +639,7 @@ fn render_app(state: Arc<AppState>) -> Dom {
     html!("div", {
         .class("app")
         .children(&mut [
-            // Header: title + room button + room controls
+            // Header: title + room button + room controls (sticky)
             html!("header", {
                 .class("header")
                 .children(&mut [
@@ -665,46 +665,114 @@ fn render_app(state: Arc<AppState>) -> Dom {
             // Room overlay (hidden by default)
             room_overlay(state.clone()),
 
-            // Main content
-            html!("main", {
-                .class("main")
+            // Scroll-snap pages container
+            html!("div", {
+                .class("pages")
+                .attr("id", "pages")
+                .after_inserted(|el| {
+                    // Track scroll to update page dots
+                    let on_scroll = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                        let Some(window) = web_sys::window() else { return };
+                        let Some(document) = window.document() else { return };
+                        let Some(pages) = document.get_element_by_id("pages") else { return };
+
+                        let scroll_top = pages.scroll_top() as f64;
+                        let page_height = pages.client_height() as f64;
+                        let current_page = if page_height > 0.0 {
+                            (scroll_top / page_height).round() as usize
+                        } else {
+                            0
+                        };
+
+                        // Update dots
+                        let dots = document.query_selector_all(".page-dot").ok();
+                        if let Some(dots) = dots {
+                            for i in 0..dots.length() {
+                                if let Some(dot) = dots.get(i) {
+                                    let dot: web_sys::Element = dot.unchecked_into();
+                                    if i as usize == current_page {
+                                        dot.class_list().add_1("active").ok();
+                                    } else {
+                                        dot.class_list().remove_1("active").ok();
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    el.add_event_listener_with_callback("scroll", on_scroll.as_ref().unchecked_ref()).ok();
+                    on_scroll.forget();
+                })
                 .children(&mut [
-                    // Keyboard with pitch info overlay
+                    // Page 1: Keyboard
                     html!("div", {
-                        .class("keyboard-section")
+                        .class("page")
+                        .class("keyboard-page")
                         .children(&mut [
-                            pitch_keyboard(state.clone()),
-                            // Overlay pitch info in center
+                            // Keyboard with pitch info overlay
                             html!("div", {
-                                .class("keyboard-overlay")
-                                .child(pitch_display(state.clone()))
+                                .class("keyboard-section")
+                                .children(&mut [
+                                    pitch_keyboard(state.clone()),
+                                    // Overlay pitch info in center
+                                    html!("div", {
+                                        .class("keyboard-overlay")
+                                        .child(pitch_display(state.clone()))
+                                    }),
+                                ])
+                            }),
+
+                            // Sing button + emoji picker row
+                            html!("div", {
+                                .class("button-row")
+                                .children(&mut [
+                                    voice_button(state.clone()),
+                                    emoji_picker(state.clone()),
+                                ])
                             }),
                         ])
                     }),
 
-                    // Sing button + emoji picker row
+                    // Page 2: Graph & Info
                     html!("div", {
-                        .class("button-row")
+                        .class("page")
+                        .class("graph-page")
                         .children(&mut [
-                            voice_button(state.clone()),
-                            emoji_picker(state.clone()),
+                            // Active pitches section
+                            html!("section", {
+                                .class("active-pitches-section")
+                                .child(active_pitches_list(state.clone()))
+                            }),
+
+                            // Graph placeholder (will be polyphonotope web component)
+                            html!("div", {
+                                .class("graph-container")
+                                .child(html!("span", {
+                                    .class("graph-placeholder")
+                                    .text("Polyphonotope graph")
+                                }))
+                            }),
                         ])
                     }),
 
-                    // Active pitches section
-                    html!("section", {
-                        .class("active-pitches-section")
-                        .child(active_pitches_list(state.clone()))
-                    }),
-
-                    // Tuning section (collapsible)
-                    html!("details", {
-                        .class("tuning-section")
+                    // Page 3: Tuning (hidden for now)
+                    html!("div", {
+                        .class("page")
+                        .class("tuning-page")
+                        .style("display", "none")
                         .children(&mut [
-                            html!("summary", { .text("Tuning") }),
+                            html!("h2", { .class("page-title").text("Tuning") }),
                             tuning_editor(state.clone()),
                         ])
                     }),
+                ])
+            }),
+
+            // Page indicator dots
+            html!("div", {
+                .class("page-dots")
+                .children(&mut [
+                    html!("div", { .class("page-dot").class("active") }),
+                    html!("div", { .class("page-dot") }),
                 ])
             }),
         ])
