@@ -1,14 +1,9 @@
 /* Walkie Songie - Voice Input UI Styles */
+/* Colors imported from polyphonotopic-colors (colors.css generated at build time) */
 
 :root {
-    --bg-primary: #0f172a;
-    --bg-secondary: #1e293b;
-    --text-primary: #f1f5f9;
-    --text-secondary: #94a3b8;
-    --voice: #10b981;
-    --voice-light: #34d399;
-    --manual: #fb7185;
-    --manual-light: #fda4af;
+    /* Aliases - accent defaults to sunny golden */
+    --accent: var(--sunny);
 }
 
 * {
@@ -83,17 +78,17 @@ all-around-keyboard.keyboard {
     max-width: 800px;
     position: relative;
 
-    /* Keyboard theming via CSS custom properties */
-    --key-lower-fill: #1e293b;
-    --key-lower-stroke: #475569;
-    --key-upper-fill: #0f172a;
-    --key-upper-stroke: #334155;
-    --key-pressed-fill: var(--manual);
-    --key-highlight-fill: var(--voice);
+    /* Keyboard theming via CSS custom properties - uses palette violet hue (280) */
+    --key-lower-fill: oklch(20% 0.03 280);
+    --key-lower-stroke: oklch(38% 0.03 280);
+    --key-upper-fill: oklch(12% 0.035 280);
+    --key-upper-stroke: oklch(30% 0.03 280);
+    /* Pressed keys keep normal fill - dot overlay renders on top */
+    --key-highlight-fill: var(--voice-light);
     --key-highlight-stroke: var(--voice);
     --key-highlight-stroke-width: 4px;
-    --key-highlight-lower-fill: var(--voice);
-    --key-highlight-upper-fill: var(--voice);
+    --key-highlight-lower-fill: var(--voice-light);
+    --key-highlight-upper-fill: var(--voice-light);
     --key-hover-opacity: 0.85;
 }
 
@@ -218,6 +213,20 @@ all-around-keyboard svg {
     animation: pulse 1.5s ease-in-out infinite;
 }
 
+/* Voice emoji in circular black background with green stroke */
+.voice-emoji {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.8em;
+    height: 1.8em;
+    background: var(--bg-primary);
+    border: 2px solid var(--voice);
+    border-radius: 50%;
+    margin-right: 0.25em;
+    vertical-align: middle;
+}
+
 /* Clear Button */
 .clear-button {
     padding: 1rem 1.5rem;
@@ -233,7 +242,7 @@ all-around-keyboard svg {
 
 .clear-button:hover {
     border-color: var(--manual);
-    background: rgba(251, 113, 133, 0.15);
+    background: color-mix(in oklch, var(--manual) 15%, transparent);
 }
 
 /* Piece Mode Button */
@@ -250,13 +259,13 @@ all-around-keyboard svg {
 }
 
 .piece-mode-button:hover {
-    border-color: #8b5cf6;
-    background: rgba(139, 92, 246, 0.15);
+    border-color: var(--piece);
+    background: color-mix(in oklch, var(--piece) 15%, transparent);
 }
 
 .piece-mode-button.active {
-    border-color: #8b5cf6;
-    background: #8b5cf6;
+    border-color: var(--piece);
+    background: var(--piece);
     color: white;
 }
 
@@ -279,13 +288,13 @@ all-around-keyboard svg {
 }
 
 .piece-lock-button:hover {
-    border-color: #8b5cf6;
-    background: rgba(139, 92, 246, 0.15);
+    border-color: var(--piece);
+    background: color-mix(in oklch, var(--piece) 15%, transparent);
 }
 
 .piece-lock-button.locked {
-    border-color: #f59e0b;
-    background: rgba(245, 158, 11, 0.2);
+    border-color: var(--accent);
+    background: color-mix(in oklch, var(--accent) 20%, transparent);
 }
 
 /* Piece Indicator (on keyboard) - positioned by all-around-keyboard via CSS custom properties */
@@ -294,7 +303,15 @@ all-around-keyboard svg {
     left: var(--indicator-x, 50%);
     top: var(--indicator-y, 50%);
     transform: translate(-50%, -50%);
+    width: 48px;
+    height: 48px;
     border-radius: 50%;
+    background: var(--piece);
+    border: 2px solid var(--bg-primary);
+    box-shadow: 0 0 12px color-mix(in oklch, var(--piece) 60%, transparent), 0 2px 8px rgba(0, 0, 0, 0.3);
+    cursor: grab;
+    user-select: none;
+    touch-action: none;
     pointer-events: auto;
     z-index: 100;
 }
@@ -302,6 +319,32 @@ all-around-keyboard svg {
 @keyframes pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.8; }
+}
+
+/* Voice Indicator (shout emoji on keyboard) */
+.voice-indicator {
+    position: absolute;
+    left: var(--indicator-x, 50%);
+    top: var(--indicator-y, 50%);
+    transform: translate(-50%, -50%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 48px;
+    height: 48px;
+    font-size: 28px;
+    background: var(--bg-primary);
+    border: 3px solid var(--voice);
+    border-radius: 50%;
+    pointer-events: none;
+    z-index: 90;
+    box-shadow: 0 0 12px var(--voice), 0 2px 8px rgba(0, 0, 0, 0.3);
+    animation: shout-pulse 0.8s ease-in-out infinite;
+}
+
+@keyframes shout-pulse {
+    0%, 100% { transform: translate(-50%, -50%) scale(1); }
+    50% { transform: translate(-50%, -50%) scale(1.15); }
 }
 
 /* Active Pitches Section */
@@ -327,7 +370,7 @@ all-around-keyboard svg {
 }
 
 .pitch-tag {
-    background: var(--manual);
+    background: var(--sunny);
     color: white;
     padding: 0.25rem 0.75rem;
     border-radius: 999px;
@@ -341,8 +384,8 @@ all-around-keyboard svg {
 }
 
 .pitch-tag.piece-pitch {
-    background: #8b5cf6;
-    box-shadow: 0 0 8px #8b5cf6;
+    background: var(--piece);
+    box-shadow: 0 0 8px var(--piece);
 }
 
 /* Tuning Section (collapsible) */
@@ -405,10 +448,10 @@ all-around-keyboard svg {
 
 .scl-error {
     display: none;
-    color: var(--accent);
+    color: var(--manual);
     font-size: 0.85rem;
     padding: 0.5rem;
-    background: rgba(233, 69, 96, 0.1);
+    background: color-mix(in oklch, var(--manual) 10%, transparent);
     border-radius: 4px;
 }
 
@@ -435,7 +478,7 @@ all-around-keyboard svg {
 
 .preset-btn:hover {
     border-color: var(--accent);
-    background: rgba(233, 69, 96, 0.1);
+    background: color-mix(in oklch, var(--accent) 10%, transparent);
 }
 
 /* Room Header Button */
@@ -461,7 +504,7 @@ all-around-keyboard svg {
 
 .room-header-button:hover {
     border-color: var(--voice);
-    background: rgba(16, 185, 129, 0.1);
+    background: color-mix(in oklch, var(--voice) 10%, transparent);
 }
 
 .room-header-button .qr-icon {
@@ -614,7 +657,7 @@ all-around-keyboard svg {
 }
 
 .peer-status.connected {
-    color: #4ade80; /* green */
+    color: var(--voice-light);
 }
 
 .qr-container {
@@ -703,7 +746,7 @@ all-around-keyboard svg {
 }
 
 .join-btn:hover {
-    background: rgba(16, 185, 129, 0.15);
+    background: color-mix(in oklch, var(--voice) 15%, transparent);
 }
 
 .room-input-hint {
@@ -785,4 +828,12 @@ all-around-keyboard svg {
     .room-name-large {
         font-size: 1.25rem;
     }
+}
+
+/* Key overlay for toggled notes - dot pattern clipped to key shape */
+.toggle-overlay {
+    display: none; /* Hidden source element, keyboard clones styles */
+    background:
+        radial-gradient(circle, var(--manual) 2px, transparent 2px);
+    background-size: 8px 8px;
 }

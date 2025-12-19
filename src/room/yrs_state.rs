@@ -551,6 +551,45 @@ impl YrsRoomState {
         self.get_peer_voice(&self.peer_id)
     }
 
+    /// Get all active voice pitch classes (from all peers).
+    pub fn all_voice_pitch_classes(&self) -> Vec<PitchClass> {
+        self.all_voice_states()
+            .into_values()
+            .filter_map(|(_, pc)| pc)
+            .collect()
+    }
+
+    /// Clear voice for any peer that has the given pitch class.
+    /// Returns true if any voice was cleared.
+    pub fn clear_voice_at_pitch_class(&mut self, target_pc: PitchClass) -> bool {
+        debug!("[CRDT] clear_voice_at_pitch_class({:?})", target_pc.0);
+
+        // Find peers with this pitch class
+        let peers_to_clear: Vec<String> = self.all_voice_states()
+            .into_iter()
+            .filter(|(_, (_, pc))| *pc == Some(target_pc))
+            .map(|(peer_id, _)| peer_id)
+            .collect();
+
+        if peers_to_clear.is_empty() {
+            return false;
+        }
+
+        let mut txn = self.doc.transact_mut();
+        let voice_state: MapRef = txn.get_or_insert_map(KEY_VOICE_STATE);
+
+        for peer_id in &peers_to_clear {
+            if let Some(peer_map) = voice_state.get(&txn, peer_id).and_then(|v| v.cast::<MapRef>().ok()) {
+                peer_map.remove(&mut txn, VOICE_PITCH);
+                peer_map.remove(&mut txn, VOICE_PITCHCLASS);
+            }
+        }
+
+        drop(txn);
+        self.notify();
+        true
+    }
+
     // ========== Piece Methods (draggable pieces with absolute pitch) ==========
 
     /// Add a new piece at the given absolute pitch. Returns the piece ID.

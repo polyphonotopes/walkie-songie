@@ -1,0 +1,11 @@
+[build]
+# Output directory for build artifacts
+dist = "dist"
+
+[watch]
+# Files to ignore during watch mode
+ignore = ["dist", "target"]
+
+# GitHub Pages deployment configuration
+# Set public_url via CLI: trunk build --release --public-url /walkie-songie/
+# Or override here for a specific deployment target

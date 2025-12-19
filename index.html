@@ -4,13 +4,35 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Walkie Songie</title>
+    <meta name="description" content="P2P collaborative music application for real-time musical collaboration">
+    <meta name="theme-color" content="#99bc66">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Walkie Songie">
+    <link rel="manifest" href="manifest.webmanifest">
+    <link rel="icon" type="image/svg+xml" href="icon.svg">
+    <link rel="apple-touch-icon" href="icon.svg">
+    <link data-trunk rel="css" href="assets/colors.css">
     <link data-trunk rel="css" href="assets/style.css">
     <link data-trunk rel="copy-file" href="assets/all-around-keyboard.esm.min.js">
     <link data-trunk rel="copy-file" href="assets/onnx-bridge.js">
     <link data-trunk rel="copy-file" href="assets/swiftf0.onnx">
+    <link data-trunk rel="copy-file" href="assets/manifest.webmanifest">
+    <link data-trunk rel="copy-file" href="assets/icon.svg">
+    <link data-trunk rel="copy-file" href="assets/sw.js">
 </head>
 <body>
     <script type="module" src="all-around-keyboard.esm.min.js"></script>
+    <script>
+        // Register service worker
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('sw.js')
+                    .then(reg => console.log('SW registered:', reg.scope))
+                    .catch(err => console.warn('SW registration failed:', err));
+            });
+        }
+    </script>
     <link data-trunk rel="rust" data-wasm-opt="z" data-target-name="walkie_songie" />
 </body>
 </html>

@@ -5,19 +5,35 @@
 //! - Indicator children: `data-pitch`, `data-key`, `data-radius`
 //! - Events out: `keyclick`, `keyhover`, `keyunhover`
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use dominator::{clone, html, Dom};
 use futures_signals::signal::SignalExt as _;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use web_sys::HtmlElement;
 use web_sys::js_sys::Reflect;
+use web_sys::HtmlElement;
 
 use crate::room::RoomState;
 use crate::tuning::{PitchClass, Tuning};
 
 use super::app::AppState;
+
+/// State for a single pointer drag operation
+#[derive(Clone)]
+struct DragState {
+    piece_id: String,
+    start_pitch: i32,
+    start_x: i32,
+    start_y: i32,
+}
+
+thread_local! {
+    /// Track active drags by pointerId for multitouch support
+    static ACTIVE_DRAGS: RefCell<HashMap<i32, DragState>> = RefCell::new(HashMap::new());
+}
 
 /// Reference frequency for A4 (standard tuning).
 const A4_HZ: f64 = 440.0;
@@ -43,10 +59,14 @@ fn set_keyboard_attr(attr: &str, value: &str) {
 
 /// Format a slice of note indices as a JSON array string.
 fn notes_to_json(notes: &[u8]) -> String {
-    format!("[{}]", notes.iter()
-        .map(|n| n.to_string())
-        .collect::<Vec<_>>()
-        .join(","))
+    format!(
+        "[{}]",
+        notes
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    )
 }
 
 /// Set which notes are pressed (active pitches).
@@ -92,7 +112,7 @@ pub fn compute_raised_notes(tuning: &Tuning) -> Vec<u8> {
 }
 
 /// Sync keyboard state with active pitches from ALL peers.
-/// - Combined pitches from all peers + pieces show as "pressed" (red)
+/// - Combined pitches from all peers + pieces show as "pressed" (using overlays for toggles)
 /// - Local voice pitch shows as "lit" (green)
 pub fn sync_active_pitches(state: &Arc<AppState>) {
     let room = state.room.lock_ref();
@@ -103,26 +123,198 @@ pub fn sync_active_pitches(state: &Arc<AppState>) {
     // Get combined pitch result from all peers (uses combination method)
     let room_result = room.compute_room_result();
 
-    // Start with pitches from peers
-    let mut combined: Vec<u8> = room_result.pitch_classes.iter().map(|pc| pc.index()).collect();
+    // Start with pitches from peers (manual toggles)
+    let toggle_notes: Vec<u8> = room_result
+        .pitch_classes
+        .iter()
+        .map(|pc| pc.index())
+        .collect();
 
-    // Add piece pitch classes
+    // Piece pitch classes (shown separately, not as toggles)
     let pieces = room.all_pieces();
-    for piece in &pieces {
-        let pc = piece.pitch.rem_euclid(pc_count) as u8;
-        if !combined.contains(&pc) {
-            combined.push(pc);
+    let piece_notes: Vec<u8> = pieces
+        .iter()
+        .map(|p| p.pitch.rem_euclid(pc_count) as u8)
+        .collect();
+
+    // Update toggle overlays (dot pattern for manual toggles)
+    sync_toggle_overlays(&toggle_notes);
+
+    // Update piece overlays (piece-dots pattern)
+    sync_piece_overlays(&piece_notes);
+
+    // Clear pressed notes (we use overlays now)
+    set_pressed_notes(&[]);
+
+    // Voice pitch classes from all peers (wavy overlay with shout emoji)
+    let voice_notes: Vec<u8> = room
+        .all_voice_pitch_classes()
+        .iter()
+        .map(|pc| pc.index())
+        .collect();
+    sync_voice_overlays(&voice_notes);
+
+    // Clear lit notes (we use overlays now)
+    set_lit_notes(&[]);
+}
+
+/// Sync toggle overlay elements for manual pitch toggles.
+/// Creates/removes overlay elements with data-key-overlay attribute.
+fn sync_toggle_overlays(notes: &[u8]) {
+    let Some(kb) = get_keyboard() else { return };
+    let document = web_sys::window().unwrap().document().unwrap();
+
+    // Get existing overlay elements
+    let existing: web_sys::NodeList = kb.query_selector_all(".toggle-overlay").unwrap();
+    let mut existing_keys: std::collections::HashSet<i32> = std::collections::HashSet::new();
+
+    // Build set of current key indices
+    let current_keys: std::collections::HashSet<i32> =
+        notes.iter().map(|&n| LEFTMOST_KEY + n as i32).collect();
+
+    // Remove overlays for notes no longer active, track existing ones
+    for i in 0..existing.length() {
+        if let Some(node) = existing.item(i) {
+            let el: web_sys::Element = node.unchecked_into();
+            if let Some(key_str) = el.get_attribute("data-key-overlay") {
+                if let Ok(key) = key_str.parse::<i32>() {
+                    if current_keys.contains(&key) {
+                        existing_keys.insert(key);
+                    } else {
+                        el.remove();
+                    }
+                }
+            }
         }
     }
 
-    set_pressed_notes(&combined);
+    // Add overlays for new active notes
+    for &note in notes {
+        let key_index = LEFTMOST_KEY + note as i32;
+        if !existing_keys.contains(&key_index) {
+            // Create new overlay element
+            let el = document.create_element("div").unwrap();
+            el.set_class_name("toggle-overlay");
+            el.set_attribute("data-key-overlay", &key_index.to_string())
+                .ok();
+            // Specify which pattern to use (defined in slot)
+            el.set_attribute("data-overlay-pattern", "manual-lines").ok();
+            kb.append_child(&el).ok();
+        }
+    }
+}
 
-    // Local voice pitch from CRDT -> lit (green)
-    let (_, local_voice_pc) = room.local_voice();
-    if let Some(pc) = local_voice_pc {
-        set_lit_notes(&[pc.index()]);
-    } else {
-        set_lit_notes(&[]);
+/// Sync piece overlay elements for piece pitch classes.
+/// Creates/removes overlay elements with data-key-overlay attribute and piece-dots pattern.
+fn sync_piece_overlays(notes: &[u8]) {
+    let Some(kb) = get_keyboard() else { return };
+    let document = web_sys::window().unwrap().document().unwrap();
+
+    // Get existing piece overlay elements
+    let existing: web_sys::NodeList = kb.query_selector_all(".piece-overlay").unwrap();
+    let mut existing_keys: std::collections::HashSet<i32> = std::collections::HashSet::new();
+
+    // Build set of current key indices
+    let current_keys: std::collections::HashSet<i32> =
+        notes.iter().map(|&n| LEFTMOST_KEY + n as i32).collect();
+
+    // Remove overlays for notes no longer active, track existing ones
+    for i in 0..existing.length() {
+        if let Some(node) = existing.item(i) {
+            let el: web_sys::Element = node.unchecked_into();
+            if let Some(key_str) = el.get_attribute("data-key-overlay") {
+                if let Ok(key) = key_str.parse::<i32>() {
+                    if current_keys.contains(&key) {
+                        existing_keys.insert(key);
+                    } else {
+                        el.remove();
+                    }
+                }
+            }
+        }
+    }
+
+    // Add overlays for new active notes
+    for &note in notes {
+        let key_index = LEFTMOST_KEY + note as i32;
+        if !existing_keys.contains(&key_index) {
+            // Create new overlay element
+            let el = document.create_element("div").unwrap();
+            el.set_class_name("piece-overlay");
+            el.set_attribute("data-key-overlay", &key_index.to_string())
+                .ok();
+            // Specify piece pattern
+            el.set_attribute("data-overlay-pattern", "piece-dots").ok();
+            kb.append_child(&el).ok();
+        }
+    }
+}
+
+/// Sync voice overlay elements for voice pitch classes.
+/// Creates/removes overlay elements with data-key-overlay attribute, voice-waves pattern, and shout emoji.
+fn sync_voice_overlays(notes: &[u8]) {
+    let Some(kb) = get_keyboard() else { return };
+    let document = web_sys::window().unwrap().document().unwrap();
+
+    // Get existing voice overlay elements
+    let existing: web_sys::NodeList = kb.query_selector_all(".voice-overlay").unwrap();
+    let mut existing_keys: std::collections::HashSet<i32> = std::collections::HashSet::new();
+
+    // Build set of current key indices
+    let current_keys: std::collections::HashSet<i32> =
+        notes.iter().map(|&n| LEFTMOST_KEY + n as i32).collect();
+
+    // Remove overlays for notes no longer active, track existing ones
+    for i in 0..existing.length() {
+        if let Some(node) = existing.item(i) {
+            let el: web_sys::Element = node.unchecked_into();
+            if let Some(key_str) = el.get_attribute("data-key-overlay") {
+                if let Ok(key) = key_str.parse::<i32>() {
+                    if current_keys.contains(&key) {
+                        existing_keys.insert(key);
+                    } else {
+                        el.remove();
+                    }
+                }
+            }
+        }
+    }
+
+    // Also remove voice indicators for notes no longer active
+    let existing_indicators: web_sys::NodeList = kb.query_selector_all(".voice-indicator").unwrap();
+    for i in 0..existing_indicators.length() {
+        if let Some(node) = existing_indicators.item(i) {
+            let el: web_sys::Element = node.unchecked_into();
+            if let Some(key_str) = el.get_attribute("data-key") {
+                if let Ok(key) = key_str.parse::<i32>() {
+                    if !current_keys.contains(&key) {
+                        el.remove();
+                    }
+                }
+            }
+        }
+    }
+
+    // Add overlays and indicators for new active notes
+    for &note in notes {
+        let key_index = LEFTMOST_KEY + note as i32;
+        if !existing_keys.contains(&key_index) {
+            // Create new overlay element
+            let el = document.create_element("div").unwrap();
+            el.set_class_name("voice-overlay");
+            el.set_attribute("data-key-overlay", &key_index.to_string())
+                .ok();
+            // Specify voice wave pattern
+            el.set_attribute("data-overlay-pattern", "voice-waves").ok();
+            kb.append_child(&el).ok();
+
+            // Create shout emoji indicator
+            let indicator = document.create_element("div").unwrap();
+            indicator.set_class_name("voice-indicator");
+            indicator.set_attribute("data-key", &key_index.to_string()).ok();
+            indicator.set_text_content(Some("🗣️"));
+            kb.append_child(&indicator).ok();
+        }
     }
 }
 
@@ -150,6 +342,73 @@ const MAX_DRAG_SEMITONES: i32 = 5;
 /// Leftmost key index for the keyboard (C3 = MIDI 36)
 const LEFTMOST_KEY: i32 = 36;
 
+/// SVG namespace for creating SVG elements
+const SVG_NS: &str = "http://www.w3.org/2000/svg";
+
+/// Create overlay patterns and add them to the keyboard via slot
+fn create_overlay_patterns(keyboard: &web_sys::HtmlElement) {
+    let document = web_sys::window().unwrap().document().unwrap();
+
+    // Create SVG container for patterns
+    let svg = document.create_element_ns(Some(SVG_NS), "svg").unwrap();
+    svg.set_attribute("slot", "overlay-pattern").ok();
+    svg.set_attribute("style", "display: none").ok();
+
+    // Manual toggle pattern - diagonal lines in sunny yellow
+    let pattern1 = document.create_element_ns(Some(SVG_NS), "pattern").unwrap();
+    pattern1.set_attribute("id", "manual-lines").ok();
+    pattern1
+        .set_attribute("patternUnits", "userSpaceOnUse")
+        .ok();
+    pattern1.set_attribute("width", "8").ok();
+    pattern1.set_attribute("height", "8").ok();
+    // Diagonal line from bottom-left to top-right
+    let line1 = document.create_element_ns(Some(SVG_NS), "path").unwrap();
+    line1.set_attribute("d", "M0,8 L8,0 M-2,2 L2,-2 M6,10 L10,6").ok();
+    line1.set_attribute("stroke", "var(--sunny)").ok();
+    line1.set_attribute("stroke-width", "2").ok();
+    line1.set_attribute("stroke-opacity", "0.6").ok();
+    pattern1.append_child(&line1).ok();
+    svg.append_child(&pattern1).ok();
+
+    // Piece pattern - larger dots
+    let pattern2 = document.create_element_ns(Some(SVG_NS), "pattern").unwrap();
+    pattern2.set_attribute("id", "piece-dots").ok();
+    pattern2
+        .set_attribute("patternUnits", "userSpaceOnUse")
+        .ok();
+    pattern2.set_attribute("width", "10").ok();
+    pattern2.set_attribute("height", "10").ok();
+    let circle2 = document.create_element_ns(Some(SVG_NS), "circle").unwrap();
+    circle2.set_attribute("cx", "5").ok();
+    circle2.set_attribute("cy", "5").ok();
+    circle2.set_attribute("r", "2").ok();
+    circle2.set_attribute("fill", "var(--piece)").ok();
+    circle2.set_attribute("fill-opacity", "0.5").ok();
+    pattern2.append_child(&circle2).ok();
+    svg.append_child(&pattern2).ok();
+
+    // Voice pattern - wavy lines
+    let pattern3 = document.create_element_ns(Some(SVG_NS), "pattern").unwrap();
+    pattern3.set_attribute("id", "voice-waves").ok();
+    pattern3
+        .set_attribute("patternUnits", "userSpaceOnUse")
+        .ok();
+    pattern3.set_attribute("width", "16").ok();
+    pattern3.set_attribute("height", "8").ok();
+    // Wavy path - sine wave approximation
+    let wave = document.create_element_ns(Some(SVG_NS), "path").unwrap();
+    wave.set_attribute("d", "M0,4 Q4,0 8,4 T16,4").ok();
+    wave.set_attribute("fill", "none").ok();
+    wave.set_attribute("stroke", "var(--voice)").ok();
+    wave.set_attribute("stroke-width", "2").ok();
+    wave.set_attribute("stroke-opacity", "0.6").ok();
+    pattern3.append_child(&wave).ok();
+    svg.append_child(&pattern3).ok();
+
+    keyboard.append_child(&svg).ok();
+}
+
 /// Calculate the shortest delta between two pitch classes around the circle.
 fn shortest_delta(from_pc: i32, to_pc: i32, pc_count: i32) -> i32 {
     let mut delta = to_pc - from_pc;
@@ -173,6 +432,8 @@ pub fn pitch_keyboard(state: Arc<AppState>) -> Dom {
         .attr("depth", "280")
         .attr("pressed-notes", "[]")
         .attr("lit-notes", "[]")
+
+        // Overlay patterns added in after_inserted (SVG elements need SVG namespace)
 
         // Pitch indicator child - stable element, attributes updated reactively
         .child(html!("div", {
@@ -199,22 +460,26 @@ pub fn pitch_keyboard(state: Arc<AppState>) -> Dom {
             .class_signal("hidden", state.continuous_hz.signal().map(clone!(state => move |_| {
                 !state.voice_active.get() || !state.gate_open.get()
             })))
-            // Update style reactively based on confidence
+            // Update style reactively based on confidence - uses voice color (hue 180)
             .attr_signal("style", state.final_confidence.signal().map(|confidence| {
                 let size = 12.0 + confidence * 12.0;
                 let opacity = 0.6 + confidence * 0.4;
                 let glow = (6.0 + confidence * 10.0) as i32;
-                let brightness = (120.0 + confidence * 135.0) as u8;
+                // Lightness varies from 65% (low confidence) to 85% (high confidence)
+                let lightness = 65.0 + confidence * 20.0;
                 format!(
                     "width: {s}px; height: {s}px; opacity: {o:.2}; \
-                     background: rgb({b}, 255, {b}); \
-                     filter: drop-shadow(0 0 {g}px rgb({b}, 255, {b}));",
-                    s = size, o = opacity, g = glow, b = brightness
+                     background: oklch({l}% 0.16 180); \
+                     filter: drop-shadow(0 0 {g}px oklch({l}% 0.16 180));",
+                    s = size, o = opacity, g = glow, l = lightness
                 )
             }))
         }))
 
         .after_inserted(clone!(state => move |el| {
+            // Add overlay patterns (SVG elements need SVG namespace)
+            create_overlay_patterns(&el);
+
             setup_keyboard_events(state.clone());
             // Initial sync with tuning
             let tuning = state.tuning.lock_ref();
@@ -235,7 +500,8 @@ fn setup_piece_sync(state: Arc<AppState>, keyboard_el: web_sys::HtmlElement) {
     use std::rc::Rc;
 
     // Track existing piece elements by ID
-    let piece_elements: Rc<RefCell<HashMap<String, web_sys::HtmlElement>>> = Rc::new(RefCell::new(HashMap::new()));
+    let piece_elements: Rc<RefCell<HashMap<String, web_sys::HtmlElement>>> =
+        Rc::new(RefCell::new(HashMap::new()));
 
     // Spawn a future that watches room_version and syncs pieces
     let piece_elements_clone = piece_elements.clone();
@@ -264,78 +530,81 @@ fn setup_piece_sync(state: Arc<AppState>, keyboard_el: web_sys::HtmlElement) {
             }
 
             // Get current pieces from room
-            let (pieces, pitch_count, piece_mode) = {
+            let (pieces, pitch_count) = {
                 let tuning = state_clone.tuning.lock_ref();
                 let pitch_count = tuning.pitch_class_count();
                 drop(tuning);
                 let room = state_clone.room.lock_ref();
                 let pieces = room.all_pieces();
-                let piece_mode = state_clone.piece_mode.get();
-                (pieces, pitch_count, piece_mode)
+                (pieces, pitch_count)
             };
 
             let mut elements = piece_elements_clone.borrow_mut();
 
-            if !piece_mode {
-                // Not in piece mode - remove all piece elements
-                for (_, el) in elements.drain() {
+            // Always show pieces (even in toggle mode) so they can be clicked to remove
+            // Build set of current piece IDs
+            let current_ids: std::collections::HashSet<String> =
+                pieces.iter().map(|p| p.id.clone()).collect();
+
+            // Remove pieces that no longer exist
+            let to_remove: Vec<String> = elements
+                .keys()
+                .filter(|id| !current_ids.contains(*id))
+                .cloned()
+                .collect();
+            for id in to_remove {
+                if let Some(el) = elements.remove(&id) {
                     el.remove();
                 }
-            } else {
-                // Build set of current piece IDs
-                let current_ids: std::collections::HashSet<String> = pieces.iter().map(|p| p.id.clone()).collect();
+            }
 
-                // Remove pieces that no longer exist
-                let to_remove: Vec<String> = elements.keys()
-                    .filter(|id| !current_ids.contains(*id))
-                    .cloned()
-                    .collect();
-                for id in to_remove {
-                    if let Some(el) = elements.remove(&id) {
-                        el.remove();
+            // Add or update pieces
+            for piece in pieces {
+                let pitch_class = piece.pitch.rem_euclid(pitch_count as i32);
+                let key_index = LEFTMOST_KEY + pitch_class;
+
+                if let Some(el) = elements.get(&piece.id) {
+                    // Piece exists - just update data-key if pitch changed
+                    let current_key = el
+                        .get_attribute("data-key")
+                        .and_then(|s| s.parse::<i32>().ok())
+                        .unwrap_or(-1);
+                    if current_key != key_index {
+                        // Ensure no data-pitch (pieces use data-key for discrete positioning)
+                        el.remove_attribute("data-pitch").ok();
+                        el.set_attribute("data-key", &key_index.to_string()).ok();
+                        el.set_attribute("data-original-pitch", &piece.pitch.to_string())
+                            .ok();
                     }
-                }
-
-                // Add or update pieces
-                for piece in pieces {
-                    let pitch_class = piece.pitch.rem_euclid(pitch_count as i32);
-                    let key_index = LEFTMOST_KEY + pitch_class;
-
-                    if let Some(el) = elements.get(&piece.id) {
-                        // Piece exists - just update data-key if pitch changed
-                        let current_key = el.get_attribute("data-key")
-                            .and_then(|s| s.parse::<i32>().ok())
-                            .unwrap_or(-1);
-                        if current_key != key_index {
-                            // Ensure no data-pitch (pieces use data-key for discrete positioning)
-                            el.remove_attribute("data-pitch").ok();
-                            el.set_attribute("data-key", &key_index.to_string()).ok();
-                            el.set_attribute("data-original-pitch", &piece.pitch.to_string()).ok();
-                        }
-                    } else {
-                        // New piece - create element
-                        let el = create_piece_element(&piece.id, piece.pitch, key_index);
-                        keyboard_el_clone.append_child(&el).ok();
-                        elements.insert(piece.id.clone(), el);
-                    }
+                } else {
+                    // New piece - create element
+                    let el = create_piece_element(&piece.id, piece.pitch, key_index);
+                    keyboard_el_clone.append_child(&el).ok();
+                    elements.insert(piece.id.clone(), el);
                 }
             }
 
             // Return a ready future (for_each needs FnMut -> Future)
             async {}
-        }).await;
+        })
+        .await;
     });
 }
 
 /// Create a piece indicator DOM element (raw web_sys version for efficient updates)
-fn create_piece_element(piece_id: &str, original_pitch: i32, key_index: i32) -> web_sys::HtmlElement {
+fn create_piece_element(
+    piece_id: &str,
+    original_pitch: i32,
+    key_index: i32,
+) -> web_sys::HtmlElement {
     let document = web_sys::window().unwrap().document().unwrap();
     let el: web_sys::HtmlElement = document.create_element("div").unwrap().unchecked_into();
 
     el.set_class_name("piece-indicator");
     el.set_attribute("data-piece-id", piece_id).ok();
     el.set_attribute("data-key", &key_index.to_string()).ok();
-    el.set_attribute("data-original-pitch", &original_pitch.to_string()).ok();
+    el.set_attribute("data-original-pitch", &original_pitch.to_string())
+        .ok();
     // Explicitly ensure no data-pitch (pieces use data-key for discrete positioning)
     el.remove_attribute("data-pitch").ok();
 
@@ -351,10 +620,13 @@ fn create_piece_element(piece_id: &str, original_pitch: i32, key_index: i32) -> 
                         if attr == "data-pitch" {
                             let has_it = el_debug.has_attribute("data-pitch");
                             let val = el_debug.get_attribute("data-pitch").unwrap_or_default();
-                            web_sys::console::error_1(&format!(
-                                "[DEBUG] data-pitch MUTATED on piece {}: has={}, val='{}'",
-                                piece_id_debug, has_it, val
-                            ).into());
+                            web_sys::console::error_1(
+                                &format!(
+                                    "[DEBUG] data-pitch MUTATED on piece {}: has={}, val='{}'",
+                                    piece_id_debug, has_it, val
+                                )
+                                .into(),
+                            );
                         }
                     }
                 }
@@ -368,16 +640,9 @@ fn create_piece_element(piece_id: &str, original_pitch: i32, key_index: i32) -> 
         callback.forget();
     }
 
-    // Inline styles
-    let style = el.style();
-    style.set_property("width", "32px").ok();
-    style.set_property("height", "32px").ok();
-    style.set_property("background", "#8b5cf6").ok();
-    style.set_property("border-radius", "50%").ok();
-    style.set_property("cursor", "grab").ok();
-    style.set_property("user-select", "none").ok();
-    style.set_property("box-shadow", "0 0 12px rgba(139, 92, 246, 0.6), 0 2px 8px rgba(0, 0, 0, 0.3)").ok();
-    style.set_property("pointer-events", "auto").ok();
+    // Styling handled by CSS .piece-indicator class
+    // Only set pointer-events here to ensure it's enabled for drag handling
+    el.style().set_property("pointer-events", "auto").ok();
 
     // Set up drag handler
     setup_piece_drag_handler(&el, piece_id, original_pitch, key_index);
@@ -385,153 +650,158 @@ fn create_piece_element(piece_id: &str, original_pitch: i32, key_index: i32) -> 
     el
 }
 
-/// Set up drag handling for a piece element
-fn setup_piece_drag_handler(el: &web_sys::HtmlElement, piece_id: &str, _original_pitch: i32, _key_index: i32) {
-    let piece_id = piece_id.to_string();
-    let el_clone = el.clone();
+/// Set up drag handling for a piece element with multitouch support
+fn setup_piece_drag_handler(
+    el: &web_sys::HtmlElement,
+    piece_id: &str,
+    _original_pitch: i32,
+    _key_index: i32,
+) {
+    let piece_id_down = piece_id.to_string();
+    let el_down = el.clone();
 
+    // Pointerdown: start drag
     let on_down = Closure::<dyn Fn(web_sys::PointerEvent)>::new(move |e: web_sys::PointerEvent| {
+        let pointer_id = e.pointer_id();
+
         // Read current pitch from element (may have been updated since creation)
-        let current_pitch = el_clone.get_attribute("data-original-pitch")
+        let current_pitch = el_down
+            .get_attribute("data-original-pitch")
             .and_then(|s| s.parse::<i32>().ok())
             .unwrap_or(0);
 
-        // Store drag info on document body for document-level handlers
-        if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-            let body = doc.body().unwrap();
-            body.set_attribute("data-dragging-piece", &piece_id).ok();
-            body.set_attribute("data-drag-start-pitch", &current_pitch.to_string()).ok();
-            // Track start position for click detection
-            body.set_attribute("data-drag-start-x", &e.x().to_string()).ok();
-            body.set_attribute("data-drag-start-y", &e.y().to_string()).ok();
-        }
+        // Store drag state in thread-local map for multitouch support
+        ACTIVE_DRAGS.with(|drags| {
+            drags.borrow_mut().insert(
+                pointer_id,
+                DragState {
+                    piece_id: piece_id_down.clone(),
+                    start_pitch: current_pitch,
+                    start_x: e.client_x(),
+                    start_y: e.client_y(),
+                },
+            );
+        });
 
-        el_clone.set_attribute("data-dragging", "true").ok();
+        // Store pointerId on element so we can track which pointer is dragging it
+        el_down
+            .set_attribute("data-pointer-id", &pointer_id.to_string())
+            .ok();
+        el_down.set_attribute("data-dragging", "true").ok();
+
+        // Capture pointer for reliable tracking even if it leaves the element
+        el_down.set_pointer_capture(pointer_id).ok();
+
         // Switch to fixed positioning for smooth drag
-        el_clone.style().set_property("position", "fixed").ok();
-        el_clone.style().set_property("z-index", "1000").ok();
-        // pointer-events: none so events pass through to keyboard
-        el_clone.style().set_property("pointer-events", "none").ok();
+        el_down.style().set_property("position", "fixed").ok();
+        el_down.style().set_property("z-index", "1000").ok();
+        // touch-action: none to prevent scrolling during drag
+        el_down.style().set_property("touch-action", "none").ok();
         // Position at cursor
-        let x = e.x() as f64 - 16.0;
-        let y = e.y() as f64 - 16.0;
-        el_clone.style().set_property("left", &format!("{}px", x)).ok();
-        el_clone.style().set_property("top", &format!("{}px", y)).ok();
+        let x = e.client_x() as f64 - 16.0;
+        let y = e.client_y() as f64 - 16.0;
+        el_down
+            .style()
+            .set_property("left", &format!("{}px", x))
+            .ok();
+        el_down
+            .style()
+            .set_property("top", &format!("{}px", y))
+            .ok();
         // Remove data-key so it doesn't snap back during drag
-        el_clone.remove_attribute("data-key").ok();
+        el_down.remove_attribute("data-key").ok();
+
+        e.prevent_default();
+        e.stop_propagation();
     });
 
-    el.add_event_listener_with_callback("pointerdown", on_down.as_ref().unchecked_ref()).ok();
+    el.add_event_listener_with_callback("pointerdown", on_down.as_ref().unchecked_ref())
+        .ok();
     on_down.forget();
-}
 
-/// Store the currently hovered key note (used during piece drag for visual feedback)
-static HOVERED_KEY_NOTE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+    // Pointermove: update position during drag (received due to pointer capture)
+    let el_move = el.clone();
+    let on_move = Closure::<dyn Fn(web_sys::PointerEvent)>::new(move |e: web_sys::PointerEvent| {
+        // Only handle if this element is being dragged
+        if el_move.get_attribute("data-dragging").is_none() {
+            return;
+        }
 
-/// Store the last key that received a pointerup event (primary drop target)
-static POINTERUP_KEY_NOTE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+        // Check pointer ID matches
+        let expected_id = el_move
+            .get_attribute("data-pointer-id")
+            .and_then(|s| s.parse::<i32>().ok());
+        if expected_id != Some(e.pointer_id()) {
+            return;
+        }
 
-/// Get the currently hovered key note (pitch class 0-11, or -1 if none)
-fn get_hovered_key_note() -> Option<i32> {
-    let val = HOVERED_KEY_NOTE.load(std::sync::atomic::Ordering::Relaxed);
-    if val >= 0 { Some(val) } else { None }
-}
+        // Update position
+        let x = e.client_x() as f64 - 16.0;
+        let y = e.client_y() as f64 - 16.0;
+        el_move
+            .style()
+            .set_property("left", &format!("{}px", x))
+            .ok();
+        el_move
+            .style()
+            .set_property("top", &format!("{}px", y))
+            .ok();
 
-/// Get and clear the last pointerup key note (primary drop target)
-fn take_pointerup_key_note() -> Option<i32> {
-    let val = POINTERUP_KEY_NOTE.swap(-1, std::sync::atomic::Ordering::Relaxed);
-    if val >= 0 { Some(val) } else { None }
+        e.prevent_default();
+    });
+
+    el.add_event_listener_with_callback("pointermove", on_move.as_ref().unchecked_ref())
+        .ok();
+    on_move.forget();
 }
 
 /// Set up document-level drag handlers for piece dragging.
-/// This is needed because the piece has pointer-events: none during drag,
-/// so we handle movement and drop at the document level.
+/// Supports multitouch by tracking drags per pointerId in ACTIVE_DRAGS.
 fn setup_document_drag_handlers(state: Arc<AppState>) {
-    let Some(window) = web_sys::window() else { return };
-    let Some(document) = window.document() else { return };
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Some(document) = window.document() else {
+        return;
+    };
 
-    // Document-level pointermove handler for dragging pieces
-    let state_move = state.clone();
-    let on_move = Closure::<dyn Fn(web_sys::PointerEvent)>::new(move |e: web_sys::PointerEvent| {
-        let Some(body) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.body()) else { return };
-
-        // Check if we're dragging a piece
-        let Some(piece_id) = body.get_attribute("data-dragging-piece") else { return };
-
-        // Find the piece element
-        let Some(doc) = web_sys::window().and_then(|w| w.document()) else { return };
-        let Some(piece_el) = doc.query_selector(&format!("[data-piece-id='{}']", piece_id)).ok().flatten() else { return };
-        let Ok(piece_el) = piece_el.dyn_into::<HtmlElement>() else { return };
-
-        // Move piece to follow cursor
-        let x = e.x() as f64 - 16.0;
-        let y = e.y() as f64 - 16.0;
-        piece_el.style().set_property("left", &format!("{}px", x)).ok();
-        piece_el.style().set_property("top", &format!("{}px", y)).ok();
-
-        // Update hover key tracking for visual feedback
-        if let Some(current_pc) = get_hovered_key_note() {
-            piece_el.set_attribute("data-hover-key", &current_pc.to_string()).ok();
-
-            // Visual feedback: change color if out of range
-            if let Some(start_str) = body.get_attribute("data-drag-start-pitch") {
-                if let Ok(start_pitch) = start_str.parse::<i32>() {
-                    let tuning = state_move.tuning.lock_ref();
-                    let pc_count = tuning.pitch_class_count() as i32;
-                    drop(tuning);
-
-                    let start_pc = start_pitch.rem_euclid(pc_count);
-                    let delta = shortest_delta(start_pc, current_pc, pc_count);
-
-                    if delta.abs() > MAX_DRAG_SEMITONES {
-                        // Out of range - show warning color (dimmed)
-                        piece_el.style().set_property("background", "#666").ok();
-                        piece_el.style().set_property("box-shadow", "0 0 8px rgba(102, 102, 102, 0.5)").ok();
-                    } else {
-                        // In range - show normal purple
-                        piece_el.style().set_property("background", "#8b5cf6").ok();
-                        piece_el.style().set_property("box-shadow", "0 0 12px rgba(139, 92, 246, 0.6), 0 2px 8px rgba(0, 0, 0, 0.3)").ok();
-                    }
-                }
-            }
-        }
-    });
-    let _ = document.add_event_listener_with_callback("pointermove", on_move.as_ref().unchecked_ref());
-    on_move.forget();
-
-    // Document-level pointerup handler for dropping pieces
+    // Document-level pointerup handler for dropping pieces (multitouch aware)
     let state_up = state.clone();
     let on_up = Closure::<dyn Fn(web_sys::PointerEvent)>::new(move |e: web_sys::PointerEvent| {
-        let Some(body) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.body()) else { return };
+        let pointer_id = e.pointer_id();
 
-        // Check if we're dragging a piece
-        let Some(piece_id) = body.get_attribute("data-dragging-piece") else { return };
-        let start_pitch = body.get_attribute("data-drag-start-pitch")
-            .and_then(|s| s.parse::<i32>().ok())
-            .unwrap_or(0);
+        // Look up and remove drag state for this pointer
+        let drag_state = ACTIVE_DRAGS.with(|drags| drags.borrow_mut().remove(&pointer_id));
 
-        // Get start position for click detection
-        let start_x = body.get_attribute("data-drag-start-x")
-            .and_then(|s| s.parse::<i32>().ok())
-            .unwrap_or(0);
-        let start_y = body.get_attribute("data-drag-start-y")
-            .and_then(|s| s.parse::<i32>().ok())
-            .unwrap_or(0);
+        let Some(drag) = drag_state else { return };
 
-        // Clear drag state from body
-        body.remove_attribute("data-dragging-piece").ok();
-        body.remove_attribute("data-drag-start-pitch").ok();
-        body.remove_attribute("data-drag-start-x").ok();
-        body.remove_attribute("data-drag-start-y").ok();
+        let piece_id = drag.piece_id;
+        let start_pitch = drag.start_pitch;
+        let start_x = drag.start_x;
+        let start_y = drag.start_y;
 
         // Find the piece element
-        let Some(doc) = web_sys::window().and_then(|w| w.document()) else { return };
-        let Some(piece_el) = doc.query_selector(&format!("[data-piece-id='{}']", piece_id)).ok().flatten() else { return };
-        let Ok(piece_el) = piece_el.dyn_into::<HtmlElement>() else { return };
+        let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+            return;
+        };
+        let Some(piece_el) = doc
+            .query_selector(&format!("[data-piece-id='{}']", piece_id))
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        let Ok(piece_el) = piece_el.dyn_into::<HtmlElement>() else {
+            return;
+        };
+
+        // Release pointer capture
+        piece_el.release_pointer_capture(pointer_id).ok();
+        piece_el.remove_attribute("data-pointer-id").ok();
 
         // Check if this was a click (minimal movement) vs a drag
-        let dx = (e.x() - start_x).abs();
-        let dy = (e.y() - start_y).abs();
+        let dx = (e.client_x() - start_x).abs();
+        let dy = (e.client_y() - start_y).abs();
         let is_click = dx < 5 && dy < 5;
 
         // If click and pieces not locked, remove the piece
@@ -541,7 +811,7 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
             piece_el.remove_attribute("data-dragging").ok();
             piece_el.style().remove_property("position").ok();
             piece_el.style().remove_property("z-index").ok();
-            piece_el.style().remove_property("pointer-events").ok();
+            piece_el.style().remove_property("touch-action").ok();
             piece_el.style().remove_property("left").ok();
             piece_el.style().remove_property("top").ok();
             state_up.room_version.set(state_up.room_version.get() + 1);
@@ -550,69 +820,40 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
             return;
         }
 
-        // Otherwise handle as drag...
-
-        // Gather all possible drop targets
-        let hover_key = piece_el.get_attribute("data-hover-key")
-            .and_then(|s| s.parse::<i32>().ok());
-        let global_hover = get_hovered_key_note();
-        let pointerup_key = take_pointerup_key_note();
-
-        // Heuristic fallback: infer from drag vector
-        // For a radial keyboard, horizontal movement maps to key changes
+        // Get drop target using keyboard's getNoteAtPoint
         let tuning = state_up.tuning.lock_ref();
         let pc_count = tuning.pitch_class_count() as i32;
         drop(tuning);
 
+        let end_key = get_key_at_point(e.client_x(), e.client_y());
+
+        // Fallback: use drag vector heuristic
         let drag_dx = e.client_x() - start_x;
-        let drag_dy = e.client_y() - start_y;
-
-        // Estimate key offset from horizontal drag distance
-        // Roughly 30-40px per key on a typical keyboard display
-        let estimated_offset = if drag_dx.abs() > 20 {
-            (drag_dx as f32 / 35.0).round() as i32
-        } else {
-            0
-        };
-
         let start_pc = start_pitch.rem_euclid(pc_count);
-        let vector_key = if estimated_offset != 0 && estimated_offset.abs() <= MAX_DRAG_SEMITONES {
-            Some((start_pc + estimated_offset).rem_euclid(pc_count))
+
+        let vector_key = if drag_dx.abs() > 20 {
+            let estimated_offset = (drag_dx as f32 / 35.0).round() as i32;
+            if estimated_offset != 0 && estimated_offset.abs() <= MAX_DRAG_SEMITONES {
+                Some((start_pc + estimated_offset).rem_euclid(pc_count))
+            } else {
+                None
+            }
         } else {
             None
         };
 
-        // Use best available: hover > pointerup > vector heuristic
-        let end_key = global_hover.or(pointerup_key).or(hover_key).or(vector_key);
-
-        web_sys::console::log_1(&format!(
-            "[drop] hover={:?} pointerup={:?} vector={:?} (dx={}) -> end_key={:?}",
-            global_hover, pointerup_key, vector_key, drag_dx, end_key
-        ).into());
+        let final_key = end_key.or(vector_key);
 
         // Check if we have a valid drop target and compute new pitch
-        let new_pitch = if let Some(end_key) = end_key {
+        let new_pitch = if let Some(end_key) = final_key {
             let delta = shortest_delta(start_pc, end_key, pc_count);
-
-            web_sys::console::log_1(&format!(
-                "[drop] start_pc={} end_key={} delta={} MAX={}",
-                start_pc, end_key, delta, MAX_DRAG_SEMITONES
-            ).into());
 
             if delta.abs() <= MAX_DRAG_SEMITONES && delta != 0 {
                 // Valid move - update CRDT
                 let new_pitch = start_pitch + delta;
-                web_sys::console::log_1(&format!(
-                    "[drop] Moving piece {} from {} to {}",
-                    piece_id, start_pitch, new_pitch
-                ).into());
                 state_up.room.lock_mut().move_piece(&piece_id, new_pitch);
                 new_pitch
             } else {
-                web_sys::console::log_1(&format!(
-                    "[drop] REJECTED: delta={} (must be 1-{})",
-                    delta, MAX_DRAG_SEMITONES
-                ).into());
                 start_pitch // No change
             }
         } else {
@@ -623,40 +864,106 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
         let pitch_class = new_pitch.rem_euclid(pc_count);
         let key_index = LEFTMOST_KEY + pitch_class;
 
-        // Reset some styling immediately
+        // Reset styling
         piece_el.remove_attribute("data-dragging").ok();
         piece_el.style().remove_property("z-index").ok();
-        piece_el.style().remove_property("pointer-events").ok();
         piece_el.remove_attribute("data-hover-key").ok();
 
         // Remove data-positioned so keyboard will re-set it after positioning
         piece_el.remove_attribute("data-positioned").ok();
 
         // Update data-key - this triggers the keyboard's MutationObserver
-        // Ensure no data-pitch (pieces use data-key for discrete positioning)
         piece_el.remove_attribute("data-pitch").ok();
-        piece_el.set_attribute("data-key", &key_index.to_string()).ok();
-        piece_el.set_attribute("data-original-pitch", &new_pitch.to_string()).ok();
+        piece_el
+            .set_attribute("data-key", &key_index.to_string())
+            .ok();
+        piece_el
+            .set_attribute("data-original-pitch", &new_pitch.to_string())
+            .ok();
 
         // Defer removing fixed positioning until after MutationObserver runs
         let piece_el_defer = piece_el.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            // Wait a frame for MutationObserver to fire and keyboard to reposition
             gloo_timers::future::TimeoutFuture::new(0).await;
             piece_el_defer.style().remove_property("position").ok();
             piece_el_defer.style().remove_property("left").ok();
             piece_el_defer.style().remove_property("top").ok();
-            piece_el_defer.style().set_property("background", "#8b5cf6").ok();
-            piece_el_defer.style().set_property("box-shadow", "0 0 12px rgba(139, 92, 246, 0.6), 0 2px 8px rgba(0, 0, 0, 0.3)").ok();
+            piece_el_defer.style().remove_property("touch-action").ok();
+            // CSS .piece-indicator class handles background/box-shadow
         });
 
         state_up.room_version.set(state_up.room_version.get() + 1);
         sync_active_pitches(&state_up);
-        // Sync MIDI output for piece changes
         state_up.sync_midi_toggle_output();
     });
     let _ = document.add_event_listener_with_callback("pointerup", on_up.as_ref().unchecked_ref());
     on_up.forget();
+
+    // Also handle pointercancel (e.g., system gesture interrupts touch)
+    let state_cancel = state.clone();
+    let on_cancel =
+        Closure::<dyn Fn(web_sys::PointerEvent)>::new(move |e: web_sys::PointerEvent| {
+            let pointer_id = e.pointer_id();
+
+            // Look up and remove drag state for this pointer
+            let drag_state = ACTIVE_DRAGS.with(|drags| drags.borrow_mut().remove(&pointer_id));
+
+            let Some(drag) = drag_state else { return };
+
+            // Find and reset the piece element
+            let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+                return;
+            };
+            let Some(piece_el) = doc
+                .query_selector(&format!("[data-piece-id='{}']", drag.piece_id))
+                .ok()
+                .flatten()
+            else {
+                return;
+            };
+            let Ok(piece_el) = piece_el.dyn_into::<HtmlElement>() else {
+                return;
+            };
+
+            // Release capture and reset to original position
+            piece_el.release_pointer_capture(pointer_id).ok();
+            piece_el.remove_attribute("data-pointer-id").ok();
+            piece_el.remove_attribute("data-dragging").ok();
+            piece_el.remove_attribute("data-positioned").ok();
+            piece_el.style().remove_property("position").ok();
+            piece_el.style().remove_property("z-index").ok();
+            piece_el.style().remove_property("left").ok();
+            piece_el.style().remove_property("top").ok();
+            piece_el.style().remove_property("touch-action").ok();
+
+            // Restore original key position
+            let tuning = state_cancel.tuning.lock_ref();
+            let pc_count = tuning.pitch_class_count() as i32;
+            drop(tuning);
+            let pitch_class = drag.start_pitch.rem_euclid(pc_count);
+            let key_index = LEFTMOST_KEY + pitch_class;
+            piece_el
+                .set_attribute("data-key", &key_index.to_string())
+                .ok();
+        });
+    let _ = document
+        .add_event_listener_with_callback("pointercancel", on_cancel.as_ref().unchecked_ref());
+    on_cancel.forget();
+}
+
+/// Get the key (pitch class) at a given screen coordinate using keyboard's getNoteAtPoint
+fn get_key_at_point(x: i32, y: i32) -> Option<i32> {
+    let keyboard = get_keyboard()?;
+    let result = Reflect::get(&keyboard, &JsValue::from_str("getNoteAtPoint")).ok()?;
+    let func: js_sys::Function = result.dyn_into().ok()?;
+    let result = func
+        .call2(&keyboard, &JsValue::from(x), &JsValue::from(y))
+        .ok()?;
+    if result.is_null() || result.is_undefined() {
+        return None;
+    }
+    let note = Reflect::get(&result, &JsValue::from_str("note")).ok()?;
+    note.as_f64().map(|n| n as i32)
 }
 
 /// Set up keyboard event listeners.
@@ -666,40 +973,6 @@ fn setup_keyboard_events(state: Arc<AppState>) {
     setup_document_drag_handlers(state.clone());
 
     if let Some(kb) = get_keyboard() {
-        // Listen for keyhover events to track hovered key (used during drag)
-        let on_hover = Closure::<dyn Fn(web_sys::Event)>::new(move |event: web_sys::Event| {
-            if let Ok(detail) = Reflect::get(&event, &JsValue::from_str("detail")) {
-                if let Ok(note_val) = Reflect::get(&detail, &JsValue::from_str("note")) {
-                    if let Some(note) = note_val.as_f64() {
-                        HOVERED_KEY_NOTE.store(note as i32, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-            }
-        });
-        let _ = kb.add_event_listener_with_callback("keyhover", on_hover.as_ref().unchecked_ref());
-        on_hover.forget();
-
-        // Listen for keyunhover to clear hovered key
-        let on_unhover = Closure::<dyn Fn(web_sys::Event)>::new(move |_event: web_sys::Event| {
-            HOVERED_KEY_NOTE.store(-1, std::sync::atomic::Ordering::Relaxed);
-        });
-        let _ = kb.add_event_listener_with_callback("keyunhover", on_unhover.as_ref().unchecked_ref());
-        on_unhover.forget();
-
-        // Listen for keypointerup - fires when pointerup happens on a key
-        // Since piece has pointer-events: none during drag, this is our primary drop target
-        let on_keypointerup = Closure::<dyn Fn(web_sys::Event)>::new(move |event: web_sys::Event| {
-            if let Ok(detail) = Reflect::get(&event, &JsValue::from_str("detail")) {
-                if let Ok(note_val) = Reflect::get(&detail, &JsValue::from_str("note")) {
-                    if let Some(note) = note_val.as_f64() {
-                        POINTERUP_KEY_NOTE.store(note as i32, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-            }
-        });
-        let _ = kb.add_event_listener_with_callback("keypointerup", on_keypointerup.as_ref().unchecked_ref());
-        on_keypointerup.forget();
-
         // Listen for keyclick events (actual user clicks, not hover)
         let state_click = state.clone();
         let on_click = Closure::<dyn Fn(web_sys::Event)>::new(move |event: web_sys::Event| {
@@ -726,29 +999,53 @@ fn setup_keyboard_events(state: Arc<AppState>) {
                         // Handle piece mode vs toggle mode
                         if state_click.piece_mode.get() {
                             // Piece mode: toggle a piece at this pitch class (one per key)
-                            state_click.room.lock_mut().toggle_piece_at_pitch_class(note, count);
+                            state_click
+                                .room
+                                .lock_mut()
+                                .toggle_piece_at_pitch_class(note, count);
                             // Sync MIDI output for piece changes
                             state_click.sync_midi_toggle_output();
                         } else {
-                            // Toggle mode: existing behavior
-                            // Check if this is the voice pitch
-                            let is_voice_pitch = state_click.voice_pitch.get() == Some(pc);
+                            // Toggle mode: check pieces, voices, then manual pitches
+                            // Priority: piece > any voice > manual pitch
 
-                            if is_voice_pitch {
-                                // Clicking voice pitch clears it
-                                state_click.voice_pitch.set(None);
-                                state_click.room.lock_mut().set_voice_pitchclass(None);
-                                state_click.sync_midi_voice_output();
-                            } else {
-                                // Toggle the pitch in room state (manual pitches)
-                                state_click.room.lock_mut().toggle_pitch(pc);
-                                // Sync MIDI toggle output
+                            // Check if there's a piece at this pitch class
+                            let has_piece = state_click
+                                .room
+                                .lock_ref()
+                                .find_piece_by_pitch_class(note, count)
+                                .is_some();
+
+                            if has_piece {
+                                // Remove the piece
+                                state_click
+                                    .room
+                                    .lock_mut()
+                                    .toggle_piece_at_pitch_class(note, count);
                                 state_click.sync_midi_toggle_output();
+                            } else {
+                                // Check if any peer has a voice at this pitch class
+                                let voice_cleared =
+                                    state_click.room.lock_mut().clear_voice_at_pitch_class(pc);
+
+                                if voice_cleared {
+                                    // Also clear local voice state if it was ours
+                                    if state_click.voice_pitch.get() == Some(pc) {
+                                        state_click.voice_pitch.set(None);
+                                    }
+                                    state_click.sync_midi_voice_output();
+                                } else {
+                                    // No piece or voice - toggle manual pitch
+                                    state_click.room.lock_mut().toggle_pitch(pc);
+                                    state_click.sync_midi_toggle_output();
+                                }
                             }
                         }
 
                         // Increment room_version to trigger UI updates
-                        state_click.room_version.set(state_click.room_version.get() + 1);
+                        state_click
+                            .room_version
+                            .set(state_click.room_version.get() + 1);
                         // Re-sync keyboard to reflect new state
                         sync_active_pitches(&state_click);
                     }
@@ -756,10 +1053,7 @@ fn setup_keyboard_events(state: Arc<AppState>) {
             }
         });
 
-        let _ = kb.add_event_listener_with_callback(
-            "keyclick",
-            on_click.as_ref().unchecked_ref(),
-        );
+        let _ = kb.add_event_listener_with_callback("keyclick", on_click.as_ref().unchecked_ref());
         on_click.forget();
     }
 }

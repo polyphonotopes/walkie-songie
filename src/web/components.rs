@@ -40,8 +40,15 @@ pub fn voice_button(state: Arc<AppState>) -> Dom {
     html!("button", {
         .class("voice-button")
         .class_signal("active", state.voice_active.signal())
-        .text_signal(state.voice_active.signal().map(|active| {
-            if active { "🗣️ Singing..." } else { "🗣️ Hold to Sing" }
+        .child(html!("span", {
+            .class("voice-emoji")
+            .text("🗣️")
+        }))
+        .child(html!("span", {
+            .class("voice-text")
+            .text_signal(state.voice_active.signal().map(|active| {
+                if active { " Singing..." } else { " Hold to Sing" }
+            }))
         }))
         .event(clone!(state => move |_: events::PointerDown| {
             state.start_voice();

@@ -43,6 +43,8 @@ yrs = "0.21"
 
 # Pitch detection: SwiftF0 ML model via onnxruntime-web JS bridge (no Rust ML deps needed)
 
+# No build dependencies - palette.css is copied directly
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.32", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 futures = "0.3"
@@ -74,6 +76,7 @@ gloo-timers = { version = "0.3", features = ["futures"] }
 web-sys = { version = "0.3", features = [
     "Window", "Location", "console",
     "Document", "Element", "HtmlElement", "HtmlButtonElement", "HtmlTextAreaElement", "HtmlInputElement", "HtmlSelectElement",
+    "HtmlCollection", "DomTokenList", "NodeList",
     "AudioContext", "AudioContextState", "AudioWorklet", "AudioWorkletNode", "AudioWorkletNodeOptions",
     "MediaDevices", "MediaStream", "MediaStreamConstraints", "MediaStreamTrack",
     "MediaStreamAudioSourceNode", "ScriptProcessorNode", "AudioProcessingEvent",
