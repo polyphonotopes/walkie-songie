@@ -18,7 +18,7 @@ use crate::tuning::{PitchClass, Tuning};
 use crate::words::generate_room_name;
 
 use super::audio::WebAudioInput;
-use super::components::{clear_button, piece_mode_button, pitch_display, room_header_button, room_overlay, tuning_editor, voice_button};
+use super::components::{clear_button, emoji_picker, lock_button, pitch_display, room_header_button, room_overlay, tuning_editor, voice_button};
 use super::keyboard::{pitch_keyboard, sync_active_pitches};
 use super::midi::{init_midi, MidiManager, pitch_class_to_midi_note, midi_note_to_pitch_class};
 use super::libp2p_sync::start_libp2p_room_sync;
@@ -100,10 +100,10 @@ pub struct AppState {
     /// Room state version - incremented on every change (local or remote).
     /// UI components subscribe to this to know when to refresh.
     pub room_version: Mutable<u64>,
-    /// Whether piece mode is active (shows draggable pieces instead of toggle mode).
-    pub piece_mode: Mutable<bool>,
-    /// Whether pieces are locked (can't add/remove, only drag to move).
+    /// Whether pieces are locked (can't drag to move or delete via hole).
     pub pieces_locked: Mutable<bool>,
+    /// Index of currently selected emoji in the picker (for prev/next navigation).
+    pub selected_emoji_idx: Mutable<usize>,
 }
 
 impl AppState {
@@ -145,8 +145,8 @@ impl AppState {
             midi_input_id: Mutable::new(None),
             midi_output_id: Mutable::new(None),
             room_version: Mutable::new(0),
-            piece_mode: Mutable::new(false), // Start in toggle mode
-            pieces_locked: Mutable::new(false), // Pieces can be added/removed
+            pieces_locked: Mutable::new(false), // Pieces can be dragged/deleted
+            selected_emoji_idx: Mutable::new(0),
         })
     }
 
@@ -639,12 +639,26 @@ fn render_app(state: Arc<AppState>) -> Dom {
     html!("div", {
         .class("app")
         .children(&mut [
-            // Compact header with room button
+            // Header: title + room button + room controls
             html!("header", {
                 .class("header")
                 .children(&mut [
-                    html!("h1", { .text("Walkie Songie") }),
-                    room_header_button(state.clone()),
+                    // Left: title + room
+                    html!("div", {
+                        .class("header-left")
+                        .children(&mut [
+                            html!("span", { .class("title").text("Walkie Songie") }),
+                            room_header_button(state.clone()),
+                        ])
+                    }),
+                    // Right: room controls
+                    html!("div", {
+                        .class("header-right")
+                        .children(&mut [
+                            lock_button(state.clone()),
+                            clear_button(state.clone()),
+                        ])
+                    }),
                 ])
             }),
 
@@ -668,13 +682,12 @@ fn render_app(state: Arc<AppState>) -> Dom {
                         ])
                     }),
 
-                    // Voice, clear, and mode buttons
+                    // Sing button + emoji picker row
                     html!("div", {
                         .class("button-row")
                         .children(&mut [
                             voice_button(state.clone()),
-                            clear_button(state.clone()),
-                            piece_mode_button(state.clone()),
+                            emoji_picker(state.clone()),
                         ])
                     }),
 

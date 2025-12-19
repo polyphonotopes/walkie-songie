@@ -227,13 +227,13 @@ all-around-keyboard svg {
     vertical-align: middle;
 }
 
-/* Clear Button */
+/* Clear Button (header) */
 .clear-button {
-    padding: 1rem 1.5rem;
-    font-size: 1.25rem;
+    padding: 0.5rem 0.75rem;
+    font-size: 1rem;
     font-weight: 600;
     border: 2px solid var(--text-secondary);
-    border-radius: 12px;
+    border-radius: 8px;
     background: transparent;
     color: var(--text-primary);
     cursor: pointer;
@@ -245,54 +245,115 @@ all-around-keyboard svg {
     background: color-mix(in oklch, var(--manual) 15%, transparent);
 }
 
-/* Piece Mode Button */
-.piece-mode-button {
-    padding: 1rem 1.5rem;
-    font-size: 1rem;
-    font-weight: 600;
+/* Emoji Picker - three-part segmented control */
+.emoji-picker {
+    display: flex;
+    align-items: stretch;
+    min-width: 33%;
+    background: color-mix(in oklch, var(--bg-secondary) 80%, transparent);
     border: 2px solid var(--text-secondary);
     border-radius: 12px;
-    background: transparent;
-    color: var(--text-primary);
-    cursor: pointer;
-    transition: all 0.2s ease;
+    overflow: hidden;
 }
 
-.piece-mode-button:hover {
-    border-color: var(--piece);
+.emoji-nav-btn {
+    flex: 1;
+    min-width: 44px;
+    font-size: 1.1rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.emoji-nav-btn:first-child {
+    border-right: 1px solid var(--text-secondary);
+}
+
+.emoji-nav-btn:last-child {
+    border-left: 1px solid var(--text-secondary);
+}
+
+.emoji-nav-btn:hover {
+    color: var(--piece);
     background: color-mix(in oklch, var(--piece) 15%, transparent);
 }
 
-.piece-mode-button.active {
-    border-color: var(--piece);
-    background: var(--piece);
-    color: white;
+.emoji-nav-btn:active {
+    background: color-mix(in oklch, var(--piece) 25%, transparent);
 }
 
-/* Piece mode container - holds mode button and lock button */
-.piece-mode-container {
+.emoji-picker-current {
+    flex: 1.5;
     display: flex;
-    gap: 0.5rem;
     align-items: center;
+    justify-content: center;
+    padding: 0.25rem;
 }
 
-/* Piece lock button */
-.piece-lock-button {
-    padding: 0.75rem 1rem;
+.emoji-picker-item {
+    width: 100%;
+    height: 100%;
+    min-height: 44px;
+    font-size: 1.8rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: none;
+    cursor: grab;
+    user-select: none;
+    transition: all 0.15s ease;
+}
+
+.emoji-picker-item:hover {
+    background: color-mix(in oklch, var(--piece) 15%, transparent);
+    transform: scale(1.1);
+}
+
+.emoji-picker-item:active {
+    cursor: grabbing;
+}
+
+/* Emoji drag ghost - follows pointer during touch drag */
+.emoji-drag-ghost {
+    position: fixed;
+    width: 40px;
+    height: 40px;
+    font-size: 2rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg-primary);
+    border: 2px solid var(--piece);
+    border-radius: 50%;
+    pointer-events: none;
+    z-index: 1000;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    opacity: 0.9;
+}
+
+/* Lock button - locks both toggles and pieces */
+.lock-button {
+    padding: 0.5rem 0.75rem;
     font-size: 1.2rem;
     border: 2px solid var(--text-secondary);
-    border-radius: 12px;
+    border-radius: 8px;
     background: transparent;
     cursor: pointer;
     transition: all 0.2s ease;
 }
 
-.piece-lock-button:hover {
-    border-color: var(--piece);
-    background: color-mix(in oklch, var(--piece) 15%, transparent);
+.lock-button:hover {
+    border-color: var(--sunny);
+    background: color-mix(in oklch, var(--sunny) 15%, transparent);
 }
 
-.piece-lock-button.locked {
+.lock-button.locked {
     border-color: var(--accent);
     background: color-mix(in oklch, var(--accent) 20%, transparent);
 }
@@ -306,19 +367,46 @@ all-around-keyboard svg {
     width: 48px;
     height: 48px;
     border-radius: 50%;
-    background: var(--piece);
-    border: 2px solid var(--bg-primary);
+    background: var(--bg-primary);
+    border: 3px solid var(--piece);
     box-shadow: 0 0 12px color-mix(in oklch, var(--piece) 60%, transparent), 0 2px 8px rgba(0, 0, 0, 0.3);
     cursor: grab;
     user-select: none;
     touch-action: none;
     pointer-events: auto;
     z-index: 100;
+    /* Center the emoji text */
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.8rem;
+    line-height: 1;
 }
 
 @keyframes pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.8; }
+}
+
+/* Delete hole - appears during piece drag for drag-to-delete */
+.delete-hole {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    font-size: 80px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 200;
+    pointer-events: auto;
+    animation: hole-fade-in 0.4s ease-out forwards;
+    opacity: 0;
+}
+
+@keyframes hole-fade-in {
+    from { opacity: 0; }
+    to { opacity: 0.85; }
 }
 
 /* Voice Indicator (shout emoji on keyboard) */
@@ -481,23 +569,39 @@ all-around-keyboard svg {
     background: color-mix(in oklch, var(--accent) 10%, transparent);
 }
 
-/* Room Header Button */
+/* Header Layout */
 .header {
     display: flex;
     justify-content: space-between;
     align-items: center;
+    gap: 0.5rem;
 }
 
-.room-header-button {
+.header-left {
     display: flex;
     align-items: center;
     gap: 0.5rem;
-    padding: 0.4rem 0.8rem;
-    font-size: 0.85rem;
+}
+
+.header-left .title {
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+}
+
+.header-right {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+/* Room Header Button - icon only */
+.room-header-button {
+    padding: 0.4rem 0.6rem;
+    font-size: 1.2rem;
     border: 2px solid var(--text-secondary);
     border-radius: 8px;
     background: transparent;
-    color: var(--text-primary);
     cursor: pointer;
     transition: all 0.15s ease;
 }
@@ -505,19 +609,6 @@ all-around-keyboard svg {
 .room-header-button:hover {
     border-color: var(--voice);
     background: color-mix(in oklch, var(--voice) 10%, transparent);
-}
-
-.room-header-button .qr-icon {
-    font-size: 1rem;
-}
-
-.room-header-button .room-name {
-    font-family: 'SF Mono', 'Consolas', monospace;
-    font-size: 0.8rem;
-    max-width: 180px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
 }
 
 /* Room Overlay */

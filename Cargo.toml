@@ -37,6 +37,7 @@ thiserror = "2.0"
 tracing = "0.1"
 rand = "0.9"
 qrcode = "0.14"
+unicode-segmentation = "1.11"
 
 # CRDT
 yrs = "0.21"
@@ -85,7 +86,8 @@ web-sys = { version = "0.3", features = [
     "MessagePort", "MessageEvent", "EventTarget", "InputEvent",
     "MidiAccess", "MidiInput", "MidiInputMap", "MidiOutput", "MidiOutputMap", "MidiMessageEvent", "MidiOptions",
     "KeyboardEvent", "FocusEvent", "PointerEvent", "DomRect",
-    "MutationObserver", "MutationObserverInit", "MutationRecord"
+    "MutationObserver", "MutationObserverInit", "MutationRecord",
+    "DragEvent", "DataTransfer"
 ] }
 console_error_panic_hook = "0.1"
 tracing-wasm = "0.2"

@@ -28,19 +28,23 @@ const KEY_PITCH_SETS: &str = "pitch_sets";  // Legacy per-peer sets (unused now)
 const KEY_SHARED_PITCHES: &str = "shared_pitches";  // Shared pitch set (anyone can add/remove)
 const KEY_COMBINATION_METHOD: &str = "combination_method";
 const KEY_VOICE_STATE: &str = "voice_state";
-const KEY_PIECES: &str = "pieces";  // Draggable pieces with absolute pitch (YMap<piece_id, pitch>)
-const KEY_PIECES_LOCKED: &str = "pieces_locked";  // Boolean - whether pieces can be added/removed
-const KEY_PIECE_MODE: &str = "piece_mode";  // Boolean - true for piece mode, false for toggle mode
+const KEY_PIECES: &str = "pieces";  // Draggable emoji pieces (YMap<piece_id, YMap{pitch, emoji}>)
+const KEY_PIECES_LOCKED: &str = "pieces_locked";  // Boolean - whether pieces can be added/removed (drag lock)
+const KEY_AVAILABLE_EMOJIS: &str = "available_emojis";  // Emoji strings for the picker (joined graphemes)
+
+/// Default emojis available in new rooms
+const DEFAULT_EMOJIS: &[&str] = &["🪨", "🥜", "🐚", "🌱", "🫟", "🌀", "✳️", "🫯", "🧶", "🐟", "🦠", "🥑"];
 
 /// Keys within each peer's voice state map.
 const VOICE_PITCH: &str = "pitch";        // i32 - absolute pitch number (like MIDI note, no modulus)
 const VOICE_PITCHCLASS: &str = "pitchclass";  // u8 - the quantized pitch class (pitch % scale_size)
 
-/// A draggable piece with an absolute pitch (includes octave).
+/// A draggable emoji piece with an absolute pitch (includes octave).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Piece {
     pub id: String,
-    pub pitch: i32,  // Absolute pitch like MIDI note (60 = C4)
+    pub pitch: i32,    // Absolute pitch like MIDI note (60 = C4)
+    pub emoji: String, // The emoji character (e.g., "🪨")
 }
 
 impl Piece {
@@ -590,16 +594,21 @@ impl YrsRoomState {
         true
     }
 
-    // ========== Piece Methods (draggable pieces with absolute pitch) ==========
+    // ========== Piece Methods (draggable emoji pieces with absolute pitch) ==========
 
-    /// Add a new piece at the given absolute pitch. Returns the piece ID.
-    pub fn add_piece(&mut self, pitch: i32) -> String {
+    /// Add a new emoji piece at the given absolute pitch. Returns the piece ID.
+    pub fn add_piece(&mut self, pitch: i32, emoji: &str) -> String {
         let id = uuid::Uuid::new_v4().to_string();
-        debug!("[CRDT] add_piece(pitch={}) -> id={}", pitch, id);
+        debug!("[CRDT] add_piece(pitch={}, emoji={}) -> id={}", pitch, emoji, id);
 
         let mut txn = self.doc.transact_mut();
         let pieces: MapRef = txn.get_or_insert_map(KEY_PIECES);
-        pieces.insert(&mut txn, id.clone(), pitch as i64);
+
+        // Store piece data as nested map: { pitch: i64, emoji: String }
+        let piece_data: MapRef = pieces.insert(&mut txn, id.clone(), MapPrelim::default());
+        piece_data.insert(&mut txn, "pitch", pitch as i64);
+        piece_data.insert(&mut txn, "emoji", emoji);
+
         drop(txn);
         self.notify();
 
@@ -624,9 +633,11 @@ impl YrsRoomState {
         let mut txn = self.doc.transact_mut();
         let pieces: MapRef = txn.get_or_insert_map(KEY_PIECES);
 
-        // Only move if piece exists
-        if pieces.get(&txn, piece_id).is_some() {
-            pieces.insert(&mut txn, piece_id, new_pitch as i64);
+        // Only move if piece exists - update the pitch in nested map
+        if let Some(piece_value) = pieces.get(&txn, piece_id) {
+            if let Ok(piece_map) = piece_value.cast::<MapRef>() {
+                piece_map.insert(&mut txn, "pitch", new_pitch as i64);
+            }
         }
         drop(txn);
         self.notify();
@@ -643,10 +654,13 @@ impl YrsRoomState {
         pieces
             .iter(&txn)
             .filter_map(|(id, value)| {
-                let pitch = value.cast::<i64>().ok()? as i32;
+                let piece_map = value.cast::<MapRef>().ok()?;
+                let pitch = piece_map.get(&txn, "pitch")?.cast::<i64>().ok()? as i32;
+                let emoji = piece_map.get(&txn, "emoji")?.cast::<String>().ok()?;
                 Some(Piece {
                     id: id.to_string(),
                     pitch,
+                    emoji,
                 })
             })
             .collect()
@@ -657,10 +671,13 @@ impl YrsRoomState {
         let txn = self.doc.transact();
         let pieces: MapRef = txn.get_map(KEY_PIECES)?;
 
-        let pitch = pieces.get(&txn, piece_id)?.cast::<i64>().ok()? as i32;
+        let piece_map = pieces.get(&txn, piece_id)?.cast::<MapRef>().ok()?;
+        let pitch = piece_map.get(&txn, "pitch")?.cast::<i64>().ok()? as i32;
+        let emoji = piece_map.get(&txn, "emoji")?.cast::<String>().ok()?;
         Some(Piece {
             id: piece_id.to_string(),
             pitch,
+            emoji,
         })
     }
 
@@ -688,23 +705,6 @@ impl YrsRoomState {
             .find(|p| p.pitch_class(notes_per_octave) == target_pc)
     }
 
-    /// Toggle a piece at the given pitch class.
-    /// If a piece exists at that pitch class, remove it.
-    /// If no piece exists, add one at the default octave (middle C range).
-    /// Returns true if a piece was added, false if removed.
-    pub fn toggle_piece_at_pitch_class(&mut self, pitch_class: u8, notes_per_octave: u8) -> bool {
-        if let Some(piece) = self.find_piece_by_pitch_class(pitch_class, notes_per_octave) {
-            self.remove_piece(&piece.id);
-            false
-        } else {
-            // Add piece at middle C octave (60 + pitch_class for 12-TET)
-            let base_pitch = 60i32 - (60i32 % notes_per_octave as i32);
-            let pitch = base_pitch + pitch_class as i32;
-            self.add_piece(pitch);
-            true
-        }
-    }
-
     // ========== Pieces Lock State ==========
 
     /// Get whether pieces are locked (can't be added/removed).
@@ -728,23 +728,46 @@ impl YrsRoomState {
         self.notify();
     }
 
-    /// Get whether piece mode is active (vs toggle mode).
-    pub fn piece_mode(&self) -> bool {
+    // ========== Available Emojis ==========
+
+    /// Get the list of available emojis for the picker.
+    /// Returns defaults if none set.
+    pub fn available_emojis(&self) -> Vec<String> {
         let txn = self.doc.transact();
         let meta: MapRef = match txn.get_map(KEY_COMBINATION_METHOD) {
             Some(m) => m,
-            None => return false,
+            None => return DEFAULT_EMOJIS.iter().map(|s| s.to_string()).collect(),
         };
-        meta.get(&txn, KEY_PIECE_MODE)
-            .and_then(|v| v.cast::<bool>().ok())
-            .unwrap_or(false)
+
+        // Try to get stored emojis as joined string
+        if let Some(emojis_str) = meta.get(&txn, KEY_AVAILABLE_EMOJIS).and_then(|v| v.cast::<String>().ok()) {
+            if emojis_str.is_empty() {
+                return DEFAULT_EMOJIS.iter().map(|s| s.to_string()).collect();
+            }
+            // Split by grapheme clusters (emojis can be multiple codepoints)
+            use unicode_segmentation::UnicodeSegmentation;
+            emojis_str.graphemes(true).map(|s| s.to_string()).collect()
+        } else {
+            DEFAULT_EMOJIS.iter().map(|s| s.to_string()).collect()
+        }
     }
 
-    /// Set whether piece mode is active.
-    pub fn set_piece_mode(&mut self, piece_mode: bool) {
+    /// Add an emoji to the available emojis list.
+    pub fn add_emoji_to_palette(&mut self, emoji: &str) {
+        let mut emojis = self.available_emojis();
+        if !emojis.contains(&emoji.to_string()) {
+            emojis.push(emoji.to_string());
+            self.set_available_emojis(&emojis);
+        }
+    }
+
+    /// Set the available emojis list.
+    fn set_available_emojis(&mut self, emojis: &[String]) {
         let mut txn = self.doc.transact_mut();
         let meta: MapRef = txn.get_or_insert_map(KEY_COMBINATION_METHOD);
-        meta.insert(&mut txn, KEY_PIECE_MODE, piece_mode);
+        // Store as joined string (grapheme-safe)
+        let emojis_str = emojis.join("");
+        meta.insert(&mut txn, KEY_AVAILABLE_EMOJIS, emojis_str);
         drop(txn);
         self.notify();
     }
@@ -935,18 +958,20 @@ mod tests {
         // Initially empty
         assert!(state.all_pieces().is_empty());
 
-        // Add a piece at middle C (60)
-        let id = state.add_piece(60);
+        // Add a piece at middle C (60) with rock emoji
+        let id = state.add_piece(60, "🪨");
 
         // Should have one piece
         let pieces = state.all_pieces();
         assert_eq!(pieces.len(), 1);
         assert_eq!(pieces[0].id, id);
         assert_eq!(pieces[0].pitch, 60);
+        assert_eq!(pieces[0].emoji, "🪨");
 
         // Get specific piece
         let piece = state.get_piece(&id).unwrap();
         assert_eq!(piece.pitch, 60);
+        assert_eq!(piece.emoji, "🪨");
 
         // Move the piece to D (62)
         state.move_piece(&id, 62);
@@ -965,7 +990,7 @@ mod tests {
         let mut state2 = YrsRoomState::new("peer2".to_string());
 
         // Peer 1 adds a piece
-        let id = state1.add_piece(60);
+        let id = state1.add_piece(60, "🥜");
 
         // Sync state1 -> state2
         let update = state1.encode_state_as_update();
@@ -976,6 +1001,7 @@ mod tests {
         assert_eq!(pieces.len(), 1);
         assert_eq!(pieces[0].id, id);
         assert_eq!(pieces[0].pitch, 60);
+        assert_eq!(pieces[0].emoji, "🥜");
 
         // Peer 2 moves the piece
         state2.move_piece(&id, 72);
@@ -994,9 +1020,9 @@ mod tests {
         let mut state = YrsRoomState::new("peer1".to_string());
 
         // Add multiple pieces
-        state.add_piece(60);
-        state.add_piece(64);
-        state.add_piece(67);
+        state.add_piece(60, "🪨");
+        state.add_piece(64, "🥜");
+        state.add_piece(67, "🐚");
         assert_eq!(state.all_pieces().len(), 3);
 
         // Clear all

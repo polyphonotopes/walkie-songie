@@ -21,7 +21,7 @@ use crate::tuning::{PitchClass, Tuning};
 
 use super::app::AppState;
 
-/// State for a single pointer drag operation
+/// State for a single pointer drag operation (existing piece)
 #[derive(Clone)]
 struct DragState {
     piece_id: String,
@@ -30,9 +30,19 @@ struct DragState {
     start_y: i32,
 }
 
+/// State for dragging a new emoji from the picker
+#[derive(Clone)]
+struct EmojiDragState {
+    emoji: String,
+    start_x: i32,
+    start_y: i32,
+}
+
 thread_local! {
     /// Track active drags by pointerId for multitouch support
     static ACTIVE_DRAGS: RefCell<HashMap<i32, DragState>> = RefCell::new(HashMap::new());
+    /// Track emoji drags from picker
+    static EMOJI_DRAGS: RefCell<HashMap<i32, EmojiDragState>> = RefCell::new(HashMap::new());
 }
 
 /// Reference frequency for A4 (standard tuning).
@@ -48,6 +58,55 @@ fn get_keyboard() -> Option<HtmlElement> {
         .query_selector("all-around-keyboard")
         .ok()?
         .map(|el| el.unchecked_into())
+}
+
+/// Show the delete hole in the center of the keyboard.
+fn show_delete_hole() {
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+
+    // Check if hole already exists
+    if document.get_element_by_id("delete-hole").is_some() {
+        return;
+    }
+
+    let Some(keyboard) = get_keyboard() else { return };
+
+    // Create hole element
+    let hole: HtmlElement = document.create_element("div").unwrap().unchecked_into();
+    hole.set_id("delete-hole");
+    hole.set_class_name("delete-hole");
+    hole.set_text_content(Some("🕳️"));
+
+    // Append to keyboard
+    keyboard.append_child(&hole).ok();
+}
+
+/// Hide the delete hole.
+fn hide_delete_hole() {
+    if let Some(hole) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("delete-hole"))
+    {
+        hole.remove();
+    }
+}
+
+/// Check if a point is over the delete hole.
+fn is_over_delete_hole(x: i32, y: i32) -> bool {
+    let Some(hole) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("delete-hole"))
+    else {
+        return false;
+    };
+
+    let rect = hole.get_bounding_client_rect();
+    let px = x as f64;
+    let py = y as f64;
+
+    px >= rect.left() && px <= rect.right() && py >= rect.top() && py <= rect.bottom()
 }
 
 /// Set an attribute on the keyboard element.
@@ -112,38 +171,34 @@ pub fn compute_raised_notes(tuning: &Tuning) -> Vec<u8> {
 }
 
 /// Sync keyboard state with active pitches from ALL peers.
-/// - Combined pitches from all peers + pieces show as "pressed" (using overlays for toggles)
-/// - Local voice pitch shows as "lit" (green)
+/// - Toggle pitches show with sunny/manual overlay
+/// - Emoji pieces show as emoji indicators on keys
+/// - Voice pitches show with wavy overlay and shout emoji
 pub fn sync_active_pitches(state: &Arc<AppState>) {
     let room = state.room.lock_ref();
     let tuning = state.tuning.lock_ref();
     let pc_count = tuning.pitch_class_count() as i32;
     drop(tuning);
 
-    // Get combined pitch result from all peers (uses combination method)
-    let room_result = room.compute_room_result();
-
-    // Start with pitches from peers (manual toggles)
-    let toggle_notes: Vec<u8> = room_result
-        .pitch_classes
+    // Toggle pitch classes (manual/ambient toggles)
+    let toggle_notes: Vec<u8> = room
+        .shared_pitches()
         .iter()
         .map(|pc| pc.index())
         .collect();
+    sync_toggle_overlays(&toggle_notes);
 
-    // Piece pitch classes (shown separately, not as toggles)
+    // Piece pitch classes (emoji pieces)
     let pieces = room.all_pieces();
     let piece_notes: Vec<u8> = pieces
         .iter()
         .map(|p| p.pitch.rem_euclid(pc_count) as u8)
         .collect();
 
-    // Update toggle overlays (dot pattern for manual toggles)
-    sync_toggle_overlays(&toggle_notes);
-
-    // Update piece overlays (piece-dots pattern)
+    // Update piece overlays (piece-dots pattern for key highlight)
     sync_piece_overlays(&piece_notes);
 
-    // Clear pressed notes (we use overlays now)
+    // Clear pressed notes (pieces are shown as emoji indicators)
     set_pressed_notes(&[]);
 
     // Voice pitch classes from all peers (wavy overlay with shout emoji)
@@ -158,28 +213,26 @@ pub fn sync_active_pitches(state: &Arc<AppState>) {
     set_lit_notes(&[]);
 }
 
-/// Sync toggle overlay elements for manual pitch toggles.
-/// Creates/removes overlay elements with data-key-overlay attribute.
+/// Sync toggle overlay elements for toggled/manual pitch classes.
+/// Creates/removes overlay elements with data-key-overlay attribute and toggle-lines pattern.
 fn sync_toggle_overlays(notes: &[u8]) {
     let Some(kb) = get_keyboard() else { return };
-    let document = web_sys::window().unwrap().document().unwrap();
 
-    // Get existing overlay elements
+    // Get existing toggle overlay elements
     let existing: web_sys::NodeList = kb.query_selector_all(".toggle-overlay").unwrap();
-    let mut existing_keys: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    let existing_count = existing.length();
 
-    // Build set of current key indices
-    let current_keys: std::collections::HashSet<i32> =
-        notes.iter().map(|&n| LEFTMOST_KEY + n as i32).collect();
+    let note_set: std::collections::HashSet<u8> = notes.iter().copied().collect();
+    let mut existing_notes: std::collections::HashSet<u8> = std::collections::HashSet::new();
 
     // Remove overlays for notes no longer active, track existing ones
-    for i in 0..existing.length() {
-        if let Some(node) = existing.item(i) {
+    for i in 0..existing_count {
+        if let Some(node) = existing.get(i) {
             let el: web_sys::Element = node.unchecked_into();
             if let Some(key_str) = el.get_attribute("data-key-overlay") {
-                if let Ok(key) = key_str.parse::<i32>() {
-                    if current_keys.contains(&key) {
-                        existing_keys.insert(key);
+                if let Ok(key) = key_str.parse::<u8>() {
+                    if note_set.contains(&key) {
+                        existing_notes.insert(key);
                     } else {
                         el.remove();
                     }
@@ -190,15 +243,14 @@ fn sync_toggle_overlays(notes: &[u8]) {
 
     // Add overlays for new active notes
     for &note in notes {
-        let key_index = LEFTMOST_KEY + note as i32;
-        if !existing_keys.contains(&key_index) {
-            // Create new overlay element
+        if !existing_notes.contains(&note) {
+            let key_index = LEFTMOST_KEY + note as i32;
+            let document = web_sys::window().unwrap().document().unwrap();
             let el = document.create_element("div").unwrap();
             el.set_class_name("toggle-overlay");
             el.set_attribute("data-key-overlay", &key_index.to_string())
                 .ok();
-            // Specify which pattern to use (defined in slot)
-            el.set_attribute("data-overlay-pattern", "manual-lines").ok();
+            el.set_attribute("data-overlay-pattern", "toggle-lines").ok();
             kb.append_child(&el).ok();
         }
     }
@@ -354,24 +406,7 @@ fn create_overlay_patterns(keyboard: &web_sys::HtmlElement) {
     svg.set_attribute("slot", "overlay-pattern").ok();
     svg.set_attribute("style", "display: none").ok();
 
-    // Manual toggle pattern - diagonal lines in sunny yellow
-    let pattern1 = document.create_element_ns(Some(SVG_NS), "pattern").unwrap();
-    pattern1.set_attribute("id", "manual-lines").ok();
-    pattern1
-        .set_attribute("patternUnits", "userSpaceOnUse")
-        .ok();
-    pattern1.set_attribute("width", "8").ok();
-    pattern1.set_attribute("height", "8").ok();
-    // Diagonal line from bottom-left to top-right
-    let line1 = document.create_element_ns(Some(SVG_NS), "path").unwrap();
-    line1.set_attribute("d", "M0,8 L8,0 M-2,2 L2,-2 M6,10 L10,6").ok();
-    line1.set_attribute("stroke", "var(--sunny)").ok();
-    line1.set_attribute("stroke-width", "2").ok();
-    line1.set_attribute("stroke-opacity", "0.6").ok();
-    pattern1.append_child(&line1).ok();
-    svg.append_child(&pattern1).ok();
-
-    // Piece pattern - larger dots
+    // Piece pattern - dots for key highlight when piece is on key
     let pattern2 = document.create_element_ns(Some(SVG_NS), "pattern").unwrap();
     pattern2.set_attribute("id", "piece-dots").ok();
     pattern2
@@ -405,6 +440,28 @@ fn create_overlay_patterns(keyboard: &web_sys::HtmlElement) {
     wave.set_attribute("stroke-opacity", "0.6").ok();
     pattern3.append_child(&wave).ok();
     svg.append_child(&pattern3).ok();
+
+    // Toggle pattern - diagonal lines (sunny/manual)
+    let pattern4 = document.create_element_ns(Some(SVG_NS), "pattern").unwrap();
+    pattern4.set_attribute("id", "toggle-lines").ok();
+    pattern4
+        .set_attribute("patternUnits", "userSpaceOnUse")
+        .ok();
+    pattern4.set_attribute("width", "8").ok();
+    pattern4.set_attribute("height", "8").ok();
+    pattern4
+        .set_attribute("patternTransform", "rotate(45)")
+        .ok();
+    let line = document.create_element_ns(Some(SVG_NS), "line").unwrap();
+    line.set_attribute("x1", "0").ok();
+    line.set_attribute("y1", "0").ok();
+    line.set_attribute("x2", "0").ok();
+    line.set_attribute("y2", "8").ok();
+    line.set_attribute("stroke", "var(--sunny)").ok();
+    line.set_attribute("stroke-width", "3").ok();
+    line.set_attribute("stroke-opacity", "0.5").ok();
+    pattern4.append_child(&line).ok();
+    svg.append_child(&pattern4).ok();
 
     keyboard.append_child(&svg).ok();
 }
@@ -513,17 +570,13 @@ fn setup_piece_sync(state: Arc<AppState>, keyboard_el: web_sys::HtmlElement) {
 
         // Process each room_version change
         futures_signals::signal::SignalExt::for_each(signal, move |_version| {
-            // Sync piece_mode and pieces_locked from CRDT to AppState
+            // Sync pieces_locked from CRDT to AppState
             {
                 let room = state_clone.room.lock_ref();
-                let crdt_piece_mode = room.piece_mode();
                 let crdt_pieces_locked = room.pieces_locked();
                 drop(room);
 
                 // Only update if different (avoid unnecessary signal triggers)
-                if state_clone.piece_mode.get() != crdt_piece_mode {
-                    state_clone.piece_mode.set(crdt_piece_mode);
-                }
                 if state_clone.pieces_locked.get() != crdt_pieces_locked {
                     state_clone.pieces_locked.set(crdt_pieces_locked);
                 }
@@ -541,7 +594,6 @@ fn setup_piece_sync(state: Arc<AppState>, keyboard_el: web_sys::HtmlElement) {
 
             let mut elements = piece_elements_clone.borrow_mut();
 
-            // Always show pieces (even in toggle mode) so they can be clicked to remove
             // Build set of current piece IDs
             let current_ids: std::collections::HashSet<String> =
                 pieces.iter().map(|p| p.id.clone()).collect();
@@ -578,7 +630,7 @@ fn setup_piece_sync(state: Arc<AppState>, keyboard_el: web_sys::HtmlElement) {
                     }
                 } else {
                     // New piece - create element
-                    let el = create_piece_element(&piece.id, piece.pitch, key_index);
+                    let el = create_piece_element(&piece.id, piece.pitch, key_index, &piece.emoji);
                     keyboard_el_clone.append_child(&el).ok();
                     elements.insert(piece.id.clone(), el);
                 }
@@ -596,6 +648,7 @@ fn create_piece_element(
     piece_id: &str,
     original_pitch: i32,
     key_index: i32,
+    emoji: &str,
 ) -> web_sys::HtmlElement {
     let document = web_sys::window().unwrap().document().unwrap();
     let el: web_sys::HtmlElement = document.create_element("div").unwrap().unchecked_into();
@@ -605,8 +658,12 @@ fn create_piece_element(
     el.set_attribute("data-key", &key_index.to_string()).ok();
     el.set_attribute("data-original-pitch", &original_pitch.to_string())
         .ok();
+    el.set_attribute("data-emoji", emoji).ok();
     // Explicitly ensure no data-pitch (pieces use data-key for discrete positioning)
     el.remove_attribute("data-pitch").ok();
+
+    // Display the emoji
+    el.set_text_content(Some(emoji));
 
     // DEBUG: Add MutationObserver to catch any code that sets data-pitch on this piece
     {
@@ -711,6 +768,9 @@ fn setup_piece_drag_handler(
         // Remove data-key so it doesn't snap back during drag
         el_down.remove_attribute("data-key").ok();
 
+        // Show delete hole for drag-to-delete
+        show_delete_hole();
+
         e.prevent_default();
         e.stop_propagation();
     });
@@ -804,8 +864,11 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
         let dy = (e.client_y() - start_y).abs();
         let is_click = dx < 5 && dy < 5;
 
-        // If click and pieces not locked, remove the piece
-        if is_click && !state_up.pieces_locked.get() {
+        // Check if dropped on delete hole
+        let dropped_on_hole = is_over_delete_hole(e.client_x(), e.client_y());
+
+        // If dropped on hole OR click (and not locked), remove the piece
+        if (dropped_on_hole || is_click) && !state_up.pieces_locked.get() {
             state_up.room.lock_mut().remove_piece(&piece_id);
             // Reset styling before removal triggers UI update
             piece_el.remove_attribute("data-dragging").ok();
@@ -814,6 +877,7 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
             piece_el.style().remove_property("touch-action").ok();
             piece_el.style().remove_property("left").ok();
             piece_el.style().remove_property("top").ok();
+            hide_delete_hole();
             state_up.room_version.set(state_up.room_version.get() + 1);
             sync_active_pitches(&state_up);
             state_up.sync_midi_toggle_output();
@@ -892,6 +956,7 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
             // CSS .piece-indicator class handles background/box-shadow
         });
 
+        hide_delete_hole();
         state_up.room_version.set(state_up.room_version.get() + 1);
         sync_active_pitches(&state_up);
         state_up.sync_midi_toggle_output();
@@ -945,9 +1010,174 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
             piece_el
                 .set_attribute("data-key", &key_index.to_string())
                 .ok();
+
+            hide_delete_hole();
         });
     let _ = document
         .add_event_listener_with_callback("pointercancel", on_cancel.as_ref().unchecked_ref());
+    on_cancel.forget();
+}
+
+/// Set up HTML5 drag-drop handlers for receiving emojis from the picker.
+fn setup_keyboard_drop_handlers(state: Arc<AppState>) {
+    let Some(kb) = get_keyboard() else { return };
+
+    // Allow drop by preventing default on dragover
+    let on_dragover = Closure::<dyn Fn(web_sys::DragEvent)>::new(move |e: web_sys::DragEvent| {
+        e.prevent_default();
+    });
+    let _ = kb.add_event_listener_with_callback("dragover", on_dragover.as_ref().unchecked_ref());
+    on_dragover.forget();
+
+    // Handle drop - create new piece at drop location
+    let state_drop = state.clone();
+    let on_drop = Closure::<dyn Fn(web_sys::DragEvent)>::new(move |e: web_sys::DragEvent| {
+        e.prevent_default();
+
+        // Get the dropped emoji
+        let Some(dt) = e.data_transfer() else { return };
+        let Ok(emoji) = dt.get_data("text/plain") else { return };
+        if emoji.is_empty() {
+            return;
+        }
+
+        // Check if pieces are locked
+        if state_drop.pieces_locked.get() {
+            return;
+        }
+
+        // Get the key at the drop location
+        let Some(key_index) = get_key_at_point(e.client_x(), e.client_y()) else {
+            return;
+        };
+
+        // Convert key index to pitch (key 0 = pitch 0 = C, etc.)
+        // The keyboard uses key indices starting from 0
+        let pitch = key_index;
+
+        // Add the piece to the CRDT
+        state_drop.room.lock_mut().add_piece(pitch, &emoji);
+
+        // Trigger UI update
+        state_drop
+            .room_version
+            .set(state_drop.room_version.get() + 1);
+        sync_active_pitches(&state_drop);
+        state_drop.sync_midi_toggle_output();
+    });
+    let _ = kb.add_event_listener_with_callback("drop", on_drop.as_ref().unchecked_ref());
+    on_drop.forget();
+}
+
+/// Start dragging an emoji from the picker (touch-friendly).
+/// Call this from component on pointerdown.
+pub fn start_emoji_drag(emoji: String, pointer_id: i32, x: i32, y: i32) {
+    EMOJI_DRAGS.with(|drags| {
+        drags.borrow_mut().insert(
+            pointer_id,
+            EmojiDragState {
+                emoji,
+                start_x: x,
+                start_y: y,
+            },
+        );
+    });
+
+    // Create ghost element
+    if let Some(document) = web_sys::window().and_then(|w| w.document()) {
+        let ghost: HtmlElement = document.create_element("div").unwrap().unchecked_into();
+        ghost.set_id("emoji-drag-ghost");
+        ghost.set_class_name("emoji-drag-ghost");
+        let emoji_text = EMOJI_DRAGS.with(|drags| {
+            drags.borrow().get(&pointer_id).map(|d| d.emoji.clone())
+        });
+        if let Some(e) = emoji_text {
+            ghost.set_text_content(Some(&e));
+        }
+        ghost.style().set_property("left", &format!("{}px", x - 20)).ok();
+        ghost.style().set_property("top", &format!("{}px", y - 20)).ok();
+        ghost.set_attribute("data-pointer-id", &pointer_id.to_string()).ok();
+        document.body().unwrap().append_child(&ghost).ok();
+    }
+}
+
+/// Set up document-level handlers for emoji drags from picker.
+fn setup_emoji_drag_handlers(state: Arc<AppState>) {
+    let Some(window) = web_sys::window() else { return };
+    let Some(document) = window.document() else { return };
+
+    // Pointermove - update ghost position
+    let on_move = Closure::<dyn Fn(web_sys::PointerEvent)>::new(move |e: web_sys::PointerEvent| {
+        let pointer_id = e.pointer_id();
+
+        // Check if we're tracking this emoji drag
+        let is_dragging = EMOJI_DRAGS.with(|drags| drags.borrow().contains_key(&pointer_id));
+        if !is_dragging {
+            return;
+        }
+
+        // Update ghost position
+        if let Some(ghost) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.get_element_by_id("emoji-drag-ghost"))
+        {
+            let ghost: HtmlElement = ghost.unchecked_into();
+            ghost.style().set_property("left", &format!("{}px", e.client_x() - 20)).ok();
+            ghost.style().set_property("top", &format!("{}px", e.client_y() - 20)).ok();
+        }
+    });
+    let _ = document.add_event_listener_with_callback("pointermove", on_move.as_ref().unchecked_ref());
+    on_move.forget();
+
+    // Pointerup - drop emoji on keyboard
+    let state_up = state.clone();
+    let on_up = Closure::<dyn Fn(web_sys::PointerEvent)>::new(move |e: web_sys::PointerEvent| {
+        let pointer_id = e.pointer_id();
+
+        // Look up and remove emoji drag state
+        let drag_state = EMOJI_DRAGS.with(|drags| drags.borrow_mut().remove(&pointer_id));
+        let Some(drag) = drag_state else { return };
+
+        // Remove ghost
+        if let Some(ghost) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.get_element_by_id("emoji-drag-ghost"))
+        {
+            ghost.remove();
+        }
+
+        // Check if pieces are locked
+        if state_up.pieces_locked.get() {
+            return;
+        }
+
+        // Check if over keyboard
+        let Some(key_index) = get_key_at_point(e.client_x(), e.client_y()) else {
+            return;
+        };
+
+        // Add piece
+        state_up.room.lock_mut().add_piece(key_index, &drag.emoji);
+        state_up.room_version.set(state_up.room_version.get() + 1);
+        sync_active_pitches(&state_up);
+        state_up.sync_midi_toggle_output();
+    });
+    let _ = document.add_event_listener_with_callback("pointerup", on_up.as_ref().unchecked_ref());
+    on_up.forget();
+
+    // Pointercancel - clean up
+    let on_cancel = Closure::<dyn Fn(web_sys::PointerEvent)>::new(move |e: web_sys::PointerEvent| {
+        let pointer_id = e.pointer_id();
+        EMOJI_DRAGS.with(|drags| drags.borrow_mut().remove(&pointer_id));
+
+        if let Some(ghost) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.get_element_by_id("emoji-drag-ghost"))
+        {
+            ghost.remove();
+        }
+    });
+    let _ = document.add_event_listener_with_callback("pointercancel", on_cancel.as_ref().unchecked_ref());
     on_cancel.forget();
 }
 
@@ -972,12 +1202,24 @@ fn setup_keyboard_events(state: Arc<AppState>) {
     // (piece has pointer-events: none during drag, so we handle it at document level)
     setup_document_drag_handlers(state.clone());
 
+    // Set up HTML5 drag-drop handlers for receiving emojis from the picker (desktop)
+    setup_keyboard_drop_handlers(state.clone());
+
+    // Set up pointer-based emoji drag handlers (touch-friendly)
+    setup_emoji_drag_handlers(state.clone());
+
     if let Some(kb) = get_keyboard() {
         // Listen for keyclick events (actual user clicks, not hover)
+        // Clicks toggle pitch classes AND clear voices at that pitch class
         let state_click = state.clone();
         let on_click = Closure::<dyn Fn(web_sys::Event)>::new(move |event: web_sys::Event| {
             // Skip if voice input is active
             if state_click.voice_active.get() {
+                return;
+            }
+
+            // Skip if locked
+            if state_click.pieces_locked.get() {
                 return;
             }
 
@@ -991,55 +1233,20 @@ fn setup_keyboard_events(state: Arc<AppState>) {
                         let pc = PitchClass::new(note);
                         drop(tuning);
 
-                        // Skip if locked (applies to both piece and toggle mode)
-                        if state_click.pieces_locked.get() {
-                            return;
-                        }
+                        // Toggle the pitch class (manual/toggle mode)
+                        let mut room = state_click.room.lock_mut();
+                        room.toggle_pitch(pc);
 
-                        // Handle piece mode vs toggle mode
-                        if state_click.piece_mode.get() {
-                            // Piece mode: toggle a piece at this pitch class (one per key)
-                            state_click
-                                .room
-                                .lock_mut()
-                                .toggle_piece_at_pitch_class(note, count);
-                            // Sync MIDI output for piece changes
-                            state_click.sync_midi_toggle_output();
-                        } else {
-                            // Toggle mode: check pieces, voices, then manual pitches
-                            // Priority: piece > any voice > manual pitch
+                        // Also clear any voice at this pitch class
+                        let voice_cleared = room.clear_voice_at_pitch_class(pc);
+                        drop(room);
 
-                            // Check if there's a piece at this pitch class
-                            let has_piece = state_click
-                                .room
-                                .lock_ref()
-                                .find_piece_by_pitch_class(note, count)
-                                .is_some();
-
-                            if has_piece {
-                                // Remove the piece
-                                state_click
-                                    .room
-                                    .lock_mut()
-                                    .toggle_piece_at_pitch_class(note, count);
-                                state_click.sync_midi_toggle_output();
-                            } else {
-                                // Check if any peer has a voice at this pitch class
-                                let voice_cleared =
-                                    state_click.room.lock_mut().clear_voice_at_pitch_class(pc);
-
-                                if voice_cleared {
-                                    // Also clear local voice state if it was ours
-                                    if state_click.voice_pitch.get() == Some(pc) {
-                                        state_click.voice_pitch.set(None);
-                                    }
-                                    state_click.sync_midi_voice_output();
-                                } else {
-                                    // No piece or voice - toggle manual pitch
-                                    state_click.room.lock_mut().toggle_pitch(pc);
-                                    state_click.sync_midi_toggle_output();
-                                }
+                        if voice_cleared {
+                            // Also clear local voice state if it was ours
+                            if state_click.voice_pitch.get() == Some(pc) {
+                                state_click.voice_pitch.set(None);
                             }
+                            state_click.sync_midi_voice_output();
                         }
 
                         // Increment room_version to trigger UI updates
@@ -1048,6 +1255,7 @@ fn setup_keyboard_events(state: Arc<AppState>) {
                             .set(state_click.room_version.get() + 1);
                         // Re-sync keyboard to reflect new state
                         sync_active_pitches(&state_click);
+                        state_click.sync_midi_toggle_output();
                     }
                 }
             }

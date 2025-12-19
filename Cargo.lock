@@ -5032,6 +5032,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-wasm",
+ "unicode-segmentation",
  "uuid 1.19.0",
  "wasm-bindgen",
  "wasm-bindgen-futures",

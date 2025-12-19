@@ -12,7 +12,7 @@ use crate::tuning::{parse_scl, Tuning};
 use crate::words::{generate_room_name, generate_room_qr_svg, is_valid_room_name, is_valid_room_input, parse_room_input};
 
 use super::app::AppState;
-use super::keyboard::{sync_active_pitches, update_tuning};
+use super::keyboard::{start_emoji_drag, sync_active_pitches, update_tuning};
 
 /// Join a room by parsing the input from the room-input field.
 /// Supports full URLs, room@peer format, or just room names.
@@ -47,7 +47,7 @@ pub fn voice_button(state: Arc<AppState>) -> Dom {
         .child(html!("span", {
             .class("voice-text")
             .text_signal(state.voice_active.signal().map(|active| {
-                if active { " Singing..." } else { " Hold to Sing" }
+                if active { "..." } else { " Sing" }
             }))
         }))
         .event(clone!(state => move |_: events::PointerDown| {
@@ -89,41 +89,107 @@ pub fn clear_button(state: Arc<AppState>) -> Dom {
     })
 }
 
-/// Piece mode toggle button.
-/// Switches between toggle mode (click to toggle notes) and piece mode (click to add pieces).
-pub fn piece_mode_button(state: Arc<AppState>) -> Dom {
+/// Lock button - prevents editing of toggles and pieces.
+pub fn lock_button(state: Arc<AppState>) -> Dom {
+    html!("button", {
+        .class("lock-button")
+        .class_signal("locked", state.pieces_locked.signal())
+        .text_signal(state.pieces_locked.signal().map(|locked| {
+            if locked { "🔒" } else { "🔓" }
+        }))
+        .attr("title", "Lock/unlock keyboard editing")
+        .event(clone!(state => move |_: events::Click| {
+            let new_locked = !state.pieces_locked.get();
+            state.pieces_locked.set(new_locked);
+            // Persist to CRDT
+            state.room.lock_mut().set_pieces_locked(new_locked);
+        }))
+    })
+}
+
+/// Emoji picker component - shows one emoji at a time with prev/next arrows.
+/// Drag the displayed emoji onto keyboard keys to add pieces.
+pub fn emoji_picker(state: Arc<AppState>) -> Dom {
+    // Signal that updates on emoji index changes (room_version updates separately)
+    let emoji_signal = state.selected_emoji_idx.signal()
+        .map(clone!(state => move |idx| {
+            let emojis = state.room.lock_ref().available_emojis();
+            let count = emojis.len();
+            let safe_idx = if count > 0 { idx % count } else { 0 };
+            (emojis, safe_idx, count)
+        }));
+
     html!("div", {
-        .class("piece-mode-container")
+        .class("emoji-picker")
         .children(&mut [
-            // Main mode toggle button
+            // Prev button
             html!("button", {
-                .class("piece-mode-button")
-                .class_signal("active", state.piece_mode.signal())
-                .text_signal(state.piece_mode.signal().map(|piece_mode| {
-                    if piece_mode { "Piece" } else { "Toggle" }
-                }))
+                .class("emoji-nav-btn")
+                .text("◀")
                 .event(clone!(state => move |_: events::Click| {
-                    let new_mode = !state.piece_mode.get();
-                    state.piece_mode.set(new_mode);
-                    // Persist to CRDT
-                    state.room.lock_mut().set_piece_mode(new_mode);
-                    // Trigger UI update
-                    state.room_version.set(state.room_version.get() + 1);
+                    let emojis = state.room.lock_ref().available_emojis();
+                    let count = emojis.len();
+                    if count > 0 {
+                        let current = state.selected_emoji_idx.get();
+                        let new_idx = if current == 0 { count - 1 } else { current - 1 };
+                        state.selected_emoji_idx.set(new_idx);
+                    }
                 }))
             }),
-            // Lock button (prevents toggling in both modes)
+            // Current emoji (draggable)
+            html!("div", {
+                .class("emoji-picker-current")
+                .child_signal(emoji_signal.map(clone!(state => move |(emojis, idx, _count): (Vec<String>, usize, usize)| {
+                    if emojis.is_empty() {
+                        return Some(html!("span", { .text("—") }));
+                    }
+                    let emoji = emojis[idx].clone();
+                    let emoji_clone = emoji.clone();
+                    let emoji_drag = emoji.clone();
+                    Some(html!("div", {
+                        .class("emoji-picker-item")
+                        .attr("data-emoji", &emoji)
+                        .attr("draggable", "true")
+                        .text(&emoji)
+                        // HTML5 drag for desktop
+                        .event(move |e: events::DragStart| {
+                            if let Some(dt) = e.data_transfer() {
+                                let _ = dt.set_data("text/plain", &emoji_clone);
+                                dt.set_effect_allowed("copy");
+                            }
+                        })
+                        // Pointer events for touch
+                        .after_inserted(move |el| {
+                            let emoji_for_drag = emoji_drag.clone();
+                            let on_down = wasm_bindgen::closure::Closure::<dyn Fn(web_sys::PointerEvent)>::new(move |e: web_sys::PointerEvent| {
+                                start_emoji_drag(
+                                    emoji_for_drag.clone(),
+                                    e.pointer_id(),
+                                    e.client_x(),
+                                    e.client_y(),
+                                );
+                            });
+                            let _ = el.add_event_listener_with_callback(
+                                "pointerdown",
+                                on_down.as_ref().unchecked_ref(),
+                            );
+                            on_down.forget();
+                        })
+                    }))
+                })))
+            }),
+            // Next button
             html!("button", {
-                .class("piece-lock-button")
-                .class_signal("locked", state.pieces_locked.signal())
-                .text_signal(state.pieces_locked.signal().map(|locked| {
-                    if locked { "🔒" } else { "🔓" }
-                }))
-                .attr("title", "Lock/unlock piece editing")
+                .class("emoji-nav-btn")
+                .text("▶")
                 .event(clone!(state => move |_: events::Click| {
-                    let new_locked = !state.pieces_locked.get();
-                    state.pieces_locked.set(new_locked);
-                    // Persist to CRDT
-                    state.room.lock_mut().set_pieces_locked(new_locked);
+                    let emojis = state.room.lock_ref().available_emojis();
+                    let count = emojis.len();
+                    if count > 0 {
+                        let current = state.selected_emoji_idx.get();
+                        let new_idx = (current + 1) % count;
+                        state.selected_emoji_idx.set(new_idx);
+                    }
                 }))
             }),
         ])
@@ -199,20 +265,12 @@ pub fn pitch_display(state: Arc<AppState>) -> Dom {
     })
 }
 
-/// Room header button - shows current room name and opens overlay.
+/// Room header button - shows satellite dish icon, opens overlay with room details.
 pub fn room_header_button(state: Arc<AppState>) -> Dom {
     html!("button", {
         .class("room-header-button")
-        .children(&mut [
-            html!("span", {
-                .class("qr-icon")
-                .text("📡")
-            }),
-            html!("span", {
-                .class("room-name")
-                .text_signal(state.room_name.signal_cloned())
-            }),
-        ])
+        .attr("title", "Room settings")
+        .text("📡")
         .event(clone!(state => move |_: events::Click| {
             state.room_overlay_visible.set(true);
         }))
