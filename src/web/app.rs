@@ -14,7 +14,7 @@ use web_time::Instant;
 use futures::StreamExt;
 
 use crate::pitch::{PitchDetectorConfig, PitchEvent, SwiftF0Detector};
-use crate::room::{RoomEvent, RoomState, YrsRoomState};
+use crate::room::{RoomEvent, RoomState};
 use crate::tuning::{PitchClass, Tuning};
 
 use crate::words::generate_room_name;
@@ -44,7 +44,7 @@ const STABILITY_DURATION_MS: u64 = 100;
 /// Uses Rc for wasm (single-threaded), Arc would work too but Rc is simpler.
 pub struct AppState {
     /// Room state with CRDT synchronization (manual/clicked pitches).
-    pub room: Mutable<YrsRoomState>,
+    pub room: Mutable<RoomState>,
     /// Current tuning system.
     pub tuning: Mutable<Tuning>,
     /// Whether voice input is active.
@@ -111,7 +111,7 @@ pub struct AppState {
 impl AppState {
     /// Create a new application state.
     pub fn new(peer_id: String) -> Arc<Self> {
-        let room = YrsRoomState::new(peer_id);
+        let room = RoomState::new(peer_id);
         let tuning = Tuning::twelve_tet();
         let config = PitchDetectorConfig::default();
         let swiftf0 = SwiftF0Detector::new(config.sample_rate);

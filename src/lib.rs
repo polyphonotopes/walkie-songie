@@ -2,7 +2,7 @@
 //!
 //! This library provides platform-agnostic abstractions for:
 //! - Pitch detection (via SwiftF0 ML model)
-//! - Room state management (via `RoomState` trait)
+//! - Room state management (via yrs CRDT `RoomState`)
 //! - P2P transport (via libp2p with gossipsub)
 //!
 //! The core library has no UI dependencies and can be used from

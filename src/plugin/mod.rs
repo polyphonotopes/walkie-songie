@@ -24,13 +24,15 @@ macro_rules! plog {
     }};
 }
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crossbeam_channel::{Receiver, Sender};
 use nih_plug::prelude::*;
 
-use crate::room::{RoomEvent, RoomState, YrsRoomState};
+use crate::room::{
+    PitchClassDelta, PitchDelta, RoomState,
+    piece_pitch_deltas, unified_pitch_class_deltas, voice_pitch_deltas,
+};
 use crate::tuning::PitchClass;
 use crate::words::generate_room_name;
 
@@ -54,32 +56,30 @@ pub enum NetCommand {
 }
 
 /// Messages from the networking thread to the plugin.
+///
+/// Uses pre-computed deltas from shared streams - the plugin just outputs MIDI directly.
 #[derive(Debug, Clone)]
 pub enum NetEvent {
     /// Connection status changed
     ConnectionStatus { connected_peers: usize },
     /// Our peer ID is now known
     PeerIdAssigned(String),
-    /// Remote peer changed a pitch class (for room PCS)
-    RemotePitchClassChange { peer_id: String, pitch_class: u8, on: bool },
-    /// Remote peer changed their voice pitch
-    RemoteVoicePitchChange { peer_id: String, pitch: Option<i32> },
-    /// Piece added or moved (absolute MIDI pitch)
-    PieceChange { piece_id: String, pitch: i32 },
-    /// Piece removed
-    PieceRemoved { piece_id: String },
-    /// Full state sync (when joining room) - pieces as (id, pitch) pairs
-    FullStateSync { pieces: Vec<(String, i32)> },
+    /// Unified pitch class delta (channel 0) - from ALL sources
+    UnifiedPitchClassDelta(PitchClassDelta),
+    /// Piece pitch delta (channel 2) - absolute pitches with octave info
+    PiecePitchDelta(PitchDelta),
+    /// Voice pitch delta (channel 1) - absolute pitches for melody
+    VoicePitchDelta(PitchDelta),
     /// Error occurred
     Error(String),
 }
 
-/// MIDI channels for output
-const CHANNEL_ROOM_PCS: u8 = 0;    // Channel 1 in DAW (0-indexed)
-const CHANNEL_VOICE: u8 = 1;       // Channel 2 in DAW
-const CHANNEL_PIECES: u8 = 2;      // Channel 3 in DAW (pieces as absolute MIDI notes)
+// MIDI channels are now configurable via params (1-16 displayed, 0-15 internal)
 
 /// The walkie-songie plugin.
+///
+/// Uses pre-computed deltas from shared streams - no shadow state needed.
+/// MIDI output is directly derived from delta events.
 pub struct WalkieSongiePlugin {
     params: Arc<WalkieSongieParams>,
 
@@ -93,24 +93,10 @@ pub struct WalkieSongiePlugin {
     /// Our peer ID (for sharing)
     peer_id: Arc<Mutex<Option<String>>>,
 
-    /// Local pitch classes (what we're contributing to the room PCS)
+    /// Local pitch classes (what we're contributing to the room via MIDI input)
     local_pitch_classes: [bool; 128],
-    /// Current local voice pitch
+    /// Current local voice pitch (from MIDI input)
     local_voice_pitch: Option<i32>,
-
-    /// Per-peer pitch class sets (for computing room PCS)
-    peer_pitch_classes: HashMap<String, [bool; 128]>,
-    /// Per-peer voice pitches
-    peer_voice_pitches: HashMap<String, Option<i32>>,
-
-    /// Currently active room PCS notes (for diffing)
-    room_pcs_output: [bool; 128],
-    /// Currently active voice notes (for diffing)
-    voice_output: [bool; 128],
-    /// Currently active piece notes (for diffing) - maps piece_id to MIDI note
-    piece_notes: HashMap<String, i32>,
-    /// Currently active piece MIDI output (for diffing)
-    pieces_output: [bool; 128],
 }
 
 impl Default for WalkieSongiePlugin {
@@ -123,12 +109,6 @@ impl Default for WalkieSongiePlugin {
             peer_id: Arc::new(Mutex::new(None)),
             local_pitch_classes: [false; 128],
             local_voice_pitch: None,
-            peer_pitch_classes: HashMap::new(),
-            peer_voice_pitches: HashMap::new(),
-            room_pcs_output: [false; 128],
-            voice_output: [false; 128],
-            piece_notes: HashMap::new(),
-            pieces_output: [false; 128],
         }
     }
 }
@@ -201,12 +181,14 @@ impl Plugin for WalkieSongiePlugin {
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
         // Process incoming MIDI
-        // Channel 1 (0): Pitch class input → room PCS contribution
-        // Channel 2 (1): Voice pitch input → voice state
+        // Uses the same channel config as output for consistency
+        let pc_channel = (self.params.pitch_classes_channel.value() - 1) as u8;
+        let voice_channel = (self.params.voice_channel.value() - 1) as u8;
+
         while let Some(event) = context.next_event() {
             match event {
                 NoteEvent::NoteOn { note, channel, .. } => {
-                    if channel == CHANNEL_ROOM_PCS {
+                    if channel == pc_channel {
                         // Pitch class input (toggle on)
                         let pc = note % 12;
                         if !self.local_pitch_classes[pc as usize] {
@@ -215,7 +197,7 @@ impl Plugin for WalkieSongiePlugin {
                                 let _ = tx.try_send(NetCommand::SetPitchClass { pitch_class: pc, on: true });
                             }
                         }
-                    } else if channel == CHANNEL_VOICE {
+                    } else if channel == voice_channel {
                         // Voice pitch input (monophonic - new note replaces old)
                         self.local_voice_pitch = Some(note as i32);
                         if let Some(tx) = &self.net_tx {
@@ -224,7 +206,7 @@ impl Plugin for WalkieSongiePlugin {
                     }
                 }
                 NoteEvent::NoteOff { note, channel, .. } => {
-                    if channel == CHANNEL_ROOM_PCS {
+                    if channel == pc_channel {
                         // Pitch class input (toggle off)
                         let pc = note % 12;
                         if self.local_pitch_classes[pc as usize] {
@@ -233,7 +215,7 @@ impl Plugin for WalkieSongiePlugin {
                                 let _ = tx.try_send(NetCommand::SetPitchClass { pitch_class: pc, on: false });
                             }
                         }
-                    } else if channel == CHANNEL_VOICE {
+                    } else if channel == voice_channel {
                         // Voice pitch off (only if it matches current voice)
                         if self.local_voice_pitch == Some(note as i32) {
                             self.local_voice_pitch = None;
@@ -247,7 +229,8 @@ impl Plugin for WalkieSongiePlugin {
             }
         }
 
-        // Process events from networking thread (non-blocking)
+        // Process delta events from networking thread (non-blocking)
+        // Deltas are pre-computed by shared streams - just output MIDI directly
         if let Some(rx) = &self.net_rx {
             while let Ok(event) = rx.try_recv() {
                 match event {
@@ -261,29 +244,85 @@ impl Plugin for WalkieSongiePlugin {
                             *pid = Some(peer_id);
                         }
                     }
-                    NetEvent::RemotePitchClassChange { peer_id, pitch_class, on } => {
-                        // Update peer's pitch class set
-                        let peer_set = self.peer_pitch_classes.entry(peer_id).or_insert([false; 128]);
-                        peer_set[pitch_class as usize] = on;
+                    NetEvent::UnifiedPitchClassDelta(delta) => {
+                        if self.params.pitch_classes_enabled.value() {
+                            let channel = (self.params.pitch_classes_channel.value() - 1) as u8;
+                            for pc in delta.added {
+                                if pc < 12 {
+                                    context.send_event(NoteEvent::NoteOn {
+                                        timing: 0,
+                                        voice_id: None,
+                                        channel,
+                                        note: pc + 60,
+                                        velocity: 0.8,
+                                    });
+                                }
+                            }
+                            for pc in delta.removed {
+                                if pc < 12 {
+                                    context.send_event(NoteEvent::NoteOff {
+                                        timing: 0,
+                                        voice_id: None,
+                                        channel,
+                                        note: pc + 60,
+                                        velocity: 0.0,
+                                    });
+                                }
+                            }
+                        }
                     }
-                    NetEvent::RemoteVoicePitchChange { peer_id, pitch } => {
-                        // Update peer's voice pitch
-                        self.peer_voice_pitches.insert(peer_id, pitch);
+                    NetEvent::VoicePitchDelta(delta) => {
+                        if self.params.voice_enabled.value() {
+                            let channel = (self.params.voice_channel.value() - 1) as u8;
+                            for pitch in delta.added {
+                                if pitch >= 0 && pitch < 128 {
+                                    context.send_event(NoteEvent::NoteOn {
+                                        timing: 0,
+                                        voice_id: None,
+                                        channel,
+                                        note: pitch as u8,
+                                        velocity: 0.8,
+                                    });
+                                }
+                            }
+                            for pitch in delta.removed {
+                                if pitch >= 0 && pitch < 128 {
+                                    context.send_event(NoteEvent::NoteOff {
+                                        timing: 0,
+                                        voice_id: None,
+                                        channel,
+                                        note: pitch as u8,
+                                        velocity: 0.0,
+                                    });
+                                }
+                            }
+                        }
                     }
-                    NetEvent::PieceChange { piece_id, pitch } => {
-                        // Update piece note
-                        nih_log!("PieceChange event: {} -> {}", piece_id, pitch);
-                        self.piece_notes.insert(piece_id, pitch);
-                    }
-                    NetEvent::PieceRemoved { piece_id } => {
-                        // Remove piece note
-                        self.piece_notes.remove(&piece_id);
-                    }
-                    NetEvent::FullStateSync { pieces } => {
-                        // Full state sync - replace all pieces
-                        self.piece_notes.clear();
-                        for (id, pitch) in pieces {
-                            self.piece_notes.insert(id, pitch);
+                    NetEvent::PiecePitchDelta(delta) => {
+                        if self.params.pieces_enabled.value() {
+                            let channel = (self.params.pieces_channel.value() - 1) as u8;
+                            for pitch in delta.added {
+                                if pitch >= 0 && pitch < 128 {
+                                    context.send_event(NoteEvent::NoteOn {
+                                        timing: 0,
+                                        voice_id: None,
+                                        channel,
+                                        note: pitch as u8,
+                                        velocity: 0.8,
+                                    });
+                                }
+                            }
+                            for pitch in delta.removed {
+                                if pitch >= 0 && pitch < 128 {
+                                    context.send_event(NoteEvent::NoteOff {
+                                        timing: 0,
+                                        voice_id: None,
+                                        channel,
+                                        note: pitch as u8,
+                                        velocity: 0.0,
+                                    });
+                                }
+                            }
                         }
                     }
                     NetEvent::Error(msg) => {
@@ -292,115 +331,6 @@ impl Plugin for WalkieSongiePlugin {
                 }
             }
         }
-
-        // Compute room PCS (union of all pitch classes including local)
-        let mut room_pcs = [false; 128];
-        for pc in 0..12u8 {
-            if self.local_pitch_classes[pc as usize] {
-                room_pcs[pc as usize] = true;
-            }
-            for peer_set in self.peer_pitch_classes.values() {
-                if peer_set[pc as usize] {
-                    room_pcs[pc as usize] = true;
-                }
-            }
-        }
-
-        // Output room PCS changes on channel 1
-        for pc in 0..12u8 {
-            let is_on = room_pcs[pc as usize];
-            let was_on = self.room_pcs_output[pc as usize];
-            if is_on && !was_on {
-                context.send_event(NoteEvent::NoteOn {
-                    timing: 0,
-                    voice_id: None,
-                    channel: CHANNEL_ROOM_PCS,
-                    note: pc + 60, // Middle C octave
-                    velocity: 0.8,
-                });
-            } else if !is_on && was_on {
-                context.send_event(NoteEvent::NoteOff {
-                    timing: 0,
-                    voice_id: None,
-                    channel: CHANNEL_ROOM_PCS,
-                    note: pc + 60,
-                    velocity: 0.0,
-                });
-            }
-        }
-        self.room_pcs_output = room_pcs;
-
-        // Compute all voice pitches (including local)
-        let mut voice_pitches = [false; 128];
-        if let Some(pitch) = self.local_voice_pitch {
-            if pitch >= 0 && pitch < 128 {
-                voice_pitches[pitch as usize] = true;
-            }
-        }
-        for pitch_opt in self.peer_voice_pitches.values() {
-            if let Some(pitch) = pitch_opt {
-                if *pitch >= 0 && *pitch < 128 {
-                    voice_pitches[*pitch as usize] = true;
-                }
-            }
-        }
-
-        // Output voice pitch changes on channel 2
-        for note in 0..128u8 {
-            let is_on = voice_pitches[note as usize];
-            let was_on = self.voice_output[note as usize];
-            if is_on && !was_on {
-                context.send_event(NoteEvent::NoteOn {
-                    timing: 0,
-                    voice_id: None,
-                    channel: CHANNEL_VOICE,
-                    note,
-                    velocity: 0.8,
-                });
-            } else if !is_on && was_on {
-                context.send_event(NoteEvent::NoteOff {
-                    timing: 0,
-                    voice_id: None,
-                    channel: CHANNEL_VOICE,
-                    note,
-                    velocity: 0.0,
-                });
-            }
-        }
-        self.voice_output = voice_pitches;
-
-        // Compute all piece pitches
-        let mut piece_pitches = [false; 128];
-        for &pitch in self.piece_notes.values() {
-            if pitch >= 0 && pitch < 128 {
-                piece_pitches[pitch as usize] = true;
-            }
-        }
-
-        // Output piece pitch changes on channel 3
-        for note in 0..128u8 {
-            let is_on = piece_pitches[note as usize];
-            let was_on = self.pieces_output[note as usize];
-            if is_on && !was_on {
-                nih_log!("MIDI piece ON: note={} channel={}", note, CHANNEL_PIECES);
-                context.send_event(NoteEvent::NoteOn {
-                    timing: 0,
-                    voice_id: None,
-                    channel: CHANNEL_PIECES,
-                    note,
-                    velocity: 0.8,
-                });
-            } else if !is_on && was_on {
-                context.send_event(NoteEvent::NoteOff {
-                    timing: 0,
-                    voice_id: None,
-                    channel: CHANNEL_PIECES,
-                    note,
-                    velocity: 0.0,
-                });
-            }
-        }
-        self.pieces_output = piece_pitches;
 
         ProcessStatus::Normal
     }
@@ -539,19 +469,22 @@ async fn run_networking_loop(
     plog!("Dialing relay: {}", relay_addr);
     swarm.dial(relay_addr.clone())?;
 
-    // Create CRDT peer ID and room state
+    // Create CRDT peer ID and room state (wrapped in Arc<Mutex<>> for stream access)
     let crdt_peer_id = format!("peer-{}", uuid::Uuid::new_v4());
     let _ = evt_tx.send(NetEvent::PeerIdAssigned(format!("{}@{}", room_name, &crdt_peer_id[5..13])));
 
-    plog!("Creating YrsRoomState with peer_id: {}", crdt_peer_id);
-    let mut room = YrsRoomState::new(crdt_peer_id.clone());
+    plog!("Creating RoomState with peer_id: {}", crdt_peer_id);
+    let room = Arc::new(RwLock::new(RoomState::new(crdt_peer_id.clone())));
 
-    // Subscribe to room events for reactive updates
-    let mut room_events = std::pin::pin!(room.events());
+    // Subscribe to delta streams for MIDI output
+    // These query authoritative CRDT state on each event
+    let mut pitch_class_deltas = std::pin::pin!(unified_pitch_class_deltas(room.clone()));
+    let mut piece_deltas = std::pin::pin!(piece_pitch_deltas(room.clone()));
+    let mut voice_deltas = std::pin::pin!(voice_pitch_deltas(room.clone()));
 
     // Track state
-    let mut last_broadcast_sv = room.state_vector();
-    let mut last_known_peer_count = room.all_peer_sets().len();
+    let mut last_broadcast_sv = room.read().unwrap().state_vector();
+    let mut last_known_peer_count = room.read().unwrap().all_peer_sets().len();
     let mut has_local_changes = false;
     let mut connected_to_relay = false;
 
@@ -564,7 +497,7 @@ async fn run_networking_loop(
         loop_count += 1;
         if loop_count % 312 == 0 {
             plog!("Heartbeat: {} loops, {} crdt_peers, connected={}, uptime {:?}",
-                loop_count, room.all_peer_sets().len(), connected_to_relay, loop_start.elapsed());
+                loop_count, room.read().unwrap().all_peer_sets().len(), connected_to_relay, loop_start.elapsed());
         }
 
         // Process commands from plugin (non-blocking)
@@ -578,20 +511,22 @@ async fn run_networking_loop(
             }
             Ok(NetCommand::SetPitchClass { pitch_class, on }) => {
                 plog!("Local change: SetPitchClass {} = {}", pitch_class, on);
+                let mut room_guard = room.write().unwrap();
                 if on {
-                    room.add_pitch(PitchClass(pitch_class));
+                    room_guard.add_pitch(PitchClass(pitch_class));
                 } else {
-                    room.remove_pitch(PitchClass(pitch_class));
+                    room_guard.remove_pitch(PitchClass(pitch_class));
                 }
                 has_local_changes = true;
             }
             Ok(NetCommand::SetVoicePitch(pitch)) => {
                 plog!("Local change: SetVoicePitch {:?}", pitch);
-                room.set_voice_pitch(pitch);
+                let mut room_guard = room.write().unwrap();
+                room_guard.set_voice_pitch(pitch);
                 if let Some(p) = pitch {
-                    room.set_voice_pitchclass(Some(PitchClass((p % 12) as u8)));
+                    room_guard.set_voice_pitchclass(Some(PitchClass((p % 12) as u8)));
                 } else {
-                    room.set_voice_pitchclass(None);
+                    room_guard.set_voice_pitchclass(None);
                 }
                 has_local_changes = true;
             }
@@ -607,82 +542,27 @@ async fn run_networking_loop(
         tokio::pin!(timeout);
 
         tokio::select! {
-            // Handle room events (emitted by apply_update and local mutations)
-            room_event = room_events.next() => {
-                if let Some(event) = room_event {
-                    plog!("RoomEvent: {:?}", event);
+            // Forward unified pitch class deltas to plugin
+            delta = pitch_class_deltas.next() => {
+                if let Some(d) = delta {
+                    plog!("PitchClassDelta: +{:?} -{:?}", d.added, d.removed);
+                    let _ = evt_tx.send(NetEvent::UnifiedPitchClassDelta(d));
+                }
+            }
 
-                    // Map RoomEvent to NetEvent for the plugin
-                    match event {
-                        RoomEvent::PitchAdded { pitch_class } => {
-                            let _ = evt_tx.send(NetEvent::RemotePitchClassChange {
-                                peer_id: "room".to_string(),
-                                pitch_class: pitch_class.0,
-                                on: true,
-                            });
-                        }
-                        RoomEvent::PitchRemoved { pitch_class } => {
-                            let _ = evt_tx.send(NetEvent::RemotePitchClassChange {
-                                peer_id: "room".to_string(),
-                                pitch_class: pitch_class.0,
-                                on: false,
-                            });
-                        }
-                        RoomEvent::PitchesCleared => {
-                            // Clear all pitch classes
-                            for pc in 0..12u8 {
-                                let _ = evt_tx.send(NetEvent::RemotePitchClassChange {
-                                    peer_id: "room".to_string(),
-                                    pitch_class: pc,
-                                    on: false,
-                                });
-                            }
-                        }
-                        RoomEvent::VoiceChanged { peer_id, pitch, .. } => {
-                            let _ = evt_tx.send(NetEvent::RemoteVoicePitchChange {
-                                peer_id,
-                                pitch,
-                            });
-                        }
-                        RoomEvent::VoiceCleared { peer_id } => {
-                            let _ = evt_tx.send(NetEvent::RemoteVoicePitchChange {
-                                peer_id,
-                                pitch: None,
-                            });
-                        }
-                        RoomEvent::PieceAdded { id, pitch, .. } => {
-                            let _ = evt_tx.send(NetEvent::PieceChange {
-                                piece_id: id,
-                                pitch,
-                            });
-                        }
-                        RoomEvent::PieceMoved { id, new_pitch, .. } => {
-                            let _ = evt_tx.send(NetEvent::PieceChange {
-                                piece_id: id,
-                                pitch: new_pitch,
-                            });
-                        }
-                        RoomEvent::PieceRemoved { id } => {
-                            let _ = evt_tx.send(NetEvent::PieceRemoved { piece_id: id });
-                        }
-                        RoomEvent::PiecesCleared => {
-                            // Signal full state sync with empty pieces
-                            let _ = evt_tx.send(NetEvent::FullStateSync { pieces: vec![] });
-                        }
-                        RoomEvent::FullStateSync { pieces, .. } => {
-                            let piece_list: Vec<(String, i32)> = pieces.into_iter()
-                                .map(|(id, pitch, _)| (id, pitch))
-                                .collect();
-                            let _ = evt_tx.send(NetEvent::FullStateSync { pieces: piece_list });
-                        }
-                        // Ignore config events for now
-                        RoomEvent::PiecesLockChanged { .. } |
-                        RoomEvent::TuningChanged { .. } |
-                        RoomEvent::CombinationMethodChanged { .. } |
-                        RoomEvent::EmojisChanged { .. } |
-                        RoomEvent::PeerJoined { .. } |
-                        RoomEvent::PeerLeft { .. } => {}
-                    }
+            // Forward piece pitch deltas to plugin
+            delta = piece_deltas.next() => {
+                if let Some(d) = delta {
+                    plog!("PieceDelta: +{:?} -{:?}", d.added, d.removed);
+                    let _ = evt_tx.send(NetEvent::PiecePitchDelta(d));
+                }
+            }
+
+            // Forward voice pitch deltas to plugin
+            delta = voice_deltas.next() => {
+                if let Some(d) = delta {
+                    plog!("VoiceDelta: +{:?} -{:?}", d.added, d.removed);
+                    let _ = evt_tx.send(NetEvent::VoicePitchDelta(d));
                 }
             }
 
@@ -706,11 +586,12 @@ async fn run_networking_loop(
                         plog!("Received gossipsub message from {} ({} bytes)",
                             propagation_source, message.data.len());
 
-                        // apply_update now emits RoomEvents which will be handled above
-                        if let Err(e) = room.apply_update(&message.data) {
+                        // apply_update now emits RoomEvents which will be handled by delta streams
+                        let mut room_guard = room.write().unwrap();
+                        if let Err(e) = room_guard.apply_update(&message.data) {
                             plog!("Failed to apply update: {}", e);
                         } else {
-                            last_broadcast_sv = room.state_vector();
+                            last_broadcast_sv = room_guard.state_vector();
                         }
                     }
                     SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Subscribed {
@@ -720,13 +601,14 @@ async fn run_networking_loop(
                         plog!("Peer {} subscribed to {}", peer_id, t);
                         // Send full state when peer subscribes to OUR topic
                         if t == topic.hash() {
-                            let state_update = room.encode_state_as_update();
+                            let room_guard = room.read().unwrap();
+                            let state_update = room_guard.encode_state_as_update();
                             plog!("Sending full state to new subscriber ({} bytes)", state_update.len());
                             if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), state_update) {
                                 plog!("Failed to send state to subscriber: {:?}", e);
                             }
                             // Emit FullStateSync for ourselves too
-                            room.emit_full_state_sync();
+                            room_guard.emit_full_state_sync();
                         }
                     }
                     _ => {}
@@ -734,7 +616,7 @@ async fn run_networking_loop(
             }
             _ = &mut timeout => {
                 // Check for new peers (triggered by receiving their state)
-                let current_peer_count = room.all_peer_sets().len();
+                let current_peer_count = room.read().unwrap().all_peer_sets().len();
                 let new_peer_joined = current_peer_count > last_known_peer_count;
                 if new_peer_joined {
                     plog!("New peer detected ({} -> {}), sending full state", last_known_peer_count, current_peer_count);
@@ -742,27 +624,29 @@ async fn run_networking_loop(
 
                     // Send full state to new peer immediately
                     if connected_to_relay {
-                        let state_update = room.encode_state_as_update();
+                        let room_guard = room.read().unwrap();
+                        let state_update = room_guard.encode_state_as_update();
                         if !state_update.is_empty() {
                             plog!("Broadcasting FULL state ({} bytes)", state_update.len());
                             if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), state_update) {
                                 plog!("Failed to publish full state: {:?}", e);
                             }
-                            last_broadcast_sv = room.state_vector();
+                            last_broadcast_sv = room_guard.state_vector();
                         }
                     }
                 }
 
                 // Send diff for local changes
                 if has_local_changes && connected_to_relay {
-                    let update = room.encode_diff(&last_broadcast_sv).unwrap_or_default();
+                    let room_guard = room.read().unwrap();
+                    let update = room_guard.encode_diff(&last_broadcast_sv).unwrap_or_default();
 
                     if !update.is_empty() {
                         plog!("Broadcasting diff ({} bytes)", update.len());
                         if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), update) {
                             plog!("Failed to publish: {:?}", e);
                         }
-                        last_broadcast_sv = room.state_vector();
+                        last_broadcast_sv = room_guard.state_vector();
                     }
                     has_local_changes = false;
                 }

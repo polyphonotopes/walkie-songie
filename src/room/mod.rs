@@ -1,15 +1,23 @@
 //! Room state management using CRDTs.
 //!
-//! Provides the `RoomState` trait for managing shared state:
-//! - Per-peer pitch class sets
+//! The CRDT is the single source of truth for room state:
+//! - Shared pitch class set (toggleable keyboard)
+//! - Emoji pieces with positions
+//! - Per-peer voice state
 //! - Room tuning (SCL content)
 //! - Combination method for computing room result
 
 pub mod events;
+pub mod streams;
 pub mod yrs_state;
 
 pub use events::RoomEvent;
-pub use yrs_state::{Piece, YrsRoomState};
+pub use streams::{
+    PitchClassDelta, PitchDelta, ActivePitchesSnapshot,
+    unified_pitch_class_deltas, piece_pitch_deltas, voice_pitch_deltas,
+    snapshot_active_pitches,
+};
+pub use yrs_state::{Piece, RoomState};
 
 use std::collections::{HashMap, HashSet};
 
@@ -106,224 +114,6 @@ pub struct RoomPitchResult {
     pub attribution: HashMap<PitchClass, Vec<String>>,
 }
 
-/// Trait for room state management.
-///
-/// Implementations handle CRDT synchronization with peers.
-pub trait RoomState: Send + Sync {
-    /// Get the local peer's ID.
-    fn local_peer_id(&self) -> &str;
-
-    /// Get the local peer's pitch set.
-    fn local_pitch_set(&self) -> &PeerPitchSet;
-
-    /// Get a mutable reference to the local peer's pitch set.
-    fn local_pitch_set_mut(&mut self) -> &mut PeerPitchSet;
-
-    /// Add a pitch class to the local peer's set.
-    fn add_pitch(&mut self, pc: PitchClass);
-
-    /// Remove a pitch class from the local peer's set.
-    fn remove_pitch(&mut self, pc: PitchClass);
-
-    /// Toggle a pitch class in the local peer's set.
-    fn toggle_pitch(&mut self, pc: PitchClass) -> bool;
-
-    /// Set the local peer's pitch to a single value (voice input mode).
-    fn set_single_pitch(&mut self, pc: PitchClass);
-
-    /// Clear the local peer's pitch set.
-    fn clear_pitches(&mut self);
-
-    /// Get all peer pitch sets.
-    fn all_peer_sets(&self) -> HashMap<String, PeerPitchSet>;
-
-    /// Get the current combination method.
-    fn combination_method(&self) -> &CombinationMethod;
-
-    /// Set the combination method.
-    fn set_combination_method(&mut self, method: CombinationMethod);
-
-    /// Compute the room result based on the combination method.
-    fn compute_room_result(&self) -> RoomPitchResult {
-        let peer_sets = self.all_peer_sets();
-        let method = self.combination_method();
-
-        let mut result = RoomPitchResult::default();
-
-        // Build attribution map
-        for (peer_id, peer_set) in &peer_sets {
-            for &pc in &peer_set.pitch_classes {
-                result
-                    .attribution
-                    .entry(pc)
-                    .or_default()
-                    .push(peer_id.clone());
-            }
-        }
-
-        // Compute combined set based on method
-        result.pitch_classes = match method {
-            CombinationMethod::Union => {
-                // Union: all pitch classes from any peer
-                peer_sets
-                    .values()
-                    .flat_map(|s| s.pitch_classes.iter().copied())
-                    .collect()
-            }
-            CombinationMethod::Intersection => {
-                // Intersection: only pitch classes present in all peers
-                if peer_sets.is_empty() {
-                    HashSet::new()
-                } else {
-                    let mut iter = peer_sets.values();
-                    let first = iter.next().unwrap().pitch_classes.clone();
-                    iter.fold(first, |acc, set| {
-                        acc.intersection(&set.pitch_classes).copied().collect()
-                    })
-                }
-            }
-            CombinationMethod::Custom(_) => {
-                // For now, custom methods fall back to union
-                peer_sets
-                    .values()
-                    .flat_map(|s| s.pitch_classes.iter().copied())
-                    .collect()
-            }
-        };
-
-        result
-    }
-
-    /// Get the room's SCL tuning content.
-    fn tuning_scl(&self) -> &str;
-
-    /// Set the room's SCL tuning content.
-    fn set_tuning_scl(&mut self, scl: &str);
-
-    /// Subscribe to state changes (for reactive UI).
-    /// Returns a receiver that gets notified on any state change.
-    fn subscribe(&self) -> tokio::sync::watch::Receiver<()>;
-}
-
-/// A simple in-memory implementation of RoomState for testing.
-#[derive(Debug)]
-pub struct LocalRoomState {
-    peer_id: String,
-    local_set: PeerPitchSet,
-    peer_sets: HashMap<String, PeerPitchSet>,
-    combination_method: CombinationMethod,
-    tuning_scl: String,
-    notify_tx: tokio::sync::watch::Sender<()>,
-    notify_rx: tokio::sync::watch::Receiver<()>,
-}
-
-impl LocalRoomState {
-    pub fn new(peer_id: String) -> Self {
-        let (notify_tx, notify_rx) = tokio::sync::watch::channel(());
-        let mut peer_sets = HashMap::new();
-        peer_sets.insert(peer_id.clone(), PeerPitchSet::new());
-
-        Self {
-            peer_id,
-            local_set: PeerPitchSet::new(),
-            peer_sets,
-            combination_method: CombinationMethod::default(),
-            tuning_scl: String::new(),
-            notify_tx,
-            notify_rx,
-        }
-    }
-
-    fn notify(&self) {
-        let _ = self.notify_tx.send(());
-    }
-}
-
-impl RoomState for LocalRoomState {
-    fn local_peer_id(&self) -> &str {
-        &self.peer_id
-    }
-
-    fn local_pitch_set(&self) -> &PeerPitchSet {
-        &self.local_set
-    }
-
-    fn local_pitch_set_mut(&mut self) -> &mut PeerPitchSet {
-        &mut self.local_set
-    }
-
-    fn add_pitch(&mut self, pc: PitchClass) {
-        self.local_set.add(pc);
-        self.peer_sets
-            .get_mut(&self.peer_id)
-            .unwrap()
-            .add(pc);
-        self.notify();
-    }
-
-    fn remove_pitch(&mut self, pc: PitchClass) {
-        self.local_set.remove(pc);
-        self.peer_sets
-            .get_mut(&self.peer_id)
-            .unwrap()
-            .remove(pc);
-        self.notify();
-    }
-
-    fn toggle_pitch(&mut self, pc: PitchClass) -> bool {
-        let added = self.local_set.toggle(pc);
-        self.peer_sets
-            .get_mut(&self.peer_id)
-            .unwrap()
-            .pitch_classes = self.local_set.pitch_classes.clone();
-        self.notify();
-        added
-    }
-
-    fn set_single_pitch(&mut self, pc: PitchClass) {
-        self.local_set.set_single(pc);
-        self.peer_sets
-            .get_mut(&self.peer_id)
-            .unwrap()
-            .pitch_classes = self.local_set.pitch_classes.clone();
-        self.notify();
-    }
-
-    fn clear_pitches(&mut self) {
-        self.local_set.clear();
-        self.peer_sets
-            .get_mut(&self.peer_id)
-            .unwrap()
-            .clear();
-        self.notify();
-    }
-
-    fn all_peer_sets(&self) -> HashMap<String, PeerPitchSet> {
-        self.peer_sets.clone()
-    }
-
-    fn combination_method(&self) -> &CombinationMethod {
-        &self.combination_method
-    }
-
-    fn set_combination_method(&mut self, method: CombinationMethod) {
-        self.combination_method = method;
-        self.notify();
-    }
-
-    fn tuning_scl(&self) -> &str {
-        &self.tuning_scl
-    }
-
-    fn set_tuning_scl(&mut self, scl: &str) {
-        self.tuning_scl = scl.to_string();
-        self.notify();
-    }
-
-    fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
-        self.notify_rx.clone()
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -351,48 +141,5 @@ mod tests {
         set.set_single(PitchClass(5));
         assert_eq!(set.pitch_classes.len(), 1);
         assert!(set.contains(PitchClass(5)));
-    }
-
-    #[test]
-    fn test_room_union() {
-        let mut state = LocalRoomState::new("peer1".to_string());
-        state.add_pitch(PitchClass(0));
-        state.add_pitch(PitchClass(4));
-
-        // Simulate another peer
-        let mut peer2_set = PeerPitchSet::new();
-        peer2_set.add(PitchClass(4));
-        peer2_set.add(PitchClass(7));
-        state.peer_sets.insert("peer2".to_string(), peer2_set);
-
-        state.set_combination_method(CombinationMethod::Union);
-        let result = state.compute_room_result();
-
-        assert_eq!(result.pitch_classes.len(), 3); // 0, 4, 7
-        assert!(result.pitch_classes.contains(&PitchClass(0)));
-        assert!(result.pitch_classes.contains(&PitchClass(4)));
-        assert!(result.pitch_classes.contains(&PitchClass(7)));
-
-        // Check attribution
-        assert_eq!(result.attribution[&PitchClass(4)].len(), 2); // Both peers
-    }
-
-    #[test]
-    fn test_room_intersection() {
-        let mut state = LocalRoomState::new("peer1".to_string());
-        state.add_pitch(PitchClass(0));
-        state.add_pitch(PitchClass(4));
-
-        // Simulate another peer
-        let mut peer2_set = PeerPitchSet::new();
-        peer2_set.add(PitchClass(4));
-        peer2_set.add(PitchClass(7));
-        state.peer_sets.insert("peer2".to_string(), peer2_set);
-
-        state.set_combination_method(CombinationMethod::Intersection);
-        let result = state.compute_room_result();
-
-        assert_eq!(result.pitch_classes.len(), 1); // Only 4
-        assert!(result.pitch_classes.contains(&PitchClass(4)));
     }
 }

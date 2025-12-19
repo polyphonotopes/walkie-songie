@@ -20,7 +20,7 @@ use libp2p_swarm::NetworkBehaviour;
 use libp2p_webrtc_websys::browser::{self, Behaviour as WebRTCBehaviour, SignalingConfig, Transport as BrowserWebrtcTransport};
 use wasm_bindgen_futures::spawn_local;
 
-use crate::room::{RoomState, YrsRoomState};
+use crate::room::RoomState;
 
 /// Relay server address (WebSocket with TLS)
 /// Note: No peer ID suffix - we accept whatever peer the server presents.
@@ -43,7 +43,7 @@ fn topic_from_room(room_name: &str) -> IdentTopic {
 
 /// Start libp2p room sync in the background.
 pub fn start_libp2p_room_sync(
-    room: Mutable<YrsRoomState>,
+    room: Mutable<RoomState>,
     room_topic: String,
     peer_id_out: Mutable<Option<String>>,
     room_version: Mutable<u64>,
@@ -61,7 +61,7 @@ pub fn start_libp2p_room_sync(
 }
 
 async fn run_sync(
-    room: Mutable<YrsRoomState>,
+    room: Mutable<RoomState>,
     room_topic: &str,
     peer_id_out: Mutable<Option<String>>,
     room_version: Mutable<u64>,
@@ -281,7 +281,7 @@ async fn run_sync(
 fn handle_swarm_event(
     swarm: &mut Swarm<Behaviour>,
     event: SwarmEvent<BehaviourEvent>,
-    room: &Mutable<YrsRoomState>,
+    room: &Mutable<RoomState>,
     room_version: &Mutable<u64>,
     topic: &IdentTopic,
     relay_addr: &Multiaddr,

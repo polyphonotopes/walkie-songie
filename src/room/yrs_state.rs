@@ -23,7 +23,7 @@ use yrs::{Doc, GetString, Map, MapPrelim, MapRef, ReadTxn, Text, TextRef, Transa
 use crate::tuning::PitchClass;
 
 use super::events::RoomEvent;
-use super::{CombinationMethod, PeerPitchSet, RoomState};
+use super::{CombinationMethod, PeerPitchSet, RoomPitchResult};
 
 /// Capacity for the event broadcast channel.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -74,8 +74,10 @@ struct StateSnapshot {
     pieces_locked: bool,
 }
 
-/// yrs-based room state that syncs with peers.
-pub struct YrsRoomState {
+/// Room state backed by yrs CRDT that syncs with peers.
+///
+/// This is THE room state - the CRDT is the single source of truth.
+pub struct RoomState {
     peer_id: String,
     doc: Doc,
     notify_tx: watch::Sender<()>,
@@ -86,8 +88,8 @@ pub struct YrsRoomState {
     _event_rx: BroadcastReceiver<RoomEvent>,
 }
 
-impl YrsRoomState {
-    /// Create a new yrs room state for the given peer.
+impl RoomState {
+    /// Create a new room state for the given peer.
     pub fn new(peer_id: String) -> Self {
         let doc = Doc::new();
         let (notify_tx, notify_rx) = watch::channel(());
@@ -185,9 +187,9 @@ impl YrsRoomState {
                 });
             }
         }
-        for id in before.pieces.keys() {
+        for (id, (pitch, _emoji)) in &before.pieces {
             if !after.pieces.contains_key(id) {
-                self.emit(RoomEvent::PieceRemoved { id: id.clone() });
+                self.emit(RoomEvent::PieceRemoved { id: id.clone(), pitch: *pitch });
             }
         }
 
@@ -200,7 +202,8 @@ impl YrsRoomState {
             };
             if changed {
                 if pitch.is_none() && pc.is_none() {
-                    self.emit(RoomEvent::VoiceCleared { peer_id: peer_id.clone() });
+                    let prev_pitch = before_voice.and_then(|(p, _)| *p);
+                    self.emit(RoomEvent::VoiceCleared { peer_id: peer_id.clone(), pitch: prev_pitch });
                 } else {
                     self.emit(RoomEvent::VoiceChanged {
                         peer_id: peer_id.clone(),
@@ -212,7 +215,8 @@ impl YrsRoomState {
         }
         for peer_id in before.voices.keys() {
             if !after.voices.contains_key(peer_id) {
-                self.emit(RoomEvent::VoiceCleared { peer_id: peer_id.clone() });
+                let prev_pitch = before.voices.get(peer_id).and_then(|(p, _)| *p);
+                self.emit(RoomEvent::VoiceCleared { peer_id: peer_id.clone(), pitch: prev_pitch });
             }
         }
 
@@ -314,25 +318,16 @@ impl YrsRoomState {
     fn notify(&self) {
         let _ = self.notify_tx.send(());
     }
-}
 
-impl RoomState for YrsRoomState {
-    fn local_peer_id(&self) -> &str {
+    // === Pitch mutation methods ===
+
+    /// Get the local peer's ID.
+    pub fn local_peer_id(&self) -> &str {
         &self.peer_id
     }
 
-    fn local_pitch_set(&self) -> &PeerPitchSet {
-        // Note: This returns a snapshot, not a live reference
-        // For the trait to work properly, we'd need interior mutability
-        // For now, we'll compute it on demand
-        unimplemented!("Use all_peer_sets() instead for yrs implementation")
-    }
-
-    fn local_pitch_set_mut(&mut self) -> &mut PeerPitchSet {
-        unimplemented!("Use add_pitch/remove_pitch/toggle_pitch instead for yrs implementation")
-    }
-
-    fn add_pitch(&mut self, pc: PitchClass) {
+    /// Add a pitch class to the shared set.
+    pub fn add_pitch(&mut self, pc: PitchClass) {
         debug!("[CRDT] add_pitch({}) for peer {}", pc.0, self.peer_id);
 
         let mut txn = self.doc.transact_mut();
@@ -346,7 +341,8 @@ impl RoomState for YrsRoomState {
         self.notify();
     }
 
-    fn remove_pitch(&mut self, pc: PitchClass) {
+    /// Remove a pitch class from the shared set.
+    pub fn remove_pitch(&mut self, pc: PitchClass) {
         debug!("[CRDT] remove_pitch({}) for peer {}", pc.0, self.peer_id);
 
         let mut txn = self.doc.transact_mut();
@@ -360,7 +356,8 @@ impl RoomState for YrsRoomState {
         self.notify();
     }
 
-    fn toggle_pitch(&mut self, pc: PitchClass) -> bool {
+    /// Toggle a pitch class in the shared set.
+    pub fn toggle_pitch(&mut self, pc: PitchClass) -> bool {
         if self.contains_pitch(pc) {
             self.remove_pitch(pc);
             false
@@ -370,7 +367,8 @@ impl RoomState for YrsRoomState {
         }
     }
 
-    fn set_single_pitch(&mut self, pc: PitchClass) {
+    /// Set a single pitch class (clears others).
+    pub fn set_single_pitch(&mut self, pc: PitchClass) {
         let mut txn = self.doc.transact_mut();
         let shared_pitches: MapRef = txn.get_or_insert_map(KEY_SHARED_PITCHES);
 
@@ -392,7 +390,8 @@ impl RoomState for YrsRoomState {
         self.notify();
     }
 
-    fn clear_pitches(&mut self) {
+    /// Clear all shared pitches.
+    pub fn clear_pitches(&mut self) {
         let mut txn = self.doc.transact_mut();
         let shared_pitches: MapRef = txn.get_or_insert_map(KEY_SHARED_PITCHES);
 
@@ -411,7 +410,8 @@ impl RoomState for YrsRoomState {
         self.notify();
     }
 
-    fn all_peer_sets(&self) -> HashMap<String, PeerPitchSet> {
+    /// Get all peer pitch sets (shared + voice).
+    pub fn all_peer_sets(&self) -> HashMap<String, PeerPitchSet> {
         let txn = self.doc.transact();
         let mut result = HashMap::new();
 
@@ -449,14 +449,64 @@ impl RoomState for YrsRoomState {
         result
     }
 
-    fn combination_method(&self) -> &CombinationMethod {
+    /// Compute the combined room result based on the combination method.
+    pub fn compute_room_result(&self) -> RoomPitchResult {
+        let peer_sets = self.all_peer_sets();
+        let method = self.combination_method();
+
+        let mut result = RoomPitchResult::default();
+
+        // Build attribution map
+        for (peer_id, peer_set) in &peer_sets {
+            for &pc in &peer_set.pitch_classes {
+                result
+                    .attribution
+                    .entry(pc)
+                    .or_default()
+                    .push(peer_id.clone());
+            }
+        }
+
+        // Compute combined set based on method
+        result.pitch_classes = match method {
+            CombinationMethod::Union => {
+                peer_sets
+                    .values()
+                    .flat_map(|s| s.pitch_classes.iter().copied())
+                    .collect()
+            }
+            CombinationMethod::Intersection => {
+                if peer_sets.is_empty() {
+                    HashSet::new()
+                } else {
+                    let mut iter = peer_sets.values();
+                    let first = iter.next().unwrap().pitch_classes.clone();
+                    iter.fold(first, |acc, set| {
+                        acc.intersection(&set.pitch_classes).copied().collect()
+                    })
+                }
+            }
+            CombinationMethod::Custom(_) => {
+                peer_sets
+                    .values()
+                    .flat_map(|s| s.pitch_classes.iter().copied())
+                    .collect()
+            }
+        };
+
+        result
+    }
+
+    /// Get the current combination method.
+    pub fn combination_method(&self) -> &CombinationMethod {
         // This returns a reference but we can't store it
         // Return a static reference for the default case
         // In a real implementation, we'd use interior mutability
         &CombinationMethod::Union
     }
 
-    fn set_combination_method(&mut self, method: CombinationMethod) {
+    /// Set the combination method.
+    pub fn set_combination_method(&mut self, method: CombinationMethod) {
         let mut txn = self.doc.transact_mut();
         let meta: MapRef = txn.get_or_insert_map(KEY_COMBINATION_METHOD);
         meta.insert(&mut txn, "method", method.as_str());
@@ -467,12 +517,14 @@ impl RoomState for YrsRoomState {
         self.notify();
     }
 
-    fn tuning_scl(&self) -> &str {
+    /// Get the room's SCL tuning content.
+    pub fn tuning_scl(&self) -> &str {
         // Return empty for now - need interior mutability for proper implementation
         ""
     }
 
-    fn set_tuning_scl(&mut self, scl: &str) {
+    /// Set the room's SCL tuning content.
+    pub fn set_tuning_scl(&mut self, scl: &str) {
         let mut txn = self.doc.transact_mut();
         let tuning: TextRef = txn.get_or_insert_text(KEY_TUNING);
 
@@ -491,13 +543,13 @@ impl RoomState for YrsRoomState {
         self.notify();
     }
 
-    fn subscribe(&self) -> watch::Receiver<()> {
+    /// Subscribe to state changes.
+    pub fn subscribe(&self) -> watch::Receiver<()> {
         self.notify_rx.clone()
     }
-}
 
-// Additional methods for getting values that can't be returned as references
-impl YrsRoomState {
+    // === Query methods ===
+
     /// Check if a pitch is in the shared pitch set (O(1) lookup).
     pub fn contains_pitch(&self, pc: PitchClass) -> bool {
         let txn = self.doc.transact();
@@ -628,6 +680,9 @@ impl YrsRoomState {
 
     /// Set both voice pitch and pitch class atomically.
     pub fn set_voice(&mut self, pitch: Option<i32>, pc: Option<PitchClass>) {
+        // Capture previous pitch for VoiceCleared event
+        let (prev_pitch, _) = self.get_peer_voice(&self.peer_id.clone());
+
         let mut txn = self.doc.transact_mut();
         let voice_state: MapRef = txn.get_or_insert_map(KEY_VOICE_STATE);
 
@@ -657,6 +712,7 @@ impl YrsRoomState {
         if pitch.is_none() && pc.is_none() {
             self.emit(RoomEvent::VoiceCleared {
                 peer_id: self.peer_id.clone(),
+                pitch: prev_pitch,
             });
         } else {
             self.emit(RoomEvent::VoiceChanged {
@@ -743,6 +799,14 @@ impl YrsRoomState {
             .collect()
     }
 
+    /// Get all active voice pitches (absolute, from all peers).
+    pub fn all_voice_pitches(&self) -> HashSet<i32> {
+        self.all_voice_states()
+            .into_values()
+            .filter_map(|(pitch, _)| pitch)
+            .collect()
+    }
+
     /// Clear voice for any peer that has the given pitch class.
     /// Returns true if any voice was cleared.
     pub fn clear_voice_at_pitch_class(&mut self, target_pc: PitchClass) -> bool {
@@ -816,12 +880,16 @@ impl YrsRoomState {
     pub fn remove_piece(&mut self, piece_id: &str) {
         debug!("[CRDT] remove_piece(id={})", piece_id);
 
+        // Capture pitch before removal for delta computation
+        let pitch = self.get_piece(piece_id).map(|p| p.pitch).unwrap_or(0);
+
         let mut txn = self.doc.transact_mut();
         let pieces: MapRef = txn.get_or_insert_map(KEY_PIECES);
         pieces.remove(&mut txn, piece_id);
         drop(txn);
         self.emit(RoomEvent::PieceRemoved {
             id: piece_id.to_string(),
+            pitch,
         });
         self.notify();
     }
@@ -995,7 +1063,7 @@ mod tests {
 
     #[test]
     fn test_yrs_add_remove_pitch() {
-        let mut state = YrsRoomState::new("peer1".to_string());
+        let mut state = RoomState::new("peer1".to_string());
 
         state.add_pitch(PitchClass(5));
         let sets = state.all_peer_sets();
@@ -1009,7 +1077,7 @@ mod tests {
 
     #[test]
     fn test_yrs_toggle() {
-        let mut state = YrsRoomState::new("peer1".to_string());
+        let mut state = RoomState::new("peer1".to_string());
 
         assert!(state.toggle_pitch(PitchClass(7))); // Added
         let sets = state.all_peer_sets();
@@ -1023,7 +1091,7 @@ mod tests {
 
     #[test]
     fn test_yrs_single_pitch() {
-        let mut state = YrsRoomState::new("peer1".to_string());
+        let mut state = RoomState::new("peer1".to_string());
 
         state.add_pitch(PitchClass(1));
         state.add_pitch(PitchClass(2));
@@ -1039,7 +1107,7 @@ mod tests {
 
     #[test]
     fn test_yrs_tuning() {
-        let mut state = YrsRoomState::new("peer1".to_string());
+        let mut state = RoomState::new("peer1".to_string());
 
         let scl = "! Test\nTest\n1\n1200.0";
         state.set_tuning_scl(scl);
@@ -1048,8 +1116,8 @@ mod tests {
 
     #[test]
     fn test_yrs_sync() {
-        let mut state1 = YrsRoomState::new("peer1".to_string());
-        let mut state2 = YrsRoomState::new("peer2".to_string());
+        let mut state1 = RoomState::new("peer1".to_string());
+        let mut state2 = RoomState::new("peer2".to_string());
 
         // Peer 1 adds a pitch (goes to shared set)
         state1.add_pitch(PitchClass(5));
@@ -1065,8 +1133,8 @@ mod tests {
 
     #[test]
     fn test_yrs_sync_shared_removal() {
-        let mut state1 = YrsRoomState::new("peer1".to_string());
-        let mut state2 = YrsRoomState::new("peer2".to_string());
+        let mut state1 = RoomState::new("peer1".to_string());
+        let mut state2 = RoomState::new("peer2".to_string());
 
         // Peer 1 adds a pitch
         state1.add_pitch(PitchClass(5));
@@ -1091,7 +1159,7 @@ mod tests {
 
     #[test]
     fn test_yrs_voice_state() {
-        let mut state = YrsRoomState::new("peer1".to_string());
+        let mut state = RoomState::new("peer1".to_string());
 
         // Initially empty
         assert_eq!(state.local_voice(), (None, None));
@@ -1121,8 +1189,8 @@ mod tests {
 
     #[test]
     fn test_yrs_voice_state_sync() {
-        let mut state1 = YrsRoomState::new("peer1".to_string());
-        let mut state2 = YrsRoomState::new("peer2".to_string());
+        let mut state1 = RoomState::new("peer1".to_string());
+        let mut state2 = RoomState::new("peer2".to_string());
 
         // Peer 1 sets voice (pitch 69 = A4, pitch class 9 = A)
         state1.set_voice(Some(69), Some(PitchClass(9)));
@@ -1172,7 +1240,7 @@ mod tests {
 
     #[test]
     fn test_yrs_pieces() {
-        let mut state = YrsRoomState::new("peer1".to_string());
+        let mut state = RoomState::new("peer1".to_string());
 
         // Initially empty
         assert!(state.all_pieces().is_empty());
@@ -1205,8 +1273,8 @@ mod tests {
 
     #[test]
     fn test_yrs_pieces_sync() {
-        let mut state1 = YrsRoomState::new("peer1".to_string());
-        let mut state2 = YrsRoomState::new("peer2".to_string());
+        let mut state1 = RoomState::new("peer1".to_string());
+        let mut state2 = RoomState::new("peer2".to_string());
 
         // Peer 1 adds a piece
         let id = state1.add_piece(60, "🥜").unwrap();
@@ -1236,7 +1304,7 @@ mod tests {
 
     #[test]
     fn test_yrs_clear_pieces() {
-        let mut state = YrsRoomState::new("peer1".to_string());
+        let mut state = RoomState::new("peer1".to_string());
 
         // Add multiple pieces
         state.add_piece(60, "🪨");

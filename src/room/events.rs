@@ -25,7 +25,8 @@ pub enum RoomEvent {
         pitch_class: Option<PitchClass>,
     },
     /// A peer's voice was cleared (stopped singing)
-    VoiceCleared { peer_id: String },
+    /// Includes previous pitch for delta computation
+    VoiceCleared { peer_id: String, pitch: Option<i32> },
 
     // === Emoji Pieces (draggable items) ===
     /// A new piece was added
@@ -36,8 +37,8 @@ pub enum RoomEvent {
         old_pitch: i32,
         new_pitch: i32,
     },
-    /// A piece was removed
-    PieceRemoved { id: String },
+    /// A piece was removed (includes pitch for delta computation)
+    PieceRemoved { id: String, pitch: i32 },
     /// All pieces were cleared
     PiecesCleared,
 
