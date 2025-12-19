@@ -12,6 +12,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use async_broadcast::{broadcast, Receiver as BroadcastReceiver, Sender as BroadcastSender};
+use futures::Stream;
 use tokio::sync::watch;
 use tracing::debug;
 use yrs::updates::decoder::Decode;
@@ -20,7 +22,11 @@ use yrs::{Doc, GetString, Map, MapPrelim, MapRef, ReadTxn, Text, TextRef, Transa
 
 use crate::tuning::PitchClass;
 
+use super::events::RoomEvent;
 use super::{CombinationMethod, PeerPitchSet, RoomState};
+
+/// Capacity for the event broadcast channel.
+const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// Document keys for the room state.
 const KEY_TUNING: &str = "tuning";
@@ -59,12 +65,25 @@ impl Piece {
     }
 }
 
+/// Snapshot of room state for diffing after remote updates.
+#[derive(Debug, Clone, Default)]
+struct StateSnapshot {
+    pitches: HashSet<PitchClass>,
+    pieces: HashMap<String, (i32, String)>, // id -> (pitch, emoji)
+    voices: HashMap<String, (Option<i32>, Option<PitchClass>)>,
+    pieces_locked: bool,
+}
+
 /// yrs-based room state that syncs with peers.
 pub struct YrsRoomState {
     peer_id: String,
     doc: Doc,
     notify_tx: watch::Sender<()>,
     notify_rx: watch::Receiver<()>,
+    /// Broadcast channel for room events (multi-consumer).
+    event_tx: BroadcastSender<RoomEvent>,
+    /// Inactive receiver to keep the channel alive.
+    _event_rx: BroadcastReceiver<RoomEvent>,
 }
 
 impl YrsRoomState {
@@ -72,6 +91,10 @@ impl YrsRoomState {
     pub fn new(peer_id: String) -> Self {
         let doc = Doc::new();
         let (notify_tx, notify_rx) = watch::channel(());
+        let (mut event_tx, event_rx) = broadcast(EVENT_CHANNEL_CAPACITY);
+
+        // Don't block when no receivers - just drop events
+        event_tx.set_overflow(true);
 
         // Initialize the document structure
         {
@@ -101,7 +124,123 @@ impl YrsRoomState {
             doc,
             notify_tx,
             notify_rx,
+            event_tx,
+            _event_rx: event_rx,
         }
+    }
+
+    /// Subscribe to room events as a Stream.
+    /// Multiple subscribers can receive the same events.
+    pub fn events(&self) -> impl Stream<Item = RoomEvent> {
+        let rx = self.event_tx.new_receiver();
+        futures::stream::unfold(rx, |mut rx| async move {
+            match rx.recv().await {
+                Ok(event) => Some((event, rx)),
+                Err(_) => None, // Channel closed
+            }
+        })
+    }
+
+    /// Emit an event to all subscribers.
+    fn emit(&self, event: RoomEvent) {
+        // Ignore send errors (no receivers is fine due to overflow mode)
+        let _ = self.event_tx.try_broadcast(event);
+    }
+
+    /// Take a snapshot of current state for diffing.
+    fn snapshot_state(&self) -> StateSnapshot {
+        StateSnapshot {
+            pitches: self.shared_pitches(),
+            pieces: self.all_pieces().into_iter().map(|p| (p.id, (p.pitch, p.emoji))).collect(),
+            voices: self.all_voice_states(),
+            pieces_locked: self.pieces_locked(),
+        }
+    }
+
+    /// Compare snapshots and emit events for differences.
+    fn emit_diffs(&self, before: StateSnapshot, after: StateSnapshot) {
+        // Pitch changes
+        for pc in after.pitches.difference(&before.pitches) {
+            self.emit(RoomEvent::PitchAdded { pitch_class: *pc });
+        }
+        for pc in before.pitches.difference(&after.pitches) {
+            self.emit(RoomEvent::PitchRemoved { pitch_class: *pc });
+        }
+
+        // Piece changes
+        for (id, (pitch, emoji)) in &after.pieces {
+            if let Some((old_pitch, _)) = before.pieces.get(id) {
+                if *old_pitch != *pitch {
+                    self.emit(RoomEvent::PieceMoved {
+                        id: id.clone(),
+                        old_pitch: *old_pitch,
+                        new_pitch: *pitch,
+                    });
+                }
+            } else {
+                self.emit(RoomEvent::PieceAdded {
+                    id: id.clone(),
+                    pitch: *pitch,
+                    emoji: emoji.clone(),
+                });
+            }
+        }
+        for id in before.pieces.keys() {
+            if !after.pieces.contains_key(id) {
+                self.emit(RoomEvent::PieceRemoved { id: id.clone() });
+            }
+        }
+
+        // Voice changes
+        for (peer_id, (pitch, pc)) in &after.voices {
+            let before_voice = before.voices.get(peer_id);
+            let changed = match before_voice {
+                Some((bp, bpc)) => *bp != *pitch || *bpc != *pc,
+                None => true,
+            };
+            if changed {
+                if pitch.is_none() && pc.is_none() {
+                    self.emit(RoomEvent::VoiceCleared { peer_id: peer_id.clone() });
+                } else {
+                    self.emit(RoomEvent::VoiceChanged {
+                        peer_id: peer_id.clone(),
+                        pitch: *pitch,
+                        pitch_class: *pc,
+                    });
+                }
+            }
+        }
+        for peer_id in before.voices.keys() {
+            if !after.voices.contains_key(peer_id) {
+                self.emit(RoomEvent::VoiceCleared { peer_id: peer_id.clone() });
+            }
+        }
+
+        // Lock state change
+        if before.pieces_locked != after.pieces_locked {
+            self.emit(RoomEvent::PiecesLockChanged { locked: after.pieces_locked });
+        }
+    }
+
+    /// Emit a full state sync event (for initial load or reconnect).
+    pub fn emit_full_state_sync(&self) {
+        let pitches: Vec<PitchClass> = self.shared_pitches().into_iter().collect();
+        let pieces: Vec<(String, i32, String)> = self.all_pieces()
+            .into_iter()
+            .map(|p| (p.id, p.pitch, p.emoji))
+            .collect();
+        let voices: Vec<(String, Option<i32>, Option<PitchClass>)> = self.all_voice_states()
+            .into_iter()
+            .map(|(peer_id, (pitch, pc))| (peer_id, pitch, pc))
+            .collect();
+        let pieces_locked = self.pieces_locked();
+
+        self.emit(RoomEvent::FullStateSync {
+            pitches,
+            pieces,
+            voices,
+            pieces_locked,
+        });
     }
 
     /// Get the yrs document for sync operations.
@@ -113,6 +252,9 @@ impl YrsRoomState {
     /// NOTE: This does NOT call notify() because it's a remote change.
     /// Only local changes should trigger notify() to avoid feedback loops.
     pub fn apply_update(&mut self, update: &[u8]) -> anyhow::Result<()> {
+        // Snapshot before applying for diff computation
+        let before = self.snapshot_state();
+
         let update = Update::decode_v1(update)?;
         self.doc.transact_mut().apply_update(update)?;
 
@@ -126,6 +268,10 @@ impl YrsRoomState {
                 set.pitch_classes.iter().map(|pc| pc.0).collect::<Vec<_>>()
             );
         }
+
+        // Snapshot after applying and emit diffs
+        let after = self.snapshot_state();
+        self.emit_diffs(before, after);
 
         // NOTE: We intentionally do NOT call notify() here!
         // apply_update() is for REMOTE changes, and notify() signals that
@@ -146,6 +292,9 @@ impl YrsRoomState {
         let update = Update::decode_v1(state)?;
         self.doc.transact_mut().apply_update(update)?;
         debug!("[CRDT] Loaded persisted state ({} bytes)", state.len());
+
+        // Emit full state sync event for subscribers to initialize
+        self.emit_full_state_sync();
         Ok(())
     }
 
@@ -193,6 +342,7 @@ impl RoomState for YrsRoomState {
         let key = pc.0.to_string();
         shared_pitches.insert(&mut txn, key, true);
         drop(txn);
+        self.emit(RoomEvent::PitchAdded { pitch_class: pc });
         self.notify();
     }
 
@@ -206,6 +356,7 @@ impl RoomState for YrsRoomState {
         let key = pc.0.to_string();
         shared_pitches.remove(&mut txn, &key);
         drop(txn);
+        self.emit(RoomEvent::PitchRemoved { pitch_class: pc });
         self.notify();
     }
 
@@ -256,6 +407,7 @@ impl RoomState for YrsRoomState {
             shared_pitches.remove(&mut txn, &key);
         }
         drop(txn);
+        self.emit(RoomEvent::PitchesCleared);
         self.notify();
     }
 
@@ -309,6 +461,9 @@ impl RoomState for YrsRoomState {
         let meta: MapRef = txn.get_or_insert_map(KEY_COMBINATION_METHOD);
         meta.insert(&mut txn, "method", method.as_str());
         drop(txn);
+        self.emit(RoomEvent::CombinationMethodChanged {
+            method: method.as_str().to_string(),
+        });
         self.notify();
     }
 
@@ -330,6 +485,9 @@ impl RoomState for YrsRoomState {
         // Insert new content
         tuning.insert(&mut txn, 0, scl);
         drop(txn);
+        self.emit(RoomEvent::TuningChanged {
+            scl: scl.to_string(),
+        });
         self.notify();
     }
 
@@ -494,6 +652,19 @@ impl YrsRoomState {
         }
 
         drop(txn);
+
+        // Emit appropriate event
+        if pitch.is_none() && pc.is_none() {
+            self.emit(RoomEvent::VoiceCleared {
+                peer_id: self.peer_id.clone(),
+            });
+        } else {
+            self.emit(RoomEvent::VoiceChanged {
+                peer_id: self.peer_id.clone(),
+                pitch,
+                pitch_class: pc,
+            });
+        }
         self.notify();
     }
 
@@ -631,6 +802,11 @@ impl YrsRoomState {
         piece_data.insert(&mut txn, "emoji", emoji);
 
         drop(txn);
+        self.emit(RoomEvent::PieceAdded {
+            id: id.clone(),
+            pitch,
+            emoji: emoji.to_string(),
+        });
         self.notify();
 
         Some(id)
@@ -644,12 +820,18 @@ impl YrsRoomState {
         let pieces: MapRef = txn.get_or_insert_map(KEY_PIECES);
         pieces.remove(&mut txn, piece_id);
         drop(txn);
+        self.emit(RoomEvent::PieceRemoved {
+            id: piece_id.to_string(),
+        });
         self.notify();
     }
 
     /// Move a piece to a new pitch (for drag operations).
     pub fn move_piece(&mut self, piece_id: &str, new_pitch: i32) {
         debug!("[CRDT] move_piece(id={}, new_pitch={})", piece_id, new_pitch);
+
+        // Get old pitch before moving
+        let old_pitch = self.get_piece(piece_id).map(|p| p.pitch);
 
         let mut txn = self.doc.transact_mut();
         let pieces: MapRef = txn.get_or_insert_map(KEY_PIECES);
@@ -661,6 +843,14 @@ impl YrsRoomState {
             }
         }
         drop(txn);
+
+        if let Some(old) = old_pitch {
+            self.emit(RoomEvent::PieceMoved {
+                id: piece_id.to_string(),
+                old_pitch: old,
+                new_pitch,
+            });
+        }
         self.notify();
     }
 
@@ -716,6 +906,7 @@ impl YrsRoomState {
             pieces.remove(&mut txn, &id);
         }
         drop(txn);
+        self.emit(RoomEvent::PiecesCleared);
         self.notify();
     }
 
@@ -746,6 +937,7 @@ impl YrsRoomState {
         let meta: MapRef = txn.get_or_insert_map(KEY_COMBINATION_METHOD);
         meta.insert(&mut txn, KEY_PIECES_LOCKED, locked);
         drop(txn);
+        self.emit(RoomEvent::PiecesLockChanged { locked });
         self.notify();
     }
 
@@ -790,6 +982,9 @@ impl YrsRoomState {
         let emojis_str = emojis.join("");
         meta.insert(&mut txn, KEY_AVAILABLE_EMOJIS, emojis_str);
         drop(txn);
+        self.emit(RoomEvent::EmojisChanged {
+            emojis: emojis.to_vec(),
+        });
         self.notify();
     }
 }
@@ -953,6 +1148,7 @@ mod tests {
         let piece = Piece {
             id: "test".to_string(),
             pitch: 60, // Middle C
+            emoji: "🪨".to_string(),
         };
         assert_eq!(piece.pitch_class(12), 0); // C is pitch class 0
         assert_eq!(piece.octave(), 4); // Middle C is octave 4
@@ -960,6 +1156,7 @@ mod tests {
         let piece_high = Piece {
             id: "test2".to_string(),
             pitch: 72, // C5
+            emoji: "🪨".to_string(),
         };
         assert_eq!(piece_high.pitch_class(12), 0);
         assert_eq!(piece_high.octave(), 5);
@@ -967,6 +1164,7 @@ mod tests {
         let piece_low = Piece {
             id: "test3".to_string(),
             pitch: 48, // C3
+            emoji: "🪨".to_string(),
         };
         assert_eq!(piece_low.pitch_class(12), 0);
         assert_eq!(piece_low.octave(), 3);
@@ -980,7 +1178,7 @@ mod tests {
         assert!(state.all_pieces().is_empty());
 
         // Add a piece at middle C (60) with rock emoji
-        let id = state.add_piece(60, "🪨");
+        let id = state.add_piece(60, "🪨").unwrap();
 
         // Should have one piece
         let pieces = state.all_pieces();
@@ -1011,7 +1209,7 @@ mod tests {
         let mut state2 = YrsRoomState::new("peer2".to_string());
 
         // Peer 1 adds a piece
-        let id = state1.add_piece(60, "🥜");
+        let id = state1.add_piece(60, "🥜").unwrap();
 
         // Sync state1 -> state2
         let update = state1.encode_state_as_update();

@@ -5,8 +5,10 @@
 //! - Room tuning (SCL content)
 //! - Combination method for computing room result
 
+pub mod events;
 pub mod yrs_state;
 
+pub use events::RoomEvent;
 pub use yrs_state::{Piece, YrsRoomState};
 
 use std::collections::{HashMap, HashSet};

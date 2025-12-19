@@ -24,6 +24,7 @@ async-channel = "2.3"
 
 # Async
 futures = "0.3"
+async-broadcast = "0.7"  # Multi-consumer broadcast for event streams
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

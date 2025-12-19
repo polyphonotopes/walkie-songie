@@ -11,8 +11,10 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 use web_time::Instant;
 
+use futures::StreamExt;
+
 use crate::pitch::{PitchDetectorConfig, PitchEvent, SwiftF0Detector};
-use crate::room::{RoomState, YrsRoomState};
+use crate::room::{RoomEvent, RoomState, YrsRoomState};
 use crate::tuning::{PitchClass, Tuning};
 
 use crate::words::generate_room_name;
@@ -969,6 +971,21 @@ async fn init_app() {
         }
     });
 
+    // Subscribe to room events for UI updates and state persistence
+    let state_for_events = state.clone();
+    let room_name_for_events = state.room_name.get_cloned();
+    spawn_local(async move {
+        // Get event stream from room
+        let events = state_for_events.room.lock_ref().events();
+
+        // Process each event
+        events.for_each(|event| {
+            // Handle the event
+            handle_room_event(&state_for_events, &event, &room_name_for_events);
+            async {}
+        }).await;
+    });
+
     // Subscribe to room_version changes to update UI and persist state
     use futures_signals::signal::SignalExt;
     let state_for_version = state.clone();
@@ -999,4 +1016,47 @@ async fn init_app() {
 
     // Mount the app to the DOM
     dominator::append_dom(&dominator::body(), render_app(state));
+}
+
+/// Handle a room event - update UI, MIDI, and persist state.
+fn handle_room_event(state: &Arc<AppState>, event: &RoomEvent, room_name: &str) {
+    // Log event for debugging
+    web_sys::console::log_1(&format!("[RoomEvent] {:?}", event).into());
+
+    // Increment room_version for backward compatibility with signal-based reactivity
+    state.room_version.set(state.room_version.get() + 1);
+
+    // Handle pitch-affecting events
+    if event.affects_pitches() {
+        sync_active_pitches(state);
+        state.sync_midi_toggle_output();
+    }
+
+    // Handle voice events
+    if event.affects_voice() {
+        sync_active_pitches(state);
+        state.sync_midi_voice_output();
+    }
+
+    // Handle piece lock changes
+    if let RoomEvent::PiecesLockChanged { locked } = event {
+        state.pieces_locked.set(*locked);
+    }
+
+    // Handle full state sync (initial load or reconnect)
+    if let RoomEvent::FullStateSync { pieces_locked, .. } = event {
+        state.pieces_locked.set(*pieces_locked);
+        sync_active_pitches(state);
+        state.sync_midi_toggle_output();
+        state.sync_midi_voice_output();
+    }
+
+    // Persist state to IndexedDB on any change
+    let state_bytes = state.room.lock_ref().encode_state_as_update();
+    let room_name = room_name.to_string();
+    spawn_local(async move {
+        if let Err(e) = super::storage::set_room_state(&room_name, &state_bytes).await {
+            web_sys::console::warn_1(&format!("Failed to save room state: {}", e).into());
+        }
+    });
 }

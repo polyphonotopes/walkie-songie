@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use crossbeam_channel::{Receiver, Sender};
 use nih_plug::prelude::*;
 
-use crate::room::{RoomState, YrsRoomState};
+use crate::room::{RoomEvent, RoomState, YrsRoomState};
 use crate::tuning::PitchClass;
 use crate::words::generate_room_name;
 
@@ -546,16 +546,14 @@ async fn run_networking_loop(
     plog!("Creating YrsRoomState with peer_id: {}", crdt_peer_id);
     let mut room = YrsRoomState::new(crdt_peer_id.clone());
 
+    // Subscribe to room events for reactive updates
+    let mut room_events = std::pin::pin!(room.events());
+
     // Track state
     let mut last_broadcast_sv = room.state_vector();
     let mut last_known_peer_count = room.all_peer_sets().len();
     let mut has_local_changes = false;
     let mut connected_to_relay = false;
-
-    // Track previous state for MIDI event diffing
-    let mut prev_peer_sets: HashMap<String, Vec<u8>> = HashMap::new();
-    let mut prev_voice_states: HashMap<String, (Option<i32>, Option<PitchClass>)> = HashMap::new();
-    let mut prev_pieces: HashMap<String, i32> = HashMap::new(); // piece_id -> pitch
 
     let mut loop_count: u64 = 0;
     let loop_start = std::time::Instant::now();
@@ -609,6 +607,85 @@ async fn run_networking_loop(
         tokio::pin!(timeout);
 
         tokio::select! {
+            // Handle room events (emitted by apply_update and local mutations)
+            room_event = room_events.next() => {
+                if let Some(event) = room_event {
+                    plog!("RoomEvent: {:?}", event);
+
+                    // Map RoomEvent to NetEvent for the plugin
+                    match event {
+                        RoomEvent::PitchAdded { pitch_class } => {
+                            let _ = evt_tx.send(NetEvent::RemotePitchClassChange {
+                                peer_id: "room".to_string(),
+                                pitch_class: pitch_class.0,
+                                on: true,
+                            });
+                        }
+                        RoomEvent::PitchRemoved { pitch_class } => {
+                            let _ = evt_tx.send(NetEvent::RemotePitchClassChange {
+                                peer_id: "room".to_string(),
+                                pitch_class: pitch_class.0,
+                                on: false,
+                            });
+                        }
+                        RoomEvent::PitchesCleared => {
+                            // Clear all pitch classes
+                            for pc in 0..12u8 {
+                                let _ = evt_tx.send(NetEvent::RemotePitchClassChange {
+                                    peer_id: "room".to_string(),
+                                    pitch_class: pc,
+                                    on: false,
+                                });
+                            }
+                        }
+                        RoomEvent::VoiceChanged { peer_id, pitch, .. } => {
+                            let _ = evt_tx.send(NetEvent::RemoteVoicePitchChange {
+                                peer_id,
+                                pitch,
+                            });
+                        }
+                        RoomEvent::VoiceCleared { peer_id } => {
+                            let _ = evt_tx.send(NetEvent::RemoteVoicePitchChange {
+                                peer_id,
+                                pitch: None,
+                            });
+                        }
+                        RoomEvent::PieceAdded { id, pitch, .. } => {
+                            let _ = evt_tx.send(NetEvent::PieceChange {
+                                piece_id: id,
+                                pitch,
+                            });
+                        }
+                        RoomEvent::PieceMoved { id, new_pitch, .. } => {
+                            let _ = evt_tx.send(NetEvent::PieceChange {
+                                piece_id: id,
+                                pitch: new_pitch,
+                            });
+                        }
+                        RoomEvent::PieceRemoved { id } => {
+                            let _ = evt_tx.send(NetEvent::PieceRemoved { piece_id: id });
+                        }
+                        RoomEvent::PiecesCleared => {
+                            // Signal full state sync with empty pieces
+                            let _ = evt_tx.send(NetEvent::FullStateSync { pieces: vec![] });
+                        }
+                        RoomEvent::FullStateSync { pieces, .. } => {
+                            let piece_list: Vec<(String, i32)> = pieces.into_iter()
+                                .map(|(id, pitch, _)| (id, pitch))
+                                .collect();
+                            let _ = evt_tx.send(NetEvent::FullStateSync { pieces: piece_list });
+                        }
+                        // Ignore config events for now
+                        RoomEvent::PiecesLockChanged { .. } |
+                        RoomEvent::TuningChanged { .. } |
+                        RoomEvent::CombinationMethodChanged { .. } |
+                        RoomEvent::EmojisChanged { .. } |
+                        RoomEvent::PeerJoined { .. } |
+                        RoomEvent::PeerLeft { .. } => {}
+                    }
+                }
+            }
+
             event = swarm.select_next_some() => {
                 match event {
                     SwarmEvent::ConnectionEstablished { peer_id, .. } => {
@@ -629,133 +706,11 @@ async fn run_networking_loop(
                         plog!("Received gossipsub message from {} ({} bytes)",
                             propagation_source, message.data.len());
 
+                        // apply_update now emits RoomEvents which will be handled above
                         if let Err(e) = room.apply_update(&message.data) {
                             plog!("Failed to apply update: {}", e);
                         } else {
                             last_broadcast_sv = room.state_vector();
-
-                            // Notify plugin of remote changes
-                            let peer_sets = room.all_peer_sets();
-
-                            // Check for new/changed pitch classes in current peers
-                            for (remote_peer_id, peer_set) in &peer_sets {
-                                if remote_peer_id == &crdt_peer_id {
-                                    continue;
-                                }
-
-                                let current_pcs: Vec<u8> = peer_set.pitch_classes.iter().map(|pc| pc.0).collect();
-                                let prev_pcs = prev_peer_sets.get(remote_peer_id).cloned().unwrap_or_default();
-
-                                // Send note ON for new pitch classes
-                                for &pc in &current_pcs {
-                                    if !prev_pcs.contains(&pc) {
-                                        plog!("Sending note ON for pc {} from peer {}", pc, remote_peer_id);
-                                        let _ = evt_tx.send(NetEvent::RemotePitchClassChange {
-                                            peer_id: remote_peer_id.clone(),
-                                            pitch_class: pc,
-                                            on: true,
-                                        });
-                                    }
-                                }
-                                // Send note OFF for removed pitch classes
-                                for &pc in &prev_pcs {
-                                    if !current_pcs.contains(&pc) {
-                                        plog!("Sending note OFF for pc {} from peer {}", pc, remote_peer_id);
-                                        let _ = evt_tx.send(NetEvent::RemotePitchClassChange {
-                                            peer_id: remote_peer_id.clone(),
-                                            pitch_class: pc,
-                                            on: false,
-                                        });
-                                    }
-                                }
-                                prev_peer_sets.insert(remote_peer_id.clone(), current_pcs);
-                            }
-
-                            // Check for peers that disappeared entirely - send note OFF for all their notes
-                            let current_peer_ids: std::collections::HashSet<_> = peer_sets.keys().collect();
-                            let disappeared_peers: Vec<_> = prev_peer_sets.keys()
-                                .filter(|k| !current_peer_ids.contains(k) && *k != &crdt_peer_id)
-                                .cloned()
-                                .collect();
-                            for peer_id in disappeared_peers {
-                                if let Some(prev_pcs) = prev_peer_sets.remove(&peer_id) {
-                                    for pc in prev_pcs {
-                                        plog!("Sending note OFF for pc {} (peer {} disappeared)", pc, peer_id);
-                                        let _ = evt_tx.send(NetEvent::RemotePitchClassChange {
-                                            peer_id: peer_id.clone(),
-                                            pitch_class: pc,
-                                            on: false,
-                                        });
-                                    }
-                                }
-                            }
-
-                            // Check voice state changes
-                            let voice_states = room.all_voice_states();
-                            for (remote_peer_id, (pitch, _pc)) in &voice_states {
-                                if remote_peer_id == &crdt_peer_id {
-                                    continue;
-                                }
-                                let prev = prev_voice_states.get(remote_peer_id).cloned();
-                                if prev.map(|(p, _)| p) != Some(*pitch) {
-                                    plog!("Voice pitch change for peer {}: {:?} -> {:?}", remote_peer_id, prev.map(|(p, _)| p), pitch);
-                                    let _ = evt_tx.send(NetEvent::RemoteVoicePitchChange {
-                                        peer_id: remote_peer_id.clone(),
-                                        pitch: *pitch,
-                                    });
-                                }
-                                prev_voice_states.insert(remote_peer_id.clone(), (*pitch, *_pc));
-                            }
-
-                            // Check for peers whose voice state disappeared - send None
-                            let current_voice_peer_ids: std::collections::HashSet<_> = voice_states.keys().collect();
-                            let disappeared_voice_peers: Vec<_> = prev_voice_states.keys()
-                                .filter(|k| !current_voice_peer_ids.contains(k) && *k != &crdt_peer_id)
-                                .cloned()
-                                .collect();
-                            for peer_id in disappeared_voice_peers {
-                                if let Some((prev_pitch, _)) = prev_voice_states.remove(&peer_id) {
-                                    if prev_pitch.is_some() {
-                                        plog!("Voice pitch OFF for peer {} (disappeared)", peer_id);
-                                        let _ = evt_tx.send(NetEvent::RemoteVoicePitchChange {
-                                            peer_id: peer_id.clone(),
-                                            pitch: None,
-                                        });
-                                    }
-                                }
-                            }
-
-                            // Check piece changes
-                            let all_pieces = room.all_pieces();
-                            plog!("Checking pieces: {} pieces in room", all_pieces.len());
-                            let current_pieces: HashMap<String, i32> = all_pieces
-                                .into_iter()
-                                .map(|p| (p.id, p.pitch))
-                                .collect();
-
-                            // Send events for new/changed pieces
-                            for (piece_id, &pitch) in &current_pieces {
-                                let prev_pitch = prev_pieces.get(piece_id);
-                                if prev_pitch != Some(&pitch) {
-                                    plog!("Piece change: {} -> {}", piece_id, pitch);
-                                    let _ = evt_tx.send(NetEvent::PieceChange {
-                                        piece_id: piece_id.clone(),
-                                        pitch,
-                                    });
-                                }
-                            }
-
-                            // Send events for removed pieces
-                            for piece_id in prev_pieces.keys() {
-                                if !current_pieces.contains_key(piece_id) {
-                                    plog!("Piece removed: {}", piece_id);
-                                    let _ = evt_tx.send(NetEvent::PieceRemoved {
-                                        piece_id: piece_id.clone(),
-                                    });
-                                }
-                            }
-
-                            prev_pieces = current_pieces;
                         }
                     }
                     SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Subscribed {
@@ -770,6 +725,8 @@ async fn run_networking_loop(
                             if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), state_update) {
                                 plog!("Failed to send state to subscriber: {:?}", e);
                             }
+                            // Emit FullStateSync for ourselves too
+                            room.emit_full_state_sync();
                         }
                     }
                     _ => {}
