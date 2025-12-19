@@ -46,10 +46,9 @@ pub fn start_libp2p_room_sync(
     room: Mutable<RoomState>,
     room_topic: String,
     peer_id_out: Mutable<Option<String>>,
-    room_version: Mutable<u64>,
 ) {
     spawn_local(async move {
-        match run_sync(room, &room_topic, peer_id_out, room_version).await {
+        match run_sync(room, &room_topic, peer_id_out).await {
             Ok(()) => {
                 web_sys::console::log_1(&"[libp2p] Sync completed".into());
             }
@@ -64,7 +63,6 @@ async fn run_sync(
     room: Mutable<RoomState>,
     room_topic: &str,
     peer_id_out: Mutable<Option<String>>,
-    room_version: Mutable<u64>,
 ) -> Result<(), String> {
     let room_name = room_topic.split('@').next().unwrap_or(room_topic);
 
@@ -203,7 +201,7 @@ async fn run_sync(
 
         futures::select! {
             event = swarm.select_next_some() => {
-                handle_swarm_event(&mut swarm, event, &room, &room_version, &topic, &relay_addr, local_peer_id, &mut last_broadcast_sv);
+                handle_swarm_event(&mut swarm, event, &room, &topic, &relay_addr, local_peer_id, &mut last_broadcast_sv);
             }
 
             _ = timeout.fuse() => {
@@ -282,7 +280,6 @@ fn handle_swarm_event(
     swarm: &mut Swarm<Behaviour>,
     event: SwarmEvent<BehaviourEvent>,
     room: &Mutable<RoomState>,
-    room_version: &Mutable<u64>,
     topic: &IdentTopic,
     relay_addr: &Multiaddr,
     local_peer_id: libp2p::PeerId,
@@ -383,10 +380,7 @@ fn handle_swarm_event(
                 "[libp2p] Applied update: peers {} -> {}, combined_pitches={:?}",
                 before_count, after_count, combined
             ).into());
-
-            // Update room_version AFTER releasing all locks (triggers signal callbacks)
-            let new_version = room_version.get() + 1;
-            room_version.set(new_version);
+            // Events are emitted automatically by apply_update, triggering signal callbacks
         }
 
         SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Subscribed {

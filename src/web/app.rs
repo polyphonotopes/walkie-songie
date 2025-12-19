@@ -11,7 +11,8 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 use web_time::Instant;
 
-use futures::StreamExt;
+use futures::{future::ready, StreamExt};
+use futures_signals::signal::from_stream;
 
 use crate::pitch::{PitchDetectorConfig, PitchEvent, SwiftF0Detector};
 use crate::room::{RoomEvent, RoomState};
@@ -99,9 +100,6 @@ pub struct AppState {
     pub midi_input_id: Mutable<Option<String>>,
     /// Selected MIDI output device ID (None = disabled).
     pub midi_output_id: Mutable<Option<String>>,
-    /// Room state version - incremented on every change (local or remote).
-    /// UI components subscribe to this to know when to refresh.
-    pub room_version: Mutable<u64>,
     /// Whether pieces are locked (can't drag to move or delete via hole).
     pub pieces_locked: Mutable<bool>,
     /// Index of currently selected emoji in the picker (for prev/next navigation).
@@ -146,7 +144,6 @@ impl AppState {
             midi: init_midi(),
             midi_input_id: Mutable::new(None),
             midi_output_id: Mutable::new(None),
-            room_version: Mutable::new(0),
             pieces_locked: Mutable::new(false), // Pieces can be dragged/deleted
             selected_emoji_idx: Mutable::new(0),
         })
@@ -268,11 +265,8 @@ impl AppState {
                     // Set voice_pitch during singing (shows as lit/green on keyboard)
                     self.voice_pitch.set(Some(pc));
 
-                    // Sync to CRDT for P2P
+                    // Sync to CRDT for P2P (events emitted automatically)
                     self.room.lock_mut().set_voice_pitchclass(Some(pc));
-
-                    // Increment room_version to trigger UI updates
-                    self.room_version.set(self.room_version.get() + 1);
 
                     // Sync keyboard (voice pitch -> lit/green, manual -> pressed/red)
                     sync_active_pitches(self);
@@ -783,44 +777,31 @@ fn render_app(state: Arc<AppState>) -> Dom {
 
 /// List of currently active pitch classes.
 fn active_pitches_list(state: Arc<AppState>) -> Dom {
-    use dominator::clone;
     use futures_signals::signal::SignalExt;
 
-    // React to room_version changes (triggers on both local and remote CRDT updates)
+    // Create signal from room events
+    let (initial_data, events) = {
+        let room = state.room.lock_ref();
+        let tuning = state.tuning.lock_ref();
+        let data = compute_active_pitches_data(&room, &tuning);
+        (data, room.events())
+    };
+
+    let state_for_stream = state.clone();
+    let state_stream = events
+        .filter(|e| ready(e.affects_pitches() || e.affects_voice() || e.affects_pieces()))
+        .map(move |_| {
+            let room = state_for_stream.room.lock_ref();
+            let tuning = state_for_stream.tuning.lock_ref();
+            compute_active_pitches_data(&room, &tuning)
+        });
+
+    let full_stream = futures::stream::once(ready(initial_data)).chain(state_stream);
+    let pitches_signal = from_stream(full_stream).map(|opt| opt.unwrap_or_default());
+
     html!("div", {
         .class("active-pitches")
-        .child_signal(state.room_version.signal().map(clone!(state => move |_version| {
-            let room = state.room.lock_ref();
-            let tuning = state.tuning.lock_ref();
-            let pc_count = tuning.pitch_class_count() as i32;
-
-            // Get combined pitches from ALL peers via CRDT
-            let room_result = room.compute_room_result();
-
-            // Get local voice pitch from CRDT (shows as green)
-            let (_, local_voice_pc) = room.local_voice();
-
-            // Build list of active pitches: (name, is_voice, is_piece, sort_key)
-            let mut active: Vec<(String, bool, bool, i32)> = Vec::new();
-
-            // Add all pitches from room result (toggle mode pitches)
-            for pc in &room_result.pitch_classes {
-                let is_voice = local_voice_pc == Some(*pc);
-                active.push((tuning.note_name(*pc).to_string(), is_voice, false, pc.index() as i32));
-            }
-
-            // Add pieces with octave info
-            for piece in room.all_pieces() {
-                let pc_idx = piece.pitch.rem_euclid(pc_count) as u8;
-                let pc = crate::tuning::PitchClass::new(pc_idx);
-                let octave = piece.octave();
-                let name = format!("{}{}", tuning.note_name(pc), octave);
-                active.push((name, false, true, piece.pitch));
-            }
-
-            // Sort by sort key for consistent ordering
-            active.sort_by_key(|(_, _, _, key)| *key);
-
+        .child_signal(pitches_signal.map(|active| {
             if active.is_empty() {
                 Some(html!("span", {
                     .class("no-pitches")
@@ -839,8 +820,46 @@ fn active_pitches_list(state: Arc<AppState>) -> Dom {
                     }).collect::<Vec<_>>())
                 }))
             }
-        })))
+        }))
     })
+}
+
+/// Compute active pitches data for display.
+/// Returns Vec of (name, is_voice, is_piece, sort_key).
+fn compute_active_pitches_data(
+    room: &RoomState,
+    tuning: &Tuning,
+) -> Vec<(String, bool, bool, i32)> {
+    let pc_count = tuning.pitch_class_count() as i32;
+
+    // Get combined pitches from ALL peers via CRDT
+    let room_result = room.compute_room_result();
+
+    // Get local voice pitch from CRDT (shows as green)
+    let (_, local_voice_pc) = room.local_voice();
+
+    // Build list of active pitches: (name, is_voice, is_piece, sort_key)
+    let mut active: Vec<(String, bool, bool, i32)> = Vec::new();
+
+    // Add all pitches from room result (toggle mode pitches)
+    for pc in &room_result.pitch_classes {
+        let is_voice = local_voice_pc == Some(*pc);
+        active.push((tuning.note_name(*pc).to_string(), is_voice, false, pc.index() as i32));
+    }
+
+    // Add pieces with octave info
+    for piece in room.all_pieces() {
+        let pc_idx = piece.pitch.rem_euclid(pc_count) as u8;
+        let pc = crate::tuning::PitchClass::new(pc_idx);
+        let octave = piece.octave();
+        let name = format!("{}{}", tuning.note_name(pc), octave);
+        active.push((name, false, true, piece.pitch));
+    }
+
+    // Sort by sort key for consistent ordering
+    active.sort_by_key(|(_, _, _, key)| *key);
+
+    active
 }
 
 /// Get room topic from URL hash or query param, or generate a new one.
@@ -927,24 +946,20 @@ async fn init_app() {
         web_sys::console::log_1(&format!("Loading saved room state ({} bytes)", saved_state.len()).into());
         if let Err(e) = state.room.lock_mut().load_state(&saved_state) {
             web_sys::console::warn_1(&format!("Failed to load saved state: {}", e).into());
-        } else {
-            // Trigger UI update after loading state
-            state.room_version.set(state.room_version.get() + 1);
         }
+        // Events are emitted by load_state, triggering UI updates automatically
     }
 
     // Start P2P sync for the room
     // Pass full room_topic (including @peer-id if present) to signaller
     let room_for_sync = state.room.clone();
     let iroh_peer_id = state.iroh_peer_id.clone();
-    let room_version = state.room_version.clone();
 
     // Start libp2p sync (WebRTC + gossipsub via circuit relay)
     start_libp2p_room_sync(
         room_for_sync,
         room_topic,
         iroh_peer_id,
-        room_version,
     );
 
     // Initialize SwiftF0 ML model in background
@@ -986,34 +1001,6 @@ async fn init_app() {
         }).await;
     });
 
-    // Subscribe to room_version changes to update UI and persist state
-    use futures_signals::signal::SignalExt;
-    let state_for_version = state.clone();
-    let room_name_for_save = state.room_name.get_cloned();
-    spawn_local(async move {
-        let mut last_save_version = 0u64;
-        state_for_version.room_version.signal()
-            .for_each(|version| {
-                // Refresh keyboard display when room state changes
-                sync_active_pitches(&state_for_version);
-
-                // Save state to IndexedDB (debounced - only if version changed)
-                if version > last_save_version {
-                    last_save_version = version;
-                    let state_bytes = state_for_version.room.lock_ref().encode_state_as_update();
-                    let room_name = room_name_for_save.clone();
-                    spawn_local(async move {
-                        if let Err(e) = super::storage::set_room_state(&room_name, &state_bytes).await {
-                            web_sys::console::warn_1(&format!("Failed to save room state: {}", e).into());
-                        }
-                    });
-                }
-
-                async {}
-            })
-            .await;
-    });
-
     // Mount the app to the DOM
     dominator::append_dom(&dominator::body(), render_app(state));
 }
@@ -1022,9 +1009,6 @@ async fn init_app() {
 fn handle_room_event(state: &Arc<AppState>, event: &RoomEvent, room_name: &str) {
     // Log event for debugging
     web_sys::console::log_1(&format!("[RoomEvent] {:?}", event).into());
-
-    // Increment room_version for backward compatibility with signal-based reactivity
-    state.room_version.set(state.room_version.get() + 1);
 
     // Handle pitch-affecting events
     if event.affects_pitches() {

@@ -79,10 +79,8 @@ pub fn clear_button(state: Arc<AppState>) -> Dom {
                 room.clear_pieces();
             }
             state.voice_pitch.set(None);
-            // Increment room_version to trigger UI updates
-            state.room_version.set(state.room_version.get() + 1);
+            // Sync UI and MIDI output (sends note-offs)
             sync_active_pitches(&state);
-            // Sync MIDI output (sends note-offs)
             state.sync_midi_toggle_output();
             state.sync_midi_voice_output();
         }))
@@ -110,7 +108,7 @@ pub fn lock_button(state: Arc<AppState>) -> Dom {
 /// Emoji picker component - shows one emoji at a time with prev/next arrows.
 /// Drag the displayed emoji onto keyboard keys to add pieces.
 pub fn emoji_picker(state: Arc<AppState>) -> Dom {
-    // Signal that updates on emoji index changes (room_version updates separately)
+    // Signal that updates on emoji index changes
     let emoji_signal = state.selected_emoji_idx.signal()
         .map(clone!(state => move |idx| {
             let emojis = state.room.lock_ref().available_emojis();

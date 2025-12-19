@@ -555,42 +555,52 @@ fn setup_piece_sync(state: Arc<AppState>, keyboard_el: web_sys::HtmlElement) {
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::rc::Rc;
+    use futures::{future::ready, StreamExt};
+    use futures_signals::signal::{from_stream, SignalExt};
 
     // Track existing piece elements by ID
     let piece_elements: Rc<RefCell<HashMap<String, web_sys::HtmlElement>>> =
         Rc::new(RefCell::new(HashMap::new()));
 
-    // Spawn a future that watches room_version and syncs pieces
+    // Create signal from room events for pieces
+    let (initial_pieces, events) = {
+        let room = state.room.lock_ref();
+        let tuning = state.tuning.lock_ref();
+        let pitch_count = tuning.pitch_class_count();
+        drop(tuning);
+        let pieces = room.all_pieces();
+        let pieces_locked = room.pieces_locked();
+        ((pieces, pitch_count, pieces_locked), room.events())
+    };
+
+    let state_for_stream = state.clone();
+    let state_stream = events
+        .filter(|e| ready(e.affects_pieces() || matches!(e, crate::room::RoomEvent::PiecesLockChanged { .. } | crate::room::RoomEvent::FullStateSync { .. })))
+        .map(move |_| {
+            let room = state_for_stream.room.lock_ref();
+            let tuning = state_for_stream.tuning.lock_ref();
+            let pitch_count = tuning.pitch_class_count();
+            drop(tuning);
+            let pieces = room.all_pieces();
+            let pieces_locked = room.pieces_locked();
+            (pieces, pitch_count, pieces_locked)
+        });
+
+    let full_stream = futures::stream::once(ready(initial_pieces)).chain(state_stream);
+    let pieces_signal = from_stream(full_stream)
+        .map(|opt| opt.unwrap_or_else(|| (vec![], 12, false)));
+
     let piece_elements_clone = piece_elements.clone();
     let state_clone = state.clone();
     let keyboard_el_clone = keyboard_el.clone();
 
     wasm_bindgen_futures::spawn_local(async move {
-        let signal = state_clone.room_version.signal();
-
-        // Process each room_version change
-        futures_signals::signal::SignalExt::for_each(signal, move |_version| {
-            // Sync pieces_locked from CRDT to AppState
-            {
-                let room = state_clone.room.lock_ref();
-                let crdt_pieces_locked = room.pieces_locked();
-                drop(room);
-
-                // Only update if different (avoid unnecessary signal triggers)
-                if state_clone.pieces_locked.get() != crdt_pieces_locked {
-                    state_clone.pieces_locked.set(crdt_pieces_locked);
-                }
+        // Process each pieces change
+        pieces_signal.for_each(move |(pieces, pitch_count, pieces_locked)| {
+            // Sync pieces_locked to AppState
+            if state_clone.pieces_locked.get() != pieces_locked {
+                state_clone.pieces_locked.set(pieces_locked);
             }
-
-            // Get current pieces from room
-            let (pieces, pitch_count) = {
-                let tuning = state_clone.tuning.lock_ref();
-                let pitch_count = tuning.pitch_class_count();
-                drop(tuning);
-                let room = state_clone.room.lock_ref();
-                let pieces = room.all_pieces();
-                (pieces, pitch_count)
-            };
 
             let mut elements = piece_elements_clone.borrow_mut();
 
@@ -878,7 +888,6 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
             piece_el.style().remove_property("left").ok();
             piece_el.style().remove_property("top").ok();
             hide_delete_hole();
-            state_up.room_version.set(state_up.room_version.get() + 1);
             sync_active_pitches(&state_up);
             state_up.sync_midi_toggle_output();
             return;
@@ -957,7 +966,6 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
         });
 
         hide_delete_hole();
-        state_up.room_version.set(state_up.room_version.get() + 1);
         sync_active_pitches(&state_up);
         state_up.sync_midi_toggle_output();
     });
@@ -1054,13 +1062,10 @@ fn setup_keyboard_drop_handlers(state: Arc<AppState>) {
         // Convert key index to absolute MIDI pitch (key 0 = middle C = 60)
         let pitch = key_index + 60;
 
-        // Add the piece to the CRDT
+        // Add the piece to the CRDT (events emitted automatically)
         state_drop.room.lock_mut().add_piece(pitch, &emoji);
 
-        // Trigger UI update
-        state_drop
-            .room_version
-            .set(state_drop.room_version.get() + 1);
+        // Sync UI
         sync_active_pitches(&state_drop);
         state_drop.sync_midi_toggle_output();
     });
@@ -1160,7 +1165,6 @@ fn setup_emoji_drag_handlers(state: Arc<AppState>) {
 
         // Add piece at absolute MIDI pitch (key 0 = middle C = 60)
         state_up.room.lock_mut().add_piece(key_index + 60, &drag.emoji);
-        state_up.room_version.set(state_up.room_version.get() + 1);
         sync_active_pitches(&state_up);
         state_up.sync_midi_toggle_output();
     });
@@ -1251,10 +1255,6 @@ fn setup_keyboard_events(state: Arc<AppState>) {
                             state_click.sync_midi_voice_output();
                         }
 
-                        // Increment room_version to trigger UI updates
-                        state_click
-                            .room_version
-                            .set(state_click.room_version.get() + 1);
                         // Re-sync keyboard to reflect new state
                         sync_active_pitches(&state_click);
                         state_click.sync_midi_toggle_output();

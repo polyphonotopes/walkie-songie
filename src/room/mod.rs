@@ -13,9 +13,17 @@ pub mod yrs_state;
 
 pub use events::RoomEvent;
 pub use streams::{
+    // Delta streams (for MIDI output)
     PitchClassDelta, PitchDelta, ActivePitchesSnapshot,
     unified_pitch_class_deltas, piece_pitch_deltas, voice_pitch_deltas,
     snapshot_active_pitches,
+};
+
+// State signals (for UI) - only available in wasm32
+#[cfg(target_arch = "wasm32")]
+pub use streams::{
+    unified_pitch_classes_signal, shared_pitches_signal, pieces_signal,
+    pieces_locked_signal, available_emojis_signal,
 };
 pub use yrs_state::{Piece, RoomState};
 

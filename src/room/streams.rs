@@ -1,7 +1,8 @@
-//! Shared output streams derived from room state.
+//! Shared output streams and signals derived from room state.
 //!
-//! These streams are the single source of truth for MIDI output.
-//! Both web app and plugin consume these streams to ensure consistent behavior.
+//! Provides both streams (for event sequences) and signals (for current state):
+//! - Streams: delta computation for MIDI output (note-on/note-off)
+//! - Signals: current state for UI rendering
 //!
 //! Pattern inspired by musical-graphs inputStreams.ts:
 //! - Compute current state as a Set
@@ -15,6 +16,13 @@ use futures::{future::ready, Stream, StreamExt};
 
 use super::events::RoomEvent;
 use super::yrs_state::RoomState;
+
+#[cfg(target_arch = "wasm32")]
+use super::yrs_state::Piece;
+#[cfg(target_arch = "wasm32")]
+use crate::tuning::PitchClass;
+#[cfg(target_arch = "wasm32")]
+use futures_signals::signal::{from_stream, Signal, SignalExt};
 
 /// Delta of pitch classes (for MIDI note-on/note-off).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -264,6 +272,130 @@ pub fn voice_pitch_deltas(
         ));
 
     futures::stream::iter(initial_delta).chain(event_deltas)
+}
+
+// =============================================================================
+// SIGNALS (for UI - current state, not deltas)
+// Only available in wasm32 where futures-signals is available.
+// =============================================================================
+
+/// Signal of unified pitch classes (all sources combined).
+/// Emits the current set whenever any pitch-related change occurs.
+/// Use this for keyboard highlighting, etc.
+#[cfg(target_arch = "wasm32")]
+pub fn unified_pitch_classes_signal(
+    room: Arc<RwLock<RoomState>>,
+) -> impl Signal<Item = HashSet<u8>> {
+    // Get initial state and events
+    let (initial, events) = {
+        let room_guard = room.read().unwrap();
+        let snapshot = snapshot_active_pitches(&room_guard);
+        (snapshot.unified_pitch_classes(), room_guard.events())
+    };
+
+    // Stream that emits current state on each relevant event
+    let room_for_stream = room.clone();
+    let state_stream = events
+        .filter(|e| ready(e.affects_pitches() || e.affects_voice()))
+        .map(move |_| {
+            let room_guard = room_for_stream.read().unwrap();
+            snapshot_active_pitches(&room_guard).unified_pitch_classes()
+        });
+
+    // Prepend initial state, convert to signal
+    let full_stream = futures::stream::once(ready(initial)).chain(state_stream);
+    from_stream(full_stream).map(|opt| opt.unwrap_or_default())
+}
+
+/// Signal of shared pitch classes (toggle-based, not pieces/voice).
+/// Use this for showing which keys are "locked on" via manual toggle.
+#[cfg(target_arch = "wasm32")]
+pub fn shared_pitches_signal(
+    room: Arc<RwLock<RoomState>>,
+) -> impl Signal<Item = HashSet<PitchClass>> {
+    let (initial, events) = {
+        let room_guard = room.read().unwrap();
+        (room_guard.shared_pitches(), room_guard.events())
+    };
+
+    let room_for_stream = room.clone();
+    let state_stream = events
+        .filter(|e| ready(matches!(e,
+            RoomEvent::PitchAdded { .. } |
+            RoomEvent::PitchRemoved { .. } |
+            RoomEvent::PitchesCleared |
+            RoomEvent::FullStateSync { .. }
+        )))
+        .map(move |_| {
+            room_for_stream.read().unwrap().shared_pitches()
+        });
+
+    let full_stream = futures::stream::once(ready(initial)).chain(state_stream);
+    from_stream(full_stream).map(|opt| opt.unwrap_or_default())
+}
+
+/// Signal of all pieces.
+/// Emits the current piece list whenever pieces change.
+#[cfg(target_arch = "wasm32")]
+pub fn pieces_signal(
+    room: Arc<RwLock<RoomState>>,
+) -> impl Signal<Item = Vec<Piece>> {
+    let (initial, events) = {
+        let room_guard = room.read().unwrap();
+        (room_guard.all_pieces(), room_guard.events())
+    };
+
+    let room_for_stream = room.clone();
+    let state_stream = events
+        .filter(|e| ready(e.affects_pieces()))
+        .map(move |_| {
+            room_for_stream.read().unwrap().all_pieces()
+        });
+
+    let full_stream = futures::stream::once(ready(initial)).chain(state_stream);
+    from_stream(full_stream).map(|opt| opt.unwrap_or_default())
+}
+
+/// Signal of pieces lock state.
+#[cfg(target_arch = "wasm32")]
+pub fn pieces_locked_signal(
+    room: Arc<RwLock<RoomState>>,
+) -> impl Signal<Item = bool> {
+    let (initial, events) = {
+        let room_guard = room.read().unwrap();
+        (room_guard.pieces_locked(), room_guard.events())
+    };
+
+    let room_for_stream = room.clone();
+    let state_stream = events
+        .filter(|e| ready(matches!(e, RoomEvent::PiecesLockChanged { .. } | RoomEvent::FullStateSync { .. })))
+        .map(move |_| {
+            room_for_stream.read().unwrap().pieces_locked()
+        });
+
+    let full_stream = futures::stream::once(ready(initial)).chain(state_stream);
+    from_stream(full_stream).map(|opt| opt.unwrap_or(false))
+}
+
+/// Signal of available emojis for the picker.
+#[cfg(target_arch = "wasm32")]
+pub fn available_emojis_signal(
+    room: Arc<RwLock<RoomState>>,
+) -> impl Signal<Item = Vec<String>> {
+    let (initial, events) = {
+        let room_guard = room.read().unwrap();
+        (room_guard.available_emojis(), room_guard.events())
+    };
+
+    let room_for_stream = room.clone();
+    let state_stream = events
+        .filter(|e| ready(matches!(e, RoomEvent::EmojisChanged { .. } | RoomEvent::FullStateSync { .. })))
+        .map(move |_| {
+            room_for_stream.read().unwrap().available_emojis()
+        });
+
+    let full_stream = futures::stream::once(ready(initial)).chain(state_stream);
+    from_stream(full_stream).map(|opt| opt.unwrap_or_default())
 }
 
 #[cfg(test)]
