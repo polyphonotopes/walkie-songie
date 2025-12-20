@@ -20,6 +20,8 @@ mod libp2p_sync;
 mod storage;
 #[cfg(target_arch = "wasm32")]
 mod voice_conditioner;
+#[cfg(target_arch = "wasm32")]
+pub mod graph;
 
 #[cfg(target_arch = "wasm32")]
 pub use app::run_app;

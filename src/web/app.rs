@@ -26,6 +26,7 @@ use super::keyboard::{pitch_keyboard, sync_active_pitches};
 use super::midi::{init_midi, MidiManager, pitch_class_to_midi_note, midi_note_to_pitch_class};
 use super::libp2p_sync::start_libp2p_room_sync;
 use super::voice_conditioner::{VoiceConditioner, ConditionerOutput};
+use super::graph;
 
 /// How long a confident pitch "lingers" when confidence drops (in milliseconds).
 const PITCH_LINGER_MS: u64 = 500;
@@ -726,12 +727,12 @@ fn render_app(state: Arc<AppState>) -> Dom {
                                 .child(active_pitches_list(state.clone()))
                             }),
 
-                            // Graph placeholder (will be polyphonotope web component)
+                            // Polyphonotopes graph visualization
                             html!("div", {
                                 .class("graph-container")
-                                .child(html!("span", {
-                                    .class("graph-placeholder")
-                                    .text("Polyphonotope graph")
+                                .child(html!("cobwebs-graph", {
+                                    .attr("id", "polyphonotopes-graph")
+                                    .attr("demo", "5")  // Demo mode with 5 nodes for testing
                                 }))
                             }),
 
@@ -907,6 +908,9 @@ pub fn run_app() {
             .build()
     );
 
+    // Register the cobwebs-graph custom element
+    cobwebs_visualizer::define_cobwebs_graph_element();
+
     // Initialize app asynchronously (to load peer ID from IndexedDB)
     spawn_local(async {
         init_app().await;
@@ -989,7 +993,51 @@ async fn init_app() {
     });
 
     // Mount the app to the DOM
-    dominator::append_dom(&dominator::body(), render_app(state));
+    dominator::append_dom(&dominator::body(), render_app(state.clone()));
+
+    // Initialize polyphonotopes graph after a short delay
+    // (to ensure cobwebs_visualizer WASM is loaded)
+    let state_for_graph = state.clone();
+    spawn_local(async move {
+        // Wait 500ms for cobwebs_visualizer to initialize
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            let window = web_sys::window().unwrap();
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                &resolve,
+                500,
+            );
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+
+        // Initialize the polyphonotopes graph data
+        graph::init_graph();
+
+        // Load the graph into the cobwebs-graph element (1-hop by default)
+        if let Err(e) = graph::load_polyphonotopes_graph(1) {
+            web_sys::console::warn_1(&format!("Failed to load graph: {:?}", e).into());
+        } else {
+            web_sys::console::log_1(&"Polyphonotopes graph loaded".into());
+
+            // Initial graph highlight based on current pitches
+            update_graph_highlights(&state_for_graph);
+        }
+    });
+}
+
+/// Update graph highlights based on current active pitch classes.
+fn update_graph_highlights(state: &Arc<AppState>) {
+    let room = state.room.lock_ref();
+    let room_result = room.compute_room_result();
+
+    // Collect all active pitch class indices
+    let pitch_classes: Vec<u8> = room_result.pitch_classes.iter().map(|pc| pc.index()).collect();
+
+    // Update the graph visualization
+    if let Err(e) = graph::update_active_scales(pitch_classes) {
+        // Only log if the graph is actually loaded (not during startup)
+        // Errors are expected before graph is initialized
+        let _ = e; // Silently ignore
+    }
 }
 
 /// Handle a room event - update UI, MIDI, and persist state.
@@ -1001,12 +1049,14 @@ fn handle_room_event(state: &Arc<AppState>, event: &RoomEvent, room_name: &str) 
     if event.affects_pitches() {
         sync_active_pitches(state);
         state.sync_midi_toggle_output();
+        update_graph_highlights(state);
     }
 
     // Handle voice events
     if event.affects_voice() {
         sync_active_pitches(state);
         state.sync_midi_voice_output();
+        update_graph_highlights(state);
     }
 
     // Handle piece lock changes

@@ -97,6 +97,12 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 js-sys = "0.3"
 gloo-net = { version = "0.6", features = ["websocket"] }
 
+# Polyphonotopes graph visualization (disable cozo feature for WASM compatibility)
+polyphonotopes-rs = { path = "../polyphonotopes-2025/polyphonotopes-rs", default-features = false }
+
+# Graph visualization custom element
+cobwebs-visualizer = { path = "../cobwebs-visualizer" }
+
 # UI framework
 dominator = "0.5"
 futures-signals = "0.3"
