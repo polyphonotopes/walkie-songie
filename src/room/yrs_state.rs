@@ -631,6 +631,9 @@ impl RoomState {
 
     /// Set the local peer's voice pitch (absolute pitch number, like MIDI note).
     pub fn set_voice_pitch(&mut self, pitch: Option<i32>) {
+        // Capture previous state for event emission
+        let (prev_pitch, _) = self.get_peer_voice(&self.peer_id.clone());
+
         let mut txn = self.doc.transact_mut();
         let voice_state: MapRef = txn.get_or_insert_map(KEY_VOICE_STATE);
 
@@ -649,12 +652,35 @@ impl RoomState {
         }
 
         drop(txn);
+
+        // Emit event for stream subscribers
+        let pc = pitch.map(|p| PitchClass((p.rem_euclid(12)) as u8));
+        if pitch.is_none() {
+            self.emit(RoomEvent::VoiceCleared {
+                peer_id: self.peer_id.clone(),
+                pitch: prev_pitch,
+            });
+        } else {
+            self.emit(RoomEvent::VoiceChanged {
+                peer_id: self.peer_id.clone(),
+                pitch,
+                pitch_class: pc,
+            });
+        }
+
         self.notify();
     }
 
     /// Set the local peer's voice pitch class.
+    /// Also sets a representative absolute pitch (pitch_class + 60 = middle octave).
     pub fn set_voice_pitchclass(&mut self, pc: Option<PitchClass>) {
         debug!("[CRDT] set_voice_pitchclass({:?}) for peer {}", pc.map(|p| p.0), self.peer_id);
+
+        // Capture previous state for event emission
+        let (prev_pitch, _) = self.get_peer_voice(&self.peer_id.clone());
+
+        // Convert pitch class to absolute pitch in middle octave (C4 = 60)
+        let pitch = pc.map(|p| 60 + p.0 as i32);
 
         let mut txn = self.doc.transact_mut();
         let voice_state: MapRef = txn.get_or_insert_map(KEY_VOICE_STATE);
@@ -669,11 +695,28 @@ impl RoomState {
 
         if let Some(p) = pc {
             peer_map.insert(&mut txn, VOICE_PITCHCLASS, p.0 as i64);
+            peer_map.insert(&mut txn, VOICE_PITCH, pitch.unwrap() as i64);
         } else {
             peer_map.remove(&mut txn, VOICE_PITCHCLASS);
+            peer_map.remove(&mut txn, VOICE_PITCH);
         }
 
         drop(txn);
+
+        // Emit event for stream subscribers
+        if pc.is_none() {
+            self.emit(RoomEvent::VoiceCleared {
+                peer_id: self.peer_id.clone(),
+                pitch: prev_pitch,
+            });
+        } else {
+            self.emit(RoomEvent::VoiceChanged {
+                peer_id: self.peer_id.clone(),
+                pitch,
+                pitch_class: pc,
+            });
+        }
+
         debug!("[CRDT] Calling notify() after voice change");
         self.notify();
     }

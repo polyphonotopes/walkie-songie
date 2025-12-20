@@ -913,8 +913,13 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
             if delta.abs() <= MAX_DRAG_SEMITONES && delta != 0 {
                 // Valid move - update CRDT
                 let new_pitch = start_pitch + delta;
-                state_up.room.lock_mut().move_piece(&piece_id, new_pitch);
-                new_pitch
+                // Don't allow moving to a key that already has a piece
+                if state_up.room.lock_ref().has_piece_at(new_pitch) {
+                    start_pitch // Can't move there
+                } else {
+                    state_up.room.lock_mut().move_piece(&piece_id, new_pitch);
+                    new_pitch
+                }
             } else {
                 start_pitch // No change
             }
@@ -1051,6 +1056,11 @@ fn setup_keyboard_drop_handlers(state: Arc<AppState>) {
         // Convert key index to absolute MIDI pitch (key 0 = middle C = 60)
         let pitch = key_index + 60;
 
+        // Don't allow dropping on a key that already has a piece
+        if state_drop.room.lock_ref().has_piece_at(pitch) {
+            return;
+        }
+
         // Add the piece to the CRDT (events emitted automatically)
         state_drop.room.lock_mut().add_piece(pitch, &emoji);
 
@@ -1148,8 +1158,15 @@ fn setup_emoji_drag_handlers(state: Arc<AppState>) {
             return;
         };
 
+        let pitch = key_index + 60;
+
+        // Don't allow dropping on a key that already has a piece
+        if state_up.room.lock_ref().has_piece_at(pitch) {
+            return;
+        }
+
         // Add piece at absolute MIDI pitch (key 0 = middle C = 60)
-        state_up.room.lock_mut().add_piece(key_index + 60, &drag.emoji);
+        state_up.room.lock_mut().add_piece(pitch, &drag.emoji);
         sync_active_pitches(&state_up);
         state_up.sync_midi_toggle_output();
     });
