@@ -21,7 +21,7 @@ use crate::tuning::{PitchClass, Tuning};
 use crate::words::generate_room_name;
 
 use super::audio::WebAudioInput;
-use super::components::{clear_button, emoji_picker, lock_button, pitch_display, room_header_button, room_overlay, tuning_editor, voice_button};
+use super::components::{emoji_picker, lock_button, midi_settings, pitch_display, room_header_button, room_overlay, tuning_editor, voice_button};
 use super::keyboard::{pitch_keyboard, sync_active_pitches};
 use super::midi::{init_midi, MidiManager, pitch_class_to_midi_note, midi_note_to_pitch_class};
 use super::libp2p_sync::start_libp2p_room_sync;
@@ -635,26 +635,13 @@ fn render_app(state: Arc<AppState>) -> Dom {
     html!("div", {
         .class("app")
         .children(&mut [
-            // Header: title + room button + room controls (sticky)
+            // Header: connect | title | lock
             html!("header", {
                 .class("header")
                 .children(&mut [
-                    // Left: title + room
-                    html!("div", {
-                        .class("header-left")
-                        .children(&mut [
-                            html!("span", { .class("title").text("Walkie Songie") }),
-                            room_header_button(state.clone()),
-                        ])
-                    }),
-                    // Right: room controls
-                    html!("div", {
-                        .class("header-right")
-                        .children(&mut [
-                            lock_button(state.clone()),
-                            clear_button(state.clone()),
-                        ])
-                    }),
+                    room_header_button(state.clone()),
+                    html!("span", { .class("title").text("walkie songie") }),
+                    lock_button(state.clone()),
                 ])
             }),
 
@@ -747,17 +734,16 @@ fn render_app(state: Arc<AppState>) -> Dom {
                                     .text("Polyphonotope graph")
                                 }))
                             }),
+
                         ])
                     }),
 
-                    // Page 3: Tuning (hidden for now)
+                    // Page 3: Settings
                     html!("div", {
                         .class("page")
-                        .class("tuning-page")
-                        .style("display", "none")
+                        .class("settings-page")
                         .children(&mut [
-                            html!("h2", { .class("page-title").text("Tuning") }),
-                            tuning_editor(state.clone()),
+                            midi_settings(state.clone()),
                         ])
                     }),
                 ])
@@ -768,6 +754,7 @@ fn render_app(state: Arc<AppState>) -> Dom {
                 .class("page-dots")
                 .children(&mut [
                     html!("div", { .class("page-dot").class("active") }),
+                    html!("div", { .class("page-dot") }),
                     html!("div", { .class("page-dot") }),
                 ])
             }),

@@ -154,12 +154,12 @@ all-around-keyboard.keyboard {
     --key-lower-stroke: oklch(38% 0.03 280);
     --key-upper-fill: oklch(12% 0.035 280);
     --key-upper-stroke: oklch(30% 0.03 280);
-    /* Pressed keys keep normal fill - dot overlay renders on top */
-    --key-highlight-fill: var(--voice-light);
-    --key-highlight-stroke: var(--voice);
+    /* Pressed keys - almost white with hint of cream */
+    --key-highlight-fill: oklch(99% 0.01 90);
+    --key-highlight-stroke: oklch(92% 0.03 90);
     --key-highlight-stroke-width: 4px;
-    --key-highlight-lower-fill: var(--voice-light);
-    --key-highlight-upper-fill: var(--voice-light);
+    --key-highlight-lower-fill: oklch(99% 0.01 90);
+    --key-highlight-upper-fill: oklch(98% 0.015 90);
     --key-hover-opacity: 0.85;
 }
 
@@ -412,10 +412,11 @@ all-around-keyboard svg {
 /* Lock button - locks both toggles and pieces */
 .lock-button {
     padding: 0.5rem 0.75rem;
-    font-size: 1.2rem;
+    font-size: 0.9rem;
     border: 2px solid var(--text-secondary);
     border-radius: 8px;
     background: transparent;
+    color: var(--text-primary);
     cursor: pointer;
     transition: all 0.2s ease;
 }
@@ -663,7 +664,7 @@ all-around-keyboard svg {
     gap: 0.5rem;
 }
 
-.header-left .title {
+.header .title {
     font-size: 1.1rem;
     font-weight: 600;
     color: var(--text-secondary);
@@ -677,11 +678,12 @@ all-around-keyboard svg {
 
 /* Room Header Button - icon only */
 .room-header-button {
-    padding: 0.4rem 0.6rem;
-    font-size: 1.2rem;
+    padding: 0.5rem 0.75rem;
+    font-size: 0.9rem;
     border: 2px solid var(--text-secondary);
     border-radius: 8px;
     background: transparent;
+    color: var(--text-primary);
     cursor: pointer;
     transition: all 0.15s ease;
 }
@@ -742,8 +744,24 @@ all-around-keyboard svg {
 }
 
 .room-overlay-header h2 {
-    font-size: 1.25rem;
+    font-size: 1.1rem;
     color: var(--text-primary);
+}
+
+/* Room sections */
+.room-section {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    text-align: center;
+}
+
+.section-label {
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-secondary);
 }
 
 .room-overlay-header .close-btn {
@@ -761,6 +779,187 @@ all-around-keyboard svg {
 .room-overlay-header .close-btn:hover {
     background: rgba(255, 255, 255, 0.1);
     color: var(--text-primary);
+}
+
+/* Room code input - full width, editable */
+.room-code-input {
+    width: 100%;
+    padding: 0.6rem 0.75rem;
+    font-family: 'SF Mono', 'Consolas', monospace;
+    font-size: 0.95rem;
+    font-weight: 600;
+    text-align: center;
+    background: var(--bg-primary);
+    color: var(--voice);
+    border: 2px solid var(--voice);
+    border-radius: 8px;
+}
+
+.room-code-input:focus {
+    outline: none;
+    border-color: var(--voice-light);
+}
+
+/* Room action buttons */
+.room-actions {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.room-action-btn {
+    flex: 1;
+    padding: 0.6rem 0.75rem;
+    font-size: 0.85rem;
+    font-weight: 500;
+    border: 2px solid var(--text-secondary);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--text-primary);
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.room-action-btn:hover, .room-action-btn:active {
+    border-color: var(--voice);
+    background: color-mix(in oklch, var(--voice) 15%, transparent);
+}
+
+/* Share button - prominent, easy to tap */
+.share-btn {
+    width: 100%;
+    padding: 0.875rem 1rem;
+    font-size: 1rem;
+    font-weight: 600;
+    border: 2px solid var(--voice);
+    border-radius: 10px;
+    background: transparent;
+    color: var(--voice);
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.share-btn:hover, .share-btn:active {
+    background: var(--voice);
+    color: white;
+}
+
+/* Room link row - shareable link with copy button */
+.room-link-row {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.room-link-input {
+    flex: 1;
+    padding: 0.6rem 0.75rem;
+    font-family: 'SF Mono', 'Consolas', monospace;
+    font-size: 0.7rem;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 2px solid var(--text-secondary);
+    border-radius: 8px;
+    min-width: 0;
+}
+
+.copy-link-btn {
+    padding: 0.5rem 0.75rem;
+    font-size: 1.1rem;
+    border: 2px solid var(--voice);
+    border-radius: 8px;
+    background: transparent;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.copy-link-btn:hover, .copy-link-btn:active {
+    background: var(--voice);
+}
+
+/* Room actions row - new room + join */
+.room-actions-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: stretch;
+}
+
+.new-room-btn {
+    padding: 0.6rem 0.75rem;
+    font-size: 0.9rem;
+    font-weight: 600;
+    border: 2px solid var(--sunny);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--sunny);
+    cursor: pointer;
+    transition: all 0.15s ease;
+    white-space: nowrap;
+}
+
+.new-room-btn:hover, .new-room-btn:active {
+    background: var(--sunny);
+    color: var(--bg-primary);
+}
+
+.join-input {
+    flex: 1;
+    padding: 0.6rem 0.75rem;
+    font-size: 0.85rem;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 2px solid var(--text-secondary);
+    border-radius: 8px;
+    min-width: 0;
+}
+
+.join-input:focus {
+    outline: none;
+    border-color: var(--voice);
+}
+
+.join-input::placeholder {
+    color: var(--text-secondary);
+    opacity: 0.7;
+}
+
+/* Collapsible sections in room overlay */
+.qr-details,
+.join-room-details {
+    border-radius: 8px;
+    background: var(--bg-primary);
+}
+
+.qr-details summary,
+.join-room-details summary {
+    padding: 0.75rem 1rem;
+    font-size: 0.9rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+    cursor: pointer;
+    user-select: none;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.qr-details summary::before,
+.join-room-details summary::before {
+    content: "▸";
+    transition: transform 0.2s;
+}
+
+.qr-details[open] summary::before,
+.join-room-details[open] summary::before {
+    transform: rotate(90deg);
+}
+
+.qr-details summary::-webkit-details-marker,
+.join-room-details summary::-webkit-details-marker {
+    display: none;
+}
+
+.join-room-details .room-input-section {
+    padding: 0 1rem 1rem 1rem;
 }
 
 .current-room-display {
@@ -1005,6 +1204,6 @@ all-around-keyboard svg {
 .toggle-overlay {
     display: none; /* Hidden source element, keyboard clones styles */
     background:
-        radial-gradient(circle, var(--manual) 2px, transparent 2px);
+        radial-gradient(circle, oklch(99% 0.01 90) 2px, transparent 2px);
     background-size: 8px 8px;
 }
