@@ -188,6 +188,7 @@ cobwebs-graph {
     display: flex;
     justify-content: center;
     align-items: center;
+    padding: 2rem; /* Space for clef indicators outside keyboard */
 }
 
 /* Pieces are now slotted children of all-around-keyboard, positioned by its indicator system */
@@ -195,21 +196,22 @@ cobwebs-graph {
 .keyboard-container all-around-keyboard,
 all-around-keyboard.keyboard {
     display: block;
-    width: min(95vw, 70vh);
-    max-width: 800px;
+    width: min(90vw, 65vh);
+    max-width: 750px;
     position: relative;
+    overflow: visible; /* Allow clefs to render outside */
 
     /* Keyboard theming via CSS custom properties - uses palette violet hue (280) */
     --key-lower-fill: oklch(20% 0.03 280);
     --key-lower-stroke: oklch(38% 0.03 280);
     --key-upper-fill: oklch(12% 0.035 280);
     --key-upper-stroke: oklch(30% 0.03 280);
-    /* Pressed keys - almost white with hint of cream */
-    --key-highlight-fill: oklch(99% 0.01 90);
-    --key-highlight-stroke: oklch(92% 0.03 90);
+    /* Pressed keys - coral */
+    --key-highlight-fill: oklch(75% 0.14 30);
+    --key-highlight-stroke: oklch(65% 0.16 30);
     --key-highlight-stroke-width: 4px;
-    --key-highlight-lower-fill: oklch(99% 0.01 90);
-    --key-highlight-upper-fill: oklch(98% 0.015 90);
+    --key-highlight-lower-fill: oklch(75% 0.14 30);
+    --key-highlight-upper-fill: oklch(70% 0.15 30);
     --key-hover-opacity: 0.85;
 }
 
@@ -566,6 +568,47 @@ all-around-keyboard svg {
     50% { transform: translate(-50%, -50%) scale(1.15); }
 }
 
+/* Radial line from clef toward keyboard center (behind keys) */
+.clef-line {
+    position: absolute;
+    left: var(--indicator-x, 50%);
+    top: var(--indicator-y, 50%);
+    width: 2px;
+    height: min(15vw, 11vh); /* ~17% of keyboard size */
+    background: linear-gradient(
+        to bottom,
+        transparent 0%,
+        var(--text-secondary, rgba(255, 255, 255, 0.5)) 20%,
+        var(--text-secondary, rgba(255, 255, 255, 0.5)) 80%,
+        transparent 100%
+    );
+    transform-origin: center top;
+    transform: translateX(-50%) rotate(calc(var(--indicator-angle, 0deg) + 180deg));
+    pointer-events: none;
+    z-index: -1; /* Behind keyboard keys */
+}
+
+.clef-line.hidden {
+    opacity: 0;
+}
+
+/* Clef Indicators (bass/treble outside keyboard) */
+.clef-indicator {
+    position: absolute;
+    left: var(--indicator-x, 50%);
+    top: var(--indicator-y, 50%);
+    transform: translate(-50%, -50%);
+    font-size: 14px;
+    font-family: "Noto Music", "Symbola", serif;
+    color: var(--text-secondary, rgba(255, 255, 255, 0.7));
+    pointer-events: none;
+    z-index: 85;
+}
+
+.clef-indicator.hidden {
+    opacity: 0;
+}
+
 /* Active Pitches Section */
 .active-pitches-section {
     background: var(--bg-secondary);
@@ -589,8 +632,8 @@ all-around-keyboard svg {
 }
 
 .pitch-tag {
-    background: var(--sunny);
-    color: white;
+    background: oklch(75% 0.14 30); /* coral - matches toggle overlay */
+    color: oklch(20% 0.05 30);
     padding: 0.25rem 0.75rem;
     border-radius: 999px;
     font-weight: 600;
@@ -1254,6 +1297,143 @@ all-around-keyboard svg {
 .toggle-overlay {
     display: none; /* Hidden source element, keyboard clones styles */
     background:
-        radial-gradient(circle, oklch(99% 0.01 90) 2px, transparent 2px);
+        radial-gradient(circle, oklch(75% 0.14 30) 2px, transparent 2px); /* coral dots */
     background-size: 8px 8px;
+}
+
+/* Info page (replaced graph page) */
+.info-page {
+    justify-content: flex-start;
+    gap: 1rem;
+    padding: 1rem;
+}
+
+.info-panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+    overflow-y: auto;
+}
+
+.info-panel-content {
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+}
+
+.info-section {
+    background: var(--bg-secondary);
+    border-radius: 0.75rem;
+    padding: 1rem;
+}
+
+.info-section .section-label {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-secondary);
+    margin-bottom: 0.75rem;
+}
+
+/* Scales section */
+.scales-section .empty-state {
+    color: var(--text-secondary);
+    font-style: italic;
+}
+
+.scale-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
+
+.scale-tag {
+    display: inline-flex;
+    padding: 0.375rem 0.75rem;
+    border-radius: 999px;
+    font-size: 0.875rem;
+    font-weight: 500;
+    background: var(--bg-tertiary, rgba(255, 255, 255, 0.1));
+    color: var(--text-primary);
+    border: 1px solid var(--border-color, rgba(255,255,255,0.1));
+}
+
+.scale-tag.exact {
+    background: var(--accent-color, #4a9eff);
+    color: #fff;
+    border-color: var(--accent-color, #4a9eff);
+    box-shadow: 0 0 8px rgba(74, 158, 255, 0.4);
+    font-weight: 600;
+}
+
+/* Solfege grid: | bass clef | bass info | treble clef | treble info | */
+.solfege-grid {
+    display: grid;
+    grid-template-columns: auto 1fr auto 1fr;
+    align-items: center;
+    gap: 0.5rem 0.75rem;
+}
+
+.clef-icon {
+    font-size: 2.5rem;
+    opacity: 0.8;
+    font-family: "Noto Music", "Symbola", serif;
+    line-height: 1;
+}
+
+.solfege-info {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.25rem;
+}
+
+.solfege-info.empty {
+    color: var(--text-secondary);
+    opacity: 0.5;
+}
+
+.note-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.375rem 0.75rem;
+    border-radius: 999px;
+    background: var(--bg-tertiary, rgba(255, 255, 255, 0.1));
+    color: var(--text-primary);
+    font-size: 1rem;
+    font-weight: 600;
+}
+
+.source-emoji {
+    font-size: 0.875rem;
+}
+
+.note-name {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+}
+
+.empty-note {
+    color: var(--text-secondary);
+    font-size: 1.25rem;
+}
+
+/* Solfege chips */
+.solfege-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.375rem;
+}
+
+.solfege-chip {
+    display: inline-flex;
+    padding: 0.25rem 0.5rem;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: lowercase;
+    background: var(--bg-tertiary, rgba(255, 255, 255, 0.1));
+    color: var(--text-secondary, rgba(255, 255, 255, 0.7));
+    border: 1px solid var(--border-color, rgba(255,255,255,0.1));
 }

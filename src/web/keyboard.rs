@@ -166,10 +166,15 @@ pub fn compute_raised_notes(tuning: &Tuning) -> Vec<u8> {
     }
 }
 
+/// Unicode clef symbols
+const BASS_CLEF: &str = "𝄢";
+const TREBLE_CLEF: &str = "𝄞";
+
 /// Sync keyboard state with active pitches from ALL peers.
 /// - Toggle pitches show with sunny/manual overlay
 /// - Emoji pieces show as emoji indicators on keys
 /// - Voice pitches show with wavy overlay and shout emoji
+/// - Bass/treble clef indicators show lowest/highest notes
 pub fn sync_active_pitches(state: &Arc<AppState>) {
     let room = state.room.lock_ref();
     let tuning = state.tuning.lock_ref();
@@ -205,8 +210,89 @@ pub fn sync_active_pitches(state: &Arc<AppState>) {
         .collect();
     sync_voice_overlays(&voice_notes);
 
+    // Collect all absolute pitches for range indicators
+    let mut all_pitches: Vec<i32> = Vec::new();
+
+    // Voice pitches (absolute)
+    for (_, (pitch_opt, _)) in room.all_voice_states() {
+        if let Some(pitch) = pitch_opt {
+            all_pitches.push(pitch);
+        }
+    }
+
+    // Piece pitches (absolute)
+    for piece in room.all_pieces() {
+        all_pitches.push(piece.pitch);
+    }
+
+    // Update bass/treble clef indicators
+    sync_clef_indicators(&all_pitches, pc_count);
+
     // Clear lit notes (we use overlays now)
     set_lit_notes(&[]);
+}
+
+/// Sync bass and treble clef indicators on the keyboard.
+/// Shows bass clef at lowest note and treble clef at highest note.
+fn sync_clef_indicators(pitches: &[i32], _pc_count: i32) {
+    let Some(kb) = get_keyboard() else { return };
+    let document = web_sys::window().unwrap().document().unwrap();
+
+    // Helper to get or create an element
+    let get_or_create = |selector: &str, class_name: &str| -> web_sys::Element {
+        if let Ok(Some(el)) = kb.query_selector(selector) {
+            el
+        } else {
+            let el = document.create_element("div").unwrap();
+            el.set_class_name(class_name);
+            kb.append_child(&el).ok();
+            el
+        }
+    };
+
+    // Get or create all elements upfront
+    let bass_line = get_or_create(".bass-clef-indicator-line", "clef-line bass-clef-indicator-line");
+    let bass_clef = get_or_create(".bass-clef-indicator", "clef-indicator bass-clef-indicator");
+    let treble_line = get_or_create(".treble-clef-indicator-line", "clef-line treble-clef-indicator-line");
+    let treble_clef = get_or_create(".treble-clef-indicator", "clef-indicator treble-clef-indicator");
+
+    if pitches.is_empty() {
+        // Hide all by adding hidden class
+        bass_line.class_list().add_1("hidden").ok();
+        bass_clef.class_list().add_1("hidden").ok();
+        treble_line.class_list().add_1("hidden").ok();
+        treble_clef.class_list().add_1("hidden").ok();
+        return;
+    }
+
+    let min_pitch = *pitches.iter().min().unwrap();
+    let max_pitch = *pitches.iter().max().unwrap();
+
+    // Update bass clef
+    bass_line.set_attribute("data-pitch", &min_pitch.to_string()).ok();
+    bass_line.set_attribute("data-radius", "0.5").ok();
+    bass_line.class_list().remove_1("hidden").ok();
+
+    bass_clef.set_attribute("data-pitch", &min_pitch.to_string()).ok();
+    bass_clef.set_attribute("data-radius", "1.1").ok();
+    bass_clef.set_text_content(Some(BASS_CLEF));
+    bass_clef.class_list().remove_1("hidden").ok();
+
+    // Update treble clef (only if different from bass)
+    if max_pitch != min_pitch {
+        treble_line.set_attribute("data-pitch", &max_pitch.to_string()).ok();
+        treble_line.set_attribute("data-radius", "0.5").ok();
+        treble_line.class_list().remove_1("hidden").ok();
+
+        treble_clef.set_attribute("data-pitch", &max_pitch.to_string()).ok();
+        treble_clef.set_attribute("data-radius", "1.1").ok();
+        treble_clef.set_text_content(Some(TREBLE_CLEF));
+        treble_clef.class_list().remove_1("hidden").ok();
+    } else {
+        // Hide treble if same as bass
+        treble_line.class_list().add_1("hidden").ok();
+        treble_clef.class_list().add_1("hidden").ok();
+    }
 }
 
 /// Sync toggle overlay elements for toggled/manual pitch classes.

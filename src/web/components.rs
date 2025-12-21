@@ -570,3 +570,256 @@ pub fn midi_settings(state: Arc<AppState>) -> Dom {
         ])
     })
 }
+
+/// Info panel component for the second page.
+/// Shows matching pitch class set names, bass note with solfege, treble note with solfege.
+pub fn info_panel(state: Arc<AppState>) -> Dom {
+    use super::solfege::{BASS_CLEF, TREBLE_CLEF};
+    use futures::stream::StreamExt;
+    use futures::future::ready;
+    use futures_signals::signal::from_stream;
+
+    // Create signal from room events
+    let (initial_data, events) = {
+        let room = state.room.lock_ref();
+        let tuning = state.tuning.lock_ref();
+        let data = compute_info_panel_data(&room, &tuning);
+        (data, room.events())
+    };
+
+    let state_for_stream = state.clone();
+    let state_stream = events
+        .filter(|e| ready(e.affects_pitches() || e.affects_voice() || e.affects_pieces()))
+        .map(move |_| {
+            let room = state_for_stream.room.lock_ref();
+            let tuning = state_for_stream.tuning.lock_ref();
+            compute_info_panel_data(&room, &tuning)
+        });
+
+    let full_stream = futures::stream::once(ready(initial_data)).chain(state_stream);
+    let info_signal = from_stream(full_stream).map(|opt| opt.unwrap_or_default());
+
+    html!("div", {
+        .class("info-panel")
+        .child_signal(info_signal.map(|info: InfoPanelData| {
+            Some(html!("div", {
+                .class("info-panel-content")
+                .children(&mut [
+                    // Possibly Solfege section (bass and treble in grid)
+                    html!("div", {
+                        .class("info-section")
+                        .class("solfege-section")
+                        .children(&mut [
+                            html!("div", {
+                                .class("section-label")
+                                .text("possibly solfege")
+                            }),
+                            html!("div", {
+                                .class("solfege-grid")
+                                .children(&mut [
+                                    // Bass clef icon
+                                    html!("span", {
+                                        .class("clef-icon")
+                                        .text(&BASS_CLEF.to_string())
+                                    }),
+                                    // Bass info
+                                    if let Some(ref bass) = info.bass {
+                                        html!("div", {
+                                            .class("solfege-info")
+                                            .children(&mut [
+                                                html!("span", {
+                                                    .class("note-chip")
+                                                    .children(&mut [
+                                                        if !bass.source_emoji.is_empty() {
+                                                            html!("span", {
+                                                                .class("source-emoji")
+                                                                .text(&bass.source_emoji)
+                                                            })
+                                                        } else {
+                                                            html!("span", {})
+                                                        },
+                                                        html!("span", {
+                                                            .class("note-name")
+                                                            .text(&bass.note_name)
+                                                        }),
+                                                    ])
+                                                }),
+                                                html!("div", {
+                                                    .class("solfege-list")
+                                                    .children(bass.solfeges.iter().map(|s| {
+                                                        html!("span", {
+                                                            .class("solfege-chip")
+                                                            .text(s)
+                                                        })
+                                                    }).collect::<Vec<_>>())
+                                                }),
+                                            ])
+                                        })
+                                    } else {
+                                        html!("div", {
+                                            .class("solfege-info")
+                                            .class("empty")
+                                            .text("—")
+                                        })
+                                    },
+                                    // Treble clef icon
+                                    html!("span", {
+                                        .class("clef-icon")
+                                        .text(&TREBLE_CLEF.to_string())
+                                    }),
+                                    // Treble info
+                                    if let Some(ref treble) = info.treble {
+                                        html!("div", {
+                                            .class("solfege-info")
+                                            .children(&mut [
+                                                html!("span", {
+                                                    .class("note-chip")
+                                                    .children(&mut [
+                                                        if !treble.source_emoji.is_empty() {
+                                                            html!("span", {
+                                                                .class("source-emoji")
+                                                                .text(&treble.source_emoji)
+                                                            })
+                                                        } else {
+                                                            html!("span", {})
+                                                        },
+                                                        html!("span", {
+                                                            .class("note-name")
+                                                            .text(&treble.note_name)
+                                                        }),
+                                                    ])
+                                                }),
+                                                html!("div", {
+                                                    .class("solfege-list")
+                                                    .children(treble.solfeges.iter().map(|s| {
+                                                        html!("span", {
+                                                            .class("solfege-chip")
+                                                            .text(s)
+                                                        })
+                                                    }).collect::<Vec<_>>())
+                                                }),
+                                            ])
+                                        })
+                                    } else {
+                                        html!("div", {
+                                            .class("solfege-info")
+                                            .class("empty")
+                                            .text("—")
+                                        })
+                                    },
+                                ])
+                            }),
+                        ])
+                    }),
+
+                    // Compatible with section (scales and chords)
+                    html!("div", {
+                        .class("info-section")
+                        .class("scales-section")
+                        .children(&mut [
+                            html!("div", {
+                                .class("section-label")
+                                .text("compatible with")
+                            }),
+                            if info.scale_names.is_empty() {
+                                html!("div", {
+                                    .class("empty-state")
+                                    .text("—")
+                                })
+                            } else {
+                                html!("div", {
+                                    .class("scale-tags")
+                                    .children(info.scale_names.iter().map(|(name, group, is_exact)| {
+                                        html!("span", {
+                                            .class("scale-tag")
+                                            .class(group.as_str())
+                                            .class_signal("exact", futures_signals::signal::always(*is_exact))
+                                            .text(name)
+                                        })
+                                    }).collect::<Vec<_>>())
+                                })
+                            }
+                        ])
+                    }),
+                ])
+            }))
+        }))
+    })
+}
+
+/// Data for the info panel display
+#[derive(Default, Clone)]
+struct InfoPanelData {
+    /// (name, category, is_exact_match)
+    scale_names: Vec<(String, String, bool)>,
+    bass: Option<NoteDisplayInfo>,
+    treble: Option<NoteDisplayInfo>,
+}
+
+/// Display info for a single note
+#[derive(Clone)]
+struct NoteDisplayInfo {
+    note_name: String,
+    solfeges: Vec<String>,
+    source_emoji: String,
+}
+
+/// Compute info panel data from room state
+fn compute_info_panel_data(
+    room: &crate::room::RoomState,
+    _tuning: &crate::tuning::Tuning,
+) -> InfoPanelData {
+    use super::graph::find_matching_scale_names;
+    use super::solfege::{analyze_range, NoteSource};
+    use crate::room::snapshot_active_pitches;
+
+    // Use canonical unified pitch classes (includes toggles + pieces + voice)
+    let snapshot = snapshot_active_pitches(room);
+    let pitch_classes: Vec<u8> = snapshot.unified_pitch_classes().into_iter().collect();
+
+    // Find matching scales
+    let scale_names = find_matching_scale_names(&pitch_classes);
+
+    // Collect all notes with their sources for range analysis
+    let mut all_notes: Vec<(i32, super::solfege::NoteSource)> = Vec::new();
+
+    // Add voice pitches
+    for &pitch in &snapshot.voice_pitches {
+        all_notes.push((pitch, NoteSource::Voice));
+    }
+
+    // Add pieces (dragged with their own emoji)
+    for piece in room.all_pieces() {
+        all_notes.push((piece.pitch, NoteSource::Piece(piece.emoji.clone())));
+    }
+
+    // If no notes with octave info, we can't show range
+    // But we can show toggle mode pitches as "generic" notes at octave 4
+    if all_notes.is_empty() && !pitch_classes.is_empty() {
+        // Use pitch classes as notes at octave 4 (MIDI 48-59)
+        for pc in &pitch_classes {
+            all_notes.push((48 + *pc as i32, NoteSource::Toggle));
+        }
+    }
+
+    // Analyze range
+    let range_info = analyze_range(&all_notes, &pitch_classes);
+
+    let bass = range_info.bass.map(|r| NoteDisplayInfo {
+        note_name: r.preferred_name().to_string(),
+        solfeges: r.solfeges,
+        source_emoji: r.source.emoji(),
+    });
+
+    let treble = range_info.treble.map(|r| NoteDisplayInfo {
+        note_name: r.preferred_name().to_string(),
+        solfeges: r.solfeges,
+        source_emoji: r.source.emoji(),
+    });
+
+    InfoPanelData {
+        scale_names,
+        bass,
+        treble,
+    }
+}

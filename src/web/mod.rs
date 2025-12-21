@@ -22,6 +22,8 @@ mod storage;
 mod voice_conditioner;
 #[cfg(target_arch = "wasm32")]
 pub mod graph;
+#[cfg(target_arch = "wasm32")]
+mod solfege;
 
 #[cfg(target_arch = "wasm32")]
 pub use app::run_app;

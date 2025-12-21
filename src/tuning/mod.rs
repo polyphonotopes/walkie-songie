@@ -35,6 +35,8 @@ pub struct QuantizeResult {
     pub cents_deviation: f64,
     /// The frequency of the pitch class center
     pub center_hz: f64,
+    /// The absolute pitch (MIDI-style: octave * pitch_count + pc, where octave 4 = 48 for 12-TET)
+    pub absolute_pitch: i32,
 }
 
 /// A tuning system defining pitch classes and their frequency ratios.
@@ -111,13 +113,16 @@ impl Tuning {
     }
 
     /// Quantize a frequency to the nearest pitch class.
-    /// Returns the pitch class, cents deviation, and center frequency.
+    /// Returns the pitch class, cents deviation, center frequency, and absolute pitch.
     pub fn quantize(&self, hz: f64) -> QuantizeResult {
+        let pitch_count = self.pitch_class_count() as i32;
+
         if hz <= 0.0 {
             return QuantizeResult {
                 pitch_class: PitchClass(0),
                 cents_deviation: 0.0,
                 center_hz: self.reference_hz,
+                absolute_pitch: 5 * pitch_count, // C4 for 12-TET = 60
             };
         }
 
@@ -161,12 +166,18 @@ impl Tuning {
         let clamped_deviation = best_deviation.clamp(-50.0, 50.0);
 
         let pitch_class = PitchClass(best_pc as u8);
-        let center_hz = self.hz_for_pitch(pitch_class, octave + 4);
+        let actual_octave = octave + 4; // octave is relative to reference (octave 4)
+        let center_hz = self.hz_for_pitch(pitch_class, actual_octave);
+
+        // Compute absolute pitch (MIDI-style: C4 = 60 for 12-TET)
+        // Formula: (octave + 1) * pitch_count + pitch_class_index
+        let absolute_pitch = (actual_octave + 1) * pitch_count + best_pc as i32;
 
         QuantizeResult {
             pitch_class,
             cents_deviation: clamped_deviation,
             center_hz,
+            absolute_pitch,
         }
     }
 }

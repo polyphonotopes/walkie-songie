@@ -21,12 +21,11 @@ use crate::tuning::{PitchClass, Tuning};
 use crate::words::generate_room_name;
 
 use super::audio::WebAudioInput;
-use super::components::{emoji_picker, lock_button, midi_settings, pitch_display, room_header_button, room_overlay, tuning_editor, voice_button};
+use super::components::{emoji_picker, info_panel, lock_button, midi_settings, pitch_display, room_header_button, room_overlay, tuning_editor, voice_button};
 use super::keyboard::{pitch_keyboard, sync_active_pitches};
 use super::midi::{init_midi, MidiManager, pitch_class_to_midi_note, midi_note_to_pitch_class};
 use super::libp2p_sync::start_libp2p_room_sync;
 use super::voice_conditioner::{VoiceConditioner, ConditionerOutput};
-use super::graph;
 
 /// How long a confident pitch "lingers" when confidence drops (in milliseconds).
 const PITCH_LINGER_MS: u64 = 500;
@@ -209,6 +208,7 @@ impl AppState {
             let tuning = self.tuning.lock_ref();
             let result = tuning.quantize(hz);
             let pc = result.pitch_class;
+            let absolute_pitch = result.absolute_pitch;
             let pitch_count = tuning.pitch_class_count() as i16;
             drop(tuning);
 
@@ -272,8 +272,8 @@ impl AppState {
                     // Set voice_pitch during singing (shows as lit/green on keyboard)
                     self.voice_pitch.set(Some(pc));
 
-                    // Sync to CRDT for P2P (events emitted automatically)
-                    self.room.lock_mut().set_voice_pitchclass(Some(pc));
+                    // Sync to CRDT for P2P (events emitted automatically) - preserve octave info
+                    self.room.lock_mut().set_voice(Some(absolute_pitch), Some(pc));
 
                     // Sync keyboard (voice pitch -> lit/green, manual -> pressed/red)
                     sync_active_pitches(self);
@@ -617,7 +617,7 @@ impl AppState {
             // Clear voice pitch and MIDI when gate closes (real-time voice following)
             if self.voice_pitch.get().is_some() {
                 self.voice_pitch.set(None);
-                self.room.lock_mut().set_voice_pitchclass(None);
+                self.room.lock_mut().set_voice(None, None);
                 self.sync_midi_voice_output();
             }
             return;
@@ -729,10 +729,10 @@ fn render_app(state: Arc<AppState>) -> Dom {
                         ])
                     }),
 
-                    // Page 2: Graph & Info
+                    // Page 2: Scale Info
                     html!("div", {
                         .class("page")
-                        .class("graph-page")
+                        .class("info-page")
                         .children(&mut [
                             // Active pitches section
                             html!("section", {
@@ -740,53 +740,8 @@ fn render_app(state: Arc<AppState>) -> Dom {
                                 .child(active_pitches_list(state.clone()))
                             }),
 
-                            // Polyphonotopes graph visualization (Bevy-based)
-                            #[cfg(feature = "bevy-graph")]
-                            html!("div", {
-                                .class("graph-container")
-                                .child(html!("musical-graphs", {
-                                    .attr("id", "musical-graphs")
-                                    .attr("layout", "3d")
-                                    .attr("hops", "1")
-                                    .attr("iterations", "5")
-                                    .attr("blur-strength", "0.8")
-                                    .attr("blur-distance", "80")
-                                    .style("width", "100%")
-                                    .style("height", "100%")
-                                    .style("display", "block")
-                                }))
-                            }),
-                            #[cfg(not(feature = "bevy-graph"))]
-                            html!("div", {
-                                .class("graph-container")
-                                .child(html!("cobwebs-graph", {
-                                    .attr("id", "polyphonotopes-graph")
-                                    .attr("mode", "3d")
-                                }))
-                                .child(html!("div", {
-                                    .class("graph-controls")
-                                    .child(html!("button", {
-                                        .class("graph-mode-toggle")
-                                        .text_signal(state.graph_3d_mode.signal().map(|is_3d| {
-                                            if is_3d { "3D" } else { "2D" }
-                                        }))
-                                        .attr("title", "Toggle 2D/3D layout")
-                                        .event(clone!(state => move |_: events::Click| {
-                                            let is_3d = state.graph_3d_mode.get();
-                                            state.graph_3d_mode.set(!is_3d);
-                                            if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-                                                if let Some(el) = doc.get_element_by_id("polyphonotopes-graph") {
-                                                    let new_mode = if is_3d { "2d" } else { "3d" };
-                                                    let _ = el.set_attribute("mode", new_mode);
-                                                    let hop = state.graph_hop_level.get();
-                                                    let _ = graph::set_hop_level(hop);
-                                                }
-                                            }
-                                        }))
-                                    }))
-                                }))
-                            }),
-
+                            // Info panel with scale names, bass/treble solfege
+                            info_panel(state.clone()),
                         ])
                     }),
 
@@ -1049,76 +1004,15 @@ async fn init_app() {
     // Mount the app to the DOM
     dominator::append_dom(&dominator::body(), render_app(state.clone()));
 
-    // Initialize polyphonotopes graph after a short delay (cobwebs-visualizer only)
-    #[cfg(not(feature = "bevy-graph"))]
-    {
-        let state_for_graph = state.clone();
-        spawn_local(async move {
-            // Wait 500ms for cobwebs_visualizer to initialize
-            let promise = js_sys::Promise::new(&mut |resolve, _| {
-                let window = web_sys::window().unwrap();
-                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                    &resolve,
-                    500,
-                );
-            });
-            let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
-
-            // Initialize the polyphonotopes graph data
-            graph::init_graph();
-
-            // Load the graph into the cobwebs-graph element (1-hop by default)
-            if let Err(e) = graph::load_polyphonotopes_graph(1) {
-                web_sys::console::warn_1(&format!("Failed to load graph: {:?}", e).into());
-            } else {
-                web_sys::console::log_1(&"Polyphonotopes graph loaded".into());
-
-                // Initial graph highlight based on current pitches
-                update_graph_highlights(&state_for_graph);
-            }
-        });
-    }
+    // Graph visualization is now disabled on page 2 (replaced with info panel)
+    // Graph initialization is no longer needed
 }
 
-/// Update graph highlights based on current active pitch classes (cobwebs-visualizer only).
-#[cfg(not(feature = "bevy-graph"))]
-fn update_graph_highlights(state: &Arc<AppState>) {
-    let room = state.room.lock_ref();
-    let room_result = room.compute_room_result();
-
-    // Collect all active pitch class indices
-    let pitch_classes: Vec<u8> = room_result.pitch_classes.iter().map(|pc| pc.index()).collect();
-
-    // Update the graph visualization
-    if let Err(e) = graph::update_active_scales(pitch_classes) {
-        // Only log if the graph is actually loaded (not during startup)
-        // Errors are expected before graph is initialized
-        let _ = e; // Silently ignore
-    }
-}
-
-/// Update graph highlights based on current active pitch classes (Bevy musical-graphs).
-#[cfg(feature = "bevy-graph")]
-fn update_graph_highlights(state: &Arc<AppState>) {
-    let room = state.room.lock_ref();
-    let room_result = room.compute_room_result();
-
-    // Collect all active pitch class indices
-    let pitch_classes: Vec<u8> = room_result.pitch_classes.iter().map(|pc| pc.index()).collect();
-
-    // Update the <musical-graphs> element's pitches attribute
-    if let Some(window) = web_sys::window() {
-        if let Some(document) = window.document() {
-            if let Some(element) = document.get_element_by_id("musical-graphs") {
-                let pitches_str = pitch_classes
-                    .iter()
-                    .map(|pc| pc.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let _ = element.set_attribute("pitches", &pitches_str);
-            }
-        }
-    }
+/// Update graph highlights - no-op since graph is disabled
+/// (kept for API compatibility but does nothing)
+#[allow(dead_code)]
+fn update_graph_highlights(_state: &Arc<AppState>) {
+    // Graph visualization is disabled - info panel handles scale display reactively
 }
 
 /// Handle a room event - update UI, MIDI, and persist state.
