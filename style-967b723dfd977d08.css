@@ -1,0 +1,1440 @@
+/* Walkie Songie - Voice Input UI Styles */
+/* Colors imported from polyphonotopic-colors (colors.css generated at build time) */
+
+:root {
+    /* Aliases - accent defaults to sunny golden */
+    --accent: var(--sunny);
+}
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    min-height: 100vh;
+}
+
+.app {
+    max-width: 100%;
+    width: 100%;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+}
+
+/* Scroll-snap page container */
+.pages {
+    flex: 1;
+    overflow-y: auto;
+    scroll-snap-type: y mandatory;
+    scroll-behavior: smooth;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none; /* Firefox */
+    -ms-overflow-style: none; /* IE/Edge */
+}
+
+.pages::-webkit-scrollbar {
+    display: none; /* Chrome/Safari/Opera */
+}
+
+.page {
+    min-height: 100%;
+    scroll-snap-align: start;
+    scroll-snap-stop: always;
+    display: flex;
+    flex-direction: column;
+    padding: 1rem;
+    padding-bottom: calc(1rem + env(safe-area-inset-bottom, 0px));
+    box-sizing: border-box;
+}
+
+/* Page indicator dots */
+.page-dots {
+    position: fixed;
+    right: 0.5rem;
+    top: 50%;
+    transform: translateY(-50%);
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    z-index: 50;
+}
+
+.page-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-secondary);
+    opacity: 0.4;
+    transition: opacity 0.2s, transform 0.2s;
+}
+
+.page-dot.active {
+    opacity: 1;
+    transform: scale(1.3);
+}
+
+/* Graph page */
+.graph-page {
+    justify-content: stretch;
+    gap: 0;
+    padding: 0;
+    height: 100%;
+}
+
+.graph-container {
+    flex: 1;
+    display: flex;
+    align-items: stretch;
+    justify-content: stretch;
+    background: var(--bg-secondary);
+    border-radius: 0;
+    min-height: 0;
+    height: 100%;
+    overflow: hidden;
+    position: relative;
+}
+
+/* Polyphonotopes graph element */
+cobwebs-graph {
+    flex: 1;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    display: block;
+    position: absolute;
+    inset: 0;
+
+    /* Map group colors to walkie-songie palette */
+    --cobwebs-color-major: var(--voice);
+    --cobwebs-text-major: var(--bg-primary);
+    --cobwebs-color-altered: var(--manual);
+    --cobwebs-text-altered: var(--bg-primary);
+    --cobwebs-color-minor: var(--piece);
+    --cobwebs-text-minor: var(--bg-primary);
+    --cobwebs-color-diminished: var(--sunny);
+    --cobwebs-text-diminished: var(--bg-primary);
+}
+
+/* Graph controls overlay */
+.graph-controls {
+    position: absolute;
+    top: 0.5rem;
+    right: 0.5rem;
+    z-index: 10;
+    display: flex;
+    gap: 0.5rem;
+}
+
+.graph-mode-toggle {
+    padding: 0.4rem 0.6rem;
+    font-size: 0.8rem;
+    font-weight: 600;
+    border: 2px solid var(--text-secondary);
+    border-radius: 0.5rem;
+    background: color-mix(in oklch, var(--bg-primary) 80%, transparent);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.15s ease;
+    backdrop-filter: blur(4px);
+}
+
+.graph-mode-toggle:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: color-mix(in oklch, var(--accent) 15%, transparent);
+}
+
+/* Compact Header - sticky at top */
+.header {
+    text-align: center;
+    padding: 0.5rem 1rem;
+    flex-shrink: 0;
+}
+
+.header h1 {
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+}
+
+/* Keyboard page - fill height, distribute space */
+.keyboard-page {
+    justify-content: space-between;
+    gap: 1rem;
+    overflow: hidden;
+}
+
+/* Keyboard Section */
+.keyboard-section {
+    position: relative;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    flex: 1;
+    min-height: 200px;
+    z-index: 1; /* Create stacking context for pieces */
+}
+
+.keyboard-container {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 2rem; /* Space for clef indicators outside keyboard */
+}
+
+/* Pieces are now slotted children of all-around-keyboard, positioned by its indicator system */
+
+.keyboard-container all-around-keyboard,
+all-around-keyboard.keyboard {
+    display: block;
+    width: min(90vw, 65vh);
+    max-width: 750px;
+    position: relative;
+    overflow: visible; /* Allow clefs to render outside */
+
+    /* Keyboard theming via CSS custom properties - uses palette violet hue (280) */
+    --key-lower-fill: oklch(20% 0.03 280);
+    --key-lower-stroke: oklch(38% 0.03 280);
+    --key-upper-fill: oklch(12% 0.035 280);
+    --key-upper-stroke: oklch(30% 0.03 280);
+    /* Pressed keys - coral */
+    --key-highlight-fill: oklch(75% 0.14 30);
+    --key-highlight-stroke: oklch(65% 0.16 30);
+    --key-highlight-stroke-width: 4px;
+    --key-highlight-lower-fill: oklch(75% 0.14 30);
+    --key-highlight-upper-fill: oklch(70% 0.15 30);
+    --key-hover-opacity: 0.85;
+}
+
+/* Force SVG in keyboard to be below indicators */
+all-around-keyboard svg {
+    z-index: 1;
+}
+
+/* Pitch Indicator - positioned by all-around-keyboard via CSS custom properties */
+.pitch-indicator {
+    position: absolute;
+    left: var(--indicator-x, 50%);
+    top: var(--indicator-y, 50%);
+    transform: translate(-50%, -50%);
+    border-radius: 50%;
+    pointer-events: none;
+    transition: left 0.05s ease-out, top 0.05s ease-out, opacity 0.1s, width 0.1s, height 0.1s;
+}
+
+.pitch-indicator.hidden {
+    opacity: 0 !important;
+    width: 0 !important;
+    height: 0 !important;
+}
+
+/* Keyboard Overlay (pitch info in center) */
+.keyboard-overlay {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    text-align: center;
+    pointer-events: none;
+    z-index: 10;
+}
+
+.pitch-display {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+.pitch-display.hidden {
+    display: none;
+}
+
+.fast-pitch, .committed-pitch {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+.pitch-label {
+    display: none; /* Hide labels in overlay mode */
+}
+
+.pitch-value {
+    font-size: 1.25rem;
+    font-weight: 700;
+    font-family: 'SF Mono', 'Consolas', monospace;
+    color: var(--text-secondary);
+    text-shadow:
+        -1px -1px 0 var(--bg-primary),
+        1px -1px 0 var(--bg-primary),
+        -1px 1px 0 var(--bg-primary),
+        1px 1px 0 var(--bg-primary),
+        0 0 8px var(--bg-primary);
+}
+
+.pitch-value.has-value {
+    color: var(--text-primary);
+}
+
+.committed-pitch .pitch-value {
+    font-size: 2.5rem;
+    font-weight: 700;
+    color: var(--active);
+    text-shadow:
+        -2px -2px 0 var(--bg-primary),
+        2px -2px 0 var(--bg-primary),
+        -2px 2px 0 var(--bg-primary),
+        2px 2px 0 var(--bg-primary),
+        0 0 12px var(--bg-primary);
+}
+
+/* Hide signal level in compact mode */
+.signal-level {
+    display: none;
+}
+
+/* Button Row */
+.button-row {
+    display: flex;
+    gap: 0.75rem;
+}
+
+/* Voice Button */
+.voice-button {
+    display: block;
+    flex: 1;
+    padding: 1rem;
+    font-size: 1.25rem;
+    font-weight: 600;
+    border: none;
+    border-radius: 12px;
+    background: var(--voice);
+    color: white;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    user-select: none;
+    touch-action: none;
+}
+
+.voice-button:hover {
+    background: var(--voice-light);
+}
+
+.voice-button.active {
+    background: var(--voice-light);
+    box-shadow: 0 0 16px var(--voice);
+    animation: pulse 1.5s ease-in-out infinite;
+}
+
+/* Voice emoji in circular black background with green stroke */
+.voice-emoji {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.8em;
+    height: 1.8em;
+    background: var(--bg-primary);
+    border: 2px solid var(--voice);
+    border-radius: 50%;
+    margin-right: 0.25em;
+    vertical-align: middle;
+}
+
+/* Clear Button (header) */
+.clear-button {
+    padding: 0.5rem 0.75rem;
+    font-size: 1rem;
+    font-weight: 600;
+    border: 2px solid var(--text-secondary);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--text-primary);
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.clear-button:hover {
+    border-color: var(--manual);
+    background: color-mix(in oklch, var(--manual) 15%, transparent);
+}
+
+/* Emoji Picker - three-part segmented control */
+.emoji-picker {
+    display: flex;
+    align-items: stretch;
+    min-width: 33%;
+    background: color-mix(in oklch, var(--bg-secondary) 80%, transparent);
+    border: 2px solid var(--text-secondary);
+    border-radius: 12px;
+    overflow: hidden;
+}
+
+.emoji-nav-btn {
+    flex: 1;
+    min-width: 44px;
+    font-size: 1.1rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.emoji-nav-btn:first-child {
+    border-right: 1px solid var(--text-secondary);
+}
+
+.emoji-nav-btn:last-child {
+    border-left: 1px solid var(--text-secondary);
+}
+
+.emoji-nav-btn:hover {
+    color: var(--piece);
+    background: color-mix(in oklch, var(--piece) 15%, transparent);
+}
+
+.emoji-nav-btn:active {
+    background: color-mix(in oklch, var(--piece) 25%, transparent);
+}
+
+.emoji-picker-current {
+    flex: 1.5;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.25rem;
+}
+
+.emoji-picker-item {
+    width: 100%;
+    height: 100%;
+    min-height: 44px;
+    font-size: 1.8rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: none;
+    cursor: grab;
+    user-select: none;
+    touch-action: none;
+    transition: all 0.15s ease;
+}
+
+.emoji-picker-item:hover {
+    background: color-mix(in oklch, var(--piece) 15%, transparent);
+    transform: scale(1.1);
+}
+
+.emoji-picker-item:active {
+    cursor: grabbing;
+}
+
+/* Emoji drag ghost - follows pointer during touch drag */
+.emoji-drag-ghost {
+    position: fixed;
+    width: 40px;
+    height: 40px;
+    font-size: 2rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg-primary);
+    border: 2px solid var(--piece);
+    border-radius: 50%;
+    pointer-events: none;
+    z-index: 1000;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    opacity: 0.9;
+}
+
+/* Lock button - locks both toggles and pieces */
+.lock-button {
+    padding: 0.5rem 0.75rem;
+    font-size: 0.9rem;
+    border: 2px solid var(--text-secondary);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--text-primary);
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.lock-button:hover {
+    border-color: var(--sunny);
+    background: color-mix(in oklch, var(--sunny) 15%, transparent);
+}
+
+.lock-button.locked {
+    border-color: var(--accent);
+    background: color-mix(in oklch, var(--accent) 20%, transparent);
+}
+
+/* Piece Indicator (on keyboard) - positioned by all-around-keyboard via CSS custom properties */
+.piece-indicator {
+    position: absolute;
+    left: var(--indicator-x, 50%);
+    top: var(--indicator-y, 50%);
+    transform: translate(-50%, -50%);
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    background: transparent;
+    border: none;
+    /* Hard outline effect (stacked drop-shadows) */
+    filter: drop-shadow(1px 0 0 white)
+            drop-shadow(-1px 0 0 white)
+            drop-shadow(0 1px 0 white)
+            drop-shadow(0 -1px 0 white)
+            drop-shadow(2px 0 0 white)
+            drop-shadow(-2px 0 0 white)
+            drop-shadow(0 2px 0 white)
+            drop-shadow(0 -2px 0 white);
+    cursor: grab;
+    user-select: none;
+    touch-action: none;
+    pointer-events: auto;
+    z-index: 100;
+    /* Center the emoji text */
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 2rem;
+    line-height: 1;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.8; }
+}
+
+/* Delete hole - appears during piece drag for drag-to-delete */
+.delete-hole {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    font-size: 80px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 200;
+    pointer-events: auto;
+    animation: hole-fade-in 0.8s ease-out forwards;
+    opacity: 0;
+}
+
+@keyframes hole-fade-in {
+    0% { opacity: 0; }
+    100% { opacity: 0.8; }
+}
+
+/* Voice Indicator (shout emoji on keyboard) */
+.voice-indicator {
+    position: absolute;
+    left: var(--indicator-x, 50%);
+    top: var(--indicator-y, 50%);
+    transform: translate(-50%, -50%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 48px;
+    height: 48px;
+    font-size: 28px;
+    background: var(--bg-primary);
+    border: 3px solid var(--voice);
+    border-radius: 50%;
+    pointer-events: none;
+    z-index: 90;
+    box-shadow: 0 0 12px var(--voice), 0 2px 8px rgba(0, 0, 0, 0.3);
+    animation: shout-pulse 0.8s ease-in-out infinite;
+}
+
+@keyframes shout-pulse {
+    0%, 100% { transform: translate(-50%, -50%) scale(1); }
+    50% { transform: translate(-50%, -50%) scale(1.15); }
+}
+
+/* Radial line from clef toward keyboard center (behind keys) */
+.clef-line {
+    position: absolute;
+    left: var(--indicator-x, 50%);
+    top: var(--indicator-y, 50%);
+    width: 2px;
+    height: min(15vw, 11vh); /* ~17% of keyboard size */
+    background: linear-gradient(
+        to bottom,
+        transparent 0%,
+        var(--text-secondary, rgba(255, 255, 255, 0.5)) 20%,
+        var(--text-secondary, rgba(255, 255, 255, 0.5)) 80%,
+        transparent 100%
+    );
+    transform-origin: center top;
+    transform: translateX(-50%) rotate(calc(var(--indicator-angle, 0deg) + 180deg));
+    pointer-events: none;
+    z-index: -1; /* Behind keyboard keys */
+}
+
+.clef-line.hidden {
+    opacity: 0;
+}
+
+/* Clef Indicators (bass/treble outside keyboard) */
+.clef-indicator {
+    position: absolute;
+    left: var(--indicator-x, 50%);
+    top: var(--indicator-y, 50%);
+    transform: translate(-50%, -50%);
+    font-size: 14px;
+    font-family: "Noto Music", "Symbola", serif;
+    color: var(--text-secondary, rgba(255, 255, 255, 0.7));
+    pointer-events: none;
+    z-index: 85;
+}
+
+.clef-indicator.hidden {
+    opacity: 0;
+}
+
+/* Active Pitches Section */
+.active-pitches-section {
+    background: var(--bg-secondary);
+    border-radius: 12px;
+    padding: 1rem;
+}
+
+.active-pitches {
+    min-height: 2rem;
+}
+
+.no-pitches {
+    color: var(--text-secondary);
+    font-style: italic;
+}
+
+.pitch-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
+
+.pitch-tag {
+    background: oklch(75% 0.14 30); /* coral - matches toggle overlay */
+    color: oklch(20% 0.05 30);
+    padding: 0.25rem 0.75rem;
+    border-radius: 999px;
+    font-weight: 600;
+    font-size: 0.9rem;
+}
+
+.pitch-tag.voice-pitch {
+    background: var(--voice);
+    box-shadow: 0 0 8px var(--voice);
+}
+
+.pitch-tag.piece-pitch {
+    background: var(--piece);
+    box-shadow: 0 0 8px var(--piece);
+}
+
+/* Tuning Section (collapsible) */
+.tuning-section {
+    background: var(--bg-secondary);
+    border-radius: 12px;
+    padding: 1rem;
+}
+
+.tuning-section summary {
+    cursor: pointer;
+    font-weight: 600;
+    color: var(--text-secondary);
+    user-select: none;
+}
+
+.tuning-section[open] summary {
+    margin-bottom: 1rem;
+}
+
+.tuning-editor {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+
+.tuning-info {
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+}
+
+.scl-editor {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.scl-editor label {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+.scl-textarea {
+    width: 100%;
+    min-height: 100px;
+    padding: 0.75rem;
+    font-family: 'SF Mono', 'Consolas', monospace;
+    font-size: 0.85rem;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 2px solid var(--text-secondary);
+    border-radius: 8px;
+    resize: vertical;
+}
+
+.scl-textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.scl-error {
+    display: none;
+    color: var(--manual);
+    font-size: 0.85rem;
+    padding: 0.5rem;
+    background: color-mix(in oklch, var(--manual) 10%, transparent);
+    border-radius: 4px;
+}
+
+.scl-error.visible {
+    display: block;
+}
+
+.tuning-presets {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+}
+
+.preset-btn {
+    padding: 0.4rem 0.8rem;
+    font-size: 0.85rem;
+    border: 2px solid var(--text-secondary);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-primary);
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.preset-btn:hover {
+    border-color: var(--accent);
+    background: color-mix(in oklch, var(--accent) 10%, transparent);
+}
+
+/* Header Layout */
+.header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.header-left {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.header .title {
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+}
+
+.header-right {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+/* Room Header Button - icon only */
+.room-header-button {
+    padding: 0.5rem 0.75rem;
+    font-size: 0.9rem;
+    border: 2px solid var(--text-secondary);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--text-primary);
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.room-header-button:hover {
+    border-color: var(--voice);
+    background: color-mix(in oklch, var(--voice) 10%, transparent);
+}
+
+/* Room Overlay */
+.room-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 100;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease;
+}
+
+.room-overlay.visible {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+.room-overlay-backdrop {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.75);
+}
+
+.room-overlay-panel {
+    position: relative;
+    background: var(--bg-secondary);
+    border-radius: 16px;
+    padding: 1.5rem;
+    max-width: 90%;
+    width: 500px;
+    max-height: 90vh;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 1.25rem;
+}
+
+.room-overlay-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.room-overlay-header h2 {
+    font-size: 1.1rem;
+    color: var(--text-primary);
+}
+
+/* Room sections */
+.room-section {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    text-align: center;
+}
+
+.section-label {
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-secondary);
+}
+
+.room-overlay-header .close-btn {
+    width: 32px;
+    height: 32px;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 1.25rem;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.room-overlay-header .close-btn:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: var(--text-primary);
+}
+
+/* Room code input - full width, editable */
+.room-code-input {
+    width: 100%;
+    padding: 0.6rem 0.75rem;
+    font-family: 'SF Mono', 'Consolas', monospace;
+    font-size: 0.95rem;
+    font-weight: 600;
+    text-align: center;
+    background: var(--bg-primary);
+    color: var(--voice);
+    border: 2px solid var(--voice);
+    border-radius: 8px;
+}
+
+.room-code-input:focus {
+    outline: none;
+    border-color: var(--voice-light);
+}
+
+/* Room action buttons */
+.room-actions {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.room-action-btn {
+    flex: 1;
+    padding: 0.6rem 0.75rem;
+    font-size: 0.85rem;
+    font-weight: 500;
+    border: 2px solid var(--text-secondary);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--text-primary);
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.room-action-btn:hover, .room-action-btn:active {
+    border-color: var(--voice);
+    background: color-mix(in oklch, var(--voice) 15%, transparent);
+}
+
+/* Share button - prominent, easy to tap */
+.share-btn {
+    width: 100%;
+    padding: 0.875rem 1rem;
+    font-size: 1rem;
+    font-weight: 600;
+    border: 2px solid var(--voice);
+    border-radius: 10px;
+    background: transparent;
+    color: var(--voice);
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.share-btn:hover, .share-btn:active {
+    background: var(--voice);
+    color: white;
+}
+
+/* Room link row - shareable link with copy button */
+.room-link-row {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.room-link-input {
+    flex: 1;
+    padding: 0.6rem 0.75rem;
+    font-family: 'SF Mono', 'Consolas', monospace;
+    font-size: 0.7rem;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 2px solid var(--text-secondary);
+    border-radius: 8px;
+    min-width: 0;
+}
+
+.copy-link-btn {
+    padding: 0.5rem 0.75rem;
+    font-size: 1.1rem;
+    border: 2px solid var(--voice);
+    border-radius: 8px;
+    background: transparent;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.copy-link-btn:hover, .copy-link-btn:active {
+    background: var(--voice);
+}
+
+/* Room actions row - new room + join */
+.room-actions-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: stretch;
+}
+
+.new-room-btn {
+    padding: 0.6rem 0.75rem;
+    font-size: 0.9rem;
+    font-weight: 600;
+    border: 2px solid var(--sunny);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--sunny);
+    cursor: pointer;
+    transition: all 0.15s ease;
+    white-space: nowrap;
+}
+
+.new-room-btn:hover, .new-room-btn:active {
+    background: var(--sunny);
+    color: var(--bg-primary);
+}
+
+.join-input {
+    flex: 1;
+    padding: 0.6rem 0.75rem;
+    font-size: 0.85rem;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 2px solid var(--text-secondary);
+    border-radius: 8px;
+    min-width: 0;
+}
+
+.join-input:focus {
+    outline: none;
+    border-color: var(--voice);
+}
+
+.join-input::placeholder {
+    color: var(--text-secondary);
+    opacity: 0.7;
+}
+
+/* Collapsible sections in room overlay */
+.qr-details,
+.join-room-details {
+    border-radius: 8px;
+    background: var(--bg-primary);
+}
+
+.qr-details summary,
+.join-room-details summary {
+    padding: 0.75rem 1rem;
+    font-size: 0.9rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+    cursor: pointer;
+    user-select: none;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.qr-details summary::before,
+.join-room-details summary::before {
+    content: "▸";
+    transition: transform 0.2s;
+}
+
+.qr-details[open] summary::before,
+.join-room-details[open] summary::before {
+    transform: rotate(90deg);
+}
+
+.qr-details summary::-webkit-details-marker,
+.join-room-details summary::-webkit-details-marker {
+    display: none;
+}
+
+.join-room-details .room-input-section {
+    padding: 0 1rem 1rem 1rem;
+}
+
+.current-room-display {
+    text-align: center;
+}
+
+.room-name-large {
+    font-family: 'SF Mono', 'Consolas', monospace;
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: var(--voice);
+}
+
+/* Shareable link section */
+.shareable-link-section {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.shareable-link-section .link-label {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+.shareable-link-section .link-row {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.shareable-link-section .link-input {
+    flex: 1;
+    padding: 0.5rem 0.6rem;
+    font-family: 'SF Mono', 'Consolas', monospace;
+    font-size: 0.75rem;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 2px solid var(--text-secondary);
+    border-radius: 8px;
+    min-width: 0; /* Allow shrinking */
+}
+
+.shareable-link-section .copy-btn {
+    padding: 0.5rem 0.75rem;
+    font-size: 0.85rem;
+    font-weight: 600;
+    border: 2px solid var(--voice);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--voice);
+    cursor: pointer;
+    transition: all 0.15s ease;
+    white-space: nowrap;
+}
+
+.shareable-link-section .copy-btn:hover {
+    background: var(--voice);
+    color: white;
+}
+
+.peer-status {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    padding: 0.25rem 0;
+}
+
+.peer-status.connected {
+    color: var(--voice-light);
+}
+
+.qr-container {
+    display: flex;
+    justify-content: center;
+    padding: 1rem;
+    background: var(--bg-primary);
+    border-radius: 12px;
+}
+
+.qr-code {
+    width: 200px;
+    height: 200px;
+}
+
+.qr-code svg {
+    width: 100%;
+    height: 100%;
+}
+
+.shuffle-btn {
+    width: 100%;
+    padding: 0.75rem 1rem;
+    font-size: 1rem;
+    font-weight: 600;
+    border: none;
+    border-radius: 10px;
+    background: var(--voice);
+    color: white;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.shuffle-btn:hover {
+    background: var(--voice-light);
+}
+
+.room-input-section {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.room-input-section label {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+.room-input-row {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.room-input {
+    flex: 1;
+    padding: 0.6rem 0.8rem;
+    font-family: 'SF Mono', 'Consolas', monospace;
+    font-size: 0.9rem;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 2px solid var(--text-secondary);
+    border-radius: 8px;
+    transition: border-color 0.15s ease;
+}
+
+.room-input:focus {
+    outline: none;
+    border-color: var(--voice);
+}
+
+.room-input::placeholder {
+    color: var(--text-secondary);
+    opacity: 0.6;
+}
+
+.join-btn {
+    padding: 0.6rem 1rem;
+    font-size: 0.9rem;
+    font-weight: 600;
+    border: 2px solid var(--voice);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--voice);
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.join-btn:hover {
+    background: color-mix(in oklch, var(--voice) 15%, transparent);
+}
+
+.room-input-hint {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+}
+
+.room-input-hint.error {
+    color: var(--manual);
+}
+
+/* MIDI Settings */
+.midi-settings {
+    padding: 0.75rem;
+    background: var(--bg-primary);
+    border-radius: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.midi-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.midi-row label {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    min-width: 70px;
+}
+
+.midi-select {
+    flex: 1;
+    padding: 0.4rem 0.6rem;
+    font-size: 0.85rem;
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    border: 2px solid var(--text-secondary);
+    border-radius: 6px;
+    cursor: pointer;
+}
+
+.midi-select:focus {
+    outline: none;
+    border-color: var(--voice);
+}
+
+.midi-select option {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+}
+
+/* Responsive */
+@media (max-width: 400px) {
+    .app {
+        padding: 0.75rem;
+    }
+
+    .header h1 {
+        font-size: 1.25rem;
+    }
+
+    .voice-button {
+        padding: 0.75rem;
+        font-size: 1rem;
+    }
+
+    .room-header-button .room-name {
+        display: none;
+    }
+
+    .room-overlay-panel {
+        padding: 1rem;
+        width: 95%;
+    }
+
+    .room-name-large {
+        font-size: 1.25rem;
+    }
+}
+
+/* Key overlay for toggled notes - dot pattern clipped to key shape */
+.toggle-overlay {
+    display: none; /* Hidden source element, keyboard clones styles */
+    background:
+        radial-gradient(circle, oklch(75% 0.14 30) 2px, transparent 2px); /* coral dots */
+    background-size: 8px 8px;
+}
+
+/* Info page (replaced graph page) */
+.info-page {
+    justify-content: flex-start;
+    gap: 1rem;
+    padding: 1rem;
+}
+
+.info-panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+    overflow-y: auto;
+}
+
+.info-panel-content {
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+}
+
+.info-section {
+    background: var(--bg-secondary);
+    border-radius: 0.75rem;
+    padding: 1rem;
+}
+
+.info-section .section-label {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-secondary);
+    margin-bottom: 0.75rem;
+}
+
+/* Scales section */
+.scales-section .empty-state {
+    color: var(--text-secondary);
+    font-style: italic;
+}
+
+.scale-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
+
+.scale-tag {
+    display: inline-flex;
+    padding: 0.375rem 0.75rem;
+    border-radius: 999px;
+    font-size: 0.875rem;
+    font-weight: 500;
+    background: var(--bg-tertiary, rgba(255, 255, 255, 0.1));
+    color: var(--text-primary);
+    border: 1px solid var(--border-color, rgba(255,255,255,0.1));
+}
+
+.scale-tag.exact {
+    background: var(--accent-color, #4a9eff);
+    color: #fff;
+    border-color: var(--accent-color, #4a9eff);
+    box-shadow: 0 0 8px rgba(74, 158, 255, 0.4);
+    font-weight: 600;
+}
+
+/* Solfege grid: | bass clef | bass info | treble clef | treble info | */
+.solfege-grid {
+    display: grid;
+    grid-template-columns: auto 1fr auto 1fr;
+    align-items: center;
+    gap: 0.5rem 0.75rem;
+}
+
+.clef-icon {
+    font-size: 2.5rem;
+    opacity: 0.8;
+    font-family: "Noto Music", "Symbola", serif;
+    line-height: 1;
+}
+
+.solfege-info {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.25rem;
+}
+
+.solfege-info.empty {
+    color: var(--text-secondary);
+    opacity: 0.5;
+}
+
+.note-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.375rem 0.75rem;
+    border-radius: 999px;
+    background: var(--bg-tertiary, rgba(255, 255, 255, 0.1));
+    color: var(--text-primary);
+    font-size: 1rem;
+    font-weight: 600;
+}
+
+.source-emoji {
+    font-size: 0.875rem;
+}
+
+.note-name {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+}
+
+.empty-note {
+    color: var(--text-secondary);
+    font-size: 1.25rem;
+}
+
+/* Solfege chips */
+.solfege-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.375rem;
+}
+
+.solfege-chip {
+    display: inline-flex;
+    padding: 0.25rem 0.5rem;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: lowercase;
+    background: var(--bg-tertiary, rgba(255, 255, 255, 0.1));
+    color: var(--text-secondary, rgba(255, 255, 255, 0.7));
+    border: 1px solid var(--border-color, rgba(255,255,255,0.1));
+}
