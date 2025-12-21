@@ -14,6 +14,8 @@ required-features = ["plugin"]
 [features]
 default = ["plugin"]
 plugin = ["dep:nih_plug", "dep:nih_plug_egui", "dep:crossbeam-channel", "dep:egui_extras", "dep:image"]
+# Use Bevy iframe for graph visualization instead of cobwebs-visualizer CSS
+bevy-graph = []
 
 [workspace]
 members = ["xtask"]
@@ -103,6 +105,37 @@ polyphonotopes-rs = { path = "../polyphonotopes-2025/polyphonotopes-rs", default
 # Graph visualization custom element
 cobwebs-visualizer = { path = "../cobwebs-visualizer" }
 
+# Bevy-based graph visualization (direct integration)
+musical-graphs-app = { path = "../polyphonotopes-2025/musical-graphs-app", default-features = false }
+
 # UI framework
 dominator = "0.5"
 futures-signals = "0.3"
+
+# Patch Bevy crates to use local checkout (required for musical-graphs-app integration)
+[patch.crates-io]
+bevy = { path = "../bevy" }
+bevy_app = { path = "../bevy/crates/bevy_app" }
+bevy_asset = { path = "../bevy/crates/bevy_asset" }
+bevy_ecs = { path = "../bevy/crates/bevy_ecs" }
+bevy_window = { path = "../bevy/crates/bevy_window" }
+bevy_utils = { path = "../bevy/crates/bevy_utils" }
+bevy_log = { path = "../bevy/crates/bevy_log" }
+bevy_math = { path = "../bevy/crates/bevy_math" }
+bevy_platform = { path = "../bevy/crates/bevy_platform" }
+bevy_render = { path = "../bevy/crates/bevy_render" }
+bevy_core_pipeline = { path = "../bevy/crates/bevy_core_pipeline" }
+bevy_pbr = { path = "../bevy/crates/bevy_pbr" }
+bevy_sprite = { path = "../bevy/crates/bevy_sprite" }
+bevy_text = { path = "../bevy/crates/bevy_text" }
+bevy_gizmos = { path = "../bevy/crates/bevy_gizmos" }
+bevy_scene = { path = "../bevy/crates/bevy_scene" }
+bevy_reflect = { path = "../bevy/crates/bevy_reflect" }
+bevy_input = { path = "../bevy/crates/bevy_input" }
+bevy_color = { path = "../bevy/crates/bevy_color" }
+bevy_image = { path = "../bevy/crates/bevy_image" }
+bevy_time = { path = "../bevy/crates/bevy_time" }
+bevy_transform = { path = "../bevy/crates/bevy_transform" }
+bevy_input_focus = { path = "../bevy/crates/bevy_input_focus" }
+bevy_winit = { path = "../bevy/crates/bevy_winit" }
+bevy_picking = { path = "../bevy/crates/bevy_picking" }

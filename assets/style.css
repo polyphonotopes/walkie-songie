@@ -111,6 +111,45 @@ cobwebs-graph {
     display: block;
     position: absolute;
     inset: 0;
+
+    /* Map group colors to walkie-songie palette */
+    --cobwebs-color-major: var(--voice);
+    --cobwebs-text-major: var(--bg-primary);
+    --cobwebs-color-altered: var(--manual);
+    --cobwebs-text-altered: var(--bg-primary);
+    --cobwebs-color-minor: var(--piece);
+    --cobwebs-text-minor: var(--bg-primary);
+    --cobwebs-color-diminished: var(--sunny);
+    --cobwebs-text-diminished: var(--bg-primary);
+}
+
+/* Graph controls overlay */
+.graph-controls {
+    position: absolute;
+    top: 0.5rem;
+    right: 0.5rem;
+    z-index: 10;
+    display: flex;
+    gap: 0.5rem;
+}
+
+.graph-mode-toggle {
+    padding: 0.4rem 0.6rem;
+    font-size: 0.8rem;
+    font-weight: 600;
+    border: 2px solid var(--text-secondary);
+    border-radius: 0.5rem;
+    background: color-mix(in oklch, var(--bg-primary) 80%, transparent);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.15s ease;
+    backdrop-filter: blur(4px);
+}
+
+.graph-mode-toggle:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: color-mix(in oklch, var(--accent) 15%, transparent);
 }
 
 /* Compact Header - sticky at top */

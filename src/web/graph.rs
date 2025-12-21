@@ -123,6 +123,12 @@ pub fn load_graph_subset(hop_level: u32, center_node_ids: Option<&[String]>) -> 
 
         // Add nodes with random initial positions (spread in a circle)
         let node_count = nodes_to_show.len();
+        let edge_count = graph.all_edges().len();
+        web_sys::console::log_1(&format!(
+            "Loading graph: {} nodes, {} edges (hop_level={})",
+            node_count, edge_count, hop_level
+        ).into());
+
         for (i, node) in graph.nodes().enumerate() {
             if !nodes_to_show.contains(&node.id) {
                 continue;

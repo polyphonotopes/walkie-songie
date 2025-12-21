@@ -33,6 +33,7 @@
             });
         }
     </script>
-    <link data-trunk rel="rust" data-wasm-opt="z" data-target-name="walkie_songie" />
+    <!-- Add data-cargo-features="bevy-graph" to use Bevy iframe instead of cobwebs-visualizer -->
+    <link data-trunk rel="rust" data-target-name="walkie_songie" data-cargo-features="bevy-graph" data-wasm-opt="0" />
 </body>
 </html>

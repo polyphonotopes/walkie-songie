@@ -2,6 +2,10 @@
 # Output directory for build artifacts
 dist = "dist"
 
+[tools]
+# Disable wasm-opt for faster dev builds
+wasm_opt = "off"
+
 [watch]
 # Files to ignore during watch mode
 ignore = ["dist", "target"]
