@@ -10,8 +10,8 @@ export async function initSwiftF0() {
         // Use wasm backend (CPU, works everywhere)
         ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/';
 
-        // Fetch the model as ArrayBuffer - trunk copies it to root
-        const modelUrl = '/swiftf0.onnx';
+        // Fetch the model as ArrayBuffer - use relative path for subdirectory deploys
+        const modelUrl = './swiftf0.onnx';
         console.log('Fetching SwiftF0 model from:', modelUrl);
 
         const response = await fetch(modelUrl);
