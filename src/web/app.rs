@@ -917,8 +917,6 @@ pub fn run_app() {
             .build()
     );
 
-    // Register graph custom elements
-    cobwebs_visualizer::define_cobwebs_graph_element();
 
     // Initialize app asynchronously (to load peer ID from IndexedDB)
     spawn_local(async {
