@@ -1,5 +1,6 @@
 // Bridge to onnxruntime-web for SwiftF0 pitch detection
-import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/ort.webgpu.min.mjs';
+// Using WASM-only bundle (smaller than WebGPU bundle)
+import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/ort.wasm.min.mjs';
 
 let session = null;
 let modelReady = false;
@@ -7,8 +8,14 @@ let modelReady = false;
 // Initialize the SwiftF0 model
 export async function initSwiftF0() {
     try {
-        // Use wasm backend (CPU, works everywhere)
+        // Configure WASM paths
         ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/';
+
+        // Enable proxy worker to offload inference off main thread (helps mobile)
+        ort.env.wasm.proxy = true;
+
+        // Single thread is often faster on mobile (less overhead)
+        ort.env.wasm.numThreads = 1;
 
         // Fetch the model as ArrayBuffer - use relative path for subdirectory deploys
         const modelUrl = './swiftf0.onnx';
@@ -27,7 +34,7 @@ export async function initSwiftF0() {
         });
 
         modelReady = true;
-        console.log('SwiftF0 ONNX model loaded via onnxruntime-web');
+        console.log('SwiftF0 ONNX model loaded with proxy worker enabled');
     } catch (e) {
         console.error('Failed to load SwiftF0 model:', e);
         throw e;
