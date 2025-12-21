@@ -1,0 +1,34 @@
+:root {
+  /* === Hues (harmonized around salmon at 21) ===
+   * violet: 280 (anchor)
+   * cyan: 180 (100° counter-clockwise - balances salmon)
+   * salmon: 21 (100° clockwise - locked)
+   * azure: 235 (between violet and cyan)
+   * gold: 60 (complement zone)
+   */
+
+  /* === Base === */
+  --bg-primary: oklch(22% 0.045 280);
+  --bg-secondary: oklch(28% 0.04 280);
+  --text-primary: oklch(92% 0.02 280);
+  --text-secondary: oklch(65% 0.04 280);
+
+  /* === Accent === */
+  --voice: oklch(65% 0.16 180);
+  --voice-light: oklch(85% 0.08 180);
+  --manual: oklch(71% 0.16 21);
+  --manual-light: oklch(88% 0.075 21);
+  --piece: oklch(70% 0.14 235);
+  --sunny: oklch(82% 0.15 60);
+  --sunny-light: oklch(92% 0.08 60);
+
+  /* === Pastel === */
+  --pastel-sage: oklch(85% 0.06 128);
+  --pastel-olive: oklch(85% 0.06 114);
+  --pastel-sky: oklch(85% 0.06 235);
+  --pastel-mint: oklch(85% 0.06 180);
+  --pastel-lavender: oklch(85% 0.06 280);
+  --pastel-mauve: oklch(85% 0.06 320);
+  --pastel-sand: oklch(85% 0.06 60);
+  --pastel-blush: oklch(85% 0.06 21);
+}
