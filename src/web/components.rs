@@ -329,7 +329,7 @@ pub fn room_overlay(state: Arc<AppState>) -> Dom {
                                     let room = state.room_name.get_cloned();
                                     let pid = state.iroh_peer_id.get_cloned();
                                     if let Some(window) = web_sys::window() {
-                                        let origin = window.location().origin().unwrap_or_else(|_| "https://walkie-songie.app".to_string());
+                                        let origin = window.location().origin().unwrap_or_else(|_| "https://polyphonotopes.github.io/walkie-songie".to_string());
                                         let link = if let Some(p) = pid {
                                             format!("{}/#{}@{}", origin, room, p)
                                         } else {
@@ -367,7 +367,7 @@ pub fn room_overlay(state: Arc<AppState>) -> Dom {
                             let room_name = state.room_name.get_cloned();
                             let origin = web_sys::window()
                                 .and_then(|w| w.location().origin().ok())
-                                .unwrap_or_else(|| "https://walkie-songie.app".to_string());
+                                .unwrap_or_else(|| "https://polyphonotopes.github.io/walkie-songie".to_string());
                             let room_with_peer = if let Some(pid) = peer_id {
                                 format!("{}@{}", room_name, pid)
                             } else {

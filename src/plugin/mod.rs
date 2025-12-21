@@ -116,7 +116,7 @@ impl Default for WalkieSongiePlugin {
 impl Plugin for WalkieSongiePlugin {
     const NAME: &'static str = "Walkie Songie";
     const VENDOR: &'static str = "@micahscopes";
-    const URL: &'static str = "https://wondering.xyz";
+    const URL: &'static str = "https://polyphonotopes.github.io/walkie-songie";
     const EMAIL: &'static str = "micahscopes@gmail.com";
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 

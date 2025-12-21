@@ -148,8 +148,9 @@ fn draw_editor(
 
             ui.horizontal(|ui| {
                 ui.label("Share:");
-                if ui.small_button("📋 Copy").clicked() {
-                    ctx.copy_text(shareable.clone());
+                if ui.small_button("📋 Copy Link").clicked() {
+                    let url = format!("https://polyphonotopes.github.io/walkie-songie/#{}", shareable);
+                    ctx.copy_text(url);
                 }
             });
             ui.add_space(8.0);
@@ -239,7 +240,7 @@ fn generate_qr_texture(ctx: &egui::Context, channel: &str) -> Option<egui::Textu
     use qrcode::QrCode;
 
     // Create URL for the QR code
-    let url = format!("walkie-songie://channel/{}", channel);
+    let url = format!("https://polyphonotopes.github.io/walkie-songie/#{}", channel);
 
     let code = QrCode::new(url.as_bytes()).ok()?;
 
