@@ -23,7 +23,7 @@ use crate::words::generate_room_name;
 use super::audio::WebAudioInput;
 use super::components::{emoji_picker, info_panel, lock_button, midi_settings, pitch_display, room_header_button, room_overlay, tuning_editor, voice_button};
 use super::keyboard::{pitch_keyboard, sync_active_pitches};
-use super::midi::{init_midi, MidiManager, pitch_class_to_midi_note, midi_note_to_pitch_class};
+use super::midi::{MidiManager, pitch_class_to_midi_note, midi_note_to_pitch_class};
 use super::libp2p_sync::start_libp2p_room_sync;
 use super::voice_conditioner::{VoiceConditioner, ConditionerOutput};
 
@@ -100,6 +100,8 @@ pub struct AppState {
     pub midi_input_id: Mutable<Option<String>>,
     /// Selected MIDI output device ID (None = disabled).
     pub midi_output_id: Mutable<Option<String>>,
+    /// Version counter for MIDI devices (increments when devices change).
+    pub midi_devices_version: Mutable<u32>,
     /// Whether pieces are locked (can't drag to move or delete via hole).
     pub pieces_locked: Mutable<bool>,
     /// Index of currently selected emoji in the picker (for prev/next navigation).
@@ -145,9 +147,10 @@ impl AppState {
             room_overlay_visible: Mutable::new(false),
             room_input: Mutable::new(String::new()),
             iroh_peer_id: Mutable::new(None), // Set when P2P sync starts
-            midi: init_midi(),
+            midi: Rc::new(RefCell::new(MidiManager::new())),
             midi_input_id: Mutable::new(None),
             midi_output_id: Mutable::new(None),
+            midi_devices_version: Mutable::new(0),
             pieces_locked: Mutable::new(false), // Pieces can be dragged/deleted
             selected_emoji_idx: Mutable::new(0),
             graph_3d_mode: Mutable::new(true), // 3D by default
@@ -930,6 +933,17 @@ async fn init_app() {
 
     // Create application state
     let state = AppState::new(peer_id);
+
+    // Initialize MIDI with hot-plug support
+    let midi_manager = state.midi.clone();
+    let midi_version = state.midi_devices_version.clone();
+    super::midi::init_midi_with_callback(midi_manager.clone(), move || {
+        // Re-enumerate devices and bump version to trigger UI update
+        if let Ok(mut midi) = midi_manager.try_borrow_mut() {
+            midi.refresh_devices();
+        }
+        midi_version.set(midi_version.get() + 1);
+    });
 
     // Initialize room name (from URL or generate new) and sync to hash
     // room_topic may include @peer-id for bootstrapping

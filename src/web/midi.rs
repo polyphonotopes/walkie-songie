@@ -238,6 +238,8 @@ pub struct MidiManager {
     pub selected_output: Option<String>,
     /// Input device closures (kept alive).
     _input_closures: Vec<Closure<dyn FnMut(MidiMessageEvent)>>,
+    /// Statechange closure (kept alive for hot-plug support).
+    _statechange_closure: Option<Closure<dyn FnMut(web_sys::Event)>>,
     /// Output state.
     pub output: Rc<RefCell<MidiOutputState>>,
 }
@@ -251,6 +253,7 @@ impl MidiManager {
             selected_input: None,
             selected_output: None,
             _input_closures: Vec::new(),
+            _statechange_closure: None,
             output: Rc::new(RefCell::new(MidiOutputState::new())),
         }
     }
@@ -293,6 +296,70 @@ impl MidiManager {
         ).into());
 
         Ok(())
+    }
+
+    /// Initialize with callback for device changes (hot-plug support).
+    pub async fn init_with_callback<F>(&mut self, on_devices_changed: Rc<F>) -> Result<(), String>
+    where
+        F: Fn() + 'static,
+    {
+        let window = web_sys::window().ok_or("No window")?;
+        let navigator = window.navigator();
+
+        // Check if Web MIDI is supported
+        let request_midi_access =
+            js_sys::Reflect::get(&navigator, &"requestMIDIAccess".into())
+                .map_err(|_| "Web MIDI not supported")?;
+
+        if !request_midi_access.is_function() {
+            return Err("Web MIDI not available".to_string());
+        }
+
+        // Request MIDI access
+        let midi_options = web_sys::MidiOptions::new();
+        let promise = navigator
+            .request_midi_access_with_options(&midi_options)
+            .map_err(|e| format!("MIDI access request failed: {:?}", e))?;
+
+        let midi_access: MidiAccess = JsFuture::from(promise)
+            .await
+            .map_err(|e| format!("MIDI access denied: {:?}", e))?
+            .dyn_into()
+            .map_err(|_| "Invalid MIDI access object")?;
+
+        // Enumerate available devices
+        self.enumerate_devices(&midi_access)?;
+
+        // Set up statechange listener for hot-plug support
+        let callback = on_devices_changed.clone();
+        let statechange_closure = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+            callback();
+        }) as Box<dyn FnMut(web_sys::Event)>);
+
+        midi_access.set_onstatechange(Some(statechange_closure.as_ref().unchecked_ref()));
+        self._statechange_closure = Some(statechange_closure);
+
+        self.access = Some(midi_access);
+
+        web_sys::console::log_1(&format!(
+            "Web MIDI initialized with hot-plug: {} inputs, {} outputs",
+            self.available_inputs.len(),
+            self.available_outputs.len()
+        ).into());
+
+        // Trigger initial callback so UI updates
+        on_devices_changed();
+
+        Ok(())
+    }
+
+    /// Re-enumerate devices (call after statechange event).
+    pub fn refresh_devices(&mut self) {
+        if let Some(access) = self.access.clone() {
+            if let Err(e) = self.enumerate_devices(&access) {
+                web_sys::console::warn_1(&format!("MIDI refresh error: {}", e).into());
+            }
+        }
     }
 
     /// Enumerate available MIDI devices without connecting.
@@ -567,20 +634,20 @@ impl Default for MidiManager {
     }
 }
 
-/// Initialize MIDI and return the manager (call from app startup).
-pub fn init_midi() -> Rc<RefCell<MidiManager>> {
-    let manager = Rc::new(RefCell::new(MidiManager::new()));
-
-    // Initialize asynchronously
+/// Initialize MIDI with a callback for device changes (hot-plug support).
+pub fn init_midi_with_callback<F>(manager: Rc<RefCell<MidiManager>>, on_devices_changed: F)
+where
+    F: Fn() + 'static,
+{
     let manager_clone = manager.clone();
+    let callback = Rc::new(on_devices_changed);
+
     spawn_local(async move {
-        let result = manager_clone.borrow_mut().init().await;
+        let result = manager_clone.borrow_mut().init_with_callback(callback).await;
         if let Err(e) = result {
             web_sys::console::warn_1(&format!("MIDI init warning: {}", e).into());
         }
     });
-
-    manager
 }
 
 /// Convert a pitch class (0-N) to a MIDI note number.

@@ -494,7 +494,7 @@ pub fn midi_settings(state: Arc<AppState>) -> Dom {
                             }),
                         ])
                         .children_signal_vec(
-                            futures_signals::signal::always(()).map(clone!(state => move |_| {
+                            state.midi_devices_version.signal().map(clone!(state => move |_| {
                                 if let Ok(midi) = state.midi.try_borrow() {
                                     midi.available_inputs.iter().map(|dev| {
                                         let id = dev.id.clone();
@@ -538,7 +538,7 @@ pub fn midi_settings(state: Arc<AppState>) -> Dom {
                             }),
                         ])
                         .children_signal_vec(
-                            futures_signals::signal::always(()).map(clone!(state => move |_| {
+                            state.midi_devices_version.signal().map(clone!(state => move |_| {
                                 if let Ok(midi) = state.midi.try_borrow() {
                                     midi.available_outputs.iter().map(|dev| {
                                         let id = dev.id.clone();
