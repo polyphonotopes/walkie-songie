@@ -1,5 +1,5 @@
 // Service Worker for Walkie Songie PWA
-const CACHE_NAME = 'walkie-songie-v1';
+const CACHE_NAME = 'walkie-songie-v3';
 
 // Assets to cache on install
 const PRECACHE_ASSETS = [

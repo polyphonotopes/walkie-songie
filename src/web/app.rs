@@ -915,9 +915,6 @@ pub fn run_app() {
     );
 
     // Register graph custom elements
-    #[cfg(feature = "bevy-graph")]
-    musical_graphs_app::web_component::define_musical_graphs_element();
-    #[cfg(not(feature = "bevy-graph"))]
     cobwebs_visualizer::define_cobwebs_graph_element();
 
     // Initialize app asynchronously (to load peer ID from IndexedDB)

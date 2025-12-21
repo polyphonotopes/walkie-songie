@@ -1,1 +1,176 @@
-<!doctype html><html lang=en><meta charset=UTF-8><meta content="width=device-width,initial-scale=1.0" name=viewport><title>Walkie Songie</title><meta content="P2P collaborative music application for real-time musical collaboration" name=description><meta content=#99bc66 name=theme-color><meta content=yes name=apple-mobile-web-app-capable><meta content=black-translucent name=apple-mobile-web-app-status-bar-style><meta content="Walkie Songie" name=apple-mobile-web-app-title><link href=manifest.webmanifest rel=manifest><link href=icon.svg rel=icon type=image/svg+xml><link href=icon.svg rel=apple-touch-icon><link href=/walkie-songie/colors-ec9b297abb87e049.css integrity=sha384-B68CEyg4_n1vZKqse2gJRCIi6vPtsE4Hd2FpHUIrqK2Ip0eGGqGL3O--yoeaMXvY rel=stylesheet><link href=/walkie-songie/style-59cddb1b8627a1dc.css integrity=sha384-atzO2Re9G487lyayvA78_bG7_71LyFHo8RzKY7kA4tXhq6IkJwwp9vwQHzmyRm82 rel=stylesheet><link as=fetch crossorigin href=/walkie-songie/walkie-songie-eca5ae332d89c406_bg.wasm integrity=sha384-hyGYkAmJhMJNkX6xsEh3ZJYi2ojNOiz-UNO9L2CC__-_4UuUsHr7pw4iZ1l0icPz rel=preload type=application/wasm><link crossorigin href=/walkie-songie/walkie-songie-eca5ae332d89c406.js integrity=sha384-HWvNEt9djqUzCl-WyeMP1AXitGRsRdZYg5UKi34z66mkwMPWy2Uk-PHL7CO6p2vk rel=modulepreload><link crossorigin href=/walkie-songie/snippets/walkie-songie-54ae4c155955ba2c/assets/onnx-bridge.js integrity=sha384-fGdHq4um0VVfZ-N_ZULaHcnErZeKGPEmVpIqJmKH-qrcy56l5Q1GlvKrFjGG1yoG rel=modulepreload><link crossorigin href=/walkie-songie/snippets/custom-elements-419327fa2779072f/src/make_custom_element.js integrity=sha384-TC3-TaLgWWaYwKjkQRYiojSIEg_atstVxsYrzw2G3trWiMaxRNJN0M77AJYrynbB rel=modulepreload></head><body><script src=all-around-keyboard.esm.min.js type=module></script><script>if(`serviceWorker` in navigator){window.addEventListener(`load`,()=>{navigator.serviceWorker.register(`sw.js`).then(a=>console.log(`SW registered:`,a.scope)).catch(a=>console.warn(`SW registration failed:`,a))})}</script><script type=module>import a,*as b from"/walkie-songie/walkie-songie-eca5ae332d89c406.js";a(`/walkie-songie/walkie-songie-eca5ae332d89c406_bg.wasm`);window.wasmBindings=b</script></body></html>
+<!DOCTYPE html><html lang="en"><head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Walkie Songie</title>
+    <meta name="description" content="P2P collaborative music application for real-time musical collaboration">
+    <meta name="theme-color" content="#99bc66">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Walkie Songie">
+    <link rel="manifest" href="manifest.webmanifest">
+    <link rel="icon" type="image/svg+xml" href="icon.svg">
+    <link rel="apple-touch-icon" href="icon.svg">
+    <link rel="stylesheet" href="/colors-1dad9d56b6b7cadc.css" integrity="sha384-lkAgGCZH_8nCtMHT5RwtcsdemQH8ecow_h9QCV1HJ0TYjOYnCTyNVPiaOrIT1S1o">
+    <link rel="stylesheet" href="/style-c7740a226620abcc.css" integrity="sha384-yODbsV3HCg-AOcAo3BxYFvurS5jqfR0MpKCT8oC4jcD7yziht3e94TGmPsxdWJb2">
+    
+    
+    
+    
+    
+    
+
+<link rel="preload" href="/walkie-songie-9be90dcce3b99e7_bg.wasm" as="fetch" type="application/wasm" crossorigin="anonymous" integrity="sha384-V7IqMGkDZtYBKZZqxqcab48xOXUDZ7Pg3kYyhVdOhGIc3vHMeQP__dBTbZwYRvfe">
+<link rel="modulepreload" href="/walkie-songie-9be90dcce3b99e7.js" crossorigin="anonymous" integrity="sha384-GlpcwoV0jVt5lI6GVH6GdSMAUjPsJ6o1QuwV_DV-tPXyow2wB3jya4Rftk8nYP9q">
+<link rel="modulepreload" href="/snippets/custom-elements-419327fa2779072f/src/make_custom_element.js" crossorigin="anonymous" integrity="sha384-TC3-TaLgWWaYwKjkQRYiojSIEg_atstVxsYrzw2G3trWiMaxRNJN0M77AJYrynbB">
+<link rel="modulepreload" href="/snippets/walkie-songie-54ae4c155955ba2c/assets/onnx-bridge.js" crossorigin="anonymous" integrity="sha384-fGdHq4um0VVfZ-N_ZULaHcnErZeKGPEmVpIqJmKH-qrcy56l5Q1GlvKrFjGG1yoG"></head>
+<body>
+    <script type="module" src="all-around-keyboard.esm.min.js"></script>
+    <script>
+        // Register service worker
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('sw.js')
+                    .then(reg => console.log('SW registered:', reg.scope))
+                    .catch(err => console.warn('SW registration failed:', err));
+            });
+        }
+    </script>
+    <!-- Skip wasm-opt via trunk - Cargo profile does LTO/strip/opt-level=z -->
+    
+<script type="module">
+import init, * as bindings from '/walkie-songie-9be90dcce3b99e7.js';
+init('/walkie-songie-9be90dcce3b99e7_bg.wasm');
+window.wasmBindings = bindings;
+
+</script>
+
+
+<script>"use strict";
+
+(function () {
+
+    const address = '{{__TRUNK_ADDRESS__}}';
+    let protocol = '';
+    protocol =
+        protocol
+            ? protocol
+            : window.location.protocol === 'https:'
+                ? 'wss'
+                : 'ws';
+    const url = protocol + '://' + address + '/_trunk/ws';
+
+    class Overlay {
+        constructor() {
+            // create an overlay
+            this._overlay = document.createElement("div");
+            const style = this._overlay.style;
+            style.height = "100vh";
+            style.width = "100vw";
+            style.position = "fixed";
+            style.top = "0";
+            style.left = "0";
+            style.backgroundColor = "rgba(222, 222, 222, 0.5)";
+            style.fontFamily = "sans-serif";
+            // not sure that's the right approach
+            style.zIndex = "1000000";
+            style.backdropFilter = "blur(1rem)";
+
+            const container = document.createElement("div");
+            // center it
+            container.style.position = "absolute";
+            container.style.top = "30%";
+            container.style.left = "15%";
+            container.style.maxWidth = "85%";
+
+            this._title = document.createElement("div");
+            this._title.innerText = "Build failure";
+            this._title.style.paddingBottom = "2rem";
+            this._title.style.fontSize = "2.5rem";
+
+            this._message = document.createElement("div");
+            this._message.style.whiteSpace = "pre-wrap";
+
+            const icon= document.createElement("div");
+            icon.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" fill="#dc3545" viewBox="0 0 16 16"><path d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/></svg>';
+            this._title.prepend(icon);
+
+            container.append(this._title, this._message);
+            this._overlay.append(container);
+
+            this._inject();
+            window.setInterval(() => {
+                this._inject();
+            }, 250);
+        }
+
+        set reason(reason) {
+            this._message.textContent = reason;
+        }
+
+        _inject() {
+            if (!this._overlay.isConnected) {
+                // prepend it
+                document.body?.prepend(this._overlay);
+            }
+        }
+
+    }
+
+    class Client {
+        constructor(url) {
+            this.url = url;
+            this.poll_interval = 5000;
+            this._overlay = null;
+        }
+
+        start() {
+            const ws = new WebSocket(this.url);
+            ws.onmessage = (ev) => {
+                const msg = JSON.parse(ev.data);
+                switch (msg.type) {
+                    case "reload":
+                        this.reload();
+                        break;
+                    case "buildFailure":
+                        this.buildFailure(msg.data)
+                        break;
+                }
+            };
+            ws.onclose = this.onclose;
+        }
+
+        onclose() {
+            window.setTimeout(
+                () => {
+                    // when we successfully reconnect, we'll force a
+                    // reload (since we presumably lost connection to
+                    // trunk due to it being killed, so it will have
+                    // rebuilt on restart)
+                    const ws = new WebSocket(this.url);
+                    ws.onopen = () => window.location.reload();
+                    ws.onclose = this.onclose;
+                },
+                this.poll_interval);
+        }
+
+        reload() {
+            window.location.reload();
+        }
+
+        buildFailure({reason}) {
+            // also log the console
+            console.error("Build failed:", reason);
+
+            console.debug("Overlay", this._overlay);
+
+            if (!this._overlay) {
+                this._overlay = new Overlay();
+            }
+            this._overlay.reason = reason;
+        }
+    }
+
+    new Client(url).start();
+
+})()
+</script></body></html>

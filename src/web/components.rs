@@ -327,14 +327,10 @@ pub fn room_overlay(state: Arc<AppState>) -> Dom {
                                 .text("📋 Copy Link")
                                 .event(clone!(state => move |_: events::Click| {
                                     let room = state.room_name.get_cloned();
-                                    let pid = state.iroh_peer_id.get_cloned();
                                     if let Some(window) = web_sys::window() {
-                                        let origin = window.location().origin().unwrap_or_else(|_| "https://polyphonotopes.github.io/walkie-songie".to_string());
-                                        let link = if let Some(p) = pid {
-                                            format!("{}/#{}@{}", origin, room, p)
-                                        } else {
-                                            format!("{}/#{}",  origin, room)
-                                        };
+                                        // Use full base URL with hash for room name
+                                        let base = "https://polyphonotopes.github.io/walkie-songie";
+                                        let link = format!("{}#{}", base, room);
                                         let clipboard = window.navigator().clipboard();
                                         let _ = clipboard.write_text(&link);
                                     }
@@ -363,23 +359,16 @@ pub fn room_overlay(state: Arc<AppState>) -> Dom {
                     // QR Code (always visible)
                     html!("div", {
                         .class("qr-container")
-                        .child_signal(state.iroh_peer_id.signal_cloned().map(clone!(state => move |peer_id| {
-                            let room_name = state.room_name.get_cloned();
-                            let origin = web_sys::window()
-                                .and_then(|w| w.location().origin().ok())
-                                .unwrap_or_else(|| "https://polyphonotopes.github.io/walkie-songie".to_string());
-                            let room_with_peer = if let Some(pid) = peer_id {
-                                format!("{}@{}", room_name, pid)
-                            } else {
-                                room_name.clone()
-                            };
-                            let svg = generate_room_qr_svg(&room_with_peer, &origin);
+                        .child_signal(state.room_name.signal_cloned().map(|room_name| {
+                            // Use full base URL with hash for room name
+                            let base = "https://polyphonotopes.github.io/walkie-songie";
+                            let svg = generate_room_qr_svg(&room_name, base);
                             Some(html!("div", {
                                 .class("qr-code")
                                 .attr("data-room", &room_name)
                                 .prop("innerHTML", &svg)
                             }))
-                        })))
+                        }))
                     }),
                 ])
             }),

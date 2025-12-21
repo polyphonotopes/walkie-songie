@@ -135,7 +135,7 @@ pub fn is_valid_room_input(input: &str) -> bool {
 pub fn generate_room_qr_svg(room_name: &str, base_url: &str) -> String {
     use qrcode::{QrCode, render::svg};
 
-    let url = format!("{}?room={}", base_url, room_name);
+    let url = format!("{}#{}", base_url, room_name);
 
     match QrCode::new(url.as_bytes()) {
         Ok(code) => {
