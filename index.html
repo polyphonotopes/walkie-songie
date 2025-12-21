@@ -6,7 +6,7 @@
     <title>Walkie Songie</title>
     <meta name="description" content="P2P collaborative music application for real-time musical collaboration">
     <meta name="theme-color" content="#99bc66">
-    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="Walkie Songie">
     <link rel="manifest" href="manifest.webmanifest">
@@ -29,7 +29,7 @@
     </script>
     <script type="module">
         import init, * as wasm from './walkie_songie.js';
-        init('./walkie_songie_bg.wasm');
+        await init();
         window.wasmBindings = wasm;
     </script>
 </body>
