@@ -11,9 +11,7 @@ export async function initSwiftF0() {
         // Configure WASM paths
         ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/';
 
-        // Enable proxy worker to offload inference off main thread (helps mobile)
-        ort.env.wasm.proxy = true;
-
+        // Note: proxy worker doesn't work - WASM-backed tensors can't be transferred
         // Single thread is often faster on mobile (less overhead)
         ort.env.wasm.numThreads = 1;
 
