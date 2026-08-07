@@ -30,7 +30,7 @@ use super::components::{
     room_header_button, room_overlay, tuning_editor, voice_button,
 };
 use super::keyboard::{pitch_keyboard, sync_active_pitches};
-use super::midi::{MidiManager, pitch_class_to_midi_note};
+use super::midi::{MidiInputEvent, MidiManager, pitch_class_to_midi_note};
 use super::voice_conditioner::{ConditionerOutput, VoiceConditioner};
 
 /// How long a confident pitch "lingers" when confidence drops (in milliseconds).
@@ -938,34 +938,41 @@ impl AppState {
             return;
         }
         while let Some(event) = MidiManager::poll_input() {
-            // MIDI input is 12-TET frequency data, even when the active room
-            // tuning is not. Quantize the frequency; never reduce modulo the
-            // room's degree count.
-            let hz = 440.0 * 2.0_f64.powf((f64::from(event.note) - 69.0) / 12.0);
-            let Ok(result) = self.tuning.lock_ref().quantize(hz) else {
-                continue;
-            };
-            let pitch_class = result.pitch_class;
+            self.route_midi_event(event);
+        }
+    }
 
-            if self.browser_host {
-                // The signed store is authoritative: route note-on/off as
-                // durable degree commands; the projection updates the UI.
-                self.set_native_degree(pitch_class, event.is_note_on);
-            } else {
-                // Route to toggle set: note-on adds, note-off removes
-                {
-                    let mut room = self.room.lock_mut();
-                    if event.is_note_on {
-                        room.add_pitch(pitch_class);
-                    } else {
-                        room.remove_pitch(pitch_class);
-                    }
+    /// Route one decoded Web MIDI input event into the store/room. Shared by the
+    /// synchronous drain ([`Self::poll_midi_input`]) and the event-driven consumer
+    /// that awaits the MIDI channel (the browser MIDI task in `run`), so the UI
+    /// never polls on a timer for MIDI.
+    fn route_midi_event(self: &Arc<Self>, event: MidiInputEvent) {
+        // MIDI input is 12-TET frequency data, even when the active room tuning is
+        // not. Quantize the frequency; never reduce modulo the room's degree count.
+        let hz = 440.0 * 2.0_f64.powf((f64::from(event.note) - 69.0) / 12.0);
+        let Ok(result) = self.tuning.lock_ref().quantize(hz) else {
+            return;
+        };
+        let pitch_class = result.pitch_class;
+
+        if self.browser_host {
+            // The signed store is authoritative: route note-on/off as durable
+            // degree commands; the projection updates the UI.
+            self.set_native_degree(pitch_class, event.is_note_on);
+        } else {
+            // Route to toggle set: note-on adds, note-off removes
+            {
+                let mut room = self.room.lock_mut();
+                if event.is_note_on {
+                    room.add_pitch(pitch_class);
+                } else {
+                    room.remove_pitch(pitch_class);
                 }
-
-                // Sync MIDI output and keyboard display
-                self.sync_midi_toggle_output();
-                sync_active_pitches(self);
             }
+
+            // Sync MIDI output and keyboard display
+            self.sync_midi_toggle_output();
+            sync_active_pitches(self);
         }
     }
 
@@ -1577,6 +1584,12 @@ pub fn run_app() {
     tracing_wasm::set_as_global_default_with_config(
         tracing_wasm::WASMLayerConfigBuilder::new()
             .set_max_level(tracing::Level::INFO)
+            // iroh's networking spans (connect, do_holepunching, relay actors,
+            // gossip) fire constantly at INFO; tracing-wasm was turning every one
+            // into a performance.mark/measure, flooding the devtools timeline and
+            // burning main-thread time during interaction (visible as ~70ms of
+            // mark/measure in a drag trace). Keep console logging, drop the marks.
+            .set_report_logs_in_timings(false)
             .build(),
     );
 
@@ -1677,18 +1690,18 @@ async fn init_app() {
     });
 
     if !state.tauri_backend() {
-        // Browser Web MIDI still uses its callback queue.
+        // Web MIDI is event-driven: the `onmidimessage` callback pushes decoded
+        // events into an async channel (see `web::midi`). Await that channel rather
+        // than waking on a 16ms `setTimeout` — the old poll loop allocated a
+        // Promise + closure + timer ~60x/sec forever, churning the main thread
+        // during drags/interaction (visible as a setTimeout/TimerFire storm in a
+        // trace). Now we wake only when MIDI actually arrives, which also removes
+        // up to ~16ms of input latency.
         let state_for_midi = state.clone();
         spawn_local(async move {
-            loop {
-                state_for_midi.poll_midi_input();
-
-                let promise = js_sys::Promise::new(&mut |resolve, _| {
-                    let window = web_sys::window().unwrap();
-                    let _ =
-                        window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 16);
-                });
-                let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+            let rx = MidiManager::input_receiver();
+            while let Ok(event) = rx.recv().await {
+                state_for_midi.route_midi_event(event);
             }
         });
     }
