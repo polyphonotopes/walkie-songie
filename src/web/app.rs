@@ -602,10 +602,15 @@ impl AppState {
                     // Set voice_pitch during singing (shows as lit/green on keyboard)
                     self.voice_pitch.set(Some(pc));
 
-                    // Sync to CRDT for P2P (events emitted automatically) - preserve octave info
-                    self.room
-                        .lock_mut()
-                        .set_voice(Some(absolute_pitch), Some(pc));
+                    // Connected: dispatch the voice preview; the projection is
+                    // the sole writer of `state.room` (voice presence echoes
+                    // back as VoiceUpdated). Offline: the local adapter is
+                    // authoritative, so write it directly - preserve octave info.
+                    if !self.native_backend {
+                        self.room
+                            .lock_mut()
+                            .set_voice(Some(absolute_pitch), Some(pc));
+                    }
                     self.send_native_voice(Some(native_pitch));
 
                     // Sync keyboard (voice pitch -> lit/green, manual -> pressed/red)
@@ -766,8 +771,9 @@ impl AppState {
             if let Some(pitch) = self.committed_pitch.get() {
                 self.set_native_degree(pitch, true);
             }
+            // Dispatch only; the projection clears the voice adapter when the
+            // SetVoicePreview(None) echo arrives. No optimistic local write.
             self.send_native_voice(None);
-            self.room.lock_mut().set_voice(None, None);
             self.voice_pitch.set(None);
         }
 
@@ -1025,7 +1031,11 @@ impl AppState {
 
                 if self.voice_pitch.get().is_some() {
                     self.voice_pitch.set(None);
-                    self.room.lock_mut().set_voice(None, None);
+                    // Connected: dispatch only; the projection clears the voice
+                    // adapter. Offline: the local adapter is authoritative.
+                    if !self.native_backend {
+                        self.room.lock_mut().set_voice(None, None);
+                    }
                     self.send_native_voice(None);
                     self.sync_midi_voice_output();
                 }

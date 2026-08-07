@@ -50,9 +50,11 @@ pub fn clear_button(state: Arc<AppState>) -> Dom {
         .class("clear-button")
         .text("🌊 Clear")
         .event(clone!(state => move |_: events::Click| {
+            // Connected: `clear_native_musical_state` dispatches the retractions
+            // and the projection is the sole writer of `state.room`. Offline:
+            // the local adapter is authoritative, so clear it here.
             state.clear_native_musical_state();
-            // Clear both manual pitches and voice pitch
-            {
+            if !state.native_backend {
                 let mut room = state.room.lock_mut();
                 room.clear_pitches();
                 room.clear_voice();
@@ -78,10 +80,14 @@ pub fn lock_button(state: Arc<AppState>) -> Dom {
         .attr("title", "Lock/unlock keyboard editing")
         .event(clone!(state => move |_: events::Click| {
             let new_locked = !state.pieces_locked.get();
-            state.pieces_locked.set(new_locked);
-            // Persist to CRDT
-            state.room.lock_mut().set_pieces_locked(new_locked);
+            // Connected: dispatch only; `pieces_locked` and `state.room` both
+            // repaint from the projection (RoomConfigChanged). Offline: the
+            // local adapter is authoritative, so write it here.
             state.set_native_pieces_locked(new_locked);
+            if !state.native_backend {
+                state.pieces_locked.set(new_locked);
+                state.room.lock_mut().set_pieces_locked(new_locked);
+            }
         }))
     })
 }
@@ -424,13 +430,17 @@ pub fn tuning_editor(state: Arc<AppState>) -> Dom {
                                         Ok(scale) => {
                                             match Tuning::from_scl("Custom".to_string(), scale, None) {
                                                 Ok(tuning) => {
-                                                    state.tuning.set(tuning.clone());
                                                     state.scl_error.set(None);
+                                                    // Connected: dispatch only; `state.tuning`, `state.room`
+                                                    // and the keyboard display all repaint from the
+                                                    // projection (TuningChanged). Offline: the local adapter
+                                                    // is authoritative, so apply it here.
                                                     state.set_native_tuning(content.clone());
-                                                    // Update standalone-browser room SCL
-                                                    state.room.lock_mut().set_tuning_scl(&content);
-                                                    // Update keyboard display
-                                                    update_tuning(&tuning);
+                                                    if !state.native_backend {
+                                                        state.tuning.set(tuning.clone());
+                                                        state.room.lock_mut().set_tuning_scl(&content);
+                                                        update_tuning(&tuning);
+                                                    }
                                                 }
                                                 Err(e) => state.scl_error.set(Some(e.to_string())),
                                             }
