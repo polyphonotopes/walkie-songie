@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use dominator::{Dom, html};
-use futures_signals::signal::Mutable;
+use futures_signals::signal::{Mutable, MutableLockMut, ReadOnlyMutable};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 use web_time::Instant;
@@ -74,7 +74,14 @@ pub struct AppState {
     /// still refreshing the 1.5-second signed lease.
     last_native_voice: Rc<RefCell<Option<(Instant, TunedPeriodicPitch)>>>,
     /// Room state with CRDT synchronization (manual/clicked pitches).
-    pub room: Mutable<RoomState>,
+    ///
+    /// PRIVATE: the projection (`project_native_snapshot`) is the sole
+    /// effective writer. Sibling UI modules (`keyboard`, `components`, …) see
+    /// it only through the read-only handle [`AppState::room`]; the vestigial
+    /// offline writers below reach it via [`AppState::room_mut`], which never
+    /// escapes this module. This makes the single-writer invariant a compile
+    /// error to violate, not a convention.
+    room: Mutable<RoomState>,
     /// Current tuning system.
     pub tuning: Mutable<Tuning>,
     /// Whether voice input is active.
@@ -213,6 +220,80 @@ impl AppState {
     /// True only inside the Tauri webview (the host is out-of-process).
     pub fn tauri_backend(&self) -> bool {
         self.native_backend && !self.browser_host
+    }
+
+    /// Read-only view of the render adapter for sibling UI modules.
+    ///
+    /// This is the ONLY way `keyboard`, `components`, `graph`, … reach room
+    /// state. `ReadOnlyMutable` exposes `lock_ref`/`signal_cloned`/`get_cloned`
+    /// but no `lock_mut`, so a component structurally cannot write unbacked
+    /// state — the projection is the sole writer, enforced by the type system.
+    pub fn room(&self) -> ReadOnlyMutable<RoomState> {
+        self.room.read_only()
+    }
+
+    /// Private mutable access to the render adapter. Module-scoped so only the
+    /// projection and the vestigial offline writers below can lock it for
+    /// mutation; no write handle escapes to sibling UI modules.
+    fn room_mut(&self) -> MutableLockMut<'_, RoomState> {
+        self.room.lock_mut()
+    }
+
+    /// Offline-only: toggle a pitch class in the authoritative local adapter,
+    /// also dropping any local voice echo at that class. Returns
+    /// `(now_active, voice_cleared)`. In connected modes the store is
+    /// authoritative and this is never called (see the keyclick handler).
+    pub fn offline_toggle_pitch(&self, pitch_class: PitchClass) -> (bool, bool) {
+        let mut room = self.room_mut();
+        let active = if room.contains_pitch(pitch_class) {
+            room.remove_pitch(pitch_class);
+            false
+        } else {
+            room.add_pitch(pitch_class);
+            true
+        };
+        let voice_cleared = room.clear_voice_at_pitch_class(pitch_class);
+        (active, voice_cleared)
+    }
+
+    /// Drop any local voice echo painted at `pitch_class`. Returns whether a
+    /// voice was cleared. In connected modes host presence is authoritative;
+    /// this only clears the transient local echo the keyclick paints.
+    pub fn clear_room_voice_at_pitch_class(&self, pitch_class: PitchClass) -> bool {
+        self.room_mut().clear_voice_at_pitch_class(pitch_class)
+    }
+
+    /// Offline-only: add a piece to the authoritative local adapter.
+    pub fn offline_add_piece(&self, pitch: i32, emoji: &str) {
+        self.room_mut().add_piece(pitch, emoji);
+    }
+
+    /// Offline-only: remove a piece from the authoritative local adapter.
+    pub fn offline_remove_piece(&self, piece_id: &str) {
+        self.room_mut().remove_piece(piece_id);
+    }
+
+    /// Offline-only: move a piece in the authoritative local adapter.
+    pub fn offline_move_piece(&self, piece_id: &str, new_pitch: i32) {
+        self.room_mut().move_piece(piece_id, new_pitch);
+    }
+
+    /// Offline-only: set the pieces-locked flag on the local adapter.
+    pub fn offline_set_pieces_locked(&self, locked: bool) {
+        self.room_mut().set_pieces_locked(locked);
+    }
+
+    /// Offline-only: wipe pitches, voice, and pieces from the local adapter.
+    pub fn offline_clear_musical_state(&self) {
+        let mut room = self.room_mut();
+        room.clear_pitches();
+        room.clear_voice();
+        room.clear_pieces();
+    }
+
+    /// Offline-only: apply an SCL tuning definition to the local adapter.
+    pub fn offline_set_tuning_scl(&self, scl: &str) {
+        self.room_mut().set_tuning_scl(scl);
     }
 
     fn dispatch_native(&self, command: ClientCommand) {

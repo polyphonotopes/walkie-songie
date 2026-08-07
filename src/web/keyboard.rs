@@ -176,7 +176,8 @@ const TREBLE_CLEF: &str = "𝄞";
 /// - Voice pitches show with wavy overlay and shout emoji
 /// - Bass/treble clef indicators show lowest/highest notes
 pub fn sync_active_pitches(state: &Arc<AppState>) {
-    let room = state.room.lock_ref();
+    let room_handle = state.room();
+    let room = room_handle.lock_ref();
     let tuning = state.tuning.lock_ref();
     let pc_count = tuning.pitch_class_count() as i32;
     drop(tuning);
@@ -666,7 +667,8 @@ fn setup_piece_sync(state: Arc<AppState>, keyboard_el: web_sys::HtmlElement) {
 
     // Create signal from room events for pieces
     let (initial_pieces, events) = {
-        let room = state.room.lock_ref();
+        let room_handle = state.room();
+        let room = room_handle.lock_ref();
         let tuning = state.tuning.lock_ref();
         let pitch_count = tuning.pitch_class_count();
         drop(tuning);
@@ -688,7 +690,8 @@ fn setup_piece_sync(state: Arc<AppState>, keyboard_el: web_sys::HtmlElement) {
             )
         })
         .map(move |_| {
-            let room = state_for_stream.room.lock_ref();
+            let room_handle = state_for_stream.room();
+            let room = room_handle.lock_ref();
             let tuning = state_for_stream.tuning.lock_ref();
             let pitch_count = tuning.pitch_class_count();
             drop(tuning);
@@ -990,7 +993,7 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
             // projection be the sole writer (an owner-gated remove that the
             // store rejects then leaves the piece in place, by construction).
             if !state_up.native_backend {
-                state_up.room.lock_mut().remove_piece(&piece_id);
+                state_up.offline_remove_piece(&piece_id);
             }
             // Reset styling before removal triggers UI update
             piece_el.remove_attribute("data-dragging").ok();
@@ -1036,14 +1039,14 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
             if delta.abs() <= MAX_DRAG_SEMITONES && delta != 0 {
                 let target_pitch = start_pitch + delta;
                 // Don't allow moving to a key that already has a piece
-                if state_up.room.lock_ref().has_piece_at(target_pitch) {
+                if state_up.room().lock_ref().has_piece_at(target_pitch) {
                     start_pitch // Can't move there
                 } else {
                     state_up.move_native_piece(&piece_id, target_pitch);
                     // Optimistic legacy view; connected modes let the signed
                     // store's projection be the sole writer.
                     if !state_up.native_backend {
-                        state_up.room.lock_mut().move_piece(&piece_id, target_pitch);
+                        state_up.offline_move_piece(&piece_id, target_pitch);
                     }
                     target_pitch
                 }
@@ -1064,7 +1067,7 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
         // `setup_piece_sync`.
         let display_pitch = if state_up.native_backend {
             state_up
-                .room
+                .room()
                 .lock_ref()
                 .get_piece(&piece_id)
                 .map(|piece| piece.pitch)
@@ -1205,14 +1208,14 @@ fn setup_keyboard_drop_handlers(state: Arc<AppState>) {
         let pitch = key_index + 60;
 
         // Don't allow dropping on a key that already has a piece
-        if state_drop.room.lock_ref().has_piece_at(pitch) {
+        if state_drop.room().lock_ref().has_piece_at(pitch) {
             return;
         }
 
         state_drop.put_native_piece(emoji.clone(), pitch);
         // Optimistic legacy view; the native snapshot replaces it once signed.
         if !state_drop.native_backend {
-            state_drop.room.lock_mut().add_piece(pitch, &emoji);
+            state_drop.offline_add_piece(pitch, &emoji);
         }
 
         // Sync UI
@@ -1329,13 +1332,13 @@ fn setup_emoji_drag_handlers(state: Arc<AppState>) {
         let pitch = key_index + 60;
 
         // Don't allow dropping on a key that already has a piece
-        if state_up.room.lock_ref().has_piece_at(pitch) {
+        if state_up.room().lock_ref().has_piece_at(pitch) {
             return;
         }
 
         state_up.put_native_piece(drag.emoji.clone(), pitch);
         if !state_up.native_backend {
-            state_up.room.lock_mut().add_piece(pitch, &drag.emoji);
+            state_up.offline_add_piece(pitch, &drag.emoji);
         }
         sync_active_pitches(&state_up);
         state_up.sync_midi_toggle_output();
@@ -1426,21 +1429,11 @@ fn setup_keyboard_events(state: Arc<AppState>) {
                             state_click.set_native_degree(pc, !present);
 
                             // Voice presence is host-side; clear the local echo.
-                            let mut room = state_click.room.lock_mut();
-                            room.clear_voice_at_pitch_class(pc)
+                            state_click.clear_room_voice_at_pitch_class(pc)
                         } else {
                             // Offline: the local `room` adapter IS the
                             // authoritative state, so it stays the writer.
-                            let mut room = state_click.room.lock_mut();
-                            let active = if room.contains_pitch(pc) {
-                                room.remove_pitch(pc);
-                                false
-                            } else {
-                                room.add_pitch(pc);
-                                true
-                            };
-                            let voice_cleared = room.clear_voice_at_pitch_class(pc);
-                            drop(room);
+                            let (active, voice_cleared) = state_click.offline_toggle_pitch(pc);
                             state_click.set_native_degree(pc, active);
                             voice_cleared
                         };

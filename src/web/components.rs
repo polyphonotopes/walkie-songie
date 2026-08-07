@@ -55,10 +55,7 @@ pub fn clear_button(state: Arc<AppState>) -> Dom {
             // the local adapter is authoritative, so clear it here.
             state.clear_native_musical_state();
             if !state.native_backend {
-                let mut room = state.room.lock_mut();
-                room.clear_pitches();
-                room.clear_voice();
-                room.clear_pieces();
+                state.offline_clear_musical_state();
             }
             state.voice_pitch.set(None);
             // Sync UI and MIDI output (sends note-offs)
@@ -86,7 +83,7 @@ pub fn lock_button(state: Arc<AppState>) -> Dom {
             state.set_native_pieces_locked(new_locked);
             if !state.native_backend {
                 state.pieces_locked.set(new_locked);
-                state.room.lock_mut().set_pieces_locked(new_locked);
+                state.offline_set_pieces_locked(new_locked);
             }
         }))
     })
@@ -100,7 +97,7 @@ pub fn emoji_picker(state: Arc<AppState>) -> Dom {
         .selected_emoji_idx
         .signal()
         .map(clone!(state => move |idx| {
-            let emojis = state.room.lock_ref().available_emojis();
+            let emojis = state.room().lock_ref().available_emojis();
             let count = emojis.len();
             let safe_idx = if count > 0 { idx % count } else { 0 };
             (emojis, safe_idx, count)
@@ -114,7 +111,7 @@ pub fn emoji_picker(state: Arc<AppState>) -> Dom {
                 .class("emoji-nav-btn")
                 .text("◀")
                 .event(clone!(state => move |_: events::Click| {
-                    let emojis = state.room.lock_ref().available_emojis();
+                    let emojis = state.room().lock_ref().available_emojis();
                     let count = emojis.len();
                     if count > 0 {
                         let current = state.selected_emoji_idx.get();
@@ -173,7 +170,7 @@ pub fn emoji_picker(state: Arc<AppState>) -> Dom {
                 .class("emoji-nav-btn")
                 .text("▶")
                 .event(clone!(state => move |_: events::Click| {
-                    let emojis = state.room.lock_ref().available_emojis();
+                    let emojis = state.room().lock_ref().available_emojis();
                     let count = emojis.len();
                     if count > 0 {
                         let current = state.selected_emoji_idx.get();
@@ -438,7 +435,7 @@ pub fn tuning_editor(state: Arc<AppState>) -> Dom {
                                                     state.set_native_tuning(content.clone());
                                                     if !state.native_backend {
                                                         state.tuning.set(tuning.clone());
-                                                        state.room.lock_mut().set_tuning_scl(&content);
+                                                        state.offline_set_tuning_scl(&content);
                                                         update_tuning(&tuning);
                                                     }
                                                 }
@@ -609,7 +606,8 @@ pub fn info_panel(state: Arc<AppState>) -> Dom {
 
     // Create signal from room events
     let (initial_data, events) = {
-        let room = state.room.lock_ref();
+        let room_handle = state.room();
+        let room = room_handle.lock_ref();
         let tuning = state.tuning.lock_ref();
         let data = compute_info_panel_data(&room, &tuning);
         (data, room.events())
@@ -619,7 +617,8 @@ pub fn info_panel(state: Arc<AppState>) -> Dom {
     let state_stream = events
         .filter(|e| ready(e.affects_pitches() || e.affects_voice() || e.affects_pieces()))
         .map(move |_| {
-            let room = state_for_stream.room.lock_ref();
+            let room_handle = state_for_stream.room();
+            let room = room_handle.lock_ref();
             let tuning = state_for_stream.tuning.lock_ref();
             compute_info_panel_data(&room, &tuning)
         });
