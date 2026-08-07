@@ -1,0 +1,1 @@
+{"main-window":{"identifier":"main-window","description":"Minimal capability set for the walkie-songie frontend","local":true,"windows":["main"],"permissions":["core:default"]}}
