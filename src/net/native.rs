@@ -13,7 +13,7 @@ use std::{collections::HashMap, time::Duration};
 use futures::{StreamExt, TryStreamExt};
 use iroh::{
     Endpoint, EndpointId,
-    address_lookup::MemoryLookup,
+    address_lookup::{MemoryLookup, PkarrPublisher, PkarrResolver},
     endpoint::{Connection, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
@@ -90,6 +90,13 @@ impl NativeRoomNetwork {
             .relay_mode(relay_mode)
             .clear_address_lookup()
             .address_lookup(memory.clone())
+            // pkarr id->relay-url discovery (see browser.rs). Resolves peers
+            // learned by id alone (ticket/gossip/rendezvous) without a cached
+            // address, and gives native<->browser plus cross-network
+            // native<->native reach that mDNS (LAN-only, added just below)
+            // can't. Relay-only filter by default, same as the browser.
+            .address_lookup(PkarrPublisher::n0_dns())
+            .address_lookup(PkarrResolver::n0_dns())
             .bind()
             .await
             .map_err(|error| NativeNetError::Bind(error.to_string()))?;
@@ -341,6 +348,16 @@ impl NativeRoomNetwork {
 
     pub async fn peer_path(&self, endpoint_id: EndpointId) -> PeerTransportPath {
         classify_peer_path(self.endpoint(), endpoint_id).await
+    }
+
+    /// The iroh handles the topic rendezvous needs to peer discovered ids —
+    /// the same `add_endpoint_info` + `join_peers` primitives `join_ticket` uses.
+    pub fn rendezvous_peering(&self) -> super::rendezvous::RendezvousPeering {
+        super::rendezvous::RendezvousPeering {
+            endpoint: self.endpoint().clone(),
+            gossip_sender: self.gossip_sender.clone(),
+            memory_lookup: self.memory_lookup.clone(),
+        }
     }
 
     pub async fn shutdown(self) -> Result<(), NativeNetError> {

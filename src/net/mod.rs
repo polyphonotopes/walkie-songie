@@ -28,6 +28,15 @@ pub mod iroh_common;
 ))]
 pub mod repair;
 
+// Topic rendezvous: two clients that type the same room code auto-peer with no
+// ticket exchange. Same cfg as `iroh_common` — it needs iroh's `Endpoint`,
+// `MemoryLookup`, and gossip `GossipSender`, present on both transports.
+#[cfg(any(
+    all(not(target_arch = "wasm32"), feature = "native-net"),
+    all(target_arch = "wasm32", feature = "browser-net")
+))]
+pub mod rendezvous;
+
 // The relay-only browser iroh transport (Topology A in a plain browser tab).
 #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
 pub mod browser;
@@ -50,6 +59,11 @@ pub use iroh_common::{
     all(target_arch = "wasm32", feature = "browser-net")
 ))]
 pub use repair::{IrohSyncStream, MAX_REPAIR_FRAME_BYTES, read_sync_frame, write_sync_frames};
+#[cfg(any(
+    all(not(target_arch = "wasm32"), feature = "native-net"),
+    all(target_arch = "wasm32", feature = "browser-net")
+))]
+pub use rendezvous::{RendezvousHandle, RendezvousPeering, spawn_rendezvous};
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-net"))]
 pub use native::{IncomingRepair, NativeRoomNetwork, RoomInbound};

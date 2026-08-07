@@ -52,6 +52,12 @@ pub(crate) const REPAIR_ACCEPT_TIMEOUT: Duration = Duration::from_secs(20);
 pub const RBSR_ALPN: &[u8] = b"walkie/rbsr/2";
 /// Production home relay. A trailing dot avoids relative DNS interpretation.
 pub const PRODUCTION_RELAY_URL: &str = "https://relay.wondering.xyz/";
+/// Topic-rendezvous signaling server (y-webrtc `funnyzak/y-webrtc-signaling`,
+/// behind traefik `Host(signal.wondering.xyz)` → port 4444, wss on 443). The
+/// y-webrtc server upgrades any WebSocket at the root path, so no path segment
+/// is appended. See [`super::rendezvous`] for the protocol; swapping this to an
+/// owned rendezvous (design §3 Option 2) is a one-line change here.
+pub const SIGNALING_SERVER_URL: &str = "wss://signal.wondering.xyz";
 
 /// Inbound repair connections are queued separately from gossip so a peer that
 /// opens repair sessions cannot head-of-line block op delivery, and so a slow

@@ -18,7 +18,7 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt, TryStreamExt, channel::mpsc};
 use iroh::{
     Endpoint, EndpointId,
-    address_lookup::MemoryLookup,
+    address_lookup::{MemoryLookup, PkarrPublisher, PkarrResolver},
     endpoint::{Connection, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
@@ -147,6 +147,16 @@ impl BrowserNetHandle {
     pub async fn peer_path(&self, endpoint_id: EndpointId) -> PeerTransportPath {
         classify_peer_path(&self.endpoint, endpoint_id).await
     }
+
+    /// The iroh handles the topic rendezvous needs to peer discovered ids —
+    /// the same `add_endpoint_info` + `join_peers` primitives `join_ticket` uses.
+    pub fn rendezvous_peering(&self) -> super::rendezvous::RendezvousPeering {
+        super::rendezvous::RendezvousPeering {
+            endpoint: self.endpoint.clone(),
+            gossip_sender: self.gossip_sender.clone(),
+            memory_lookup: self.memory_lookup.clone(),
+        }
+    }
 }
 
 /// A bound browser Iroh endpoint and its active gossip topic.
@@ -181,6 +191,16 @@ impl BrowserRoomNetwork {
             .relay_mode(relay_mode)
             .clear_address_lookup()
             .address_lookup(memory.clone())
+            // Re-add iroh's built-in pkarr discovery that `presets::N0` installs
+            // and `clear_address_lookup` just stripped: publish/resolve
+            // endpoint-id -> relay-url over HTTP (fully wasm-capable; n0's dns
+            // server sends `Access-Control-Allow-Origin: *`). Without a resolver,
+            // a known node id whose address isn't already cached is undialable
+            // -> gossip's "No addressing information available". Default
+            // `AddrFilter::relay_only()` is exactly what a relay-only browser
+            // wants; do not widen it.
+            .address_lookup(PkarrPublisher::n0_dns())
+            .address_lookup(PkarrResolver::n0_dns())
             .bind()
             .await
             .map_err(|error| NativeNetError::Bind(error.to_string()))?;
