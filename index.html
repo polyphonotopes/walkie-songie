@@ -20,7 +20,7 @@
     
     
     
-<link rel="modulepreload" href="/walkie-songie/walkie-songie-b45cab613310b3b7.js" crossorigin="anonymous" integrity="sha384-u4t9R6L/wAnVHQoH/p/F5kNADBgqVF2OOTJwlcLjBPLa/SthyPnYgzeu5KJm3PPS"><link rel="modulepreload" href="/walkie-songie/snippets/walkie-songie-54ae4c155955ba2c/inline0.js" crossorigin="anonymous" integrity="sha384-GCMsVXoXWpwe5MBnn3AK6gd+6y4tFDR7nEZmqblFVigYpnAUQ0W5szRWDpWF2rpo"><link rel="modulepreload" href="/walkie-songie/snippets/walkie-songie-54ae4c155955ba2c/assets/onnx-bridge.js" crossorigin="anonymous" integrity="sha384-4rSCaxzU8VwksA1m9YOAgpO41pZnx9yCizN3ObDAIJHPqm51bxWCz1lfE/6VV1p+"><link rel="preload" href="/walkie-songie/walkie-songie-b45cab613310b3b7_bg.wasm" crossorigin="anonymous" integrity="sha384-pgmfHxiJVkSVcA4TslBxzRiozLLPnVNejipImoyz+7u0t9044vj5aZbPMWlJnjpi" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/walkie-songie/walkie-songie-98320d769c39d75d.js" crossorigin="anonymous" integrity="sha384-H45UjPqIT+/7VMEwbj80zfiRv0n539gQiFW99rjgXF9qZBWvskAGdr/26RgrXSBC"><link rel="modulepreload" href="/walkie-songie/snippets/walkie-songie-54ae4c155955ba2c/assets/onnx-bridge.js" crossorigin="anonymous" integrity="sha384-4rSCaxzU8VwksA1m9YOAgpO41pZnx9yCizN3ObDAIJHPqm51bxWCz1lfE/6VV1p+"><link rel="modulepreload" href="/walkie-songie/snippets/walkie-songie-54ae4c155955ba2c/inline0.js" crossorigin="anonymous" integrity="sha384-GCMsVXoXWpwe5MBnn3AK6gd+6y4tFDR7nEZmqblFVigYpnAUQ0W5szRWDpWF2rpo"><link rel="preload" href="/walkie-songie/walkie-songie-98320d769c39d75d_bg.wasm" crossorigin="anonymous" integrity="sha384-gfLaup2AixB10gXuPBdJolUDRkmkrK3C8s2j53wudLTxYxdBved8X+HUi5Pgm0Zi" as="fetch" type="application/wasm"></head>
 <body>
     <script type="module" src="all-around-keyboard.esm.min.js"></script>
     <script>
@@ -38,8 +38,8 @@
     <!-- Skip wasm-opt via trunk - Cargo profile does LTO/strip/opt-level=z -->
     
 <script type="module">
-import init, * as bindings from '/walkie-songie/walkie-songie-b45cab613310b3b7.js';
-const wasm = await init({ module_or_path: '/walkie-songie/walkie-songie-b45cab613310b3b7_bg.wasm' });
+import init, * as bindings from '/walkie-songie/walkie-songie-98320d769c39d75d.js';
+const wasm = await init({ module_or_path: '/walkie-songie/walkie-songie-98320d769c39d75d_bg.wasm' });
 
 
 window.wasmBindings = bindings;
