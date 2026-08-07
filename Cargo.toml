@@ -34,8 +34,13 @@ name = "reach_mem"
 harness = false
 
 [features]
-default = []
+default = ["merkle"]
 core = []
+# Additive Merkle commitment/proof layer (M2): `ops_root` + `state_root` over the
+# radix_immutable trie, BESIDE RBSR (never replacing it). Pulls in the wasm-safe
+# `radix_immutable` crate with its `merkle` feature (blake3-256). Enabled by the
+# normal build (`default`); a `--no-default-features` leaf profile drops it.
+merkle = ["dep:radix_immutable"]
 web-ui = [
     "dep:wasm-bindgen",
     "dep:wasm-bindgen-futures",
@@ -113,6 +118,13 @@ rand = "0.9"
 qrcode = "0.14"
 unicode-segmentation = "1.11"
 blake3 = "=1.8.5"
+
+# Merkle commitment/proof layer (feature `merkle`, M2). Local sibling checkout —
+# the canonical blake3-256 radix trie the merkle-audit report describes. Path dep
+# for reproducible local builds; the commit is also on origin/main
+# (github.com/micahscopes/radix_immutable @ a039226), so this is a one-line swap
+# to a `{ git = ..., rev = ... }` pin mirroring hhhs-core once published.
+radix_immutable = { path = "/laboratory/radix_immutable", features = ["merkle"], optional = true }
 
 # CRDT (legacy — being replaced by p2panda signed op-log + HHHS)
 yrs = "0.21"

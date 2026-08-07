@@ -196,8 +196,49 @@ impl RoomStore {
     /// divergent range — a fingerprint collision, a peer that advertised what it
     /// could not serve — reports success while the peers have not converged, and
     /// nothing anywhere notices.
+    ///
+    /// NOTE (M2): [`Self::ops_root`] is a strictly stronger digest over the *same*
+    /// entry-hash set (root equality iff set equality, plus inclusion/exclusion
+    /// proofs), so `sync_root` is **superseded for proofs**. It is intentionally
+    /// NOT removed: it remains the value the RBSR session cross-checks on `Done`.
+    /// Any eventual retirement is a sync-layer decision, not part of this layer.
     pub fn sync_root(&self) -> [u8; 32] {
         sync_root_of(self.entry_to_source.keys())
+    }
+
+    /// M2 — the additive `ops_root`: a canonical blake3-256 Merkle commitment to
+    /// this store's entry-hash identity set, computed over exactly the same
+    /// `entry_to_source.keys()` iterator [`Self::sync_root`] digests (so the two
+    /// can never skew). Strictly stronger than `sync_root`: root equality iff
+    /// entry-set equality, PLUS the proofs [`Self::prove_op`] emits. Beside RBSR,
+    /// never replacing it. See [`crate::room::merkle`].
+    #[cfg(feature = "merkle")]
+    pub fn ops_root(&self) -> [u8; 32] {
+        crate::room::merkle::ops_root_of(self.entry_to_source.keys())
+    }
+
+    /// An inclusion (op present) or non-inclusion (op absent) proof for `entry`
+    /// against [`Self::ops_root`]. Verify standalone — no store, no crate state —
+    /// with [`radix_immutable::verify`]: `Some(&[])` demands inclusion (the `()`
+    /// leaf value is empty bytes), `None` demands non-inclusion.
+    ///
+    /// ```ignore
+    /// let root = store.ops_root();
+    /// let proof = store.prove_op(&entry);
+    /// assert!(radix_immutable::verify(&root, entry.as_bytes(), Some(&[]), &proof));
+    /// ```
+    #[cfg(feature = "merkle")]
+    pub fn prove_op(&self, entry: &EntryHash) -> radix_immutable::Proof {
+        crate::room::merkle::prove_op(self.entry_to_source.keys(), entry)
+    }
+
+    /// M2 — the additive `state_root`: a canonical blake3-256 Merkle commitment to
+    /// the projected [`RoomView`] (a pure function of the view). Delegates to
+    /// [`RoomView::state_root`] over the current [`Self::view`]. See
+    /// [`crate::room::merkle`] for the canonical leaf grammar.
+    #[cfg(feature = "merkle")]
+    pub fn state_root(&self) -> [u8; 32] {
+        self.view().state_root()
     }
 
     /// Signed bytes plus causal predecessors for ONE lifted entry.
@@ -687,6 +728,18 @@ pub struct RoomView {
     pub pieces_locked: bool,
     /// Room-wide available-emoji palette, if set.
     pub available_emojis: Option<String>,
+}
+
+#[cfg(feature = "merkle")]
+impl RoomView {
+    /// M2 — the additive `state_root`: a canonical blake3-256 Merkle commitment to
+    /// this projected view. A pure, deterministic function of the view's fields;
+    /// see [`crate::room::merkle::state_trie`] for the leaf grammar. `RoomView` is
+    /// the projected room state, so this is the "`RoomState::state_root`" the M2
+    /// spec names.
+    pub fn state_root(&self) -> [u8; 32] {
+        crate::room::merkle::state_root_of(self)
+    }
 }
 
 #[cfg(test)]
@@ -1578,5 +1631,171 @@ mod tests {
         let wrong = wrong_oracle_remove_wins(&ops);
         assert!(!wrong.pitches.contains(&tet_degree(5)));
         assert_ne!(real, wrong, "a broken pitch rule must be caught by parity");
+    }
+
+    // ---------------------------------------------------------------------
+    // M2 — the Merkle commitment / proof layer (ops_root / state_root).
+    // ADDITIVE: RBSR, the `sync_root` convergence digest, and view() are all
+    // untouched; these tests only add commitments beside them.
+    // ---------------------------------------------------------------------
+
+    #[cfg(feature = "merkle")]
+    fn hex32(bytes: &[u8; 32]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Golden vector: a fixed op-set pins concrete `ops_root` and `state_root`,
+    /// and both are history-independent — the SAME roots regardless of ingest
+    /// order (the whole point of a canonical Merkle commitment).
+    #[cfg(feature = "merkle")]
+    #[test]
+    fn merkle_golden_roots_and_history_independence() {
+        let base = rich_history();
+        let n = base.len();
+
+        let identity: Vec<usize> = (0..n).collect();
+        let reversed: Vec<usize> = (0..n).rev().collect();
+        let mut interleave: Vec<usize> = (0..n).step_by(2).collect();
+        interleave.extend((1..n).step_by(2));
+
+        let baseline = ingest_in_order(&base, &identity);
+        let ops_root = baseline.ops_root();
+        let state_root = baseline.state_root();
+
+        // Pinned golden vectors (blake3-256, radix_immutable merkle v1 format).
+        const GOLDEN_OPS_ROOT: &str =
+            "0c06563b3c948882383459c249421e0f5b809af3d843d3f7f362fe527ea3ca01";
+        const GOLDEN_STATE_ROOT: &str =
+            "d4d3e5b6c1e3d407d0cc744101d2f0d06deb9a671ee4b7e3aac3ba6d8d2454b4";
+        assert_eq!(hex32(&ops_root), GOLDEN_OPS_ROOT, "ops_root golden vector");
+        assert_eq!(hex32(&state_root), GOLDEN_STATE_ROOT, "state_root golden vector");
+
+        // History-independence: every ingest order yields the identical roots.
+        for order in [reversed, interleave] {
+            let store = ingest_in_order(&base, &order);
+            assert_eq!(store.ops_root(), ops_root, "ops_root differs for {order:?}");
+            assert_eq!(
+                store.state_root(),
+                state_root,
+                "state_root differs for {order:?}"
+            );
+        }
+
+        // The two roots are distinct digests, and ops_root is a DIFFERENT
+        // (stronger) digest than the legacy sync_root over the same set.
+        assert_ne!(ops_root, state_root);
+        assert_ne!(ops_root, baseline.sync_root());
+    }
+
+    /// Inclusion-proof round-trip: prove every lifted op is in `ops_root`, verify
+    /// each proof STANDALONE against the root, survive a wire round-trip, and
+    /// reject a tampered root.
+    #[cfg(feature = "merkle")]
+    #[test]
+    fn merkle_inclusion_proofs_verify_standalone() {
+        use radix_immutable::{Proof, verify};
+
+        let ops = rich_history();
+        let store = ingest(&ops);
+        let root = store.ops_root();
+
+        for entry in store.entry_hashes() {
+            let proof = store.prove_op(&entry);
+            assert!(proof.is_inclusion(), "a present op proves inclusion");
+            // Standalone verify: the `()` leaf value encodes to empty bytes.
+            assert!(
+                verify(&root, entry.as_bytes(), Some(&[]), &proof),
+                "inclusion proof verifies against the root"
+            );
+            // Wire round-trip, then re-verify the decoded proof.
+            let bytes = proof.to_bytes();
+            let decoded = Proof::from_bytes(&bytes).expect("proof decodes");
+            assert_eq!(decoded, proof, "proof survives a serialize round-trip");
+            assert!(verify(&root, entry.as_bytes(), Some(&[]), &decoded));
+            // A tampered root must reject.
+            let mut bad = root;
+            bad[0] ^= 1;
+            assert!(!verify(&bad, entry.as_bytes(), Some(&[]), &proof));
+        }
+    }
+
+    /// Non-inclusion: an op ABSENT from the store proves exclusion against its
+    /// `ops_root`, verified standalone; the same hash proves inclusion in a store
+    /// that DOES hold it — one key, opposite verdicts.
+    #[cfg(feature = "merkle")]
+    #[test]
+    fn merkle_non_inclusion_proof_for_absent_op() {
+        use radix_immutable::verify;
+
+        let mut a = Peer::new(&SEED_A);
+        let op0 = a.sign(
+            1,
+            vec![],
+            AddDegree {
+                pitch: tet_degree(0),
+            },
+        );
+        let op1 = a.sign(
+            2,
+            vec![],
+            AddDegree {
+                pitch: tet_degree(4),
+            },
+        );
+
+        // store_all holds both ops; store_missing holds only op0.
+        let store_all = ingest(&[op0.clone(), op1.clone()]);
+        let store_missing = ingest(&[op0.clone()]);
+
+        // The entry hash op1 lifts to (learned from the full store).
+        let missing = store_all
+            .lifted_entry(op1.id())
+            .expect("op1 is lifted in store_all");
+
+        // Absent from store_missing -> non-inclusion, verifies with value=None.
+        let np = store_missing.prove_op(&missing);
+        assert!(!np.is_inclusion(), "an absent op proves non-inclusion");
+        let missing_root = store_missing.ops_root();
+        assert!(
+            verify(&missing_root, missing.as_bytes(), None, &np),
+            "non-inclusion proof verifies against the root"
+        );
+        // Demanding inclusion of an absent key must fail.
+        assert!(!verify(&missing_root, missing.as_bytes(), Some(&[]), &np));
+
+        // The SAME hash proves inclusion in the store that holds it.
+        let all_root = store_all.ops_root();
+        let ip = store_all.prove_op(&missing);
+        assert!(ip.is_inclusion());
+        assert!(verify(&all_root, missing.as_bytes(), Some(&[]), &ip));
+    }
+
+    /// The Merkle layer is purely additive: querying the roots leaves the view,
+    /// the entry-hash set, and the legacy `sync_root` unchanged, and `ops_root`
+    /// covers the SAME set as `sync_root` (both order-independent, no skew).
+    #[cfg(feature = "merkle")]
+    #[test]
+    fn merkle_roots_do_not_perturb_existing_behavior() {
+        let ops = rich_history();
+        let store = ingest(&ops);
+
+        let view_before = store.view();
+        let hashes_before = store.entry_hashes();
+        let sync_before = store.sync_root();
+
+        let _ = store.ops_root();
+        let _ = store.state_root();
+        let _ = store.prove_op(store.entry_hashes().iter().next().unwrap());
+
+        assert_eq!(store.view(), view_before, "view unchanged by merkle queries");
+        assert_eq!(store.entry_hashes(), hashes_before, "entry set unchanged");
+        assert_eq!(store.sync_root(), sync_before, "sync_root unchanged");
+
+        // Same input set on any ingest order -> same ops_root AND same sync_root
+        // (the "one entry set, one capture" invariant: no skew between the two).
+        let reversed: Vec<usize> = (0..ops.len()).rev().collect();
+        let store_rev = ingest_in_order(&ops, &reversed);
+        assert_eq!(store_rev.ops_root(), store.ops_root());
+        assert_eq!(store_rev.sync_root(), store.sync_root());
     }
 }

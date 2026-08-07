@@ -10,6 +10,9 @@
 pub mod events;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod journal;
+/// Additive Merkle commitment/proof layer (`ops_root` + `state_root`), beside RBSR.
+#[cfg(feature = "merkle")]
+pub mod merkle;
 pub mod ops;
 pub mod presence;
 pub mod store;
