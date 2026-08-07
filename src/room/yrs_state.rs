@@ -12,13 +12,15 @@
 
 use std::collections::{HashMap, HashSet};
 
-use async_broadcast::{broadcast, Receiver as BroadcastReceiver, Sender as BroadcastSender};
+use async_broadcast::{Receiver as BroadcastReceiver, Sender as BroadcastSender, broadcast};
 use futures::Stream;
 use tokio::sync::watch;
 use tracing::debug;
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
-use yrs::{Doc, GetString, Map, MapPrelim, MapRef, ReadTxn, Text, TextRef, Transact, Update, WriteTxn};
+use yrs::{
+    Doc, GetString, Map, MapPrelim, MapRef, ReadTxn, Text, TextRef, Transact, Update, WriteTxn,
+};
 
 use crate::tuning::PitchClass;
 
@@ -30,20 +32,22 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// Document keys for the room state.
 const KEY_TUNING: &str = "tuning";
-const KEY_PITCH_SETS: &str = "pitch_sets";  // Legacy per-peer sets (unused now)
-const KEY_SHARED_PITCHES: &str = "shared_pitches";  // Shared pitch set (anyone can add/remove)
+const KEY_PITCH_SETS: &str = "pitch_sets"; // Legacy per-peer sets (unused now)
+const KEY_SHARED_PITCHES: &str = "shared_pitches"; // Shared pitch set (anyone can add/remove)
 const KEY_COMBINATION_METHOD: &str = "combination_method";
 const KEY_VOICE_STATE: &str = "voice_state";
-const KEY_PIECES: &str = "pieces";  // Draggable emoji pieces (YMap<piece_id, YMap{pitch, emoji}>)
-const KEY_PIECES_LOCKED: &str = "pieces_locked";  // Boolean - whether pieces can be added/removed (drag lock)
-const KEY_AVAILABLE_EMOJIS: &str = "available_emojis";  // Emoji strings for the picker (joined graphemes)
+const KEY_PIECES: &str = "pieces"; // Draggable emoji pieces (YMap<piece_id, YMap{pitch, emoji}>)
+const KEY_PIECES_LOCKED: &str = "pieces_locked"; // Boolean - whether pieces can be added/removed (drag lock)
+const KEY_AVAILABLE_EMOJIS: &str = "available_emojis"; // Emoji strings for the picker (joined graphemes)
 
 /// Default emojis available in new rooms
-const DEFAULT_EMOJIS: &[&str] = &["🪨", "🥜", "🐚", "🌱", "🫟", "🌀", "✳️", "🫯", "🧶", "🐟", "🦠", "🥑"];
+const DEFAULT_EMOJIS: &[&str] = &[
+    "🪨", "🥜", "🐚", "🌱", "🫟", "🌀", "✳️", "🫯", "🧶", "🐟", "🦠", "🥑",
+];
 
 /// Keys within each peer's voice state map.
-const VOICE_PITCH: &str = "pitch";        // i32 - absolute pitch number (like MIDI note, no modulus)
-const VOICE_PITCHCLASS: &str = "pitchclass";  // u8 - the quantized pitch class (pitch % scale_size)
+const VOICE_PITCH: &str = "pitch"; // i32 - absolute pitch number (like MIDI note, no modulus)
+const VOICE_PITCHCLASS: &str = "pitchclass"; // u8 - the quantized pitch class (pitch % scale_size)
 
 /// A draggable emoji piece with an absolute pitch (includes octave).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,7 +137,7 @@ impl RoomState {
 
     /// Subscribe to room events as a Stream.
     /// Multiple subscribers can receive the same events.
-    pub fn events(&self) -> impl Stream<Item = RoomEvent> {
+    pub fn events(&self) -> impl Stream<Item = RoomEvent> + use<> {
         let rx = self.event_tx.new_receiver();
         futures::stream::unfold(rx, |mut rx| async move {
             match rx.recv().await {
@@ -153,7 +157,11 @@ impl RoomState {
     fn snapshot_state(&self) -> StateSnapshot {
         StateSnapshot {
             pitches: self.shared_pitches(),
-            pieces: self.all_pieces().into_iter().map(|p| (p.id, (p.pitch, p.emoji))).collect(),
+            pieces: self
+                .all_pieces()
+                .into_iter()
+                .map(|p| (p.id, (p.pitch, p.emoji)))
+                .collect(),
             voices: self.all_voice_states(),
             pieces_locked: self.pieces_locked(),
         }
@@ -189,7 +197,10 @@ impl RoomState {
         }
         for (id, (pitch, _emoji)) in &before.pieces {
             if !after.pieces.contains_key(id) {
-                self.emit(RoomEvent::PieceRemoved { id: id.clone(), pitch: *pitch });
+                self.emit(RoomEvent::PieceRemoved {
+                    id: id.clone(),
+                    pitch: *pitch,
+                });
             }
         }
 
@@ -203,7 +214,10 @@ impl RoomState {
             if changed {
                 if pitch.is_none() && pc.is_none() {
                     let prev_pitch = before_voice.and_then(|(p, _)| *p);
-                    self.emit(RoomEvent::VoiceCleared { peer_id: peer_id.clone(), pitch: prev_pitch });
+                    self.emit(RoomEvent::VoiceCleared {
+                        peer_id: peer_id.clone(),
+                        pitch: prev_pitch,
+                    });
                 } else {
                     self.emit(RoomEvent::VoiceChanged {
                         peer_id: peer_id.clone(),
@@ -216,24 +230,31 @@ impl RoomState {
         for peer_id in before.voices.keys() {
             if !after.voices.contains_key(peer_id) {
                 let prev_pitch = before.voices.get(peer_id).and_then(|(p, _)| *p);
-                self.emit(RoomEvent::VoiceCleared { peer_id: peer_id.clone(), pitch: prev_pitch });
+                self.emit(RoomEvent::VoiceCleared {
+                    peer_id: peer_id.clone(),
+                    pitch: prev_pitch,
+                });
             }
         }
 
         // Lock state change
         if before.pieces_locked != after.pieces_locked {
-            self.emit(RoomEvent::PiecesLockChanged { locked: after.pieces_locked });
+            self.emit(RoomEvent::PiecesLockChanged {
+                locked: after.pieces_locked,
+            });
         }
     }
 
     /// Emit a full state sync event (for initial load or reconnect).
     pub fn emit_full_state_sync(&self) {
         let pitches: Vec<PitchClass> = self.shared_pitches().into_iter().collect();
-        let pieces: Vec<(String, i32, String)> = self.all_pieces()
+        let pieces: Vec<(String, i32, String)> = self
+            .all_pieces()
             .into_iter()
             .map(|p| (p.id, p.pitch, p.emoji))
             .collect();
-        let voices: Vec<(String, Option<i32>, Option<PitchClass>)> = self.all_voice_states()
+        let voices: Vec<(String, Option<i32>, Option<PitchClass>)> = self
+            .all_voice_states()
             .into_iter()
             .map(|(peer_id, (pitch, pc))| (peer_id, pitch, pc))
             .collect();
@@ -245,6 +266,89 @@ impl RoomState {
             voices,
             pieces_locked,
         });
+    }
+
+    /// Replace the legacy browser view model with a projection received from
+    /// the native runtime.
+    ///
+    /// The signed RoomStore remains authoritative in Tauri. Keeping this
+    /// adapter here lets the existing dominator components render that view
+    /// without giving the browser-side Yrs document any transport ownership.
+    pub fn replace_native_projection(
+        &mut self,
+        pitches: &[PitchClass],
+        pieces: &[Piece],
+        voices: &[(String, Option<i32>, Option<PitchClass>)],
+        pieces_locked: bool,
+        available_emojis: Option<&str>,
+    ) {
+        let before = self.snapshot_state();
+        let before_emojis = self.available_emojis();
+
+        {
+            let mut txn = self.doc.transact_mut();
+
+            let shared_pitches: MapRef = txn.get_or_insert_map(KEY_SHARED_PITCHES);
+            let pitch_keys: Vec<String> = shared_pitches
+                .keys(&txn)
+                .map(|key| key.to_string())
+                .collect();
+            for key in pitch_keys {
+                shared_pitches.remove(&mut txn, &key);
+            }
+            for pitch in pitches {
+                shared_pitches.insert(&mut txn, pitch.index().to_string(), true);
+            }
+
+            let piece_map: MapRef = txn.get_or_insert_map(KEY_PIECES);
+            let piece_keys: Vec<String> = piece_map.keys(&txn).map(|key| key.to_string()).collect();
+            for key in piece_keys {
+                piece_map.remove(&mut txn, &key);
+            }
+            for piece in pieces {
+                let entry: MapRef =
+                    piece_map.insert(&mut txn, piece.id.clone(), MapPrelim::default());
+                entry.insert(&mut txn, "pitch", i64::from(piece.pitch));
+                entry.insert(&mut txn, "emoji", piece.emoji.clone());
+            }
+
+            let voice_map: MapRef = txn.get_or_insert_map(KEY_VOICE_STATE);
+            let voice_keys: Vec<String> = voice_map.keys(&txn).map(|key| key.to_string()).collect();
+            for key in voice_keys {
+                voice_map.remove(&mut txn, &key);
+            }
+            for (author, pitch, pitch_class) in voices {
+                let entry: MapRef =
+                    voice_map.insert(&mut txn, author.clone(), MapPrelim::default());
+                if let Some(pitch) = pitch {
+                    entry.insert(&mut txn, VOICE_PITCH, i64::from(*pitch));
+                }
+                if let Some(pitch_class) = pitch_class {
+                    entry.insert(&mut txn, VOICE_PITCHCLASS, i64::from(pitch_class.index()));
+                }
+            }
+
+            let meta: MapRef = txn.get_or_insert_map(KEY_COMBINATION_METHOD);
+            meta.insert(&mut txn, KEY_PIECES_LOCKED, pieces_locked);
+            match available_emojis {
+                Some(emojis) => {
+                    meta.insert(&mut txn, KEY_AVAILABLE_EMOJIS, emojis.to_owned());
+                }
+                None => {
+                    meta.remove(&mut txn, KEY_AVAILABLE_EMOJIS);
+                }
+            }
+        }
+
+        let after = self.snapshot_state();
+        self.emit_diffs(before, after);
+        let after_emojis = self.available_emojis();
+        if before_emojis != after_emojis {
+            self.emit(RoomEvent::EmojisChanged {
+                emojis: after_emojis,
+            });
+        }
+        self.notify();
     }
 
     /// Get the yrs document for sync operations.
@@ -373,10 +477,8 @@ impl RoomState {
         let shared_pitches: MapRef = txn.get_or_insert_map(KEY_SHARED_PITCHES);
 
         // Collect existing keys to remove
-        let keys_to_remove: Vec<String> = shared_pitches
-            .keys(&txn)
-            .map(|k| k.to_string())
-            .collect();
+        let keys_to_remove: Vec<String> =
+            shared_pitches.keys(&txn).map(|k| k.to_string()).collect();
 
         // Remove all existing pitches
         for key in keys_to_remove {
@@ -396,10 +498,8 @@ impl RoomState {
         let shared_pitches: MapRef = txn.get_or_insert_map(KEY_SHARED_PITCHES);
 
         // Collect keys to remove
-        let keys_to_remove: Vec<String> = shared_pitches
-            .keys(&txn)
-            .map(|k| k.to_string())
-            .collect();
+        let keys_to_remove: Vec<String> =
+            shared_pitches.keys(&txn).map(|k| k.to_string()).collect();
 
         // Remove all pitches
         for key in keys_to_remove {
@@ -417,16 +517,24 @@ impl RoomState {
 
         // Get shared pitch toggles (manually clicked pitches that anyone can add/remove)
         if let Some(shared_pitches) = txn.get_map(KEY_SHARED_PITCHES) {
-            let shared_set = result.entry("shared".to_string()).or_insert_with(PeerPitchSet::new);
+            let shared_set = result
+                .entry("shared".to_string())
+                .or_insert_with(PeerPitchSet::new);
 
             for (pitch_key, _) in shared_pitches.iter(&txn) {
-                if let Ok(pitch_num) = pitch_key.parse::<u8>() {
+                if let Ok(pitch_num) = pitch_key.parse::<u16>() {
                     shared_set.add(PitchClass(pitch_num));
                 }
             }
 
-            debug!("[CRDT] all_peer_sets: shared_pitches = {:?}",
-                shared_set.pitch_classes.iter().map(|pc| pc.0).collect::<Vec<_>>());
+            debug!(
+                "[CRDT] all_peer_sets: shared_pitches = {:?}",
+                shared_set
+                    .pitch_classes
+                    .iter()
+                    .map(|pc| pc.0)
+                    .collect::<Vec<_>>()
+            );
         }
 
         // Include voice pitches from KEY_VOICE_STATE (per-peer voice input)
@@ -439,7 +547,9 @@ impl RoomState {
                     // Get voice pitch class if present
                     if let Some(pc_val) = peer_map.get(&txn, VOICE_PITCHCLASS) {
                         if let Some(pc_num) = pc_val.cast::<i64>().ok() {
-                            peer_set.add(PitchClass(pc_num as u8));
+                            if let Ok(pc_num) = u16::try_from(pc_num) {
+                                peer_set.add(PitchClass(pc_num));
+                            }
                         }
                     }
                 }
@@ -469,12 +579,10 @@ impl RoomState {
 
         // Compute combined set based on method
         result.pitch_classes = match method {
-            CombinationMethod::Union => {
-                peer_sets
-                    .values()
-                    .flat_map(|s| s.pitch_classes.iter().copied())
-                    .collect()
-            }
+            CombinationMethod::Union => peer_sets
+                .values()
+                .flat_map(|s| s.pitch_classes.iter().copied())
+                .collect(),
             CombinationMethod::Intersection => {
                 if peer_sets.is_empty() {
                     HashSet::new()
@@ -486,12 +594,10 @@ impl RoomState {
                     })
                 }
             }
-            CombinationMethod::Custom(_) => {
-                peer_sets
-                    .values()
-                    .flat_map(|s| s.pitch_classes.iter().copied())
-                    .collect()
-            }
+            CombinationMethod::Custom(_) => peer_sets
+                .values()
+                .flat_map(|s| s.pitch_classes.iter().copied())
+                .collect(),
         };
 
         result
@@ -572,7 +678,7 @@ impl RoomState {
 
         shared_pitches
             .keys(&txn)
-            .filter_map(|k| k.parse::<u8>().ok())
+            .filter_map(|k| k.parse::<u16>().ok())
             .map(PitchClass)
             .collect()
     }
@@ -642,7 +748,11 @@ impl RoomState {
             .and_then(|v| v.cast().ok())
             .unwrap_or_else(|| {
                 voice_state.insert(&mut txn, self.peer_id.clone(), MapPrelim::default());
-                voice_state.get(&txn, &self.peer_id).unwrap().cast().unwrap()
+                voice_state
+                    .get(&txn, &self.peer_id)
+                    .unwrap()
+                    .cast()
+                    .unwrap()
             });
 
         if let Some(p) = pitch {
@@ -654,7 +764,7 @@ impl RoomState {
         drop(txn);
 
         // Emit event for stream subscribers
-        let pc = pitch.map(|p| PitchClass((p.rem_euclid(12)) as u8));
+        let pc = pitch.map(|p| PitchClass((p.rem_euclid(12)) as u16));
         if pitch.is_none() {
             self.emit(RoomEvent::VoiceCleared {
                 peer_id: self.peer_id.clone(),
@@ -674,7 +784,11 @@ impl RoomState {
     /// Set the local peer's voice pitch class.
     /// Also sets a representative absolute pitch (pitch_class + 60 = middle octave).
     pub fn set_voice_pitchclass(&mut self, pc: Option<PitchClass>) {
-        debug!("[CRDT] set_voice_pitchclass({:?}) for peer {}", pc.map(|p| p.0), self.peer_id);
+        debug!(
+            "[CRDT] set_voice_pitchclass({:?}) for peer {}",
+            pc.map(|p| p.0),
+            self.peer_id
+        );
 
         // Capture previous state for event emission
         let (prev_pitch, _) = self.get_peer_voice(&self.peer_id.clone());
@@ -690,7 +804,11 @@ impl RoomState {
             .and_then(|v| v.cast().ok())
             .unwrap_or_else(|| {
                 voice_state.insert(&mut txn, self.peer_id.clone(), MapPrelim::default());
-                voice_state.get(&txn, &self.peer_id).unwrap().cast().unwrap()
+                voice_state
+                    .get(&txn, &self.peer_id)
+                    .unwrap()
+                    .cast()
+                    .unwrap()
             });
 
         if let Some(p) = pc {
@@ -734,7 +852,11 @@ impl RoomState {
             .and_then(|v| v.cast().ok())
             .unwrap_or_else(|| {
                 voice_state.insert(&mut txn, self.peer_id.clone(), MapPrelim::default());
-                voice_state.get(&txn, &self.peer_id).unwrap().cast().unwrap()
+                voice_state
+                    .get(&txn, &self.peer_id)
+                    .unwrap()
+                    .cast()
+                    .unwrap()
             });
 
         if let Some(p) = pitch {
@@ -794,7 +916,8 @@ impl RoomState {
                 let pitch_class = peer_map
                     .get(&txn, VOICE_PITCHCLASS)
                     .and_then(|v| v.cast::<i64>().ok())
-                    .map(|i| PitchClass(i as u8));
+                    .and_then(|i| u16::try_from(i).ok())
+                    .map(PitchClass);
 
                 result.insert(peer_id, (pitch, pitch_class));
             }
@@ -824,7 +947,8 @@ impl RoomState {
         let pitch_class = peer_map
             .get(&txn, VOICE_PITCHCLASS)
             .and_then(|v| v.cast::<i64>().ok())
-            .map(|i| PitchClass(i as u8));
+            .and_then(|i| u16::try_from(i).ok())
+            .map(PitchClass);
 
         (pitch, pitch_class)
     }
@@ -856,7 +980,8 @@ impl RoomState {
         debug!("[CRDT] clear_voice_at_pitch_class({:?})", target_pc.0);
 
         // Find peers with this pitch class
-        let peers_to_clear: Vec<String> = self.all_voice_states()
+        let peers_to_clear: Vec<String> = self
+            .all_voice_states()
             .into_iter()
             .filter(|(_, (_, pc))| *pc == Some(target_pc))
             .map(|(peer_id, _)| peer_id)
@@ -870,7 +995,10 @@ impl RoomState {
         let voice_state: MapRef = txn.get_or_insert_map(KEY_VOICE_STATE);
 
         for peer_id in &peers_to_clear {
-            if let Some(peer_map) = voice_state.get(&txn, peer_id).and_then(|v| v.cast::<MapRef>().ok()) {
+            if let Some(peer_map) = voice_state
+                .get(&txn, peer_id)
+                .and_then(|v| v.cast::<MapRef>().ok())
+            {
                 peer_map.remove(&mut txn, VOICE_PITCH);
                 peer_map.remove(&mut txn, VOICE_PITCHCLASS);
             }
@@ -893,12 +1021,18 @@ impl RoomState {
     pub fn add_piece(&mut self, pitch: i32, emoji: &str) -> Option<String> {
         // Check for existing piece at this pitch (first dibs)
         if self.has_piece_at(pitch) {
-            debug!("[CRDT] add_piece(pitch={}) - blocked, pitch occupied", pitch);
+            debug!(
+                "[CRDT] add_piece(pitch={}) - blocked, pitch occupied",
+                pitch
+            );
             return None;
         }
 
         let id = uuid::Uuid::new_v4().to_string();
-        debug!("[CRDT] add_piece(pitch={}, emoji={}) -> id={}", pitch, emoji, id);
+        debug!(
+            "[CRDT] add_piece(pitch={}, emoji={}) -> id={}",
+            pitch, emoji, id
+        );
 
         let mut txn = self.doc.transact_mut();
         let pieces: MapRef = txn.get_or_insert_map(KEY_PIECES);
@@ -939,7 +1073,10 @@ impl RoomState {
 
     /// Move a piece to a new pitch (for drag operations).
     pub fn move_piece(&mut self, piece_id: &str, new_pitch: i32) {
-        debug!("[CRDT] move_piece(id={}, new_pitch={})", piece_id, new_pitch);
+        debug!(
+            "[CRDT] move_piece(id={}, new_pitch={})",
+            piece_id, new_pitch
+        );
 
         // Get old pitch before moving
         let old_pitch = self.get_piece(piece_id).map(|p| p.pitch);
@@ -1008,10 +1145,7 @@ impl RoomState {
         let mut txn = self.doc.transact_mut();
         let pieces: MapRef = txn.get_or_insert_map(KEY_PIECES);
 
-        let ids_to_remove: Vec<String> = pieces
-            .keys(&txn)
-            .map(|k| k.to_string())
-            .collect();
+        let ids_to_remove: Vec<String> = pieces.keys(&txn).map(|k| k.to_string()).collect();
 
         for id in ids_to_remove {
             pieces.remove(&mut txn, &id);
@@ -1064,7 +1198,10 @@ impl RoomState {
         };
 
         // Try to get stored emojis as joined string
-        if let Some(emojis_str) = meta.get(&txn, KEY_AVAILABLE_EMOJIS).and_then(|v| v.cast::<String>().ok()) {
+        if let Some(emojis_str) = meta
+            .get(&txn, KEY_AVAILABLE_EMOJIS)
+            .and_then(|v| v.cast::<String>().ok())
+        {
             if emojis_str.is_empty() {
                 return DEFAULT_EMOJIS.iter().map(|s| s.to_string()).collect();
             }
@@ -1116,6 +1253,46 @@ mod tests {
         state.remove_pitch(PitchClass(5));
         let sets = state.all_peer_sets();
         assert!(!sets["shared"].contains(PitchClass(5)));
+    }
+
+    #[test]
+    fn native_projection_replaces_every_rendered_collection() {
+        let mut state = RoomState::new("native-ui".to_owned());
+        state.add_pitch(PitchClass(1));
+        state.add_piece(60, "old");
+        state.set_voice(Some(61), Some(PitchClass(1)));
+
+        state.replace_native_projection(
+            &[PitchClass(4), PitchClass(7)],
+            &[Piece {
+                id: "native-piece".to_owned(),
+                pitch: 72,
+                emoji: "🎻".to_owned(),
+            }],
+            &[("remote-author".to_owned(), Some(67), Some(PitchClass(7)))],
+            true,
+            Some("🎻🪕"),
+        );
+
+        assert_eq!(
+            state.shared_pitches(),
+            HashSet::from([PitchClass(4), PitchClass(7)])
+        );
+        assert_eq!(
+            state.all_pieces(),
+            vec![Piece {
+                id: "native-piece".to_owned(),
+                pitch: 72,
+                emoji: "🎻".to_owned(),
+            }]
+        );
+        assert_eq!(
+            state.get_peer_voice("remote-author"),
+            (Some(67), Some(PitchClass(7)))
+        );
+        assert_eq!(state.local_voice(), (None, None));
+        assert!(state.pieces_locked());
+        assert_eq!(state.available_emojis(), vec!["🎻", "🪕"]);
     }
 
     #[test]
@@ -1171,7 +1348,11 @@ mod tests {
 
         // Peer 2 should see the shared pitch
         let sets = state2.all_peer_sets();
-        assert!(sets.get("shared").map(|s| s.contains(PitchClass(5))).unwrap_or(false));
+        assert!(
+            sets.get("shared")
+                .map(|s| s.contains(PitchClass(5)))
+                .unwrap_or(false)
+        );
     }
 
     #[test]
@@ -1196,8 +1377,18 @@ mod tests {
         // Both should see the pitch removed
         let sets1 = state1.all_peer_sets();
         let sets2 = state2.all_peer_sets();
-        assert!(!sets1.get("shared").map(|s| s.contains(PitchClass(5))).unwrap_or(true));
-        assert!(!sets2.get("shared").map(|s| s.contains(PitchClass(5))).unwrap_or(true));
+        assert!(
+            !sets1
+                .get("shared")
+                .map(|s| s.contains(PitchClass(5)))
+                .unwrap_or(true)
+        );
+        assert!(
+            !sets2
+                .get("shared")
+                .map(|s| s.contains(PitchClass(5)))
+                .unwrap_or(true)
+        );
     }
 
     #[test]

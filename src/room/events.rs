@@ -30,7 +30,11 @@ pub enum RoomEvent {
 
     // === Emoji Pieces (draggable items) ===
     /// A new piece was added
-    PieceAdded { id: String, pitch: i32, emoji: String },
+    PieceAdded {
+        id: String,
+        pitch: i32,
+        emoji: String,
+    },
     /// A piece was moved to a new pitch
     PieceMoved {
         id: String,
@@ -131,35 +135,45 @@ mod tests {
 
     #[test]
     fn test_affects_pitches() {
-        assert!(RoomEvent::PitchAdded {
-            pitch_class: PitchClass(0)
-        }
-        .affects_pitches());
-        assert!(RoomEvent::PieceAdded {
-            id: "test".to_string(),
-            pitch: 60,
-            emoji: "🪨".to_string()
-        }
-        .affects_pitches());
-        assert!(!RoomEvent::VoiceChanged {
-            peer_id: "peer".to_string(),
-            pitch: Some(60),
-            pitch_class: Some(PitchClass(0))
-        }
-        .affects_pitches());
+        assert!(
+            RoomEvent::PitchAdded {
+                pitch_class: PitchClass(0)
+            }
+            .affects_pitches()
+        );
+        assert!(
+            RoomEvent::PieceAdded {
+                id: "test".to_string(),
+                pitch: 60,
+                emoji: "🪨".to_string()
+            }
+            .affects_pitches()
+        );
+        assert!(
+            !RoomEvent::VoiceChanged {
+                peer_id: "peer".to_string(),
+                pitch: Some(60),
+                pitch_class: Some(PitchClass(0))
+            }
+            .affects_pitches()
+        );
     }
 
     #[test]
     fn test_affects_voice() {
-        assert!(RoomEvent::VoiceChanged {
-            peer_id: "peer".to_string(),
-            pitch: Some(60),
-            pitch_class: Some(PitchClass(0))
-        }
-        .affects_voice());
-        assert!(!RoomEvent::PitchAdded {
-            pitch_class: PitchClass(0)
-        }
-        .affects_voice());
+        assert!(
+            RoomEvent::VoiceChanged {
+                peer_id: "peer".to_string(),
+                pitch: Some(60),
+                pitch_class: Some(PitchClass(0))
+            }
+            .affects_voice()
+        );
+        assert!(
+            !RoomEvent::PitchAdded {
+                pitch_class: PitchClass(0)
+            }
+            .affects_voice()
+        );
     }
 }

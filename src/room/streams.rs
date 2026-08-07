@@ -12,7 +12,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
-use futures::{future::ready, Stream, StreamExt};
+use futures::{Stream, StreamExt, future::ready};
 
 use super::events::RoomEvent;
 use super::yrs_state::RoomState;
@@ -22,15 +22,15 @@ use super::yrs_state::Piece;
 #[cfg(target_arch = "wasm32")]
 use crate::tuning::PitchClass;
 #[cfg(target_arch = "wasm32")]
-use futures_signals::signal::{from_stream, Signal, SignalExt};
+use futures_signals::signal::{Signal, SignalExt, from_stream};
 
 /// Delta of pitch classes (for MIDI note-on/note-off).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PitchClassDelta {
     /// Pitch classes that just became active (send note-on)
-    pub added: Vec<u8>,
+    pub added: Vec<u16>,
     /// Pitch classes that just became inactive (send note-off)
-    pub removed: Vec<u8>,
+    pub removed: Vec<u16>,
 }
 
 impl PitchClassDelta {
@@ -59,7 +59,7 @@ impl PitchDelta {
 #[derive(Debug, Clone, Default)]
 pub struct ActivePitchesSnapshot {
     /// Toggle pitch classes (manual keyboard clicks)
-    pub toggle_pitch_classes: HashSet<u8>,
+    pub toggle_pitch_classes: HashSet<u16>,
     /// Piece absolute pitches
     pub piece_pitches: HashSet<i32>,
     /// Voice absolute pitches (all peers)
@@ -68,35 +68,35 @@ pub struct ActivePitchesSnapshot {
 
 impl ActivePitchesSnapshot {
     /// Compute unified pitch classes from all sources.
-    pub fn unified_pitch_classes(&self) -> HashSet<u8> {
+    pub fn unified_pitch_classes(&self) -> HashSet<u16> {
         let mut unified = self.toggle_pitch_classes.clone();
 
         // Add piece pitch classes
         for &pitch in &self.piece_pitches {
-            unified.insert(pitch.rem_euclid(12) as u8);
+            unified.insert(pitch.rem_euclid(12) as u16);
         }
 
         // Add voice pitch classes
         for &pitch in &self.voice_pitches {
-            unified.insert(pitch.rem_euclid(12) as u8);
+            unified.insert(pitch.rem_euclid(12) as u16);
         }
 
         unified
     }
 
     /// Compute piece pitch classes (for separate output).
-    pub fn piece_pitch_classes(&self) -> HashSet<u8> {
+    pub fn piece_pitch_classes(&self) -> HashSet<u16> {
         self.piece_pitches
             .iter()
-            .map(|&p| p.rem_euclid(12) as u8)
+            .map(|&p| p.rem_euclid(12) as u16)
             .collect()
     }
 
     /// Compute voice pitch classes (for separate output).
-    pub fn voice_pitch_classes(&self) -> HashSet<u8> {
+    pub fn voice_pitch_classes(&self) -> HashSet<u16> {
         self.voice_pitches
             .iter()
-            .map(|&p| p.rem_euclid(12) as u8)
+            .map(|&p| p.rem_euclid(12) as u16)
             .collect()
     }
 }
@@ -152,16 +152,14 @@ pub fn unified_pitch_class_deltas(
             };
 
             // Compute delta (lock already released)
-            let added: Vec<u8> = new_unified.difference(prev_unified).copied().collect();
-            let removed: Vec<u8> = prev_unified.difference(&new_unified).copied().collect();
+            let added: Vec<u16> = new_unified.difference(prev_unified).copied().collect();
+            let removed: Vec<u16> = prev_unified.difference(&new_unified).copied().collect();
 
             *prev_unified = new_unified;
 
             ready(Some(PitchClassDelta { added, removed }))
         })
-        .filter_map(|delta| ready(
-            if delta.is_empty() { None } else { Some(delta) }
-        ));
+        .filter_map(|delta| ready(if delta.is_empty() { None } else { Some(delta) }));
 
     // Prepend initial delta (if any) before event-driven deltas
     futures::stream::iter(initial_delta).chain(event_deltas)
@@ -171,9 +169,7 @@ pub fn unified_pitch_class_deltas(
 /// For routing pieces to a separate MIDI channel with octave info.
 ///
 /// The first emitted delta represents the initial state (empty → current).
-pub fn piece_pitch_deltas(
-    room: Arc<RwLock<RoomState>>,
-) -> impl Stream<Item = PitchDelta> {
+pub fn piece_pitch_deltas(room: Arc<RwLock<RoomState>>) -> impl Stream<Item = PitchDelta> {
     // Get initial state and event stream (read lock, release immediately)
     let (initial, events) = {
         let room_guard = room.read().unwrap();
@@ -196,11 +192,11 @@ pub fn piece_pitch_deltas(
         .scan(initial, move |prev_pitches, event| {
             // Only recompute on piece-related events
             let new_pitches: HashSet<i32> = match &event {
-                RoomEvent::PieceAdded { .. } |
-                RoomEvent::PieceMoved { .. } |
-                RoomEvent::PieceRemoved { .. } |
-                RoomEvent::PiecesCleared |
-                RoomEvent::FullStateSync { .. } => {
+                RoomEvent::PieceAdded { .. }
+                | RoomEvent::PieceMoved { .. }
+                | RoomEvent::PieceRemoved { .. }
+                | RoomEvent::PiecesCleared
+                | RoomEvent::FullStateSync { .. } => {
                     // Read lock, grab data, release immediately
                     let room_guard = room_for_stream.read().unwrap();
                     room_guard.all_pieces().iter().map(|p| p.pitch).collect()
@@ -215,9 +211,7 @@ pub fn piece_pitch_deltas(
 
             ready(Some(PitchDelta { added, removed }))
         })
-        .filter_map(|delta| ready(
-            if delta.is_empty() { None } else { Some(delta) }
-        ));
+        .filter_map(|delta| ready(if delta.is_empty() { None } else { Some(delta) }));
 
     futures::stream::iter(initial_delta).chain(event_deltas)
 }
@@ -226,9 +220,7 @@ pub fn piece_pitch_deltas(
 /// For routing voice to a separate MIDI channel.
 ///
 /// The first emitted delta represents the initial state (empty → current).
-pub fn voice_pitch_deltas(
-    room: Arc<RwLock<RoomState>>,
-) -> impl Stream<Item = PitchDelta> {
+pub fn voice_pitch_deltas(room: Arc<RwLock<RoomState>>) -> impl Stream<Item = PitchDelta> {
     // Get initial state and event stream (read lock, release immediately)
     let (initial, events) = {
         let room_guard = room.read().unwrap();
@@ -250,9 +242,9 @@ pub fn voice_pitch_deltas(
         .scan(initial, move |prev_pitches, event| {
             // Only recompute on voice-related events
             let new_pitches: HashSet<i32> = match &event {
-                RoomEvent::VoiceChanged { .. } |
-                RoomEvent::VoiceCleared { .. } |
-                RoomEvent::FullStateSync { .. } => {
+                RoomEvent::VoiceChanged { .. }
+                | RoomEvent::VoiceCleared { .. }
+                | RoomEvent::FullStateSync { .. } => {
                     // Read lock, grab data, release immediately
                     let room_guard = room_for_stream.read().unwrap();
                     room_guard.all_voice_pitches()
@@ -267,9 +259,7 @@ pub fn voice_pitch_deltas(
 
             ready(Some(PitchDelta { added, removed }))
         })
-        .filter_map(|delta| ready(
-            if delta.is_empty() { None } else { Some(delta) }
-        ));
+        .filter_map(|delta| ready(if delta.is_empty() { None } else { Some(delta) }));
 
     futures::stream::iter(initial_delta).chain(event_deltas)
 }
@@ -285,7 +275,7 @@ pub fn voice_pitch_deltas(
 #[cfg(target_arch = "wasm32")]
 pub fn unified_pitch_classes_signal(
     room: Arc<RwLock<RoomState>>,
-) -> impl Signal<Item = HashSet<u8>> {
+) -> impl Signal<Item = HashSet<u16>> {
     // Get initial state and events
     let (initial, events) = {
         let room_guard = room.read().unwrap();
@@ -320,15 +310,16 @@ pub fn shared_pitches_signal(
 
     let room_for_stream = room.clone();
     let state_stream = events
-        .filter(|e| ready(matches!(e,
-            RoomEvent::PitchAdded { .. } |
-            RoomEvent::PitchRemoved { .. } |
-            RoomEvent::PitchesCleared |
-            RoomEvent::FullStateSync { .. }
-        )))
-        .map(move |_| {
-            room_for_stream.read().unwrap().shared_pitches()
-        });
+        .filter(|e| {
+            ready(matches!(
+                e,
+                RoomEvent::PitchAdded { .. }
+                    | RoomEvent::PitchRemoved { .. }
+                    | RoomEvent::PitchesCleared
+                    | RoomEvent::FullStateSync { .. }
+            ))
+        })
+        .map(move |_| room_for_stream.read().unwrap().shared_pitches());
 
     let full_stream = futures::stream::once(ready(initial)).chain(state_stream);
     from_stream(full_stream).map(|opt| opt.unwrap_or_default())
@@ -337,9 +328,7 @@ pub fn shared_pitches_signal(
 /// Signal of all pieces.
 /// Emits the current piece list whenever pieces change.
 #[cfg(target_arch = "wasm32")]
-pub fn pieces_signal(
-    room: Arc<RwLock<RoomState>>,
-) -> impl Signal<Item = Vec<Piece>> {
+pub fn pieces_signal(room: Arc<RwLock<RoomState>>) -> impl Signal<Item = Vec<Piece>> {
     let (initial, events) = {
         let room_guard = room.read().unwrap();
         (room_guard.all_pieces(), room_guard.events())
@@ -348,9 +337,7 @@ pub fn pieces_signal(
     let room_for_stream = room.clone();
     let state_stream = events
         .filter(|e| ready(e.affects_pieces()))
-        .map(move |_| {
-            room_for_stream.read().unwrap().all_pieces()
-        });
+        .map(move |_| room_for_stream.read().unwrap().all_pieces());
 
     let full_stream = futures::stream::once(ready(initial)).chain(state_stream);
     from_stream(full_stream).map(|opt| opt.unwrap_or_default())
@@ -358,9 +345,7 @@ pub fn pieces_signal(
 
 /// Signal of pieces lock state.
 #[cfg(target_arch = "wasm32")]
-pub fn pieces_locked_signal(
-    room: Arc<RwLock<RoomState>>,
-) -> impl Signal<Item = bool> {
+pub fn pieces_locked_signal(room: Arc<RwLock<RoomState>>) -> impl Signal<Item = bool> {
     let (initial, events) = {
         let room_guard = room.read().unwrap();
         (room_guard.pieces_locked(), room_guard.events())
@@ -368,10 +353,13 @@ pub fn pieces_locked_signal(
 
     let room_for_stream = room.clone();
     let state_stream = events
-        .filter(|e| ready(matches!(e, RoomEvent::PiecesLockChanged { .. } | RoomEvent::FullStateSync { .. })))
-        .map(move |_| {
-            room_for_stream.read().unwrap().pieces_locked()
-        });
+        .filter(|e| {
+            ready(matches!(
+                e,
+                RoomEvent::PiecesLockChanged { .. } | RoomEvent::FullStateSync { .. }
+            ))
+        })
+        .map(move |_| room_for_stream.read().unwrap().pieces_locked());
 
     let full_stream = futures::stream::once(ready(initial)).chain(state_stream);
     from_stream(full_stream).map(|opt| opt.unwrap_or(false))
@@ -379,9 +367,7 @@ pub fn pieces_locked_signal(
 
 /// Signal of available emojis for the picker.
 #[cfg(target_arch = "wasm32")]
-pub fn available_emojis_signal(
-    room: Arc<RwLock<RoomState>>,
-) -> impl Signal<Item = Vec<String>> {
+pub fn available_emojis_signal(room: Arc<RwLock<RoomState>>) -> impl Signal<Item = Vec<String>> {
     let (initial, events) = {
         let room_guard = room.read().unwrap();
         (room_guard.available_emojis(), room_guard.events())
@@ -389,10 +375,13 @@ pub fn available_emojis_signal(
 
     let room_for_stream = room.clone();
     let state_stream = events
-        .filter(|e| ready(matches!(e, RoomEvent::EmojisChanged { .. } | RoomEvent::FullStateSync { .. })))
-        .map(move |_| {
-            room_for_stream.read().unwrap().available_emojis()
-        });
+        .filter(|e| {
+            ready(matches!(
+                e,
+                RoomEvent::EmojisChanged { .. } | RoomEvent::FullStateSync { .. }
+            ))
+        })
+        .map(move |_| room_for_stream.read().unwrap().available_emojis());
 
     let full_stream = futures::stream::once(ready(initial)).chain(state_stream);
     from_stream(full_stream).map(|opt| opt.unwrap_or_default())

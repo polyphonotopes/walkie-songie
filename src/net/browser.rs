@@ -1,0 +1,476 @@
+//! Browser Iroh room transport (wasm32, relay-only).
+//!
+//! The exact protocol surface of [`super::native`] — the same ALPNs, gossip
+//! topic derivation, ticket format, and HHHS repair protocol — compiled to
+//! `wasm32-unknown-unknown`. What differs is the runtime and the reachability:
+//!
+//! * No mDNS: browsers have no UDP. Peers meet through the relay via ticket
+//!   bootstrap (`MemoryLookup`) or gossip.
+//! * Relay-only: iroh's wasm build compiles the IP transport out and tunnels
+//!   QUIC over the relay's WebSocket, so [`PeerTransportPath`] can honestly
+//!   report only `Relayed` (or `Connecting`/`Disconnected`).
+//! * `n0-future` supplies spawn/sleep/timeout where native uses tokio, and the
+//!   queues are `futures` channels — everything here is single-threaded and
+//!   `!Send` by construction.
+
+use std::time::Duration;
+
+use futures::{SinkExt, StreamExt, TryStreamExt, channel::mpsc};
+use iroh::{
+    Endpoint, EndpointId,
+    address_lookup::MemoryLookup,
+    endpoint::{Connection, presets},
+    protocol::{AcceptError, ProtocolHandler, Router},
+};
+use iroh_gossip::{
+    api::{Event as GossipEvent, GossipSender},
+    net::{GOSSIP_ALPN, Gossip},
+};
+
+use super::iroh_common::{
+    EVENT_QUEUE_DEPTH, MAX_GOSSIP_MESSAGE_BYTES, NativeNetError, NativeNetworkEvent,
+    NativeRoomNetworkConfig, NativeRoomTicket, PeerTransportPath, RBSR_ALPN,
+    REPAIR_ACCEPT_TIMEOUT, REPAIR_QUEUE_DEPTH, RoomTopic, classify_peer_path, peer_of,
+};
+use super::repair::IrohSyncStream;
+use super::sync::SyncTimer;
+use super::{PeerId, Transport, TransportError, TransportEvent, TransportMode};
+use crate::client::{DiscoverySource, PeerPath};
+
+/// The browser runtime's clock for [`SyncTimer`]: `n0-future`'s wasm sleep
+/// (a `setTimeout` under the hood).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BrowserTimer;
+
+impl SyncTimer for BrowserTimer {
+    async fn sleep(&self, duration: Duration) {
+        n0_future::time::sleep(duration).await
+    }
+}
+
+/// An inbound repair connection, delivered on its own queue. Browser twin of
+/// `native::IncomingRepair`: the bi-stream is already accepted inside the
+/// protocol handler, and `connection` keeps the QUIC state alive.
+#[derive(Debug)]
+pub struct BrowserIncomingRepair {
+    pub endpoint_id: EndpointId,
+    pub connection: Connection,
+    pub stream: IrohSyncStream,
+}
+
+/// One item from either of the room's two inbound queues.
+#[derive(Debug)]
+pub enum BrowserRoomInbound {
+    Event(NativeNetworkEvent),
+    Repair(BrowserIncomingRepair),
+}
+
+/// The shareable half of the browser room network: every operation that only
+/// needs `&self` and no queue. Cheap to clone (`Endpoint`, `GossipSender`, and
+/// `MemoryLookup` are all handles), so the room loop, commit path, and repair
+/// dialer can each hold their own copy while the inbound queues live in one
+/// place.
+#[derive(Debug, Clone)]
+pub struct BrowserNetHandle {
+    topic: RoomTopic,
+    endpoint: Endpoint,
+    gossip_sender: GossipSender,
+    memory_lookup: MemoryLookup,
+}
+
+impl BrowserNetHandle {
+    pub const fn topic(&self) -> RoomTopic {
+        self.topic
+    }
+
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
+    pub fn endpoint_id(&self) -> EndpointId {
+        self.endpoint.id()
+    }
+
+    /// Current ticket. The relay address appears once iroh has a home relay —
+    /// and in a browser the relay address is the only address there will be.
+    pub fn ticket(&self) -> NativeRoomTicket {
+        NativeRoomTicket::new(self.topic, self.endpoint.addr())
+    }
+
+    /// Wait briefly for relay readiness so a shared ticket carries the relay
+    /// address. In a browser an offline ticket is useless, but a bounded wait
+    /// keeps room entry responsive when the relay is unreachable.
+    pub async fn settle_ticket(&self, timeout: Duration) -> NativeRoomTicket {
+        let _ = n0_future::time::timeout(timeout, self.endpoint.online()).await;
+        self.ticket()
+    }
+
+    /// Add or refresh ticket addressing, then ask gossip to join that peer.
+    pub async fn join_ticket(&self, ticket: &NativeRoomTicket) -> Result<(), NativeNetError> {
+        if ticket.topic() != self.topic {
+            return Err(NativeNetError::Gossip(
+                "ticket belongs to a different room topic".into(),
+            ));
+        }
+        self.memory_lookup
+            .add_endpoint_info(ticket.endpoint_addr().clone());
+        self.gossip_sender
+            .join_peers(vec![ticket.endpoint_addr().id])
+            .await
+            .map_err(|error| NativeNetError::Gossip(error.to_string()))
+    }
+
+    pub async fn broadcast(&self, bytes: Vec<u8>) -> Result<(), NativeNetError> {
+        if bytes.len() > MAX_GOSSIP_MESSAGE_BYTES {
+            return Err(NativeNetError::Gossip(format!(
+                "message is {} bytes; limit is {MAX_GOSSIP_MESSAGE_BYTES}",
+                bytes.len()
+            )));
+        }
+        self.gossip_sender
+            .broadcast(bytes.into())
+            .await
+            .map_err(|error| NativeNetError::Gossip(error.to_string()))
+    }
+
+    /// Open an authenticated Iroh connection for one HHHS H6 repair session.
+    pub async fn begin_repair(
+        &self,
+        endpoint_id: EndpointId,
+    ) -> Result<Connection, NativeNetError> {
+        self.endpoint
+            .connect(endpoint_id, RBSR_ALPN)
+            .await
+            .map_err(|error| NativeNetError::Gossip(format!("repair connection failed: {error}")))
+    }
+
+    pub async fn peer_path(&self, endpoint_id: EndpointId) -> PeerTransportPath {
+        classify_peer_path(&self.endpoint, endpoint_id).await
+    }
+}
+
+/// A bound browser Iroh endpoint and its active gossip topic.
+pub struct BrowserRoomNetwork {
+    handle: BrowserNetHandle,
+    router: Router,
+    events: mpsc::Receiver<NativeNetworkEvent>,
+    repairs: mpsc::Receiver<BrowserIncomingRepair>,
+    event_task: n0_future::task::JoinHandle<()>,
+}
+
+impl BrowserRoomNetwork {
+    /// Bind an endpoint using one persistent identity seed.
+    ///
+    /// Identical to `NativeRoomNetwork::bind` minus the mDNS lookup; the
+    /// `presets::N0` builder compiles the IP transport out on wasm by itself.
+    pub async fn bind(
+        secret_key: iroh::SecretKey,
+        config: NativeRoomNetworkConfig,
+    ) -> Result<Self, NativeNetError> {
+        let relay_mode = config.relay.to_iroh()?;
+        let memory = MemoryLookup::new();
+        if let Some(bootstrap) = config.bootstrap.clone() {
+            memory.add_endpoint_info(bootstrap);
+        }
+        let (mut events_tx, events) = mpsc::channel(EVENT_QUEUE_DEPTH);
+        let (repairs_tx, repairs) = mpsc::channel(REPAIR_QUEUE_DEPTH);
+
+        let endpoint = Endpoint::builder(presets::N0)
+            .secret_key(secret_key)
+            .alpns(vec![GOSSIP_ALPN.to_vec(), RBSR_ALPN.to_vec()])
+            .relay_mode(relay_mode)
+            .clear_address_lookup()
+            .address_lookup(memory.clone())
+            .bind()
+            .await
+            .map_err(|error| NativeNetError::Bind(error.to_string()))?;
+
+        let gossip = Gossip::builder()
+            .max_message_size(MAX_GOSSIP_MESSAGE_BYTES)
+            .spawn(endpoint.clone());
+        let router = Router::builder(endpoint.clone())
+            .accept(GOSSIP_ALPN, gossip.clone())
+            .accept(
+                RBSR_ALPN,
+                BrowserRepairProtocol {
+                    repairs: repairs_tx,
+                },
+            )
+            .spawn();
+
+        let bootstrap = config
+            .bootstrap
+            .as_ref()
+            .map(|address| vec![address.id])
+            .unwrap_or_default();
+        let bootstrap_ids: Vec<EndpointId> = bootstrap.clone();
+        let topic = gossip
+            .subscribe(config.topic.gossip_topic(), bootstrap)
+            .await
+            .map_err(|error| NativeNetError::Gossip(error.to_string()))?;
+        let (gossip_sender, mut gossip_events) = topic.split();
+
+        // No mDNS branch in a browser, so the event task is a single stream
+        // pump: gossip events in, `NativeNetworkEvent`s out. Bootstrap peers
+        // keep their `Ticket` attribution; everyone else arrived via gossip.
+        let event_task = n0_future::task::spawn(async move {
+            loop {
+                match gossip_events.try_next().await {
+                    Ok(Some(GossipEvent::NeighborUp(endpoint_id))) => {
+                        let discovery = if bootstrap_ids.contains(&endpoint_id) {
+                            DiscoverySource::Ticket
+                        } else {
+                            DiscoverySource::Gossip
+                        };
+                        if events_tx
+                            .send(NativeNetworkEvent::NeighborUp {
+                                endpoint_id,
+                                discovery,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(Some(GossipEvent::NeighborDown(endpoint_id))) => {
+                        if events_tx
+                            .send(NativeNetworkEvent::NeighborDown { endpoint_id })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(Some(GossipEvent::Received(message))) => {
+                        if events_tx
+                            .send(NativeNetworkEvent::Message {
+                                delivered_from: message.delivered_from,
+                                bytes: message.content.to_vec(),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(Some(GossipEvent::Lagged)) => {
+                        if events_tx.send(NativeNetworkEvent::Lagged).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        let _ = events_tx.send(NativeNetworkEvent::Closed).await;
+                        break;
+                    }
+                    Err(error) => {
+                        let _ = events_tx
+                            .send(NativeNetworkEvent::Diagnostic(format!(
+                                "gossip event stream failed: {error}"
+                            )))
+                            .await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            handle: BrowserNetHandle {
+                topic: config.topic,
+                endpoint,
+                gossip_sender,
+                memory_lookup: memory,
+            },
+            router,
+            events,
+            repairs,
+            event_task,
+        })
+    }
+
+    /// A cheap clone of the `&self` operations (broadcast, dial, tickets),
+    /// usable while `next_inbound` holds `&mut self` elsewhere.
+    pub fn handle(&self) -> BrowserNetHandle {
+        self.handle.clone()
+    }
+
+    pub const fn topic(&self) -> RoomTopic {
+        self.handle.topic()
+    }
+
+    pub fn endpoint_id(&self) -> EndpointId {
+        self.handle.endpoint_id()
+    }
+
+    pub async fn next_event(&mut self) -> Option<NativeNetworkEvent> {
+        self.events.next().await
+    }
+
+    pub async fn next_repair(&mut self) -> Option<BrowserIncomingRepair> {
+        self.repairs.next().await
+    }
+
+    /// Whichever of the two queues is ready first. The queues stay SEPARATE
+    /// and separately bounded for the same head-of-line reasons as native.
+    pub async fn next_inbound(&mut self) -> Option<BrowserRoomInbound> {
+        futures::select! {
+            repair = self.repairs.next() => repair.map(BrowserRoomInbound::Repair),
+            event = self.events.next() => event.map(BrowserRoomInbound::Event),
+        }
+    }
+
+    pub async fn shutdown(self) -> Result<(), NativeNetError> {
+        self.event_task.abort();
+        self.router
+            .shutdown()
+            .await
+            .map_err(|_| NativeNetError::Closed)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BrowserRepairProtocol {
+    repairs: mpsc::Sender<BrowserIncomingRepair>,
+}
+
+impl ProtocolHandler for BrowserRepairProtocol {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let endpoint_id = connection.remote_id();
+        // Take the bi-stream HERE, in the per-connection handler task, exactly
+        // as native does — a peer that dials without opening one wastes only
+        // its own connection.
+        let stream = match n0_future::time::timeout(
+            REPAIR_ACCEPT_TIMEOUT,
+            IrohSyncStream::accept(&connection),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(_)) | Err(_) => {
+                connection.close(3u32.into(), b"no repair stream");
+                return Ok(());
+            }
+        };
+        // Reject rather than queue when saturated; a dropped dial is
+        // recoverable, an unbounded backlog of live QUIC state is not.
+        let mut repairs = self.repairs.clone();
+        match repairs.try_send(BrowserIncomingRepair {
+            endpoint_id,
+            connection,
+            stream,
+        }) {
+            Ok(()) => Ok(()),
+            Err(refused) => {
+                let reason: &[u8] = if refused.is_full() {
+                    b"repair queue full"
+                } else {
+                    b"shutting down"
+                };
+                refused
+                    .into_inner()
+                    .connection
+                    .close(1u32.into(), reason);
+                Ok(())
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The pluggable transport seam.
+// ---------------------------------------------------------------------------
+
+/// The browser iroh backend behind the transport-neutral seam. Same event
+/// mapping as the native impl, minus the mDNS diagnostics that cannot occur.
+impl Transport for BrowserRoomNetwork {
+    type Stream = IrohSyncStream;
+
+    fn mode(&self) -> TransportMode {
+        TransportMode::Iroh
+    }
+
+    fn max_broadcast_bytes(&self) -> usize {
+        MAX_GOSSIP_MESSAGE_BYTES
+    }
+
+    async fn broadcast(&self, frame: Vec<u8>) -> Result<(), TransportError> {
+        let length = frame.len();
+        self.handle
+            .broadcast(frame)
+            .await
+            .map_err(|error| match error {
+                NativeNetError::Gossip(_) if length > MAX_GOSSIP_MESSAGE_BYTES => {
+                    TransportError::FrameTooLarge {
+                        actual: length,
+                        limit: MAX_GOSSIP_MESSAGE_BYTES,
+                    }
+                }
+                other => TransportError::Backend(other.to_string()),
+            })
+    }
+
+    async fn next_event(&mut self) -> Option<TransportEvent<Self::Stream>> {
+        let event = match self.next_inbound().await? {
+            BrowserRoomInbound::Repair(repair) => {
+                return Some(TransportEvent::SyncRequested {
+                    peer: peer_of(repair.endpoint_id),
+                    stream: repair.stream.owning(repair.connection),
+                });
+            }
+            BrowserRoomInbound::Event(event) => event,
+        };
+        Some(match event {
+            NativeNetworkEvent::NeighborUp {
+                endpoint_id,
+                discovery,
+            } => TransportEvent::PeerUp {
+                peer: peer_of(endpoint_id),
+                discovery,
+            },
+            NativeNetworkEvent::NeighborDown { endpoint_id } => TransportEvent::PeerDown {
+                peer: peer_of(endpoint_id),
+            },
+            NativeNetworkEvent::Message {
+                delivered_from,
+                bytes,
+            } => TransportEvent::Message {
+                from: peer_of(delivered_from),
+                bytes,
+            },
+            NativeNetworkEvent::Lagged => TransportEvent::Lagged,
+            NativeNetworkEvent::Closed => TransportEvent::Closed,
+            NativeNetworkEvent::Diagnostic(message) => TransportEvent::Diagnostic(message),
+            NativeNetworkEvent::MdnsDiscovered { endpoint_id } => {
+                TransportEvent::Diagnostic(format!("mdns discovered {endpoint_id}"))
+            }
+            NativeNetworkEvent::MdnsExpired { endpoint_id } => {
+                TransportEvent::Diagnostic(format!("mdns expired {endpoint_id}"))
+            }
+        })
+    }
+
+    async fn open_sync(&self, peer: PeerId) -> Result<Self::Stream, TransportError> {
+        let endpoint_id = EndpointId::from_bytes(peer.as_bytes())
+            .map_err(|_| TransportError::Unreachable(peer.to_hex()))?;
+        let connection = self
+            .handle
+            .begin_repair(endpoint_id)
+            .await
+            .map_err(|error| TransportError::Backend(error.to_string()))?;
+        Ok(IrohSyncStream::open(&connection).await?.owning(connection))
+    }
+
+    async fn peer_path(&self, peer: PeerId) -> PeerPath {
+        let Ok(endpoint_id) = EndpointId::from_bytes(peer.as_bytes()) else {
+            return PeerPath::Disconnected;
+        };
+        self.handle.peer_path(endpoint_id).await.into()
+    }
+
+    async fn shutdown(self) -> Result<(), TransportError> {
+        BrowserRoomNetwork::shutdown(self)
+            .await
+            .map_err(|error| TransportError::Backend(error.to_string()))
+    }
+}

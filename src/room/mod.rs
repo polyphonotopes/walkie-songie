@@ -8,22 +8,39 @@
 //! - Combination method for computing room result
 
 pub mod events;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod journal;
+pub mod ops;
+pub mod presence;
+pub mod store;
 pub mod streams;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod yrs_state;
+
+// `view.rs` (per-author-union hand fold) and `mirror.rs` (opaque-entry HHHS mirror)
+// were removed: the data design consolidated onto HHHS-native materialization
+// (content-keyed add-wins pitches, op-id-keyed pieces, causal-maxima registers). The
+// replacement lands in `store.rs` (RoomStore: verbatim-bytes lift + cover/register
+// views). `ops.rs` (WalkieOp v2) is the shared op alphabet.
 
 pub use events::RoomEvent;
 pub use streams::{
+    ActivePitchesSnapshot,
     // Delta streams (for MIDI output)
-    PitchClassDelta, PitchDelta, ActivePitchesSnapshot,
-    unified_pitch_class_deltas, piece_pitch_deltas, voice_pitch_deltas,
+    PitchClassDelta,
+    PitchDelta,
+    piece_pitch_deltas,
     snapshot_active_pitches,
+    unified_pitch_class_deltas,
+    voice_pitch_deltas,
 };
 
 // State signals (for UI) - only available in wasm32
 #[cfg(target_arch = "wasm32")]
 pub use streams::{
-    unified_pitch_classes_signal, shared_pitches_signal, pieces_signal,
-    pieces_locked_signal, available_emojis_signal,
+    available_emojis_signal, pieces_locked_signal, pieces_signal, shared_pitches_signal,
+    unified_pitch_classes_signal,
 };
 pub use yrs_state::{Piece, RoomState};
 
@@ -121,7 +138,6 @@ pub struct RoomPitchResult {
     /// Attribution: which peers contributed each pitch class
     pub attribution: HashMap<PitchClass, Vec<String>>,
 }
-
 
 #[cfg(test)]
 mod tests {
