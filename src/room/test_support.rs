@@ -272,84 +272,7 @@ pub fn oracle(ops: &[VerifiedOp]) -> RoomView {
         }
     }
 
-    // --- Pieces: owner-gated, per-owner seq register ---
-    let mut puts: Vec<(OpId, AuthorId, u64, String, TunedPeriodicPitch)> = Vec::new();
-    let mut piece_removes: Vec<(OpId, OpId, AuthorId, u64)> = Vec::new();
-    let mut unremoves: Vec<(OpId, AuthorId, u64)> = Vec::new();
-    let mut moves: Vec<(OpId, AuthorId, u64, TunedPeriodicPitch)> = Vec::new();
-    for id in &ids {
-        let op = by_id[id];
-        match op.payload() {
-            PutPiece { emoji, pitch }
-                if active_tuning
-                    .as_ref()
-                    .is_some_and(|tuning| pitch.validate(tuning).is_ok()) =>
-            {
-                puts.push((*id, op.author(), op.seq_num(), emoji.clone(), *pitch))
-            }
-            RemovePiece { piece } => piece_removes.push((*id, *piece, op.author(), op.seq_num())),
-            UnremovePiece { remove } => unremoves.push((*remove, op.author(), op.seq_num())),
-            MovePiece { piece, pitch }
-                if active_tuning
-                    .as_ref()
-                    .is_some_and(|tuning| pitch.validate(tuning).is_ok()) =>
-            {
-                moves.push((*piece, op.author(), op.seq_num(), *pitch))
-            }
-            _ => {}
-        }
-    }
-    let mut pieces = BTreeMap::new();
-    for put in &puts {
-        let piece_id = put.0;
-        let owner = put.1;
-        let owner_remove_ids: BTreeSet<OpId> = piece_removes
-            .iter()
-            .filter(|r| r.2 == owner && r.1 == piece_id)
-            .map(|r| r.0)
-            .collect();
-        let mut best_seq = put.2;
-        let mut alive = true;
-        for r in piece_removes
-            .iter()
-            .filter(|r| r.2 == owner && r.1 == piece_id)
-        {
-            if r.3 > best_seq {
-                best_seq = r.3;
-                alive = false;
-            }
-        }
-        for u in unremoves
-            .iter()
-            .filter(|u| u.1 == owner && owner_remove_ids.contains(&u.0))
-        {
-            if u.2 > best_seq {
-                best_seq = u.2;
-                alive = true;
-            }
-        }
-        if !alive {
-            continue;
-        }
-        let mut best_move: Option<(u64, TunedPeriodicPitch)> = None;
-        for m in moves.iter().filter(|m| m.1 == owner && m.0 == piece_id) {
-            if best_move.is_none_or(|(seq, _)| m.2 > seq) {
-                best_move = Some((m.2, m.3));
-            }
-        }
-        let pitch = best_move.map_or(put.4, |(_, pitch)| pitch);
-        pieces.insert(
-            piece_id,
-            Piece {
-                id: piece_id,
-                owner,
-                emoji: put.3.clone(),
-                pitch,
-            },
-        );
-    }
-
-    // --- Config registers ---
+    // --- Config registers (resolved first: the lock gate reads them per op) ---
     let mut locked_c = BTreeSet::new();
     let mut emoji_c = BTreeSet::new();
     for id in &ids {
@@ -368,6 +291,113 @@ pub fn oracle(ops: &[VerifiedOp]) -> RoomView {
             _ => {}
         }
     }
+
+    // --- Pieces: SHARED — cross-author observed-remove + causal position register.
+    // Independent mirror of `RoomStore::with_pieces`: owner is attribution only,
+    // `pieces_locked` (resolved over an op's causal past) is the consent gate. ---
+    // put:      (piece_id, owner, emoji, put_pitch)
+    let mut puts: Vec<(OpId, AuthorId, String, TunedPeriodicPitch)> = Vec::new();
+    // move:     (move_id, target_piece, pitch)
+    let mut moves: Vec<(OpId, OpId, TunedPeriodicPitch)> = Vec::new();
+    // remove:   (remove_id, target_piece)
+    let mut piece_removes: Vec<(OpId, OpId)> = Vec::new();
+    // unremove: (unremove_id, target_remove)
+    let mut unremoves: Vec<(OpId, OpId)> = Vec::new();
+    for id in &ids {
+        let op = by_id[id];
+        match op.payload() {
+            PutPiece { emoji, pitch }
+                if active_tuning
+                    .as_ref()
+                    .is_some_and(|tuning| pitch.validate(tuning).is_ok()) =>
+            {
+                puts.push((*id, op.author(), emoji.clone(), *pitch))
+            }
+            MovePiece { piece, pitch }
+                if active_tuning
+                    .as_ref()
+                    .is_some_and(|tuning| pitch.validate(tuning).is_ok()) =>
+            {
+                moves.push((*id, *piece, *pitch))
+            }
+            RemovePiece { piece } => piece_removes.push((*id, *piece)),
+            UnremovePiece { remove } => unremoves.push((*id, *remove)),
+            _ => {}
+        }
+    }
+
+    // Whether the lock register, resolved over ONLY the causal ancestors of `op`,
+    // reads `true` — the per-op consent gate (matches the store's `locked_as_of`).
+    let locked_as_of = |op: &OpId| -> bool {
+        let observed: BTreeSet<OpId> = locked_c
+            .iter()
+            .copied()
+            .filter(|write| is_anc(write, op))
+            .collect();
+        resolve(&observed).is_some_and(|winner| {
+            matches!(
+                by_id[&winner].payload(),
+                SetConfig {
+                    pieces_locked: Some(true),
+                    ..
+                }
+            )
+        })
+    };
+
+    let mut pieces = BTreeMap::new();
+    for (piece_id, owner, emoji, put_pitch) in &puts {
+        // Effective removes: not lock-suppressed, not overridden by an observing
+        // (and itself unlocked) unremove.
+        let effective_removes: Vec<OpId> = piece_removes
+            .iter()
+            .filter(|(_, target)| target == piece_id)
+            .filter(|(rem_id, _)| {
+                if locked_as_of(rem_id) {
+                    return false;
+                }
+                let overridden = unremoves.iter().any(|(un_id, target_rem)| {
+                    target_rem == rem_id && is_anc(rem_id, un_id) && !locked_as_of(un_id)
+                });
+                !overridden
+            })
+            .map(|(rem_id, _)| *rem_id)
+            .collect();
+
+        // Adds = put + non-suppressed moves; survives iff no effective remove
+        // observed it (add-wins).
+        let survives = |add: &OpId| !effective_removes.iter().any(|rem| is_anc(add, rem));
+        let mut surviving: BTreeSet<OpId> = BTreeSet::new();
+        if survives(piece_id) {
+            surviving.insert(*piece_id);
+        }
+        for (move_id, _, _) in moves.iter().filter(|(_, target, _)| target == piece_id) {
+            if !locked_as_of(move_id) && survives(move_id) {
+                surviving.insert(*move_id);
+            }
+        }
+        if surviving.is_empty() {
+            continue;
+        }
+
+        // Position = register winner over the surviving adds' pitches.
+        let pitch = resolve(&surviving)
+            .map(|winner| match by_id[&winner].payload() {
+                PutPiece { pitch, .. } | MovePiece { pitch, .. } => *pitch,
+                _ => unreachable!("a surviving add is a PutPiece or MovePiece"),
+            })
+            .unwrap_or(*put_pitch);
+        pieces.insert(
+            *piece_id,
+            Piece {
+                id: *piece_id,
+                owner: *owner,
+                emoji: emoji.clone(),
+                pitch,
+            },
+        );
+    }
+
     let pieces_locked = resolve(&locked_c)
         .map(|id| match by_id[&id].payload() {
             SetConfig {

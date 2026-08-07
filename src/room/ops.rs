@@ -16,10 +16,12 @@
 //! - **Degrees** are a content-keyed add-wins set keyed by [`TunedDegree`]. A
 //!   `RemoveDegree` supersedes only the adds in its causal past; a concurrent add
 //!   survives.
-//! - **Pieces** are graph-shaped and owner-gated: identity is the *op id* of the
+//! - **Pieces** are graph-shaped and SHARED: identity is the *op id* of the
 //!   `PutPiece` that created them, so two peers creating "the same" piece
 //!   concurrently are simply two pieces. `MovePiece`/`RemovePiece`/`UnremovePiece`
-//!   reference that [`OpId`]; only the owner's ops take effect.
+//!   reference that [`OpId`]; ANY author's ops take effect, resolved by
+//!   cross-author observed-remove and a causal-maxima position register. The
+//!   `PutPiece` author is attribution only; `pieces_locked` is the consent gate.
 //! - **Tuning/config** are room-wide registers resolved by causal maxima.
 //! - **Voice preview** is deliberately absent. It is signed, sequenced, leased
 //!   presence and never enters durable history.
@@ -121,12 +123,13 @@ pub enum WalkieOp {
         emoji: String,
         pitch: TunedPeriodicPitch,
     },
-    /// Move the piece created by `piece` to a new periodic pitch (owner-gated).
+    /// Move the piece created by `piece` to a new periodic pitch (shared: any
+    /// author, resolved by the cross-author position register).
     MovePiece {
         piece: OpId,
         pitch: TunedPeriodicPitch,
     },
-    /// Remove the piece created by `piece` (owner-gated).
+    /// Remove the piece created by `piece` (shared: any author; observed-remove).
     RemovePiece { piece: OpId },
     /// Undo a `RemovePiece` (a remove-of-remove); resurrects the piece.
     UnremovePiece { remove: OpId },

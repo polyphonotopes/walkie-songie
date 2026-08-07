@@ -11,9 +11,10 @@
 //! The read model ([`RoomView`]) is then computed HHHS-natively: pitches are a
 //! content-keyed add-wins set resolved by causal ancestry
 //! ([`ReachIndex`](hhhs_core::cover::ReachIndex)), voice is a per-author
-//! seq-register, pieces are owner-gated per-owner seq-registers, and
-//! tuning/config are cross-author registers resolved by
-//! [`register::resolve`](hhhs_core::register::resolve).
+//! seq-register, pieces are SHARED — cross-author observed-remove for lifecycle
+//! plus a causal-maxima position register (owner is attribution, `pieces_locked`
+//! is the consent gate) — and tuning/config are cross-author registers resolved
+//! by [`register::resolve`](hhhs_core::register::resolve).
 //!
 //! Signature verification happens once, at ingest, against a [`VerifiedOp`];
 //! reads never re-verify.
@@ -105,6 +106,10 @@ struct DecodedOp {
     /// causal view but kept per the store contract).
     #[allow(dead_code)]
     ts_ms: u64,
+    /// This op's per-author log position. The shared piece fold resolves cross-
+    /// author, so seqs (incomparable across authors) no longer decide anything;
+    /// retained as part of the decoded record.
+    #[allow(dead_code)]
     seq: u64,
 }
 
@@ -404,7 +409,7 @@ impl RoomStore {
         }
         .with_registers(self, &reach)
         .with_pitches(self, &reach)
-        .with_pieces(self)
+        .with_pieces(self, &reach)
     }
 }
 
@@ -451,10 +456,36 @@ impl RoomView {
         self
     }
 
-    /// Pieces: owner-gated, per-owner seq register. Only the owner's ops affect a
-    /// piece; the greatest-seq lifecycle op decides liveness; the greatest-seq
-    /// move decides position; emoji comes from the PutPiece.
-    fn with_pieces(mut self, store: &RoomStore) -> Self {
+    /// Pieces: SHARED, resolved as a pure function of the op-set — any author's
+    /// `Move`/`Remove`/`UnremovePiece` counts. `owner` is attribution only (the
+    /// `PutPiece` author), never a gate; `pieces_locked` is the consent gate.
+    ///
+    /// This generalizes the per-owner seq register — whose seqs are incomparable
+    /// across authors — to the cross-author machinery the rest of the store
+    /// already uses ([`Self::with_pitches`], [`Self::with_registers`]):
+    ///
+    /// * **Lifecycle — observed-remove + add-wins, mirroring degrees.** The
+    ///   `PutPiece` and every valid `MovePiece` of the piece are *adds* (each is a
+    ///   presence-and-position assertion). A `RemovePiece` `R` **kills** exactly
+    ///   the adds in its causal past (`is_ancestor(add, R)`) — so a remove
+    ///   concurrent with an add cannot kill it (add-wins), and a move/put causally
+    ///   *after* a remove resurrects the piece exactly as re-adding a degree does.
+    ///   An `UnremovePiece` `U` **overrides** the remove it observed
+    ///   (`U.remove == R` and `is_ancestor(R, U)`), so that remove kills nothing.
+    ///   The piece is alive iff at least one add survives every effective remove.
+    /// * **Position — a register across ALL authors.** Per-author seqs are
+    ///   incomparable, so concurrent moves are resolved by
+    ///   [`register::resolve`] over the *surviving* adds: causal precedence where
+    ///   comparable, then the max raw-bytes [`EntryHash`] tiebreak — the same
+    ///   deterministic total order tuning/config use. No wall-clock, no seqs.
+    /// * **`pieces_locked` — the consent gate, applied per op by causal past.** A
+    ///   `MovePiece`/`RemovePiece`/`UnremovePiece` is suppressed (has no effect)
+    ///   iff the lock register **resolved over that op's causal ancestors** reads
+    ///   `true`. So an op is frozen only once an active lock is in its causal
+    ///   past; a move/remove *concurrent* with a lock (neither observed the other)
+    ///   still applies — you cannot retroactively freeze an op you did not
+    ///   causally precede. `PutPiece` is never suppressed.
+    fn with_pieces(mut self, store: &RoomStore, reach: &ReachIndex) -> Self {
         let Some(active_tuning) = self
             .tuning
             .as_ref()
@@ -462,87 +493,114 @@ impl RoomView {
         else {
             return self;
         };
-        // (piece_id, owner, seq, emoji, pitch)
-        let mut puts: Vec<(OpId, AuthorId, u64, String, TunedPeriodicPitch)> = Vec::new();
-        // (remove_op_id, target_piece, author, seq)
-        let mut removes: Vec<(OpId, OpId, AuthorId, u64)> = Vec::new();
-        // (target_remove, author, seq)
-        let mut unremoves: Vec<(OpId, AuthorId, u64)> = Vec::new();
-        // (target_piece, author, seq, pitch)
-        let mut moves: Vec<(OpId, AuthorId, u64, TunedPeriodicPitch)> = Vec::new();
+
+        // (put_entry, piece_id, owner, emoji, put_pitch)
+        let mut puts: Vec<(EntryHash, OpId, AuthorId, String, TunedPeriodicPitch)> = Vec::new();
+        // (move_entry, target_piece) — pitch is read back from `store.decoded`.
+        let mut moves: Vec<(EntryHash, OpId)> = Vec::new();
+        // (remove_entry, remove_op_id, target_piece)
+        let mut removes: Vec<(EntryHash, OpId, OpId)> = Vec::new();
+        // (unremove_entry, target_remove_op_id)
+        let mut unremoves: Vec<(EntryHash, OpId)> = Vec::new();
+        // SetConfig writes that carry a `pieces_locked` value (the lock register).
+        let mut lock_writes: BTreeSet<EntryHash> = BTreeSet::new();
 
         for (entry, decoded) in &store.decoded {
             let op_id = store.entry_to_source[entry];
             match &decoded.op {
                 WalkieOp::PutPiece { emoji, pitch } if pitch.validate(&active_tuning).is_ok() => {
-                    puts.push((op_id, decoded.author, decoded.seq, emoji.clone(), *pitch))
-                }
-                WalkieOp::RemovePiece { piece } => {
-                    removes.push((op_id, *piece, decoded.author, decoded.seq))
-                }
-                WalkieOp::UnremovePiece { remove } => {
-                    unremoves.push((*remove, decoded.author, decoded.seq))
+                    puts.push((*entry, op_id, decoded.author, emoji.clone(), *pitch))
                 }
                 WalkieOp::MovePiece { piece, pitch } if pitch.validate(&active_tuning).is_ok() => {
-                    moves.push((*piece, decoded.author, decoded.seq, *pitch))
+                    moves.push((*entry, *piece))
+                }
+                WalkieOp::RemovePiece { piece } => removes.push((*entry, op_id, *piece)),
+                WalkieOp::UnremovePiece { remove } => unremoves.push((*entry, *remove)),
+                WalkieOp::SetConfig {
+                    pieces_locked: Some(_),
+                    ..
+                } => {
+                    lock_writes.insert(*entry);
                 }
                 _ => {}
             }
         }
 
-        for put in &puts {
-            let piece_id = put.0;
-            let owner = put.1;
-            let put_seq = put.2;
-
-            // The owner's removes of THIS piece, and the ids that unremoves may target.
-            let owner_remove_ids: BTreeSet<OpId> = removes
+        // Whether the pieces-lock register, resolved over ONLY the causal
+        // ancestors of `op`, reads `true`. A move/remove/unremove is suppressed
+        // exactly when this holds — i.e. an active lock sits in its causal past.
+        let locked_as_of = |op: &EntryHash| -> bool {
+            let observed: BTreeSet<EntryHash> = lock_writes
                 .iter()
-                .filter(|r| r.2 == owner && r.1 == piece_id)
-                .map(|r| r.0)
+                .copied()
+                .filter(|write| reach.is_ancestor(write, op))
+                .collect();
+            register::resolve(&observed, reach).is_some_and(|winner| {
+                matches!(
+                    &store.decoded[&winner].op,
+                    WalkieOp::SetConfig {
+                        pieces_locked: Some(true),
+                        ..
+                    }
+                )
+            })
+        };
+
+        for (put_entry, piece_id, owner, emoji, put_pitch) in &puts {
+            // Effective removes of this piece: not lock-suppressed, and not
+            // overridden by an unremove that observed them (and is itself unlocked).
+            let effective_removes: Vec<EntryHash> = removes
+                .iter()
+                .filter(|(_, _, target)| target == piece_id)
+                .filter(|(rem_entry, rem_id, _)| {
+                    if locked_as_of(rem_entry) {
+                        return false;
+                    }
+                    let overridden = unremoves.iter().any(|(un_entry, target_rem)| {
+                        target_rem == rem_id
+                            && reach.is_ancestor(rem_entry, un_entry)
+                            && !locked_as_of(un_entry)
+                    });
+                    !overridden
+                })
+                .map(|(rem_entry, _, _)| *rem_entry)
                 .collect();
 
-            // Greatest-seq lifecycle event decides liveness. Within one author's log
-            // seqs are unique, so the max is unambiguous.
-            let mut best_seq = put_seq;
-            let mut alive = true;
-            for r in removes.iter().filter(|r| r.2 == owner && r.1 == piece_id) {
-                if r.3 > best_seq {
-                    best_seq = r.3;
-                    alive = false;
+            // Adds = the put + every non-suppressed move of this piece; an add
+            // survives iff no effective remove causally observed it (add-wins).
+            let survives = |add: &EntryHash| {
+                !effective_removes
+                    .iter()
+                    .any(|rem| reach.is_ancestor(add, rem))
+            };
+            let mut surviving: BTreeSet<EntryHash> = BTreeSet::new();
+            if survives(put_entry) {
+                surviving.insert(*put_entry);
+            }
+            for (move_entry, _) in moves.iter().filter(|(_, target)| target == piece_id) {
+                if !locked_as_of(move_entry) && survives(move_entry) {
+                    surviving.insert(*move_entry);
                 }
             }
-            for u in unremoves
-                .iter()
-                .filter(|u| u.1 == owner && owner_remove_ids.contains(&u.0))
-            {
-                if u.2 > best_seq {
-                    best_seq = u.2;
-                    alive = true;
-                }
-            }
-            if !alive {
+            if surviving.is_empty() {
+                // Every assertion of this piece was observed-removed: it is gone.
                 continue;
             }
 
-            // Position from the owner's greatest-seq valid move of this piece.
-            let mut best_move: Option<(u64, TunedPeriodicPitch)> = None;
-            for m in moves.iter().filter(|m| m.1 == owner && m.0 == piece_id) {
-                if best_move.is_none_or(|(seq, _)| m.2 > seq) {
-                    best_move = Some((m.2, m.3));
-                }
-            }
-            let pitch = match best_move {
-                Some((_, pitch)) => pitch,
-                None => put.4,
-            };
+            // Position = the register winner among the surviving adds' pitches.
+            let pitch = register::resolve(&surviving, reach)
+                .map(|winner| match &store.decoded[&winner].op {
+                    WalkieOp::PutPiece { pitch, .. } | WalkieOp::MovePiece { pitch, .. } => *pitch,
+                    _ => unreachable!("a surviving add is a PutPiece or MovePiece"),
+                })
+                .unwrap_or(*put_pitch);
 
             self.pieces.insert(
-                piece_id,
+                *piece_id,
                 Piece {
-                    id: piece_id,
-                    owner,
-                    emoji: put.3.clone(),
+                    id: *piece_id,
+                    owner: *owner,
+                    emoji: emoji.clone(),
                     pitch,
                 },
             );
@@ -764,8 +822,9 @@ mod tests {
             },
         );
 
-        // Pieces: A owns; move by A wins position; a non-owner move by B ignored;
-        // remove then unremove by A -> alive.
+        // Pieces (SHARED): A creates; non-owner B moves it (takes effect); A then
+        // moves it later, observing B's move, so A's position wins by causal
+        // recency (not by ownership); remove then unremove by A -> alive.
         let a_put = a.sign(
             7,
             vec![],
@@ -775,20 +834,22 @@ mod tests {
             },
         );
         let piece = a_put.id();
-        let a_mov = a.sign(
-            8,
-            vec![],
-            MovePiece {
-                piece,
-                pitch: tet_pitch(72),
-            },
-        );
+        // B (non-owner) moves first, observing the put.
         let b_mov = b.sign(
-            9,
-            vec![],
+            8,
+            vec![a_put.hash()],
             MovePiece {
                 piece,
                 pitch: tet_pitch(61),
+            },
+        );
+        // A moves later, observing B's move -> causally dominates it -> A wins.
+        let a_mov = a.sign(
+            9,
+            vec![b_mov.hash()],
+            MovePiece {
+                piece,
+                pitch: tet_pitch(72),
             },
         );
         let a_rem_p = a.sign(10, vec![], RemovePiece { piece });
@@ -835,7 +896,7 @@ mod tests {
         );
 
         vec![
-            a_add0, b_add0, a_rem0, c_add7, a_add7, c_rem7, a_put, a_mov, b_mov, a_rem_p, a_unrem,
+            a_add0, b_add0, a_rem0, c_add7, a_add7, c_rem7, a_put, b_mov, a_mov, a_rem_p, a_unrem,
             a_tune, b_tune, a_cfg, c_cfg,
         ]
     }
@@ -979,14 +1040,23 @@ mod tests {
         let p = &view.pieces[&piece];
         assert_eq!(p.owner, owner);
         assert_eq!(p.emoji, "🎵");
-        assert_eq!(p.pitch, tet_pitch(72), "greatest-seq move sets position");
+        assert_eq!(
+            p.pitch,
+            tet_pitch(72),
+            "the move wins the position register (it causally dominates the put); \
+             the unremove overrides the remove -> alive"
+        );
         assert_parity(&ops);
     }
 
+    /// Shared pieces: a NON-owner's `MovePiece` takes effect. `owner` stays A as
+    /// attribution only — never a gate. (This is the flip of the old
+    /// `non_owner_piece_ops_are_ignored`.)
     #[test]
-    fn non_owner_piece_ops_are_ignored() {
+    fn non_owner_move_takes_effect() {
         let mut a = Peer::new(&SEED_A);
         let mut b = Peer::new(&SEED_B);
+        let owner = a.author();
         let put = a.sign(
             1,
             vec![],
@@ -996,7 +1066,7 @@ mod tests {
             },
         );
         let piece = put.id();
-        // B (not the owner) tries to move and remove A's piece.
+        // B (not the owner) moves A's piece, observing the put.
         let b_mov = b.sign(
             2,
             vec![put.hash()],
@@ -1005,25 +1075,27 @@ mod tests {
                 pitch: tet_pitch(72),
             },
         );
-        let b_rem = b.sign(3, vec![put.hash()], RemovePiece { piece });
-        let ops = vec![put, b_mov, b_rem];
+        let ops = vec![put, b_mov];
         let view = ingest(&ops).view();
         let p = &view.pieces[&piece];
-        assert_eq!(p.pitch, tet_pitch(60), "non-owner move ignored");
-        assert!(view.pieces.contains_key(&piece), "non-owner remove ignored");
+        assert_eq!(p.pitch, tet_pitch(72), "non-owner move takes effect");
+        assert_eq!(
+            p.owner, owner,
+            "owner is attribution only, unchanged by B's move"
+        );
         assert_parity(&ops);
     }
 
-    /// W17 — the drag-divergence scenario at the data layer: A owns a piece,
-    /// non-owner B moves it, and BOTH peers ingest BOTH ops (in opposite
-    /// orders). Every store — including B's, whose own view never showed the
-    /// move — converges on the owner's position. So any UI that displayed B's
-    /// move was showing state without data; the data was never the bug
-    /// (docs/research/reactive-effectful-ui-adapter-design.md §1, §6.1).
+    /// W17 (shared-pieces update) — the semantics flipped: A creates a piece,
+    /// non-owner B moves it, and BOTH peers ingest BOTH ops (in opposite orders).
+    /// Every store — including A's — now converges on B's MOVED position, because
+    /// any author may move a piece; `owner` is attribution only. The reversed
+    /// order also exercises strict deferral of the move behind the put.
     #[test]
-    fn w17_non_owner_move_converges_to_owner_position() {
+    fn w17_non_owner_move_converges_to_the_moved_position() {
         let mut a = Peer::new(&SEED_A);
         let mut b = Peer::new(&SEED_B);
+        let owner = a.author();
         let put = a.sign(
             1,
             vec![],
@@ -1056,20 +1128,20 @@ mod tests {
             let held = &view.pieces[&piece];
             assert_eq!(
                 held.pitch,
-                tet_pitch(60),
-                "{name} holds the owner's position, not B's move"
+                tet_pitch(64),
+                "{name} holds B's moved position, not the original"
             );
+            assert_eq!(held.owner, owner, "{name} keeps A as attribution");
         }
         assert_parity(&ops);
     }
 
-    /// The mechanism behind the drag divergence: an owner-gated-rejected op
-    /// produces ZERO view delta, so a diff-driven projection has no correction
-    /// to emit. Any snap-back must therefore come from *rendering the
-    /// projection*, never from a view event that will never fire
-    /// (docs/research/reactive-effectful-ui-adapter-design.md §1.3, §6.2).
+    /// Shared-pieces update: a non-owner's move is no longer inert — it produces
+    /// a real view delta (the piece moves), so diff-driven projections update
+    /// normally and there is nothing to "snap back". (Flip of the old
+    /// `non_owner_move_produces_no_view_delta`.)
     #[test]
-    fn non_owner_move_produces_no_view_delta() {
+    fn non_owner_move_produces_a_view_delta() {
         // B's store ingests A's put, then commits B's own (non-owner) move.
         let mut a = Peer::new(&SEED_A);
         let put = a.sign(
@@ -1085,6 +1157,7 @@ mod tests {
         let mut store = RoomStore::new();
         store.ingest_verified(put);
         let before = store.view();
+        assert_eq!(before.pieces[&piece].pitch, tet_pitch(60));
 
         let b_key = signing_key_from_seed(&SEED_B);
         store.commit(
@@ -1097,12 +1170,205 @@ mod tests {
             },
         );
 
+        let after = store.view();
+        assert_ne!(after, before, "a non-owner move now changes the view");
         assert_eq!(
-            store.view(),
-            before,
-            "inert op => zero delta => a diff-driven projection has nothing to \
-             say; snap-back must come from rendering the projection"
+            after.pieces[&piece].pitch,
+            tet_pitch(64),
+            "piece moved to B's target"
         );
+    }
+
+    /// Two DIFFERENT authors move the same piece concurrently (neither observed
+    /// the other's move). Ingested in OPPOSITE orders on two stores, both compute
+    /// the identical deterministic position — the cross-author position
+    /// register's entry-hash tiebreak — which is one of the two proposed pitches.
+    #[test]
+    fn concurrent_moves_by_two_authors_converge_deterministically() {
+        let mut a = Peer::new(&SEED_A);
+        let mut b = Peer::new(&SEED_B);
+        let put = a.sign(
+            1,
+            vec![],
+            PutPiece {
+                emoji: "🌵".into(),
+                pitch: tet_pitch(60),
+            },
+        );
+        let piece = put.id();
+        // A and B each move the piece observing only the put -> mutually concurrent.
+        let a_mov = a.sign(
+            2,
+            vec![put.hash()],
+            MovePiece {
+                piece,
+                pitch: tet_pitch(67),
+            },
+        );
+        let b_mov = b.sign(
+            3,
+            vec![put.hash()],
+            MovePiece {
+                piece,
+                pitch: tet_pitch(65),
+            },
+        );
+        let ops = vec![put, a_mov, b_mov];
+
+        let store_fwd = ingest_in_order(&ops, &[0, 1, 2]);
+        let store_rev = ingest_in_order(&ops, &[2, 1, 0]);
+
+        assert_eq!(
+            store_fwd.view(),
+            store_rev.view(),
+            "opposite ingest orders converge"
+        );
+        assert_eq!(entryhash_set(&store_fwd), entryhash_set(&store_rev));
+        let pitch = store_fwd.view().pieces[&piece].pitch;
+        assert!(
+            pitch == tet_pitch(67) || pitch == tet_pitch(65),
+            "position is one of the two concurrent moves, chosen deterministically"
+        );
+        assert_parity(&ops);
+    }
+
+    /// Author A creates a piece; a DIFFERENT author B removes it (observing the
+    /// put). Both peers, in opposite ingest orders, converge to the piece being
+    /// gone — shared removes are cross-author observed-removes.
+    #[test]
+    fn non_owner_remove_converges_removed() {
+        let mut a = Peer::new(&SEED_A);
+        let mut b = Peer::new(&SEED_B);
+        let put = a.sign(
+            1,
+            vec![],
+            PutPiece {
+                emoji: "🌵".into(),
+                pitch: tet_pitch(60),
+            },
+        );
+        let piece = put.id();
+        let b_rem = b.sign(2, vec![put.hash()], RemovePiece { piece });
+        let ops = vec![put, b_rem];
+
+        let store_fwd = ingest_in_order(&ops, &[0, 1]);
+        let store_rev = ingest_in_order(&ops, &[1, 0]);
+
+        assert_eq!(store_fwd.view(), store_rev.view(), "peers converge");
+        assert_eq!(entryhash_set(&store_fwd), entryhash_set(&store_rev));
+        for (name, store) in [("fwd", &store_fwd), ("rev", &store_rev)] {
+            assert!(
+                !store.view().pieces.contains_key(&piece),
+                "{name}: a non-owner remove takes effect (piece gone)"
+            );
+        }
+        assert_parity(&ops);
+    }
+
+    /// A move whose causal past is locked is suppressed: the piece stays at its
+    /// original position on both peers. `pieces_locked` is the consent gate.
+    #[test]
+    fn move_under_pieces_locked_is_a_noop() {
+        let mut a = Peer::new(&SEED_A);
+        let mut b = Peer::new(&SEED_B);
+        let put = a.sign(
+            1,
+            vec![],
+            PutPiece {
+                emoji: "🌵".into(),
+                pitch: tet_pitch(60),
+            },
+        );
+        let piece = put.id();
+        // Lock pieces, observing the put.
+        let lock = a.sign(
+            2,
+            vec![put.hash()],
+            SetConfig {
+                pieces_locked: Some(true),
+                available_emojis: None,
+            },
+        );
+        // B moves the piece AFTER observing the lock -> suppressed.
+        let b_mov = b.sign(
+            3,
+            vec![lock.hash()],
+            MovePiece {
+                piece,
+                pitch: tet_pitch(64),
+            },
+        );
+        let ops = vec![put, lock, b_mov];
+
+        let store_fwd = ingest_in_order(&ops, &[0, 1, 2]);
+        let store_rev = ingest_in_order(&ops, &[2, 1, 0]);
+
+        assert_eq!(store_fwd.view(), store_rev.view(), "peers converge");
+        assert_eq!(entryhash_set(&store_fwd), entryhash_set(&store_rev));
+        for (name, store) in [("fwd", &store_fwd), ("rev", &store_rev)] {
+            let view = store.view();
+            assert!(view.pieces_locked, "{name}: the room is locked");
+            assert_eq!(
+                view.pieces[&piece].pitch,
+                tet_pitch(60),
+                "{name}: a move whose past is locked is a no-op"
+            );
+        }
+        assert_parity(&ops);
+    }
+
+    /// The lock is a CAUSAL gate, not a global freeze: a move CONCURRENT with the
+    /// lock (neither observed the other) still applies — an op cannot be
+    /// retroactively frozen by a lock it did not causally precede. The room still
+    /// ends up locked; only the concurrent move slips through. Deterministic on
+    /// both peers.
+    #[test]
+    fn move_concurrent_with_lock_still_applies() {
+        let mut a = Peer::new(&SEED_A);
+        let mut b = Peer::new(&SEED_B);
+        let put = a.sign(
+            1,
+            vec![],
+            PutPiece {
+                emoji: "🌵".into(),
+                pitch: tet_pitch(60),
+            },
+        );
+        let piece = put.id();
+        // A locks the room observing only the put.
+        let lock = a.sign(
+            2,
+            vec![put.hash()],
+            SetConfig {
+                pieces_locked: Some(true),
+                available_emojis: None,
+            },
+        );
+        // B moves observing only the put -> concurrent with the lock.
+        let b_mov = b.sign(
+            3,
+            vec![put.hash()],
+            MovePiece {
+                piece,
+                pitch: tet_pitch(64),
+            },
+        );
+        let ops = vec![put, lock, b_mov];
+
+        let store_fwd = ingest_in_order(&ops, &[0, 1, 2]);
+        let store_rev = ingest_in_order(&ops, &[2, 1, 0]);
+
+        assert_eq!(store_fwd.view(), store_rev.view(), "peers converge");
+        for (name, store) in [("fwd", &store_fwd), ("rev", &store_rev)] {
+            let view = store.view();
+            assert!(view.pieces_locked, "{name}: the room ends up locked");
+            assert_eq!(
+                view.pieces[&piece].pitch,
+                tet_pitch(64),
+                "{name}: a move concurrent with the lock still applies"
+            );
+        }
+        assert_parity(&ops);
     }
 
     #[test]
@@ -1182,7 +1448,7 @@ mod tests {
         assert_eq!(
             piece.pitch,
             tet_pitch(72),
-            "owner move wins over non-owner move"
+            "later causal move wins under shared pieces (A observed B's move)"
         );
         assert!(view.tuning.is_some());
         assert!(view.pieces_locked);

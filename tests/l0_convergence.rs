@@ -167,11 +167,14 @@ fn w4_concurrent_tuning_tiebreak_across_partition() {
     net.assert_converged();
 }
 
-/// W5 — owner gating cross-node, including the before-put (defer) order. A owns a
-/// piece; B's move/remove of it are ignored; and a third peer that receives B's
-/// ops before the put defers them until the put arrives.
+/// W5 (shared pieces) — cross-node non-owner writes take effect, including the
+/// before-put (defer) order. A creates a piece; non-owner B moves then removes
+/// it; a third peer C that receives B's ops before the put defers them until the
+/// put arrives, then converges. Under shared semantics B's remove (causally after
+/// its own move, so it observed both put and move) wins: the piece is gone on
+/// every peer. `owner` never gated anything.
 #[test]
-fn w5_owner_gating_cross_node_defer_before_put() {
+fn w5_shared_non_owner_writes_cross_node_defer_before_put() {
     let mut net = SimNet::new(4, &["A", "B", "C"], Policy::Fifo);
     net.partition("A", "C");
     net.partition("B", "C"); // isolate the late peer C
@@ -193,7 +196,7 @@ fn w5_owner_gating_cross_node_defer_before_put() {
             pitch: tet_pitch(61),
         },
     ); // non-owner, observes put
-    let rm = net.act("B", RemovePiece { piece: piece_id }); // non-owner
+    let rm = net.act("B", RemovePiece { piece: piece_id }); // non-owner, observes the move
     net.step_until_quiescent(); // A receives mv, rm
 
     net.heal();
@@ -212,15 +215,17 @@ fn w5_owner_gating_cross_node_defer_before_put() {
     );
 
     net.assert_converged();
-    let view = net.view("A");
-    let piece = view.pieces.values().next().expect("piece is live");
-    assert_eq!(piece.owner, net.author("A"), "piece is owned by A");
-    assert_eq!(piece.pitch, tet_pitch(60), "non-owner move is ignored");
-    assert_eq!(view.pieces.len(), 1, "non-owner remove is ignored");
+    // Shared: B's remove observed both the put and its own move -> the piece is
+    // observed-removed on every peer, non-owner writes and all.
+    assert!(
+        net.view("A").pieces.is_empty(),
+        "a non-owner move+remove takes effect across nodes"
+    );
 }
 
-/// W6 — remove/unremove race across a partition. The greatest-seq owner lifecycle
-/// op decides liveness; both terminal states are exercised.
+/// W6 — remove/unremove race across a partition. Observed-remove lifecycle: an
+/// unremove that observed the remove overrides it (alive); a bare remove that
+/// observed the put kills it (dead). Both terminal states are exercised.
 #[test]
 fn w6_remove_unremove_race_across_partition() {
     // Variant 1: ...put, remove, UNremove -> alive.
@@ -245,7 +250,7 @@ fn w6_remove_unremove_race_across_partition() {
         assert_eq!(
             net.view("B").pieces.len(),
             1,
-            "unremove is the greatest-seq op -> alive"
+            "the unremove observed the remove -> override -> alive"
         );
     }
     // Variant 2: ...put, remove -> dead.
@@ -267,7 +272,7 @@ fn w6_remove_unremove_race_across_partition() {
         net.assert_converged();
         assert!(
             net.view("B").pieces.is_empty(),
-            "remove is the greatest-seq op -> dead"
+            "a bare remove that observed the put -> dead"
         );
     }
 }
