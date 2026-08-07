@@ -8,15 +8,18 @@
 //! seam either way.
 //!
 //! Differences from the desktop runtime, all deliberate:
-//! * no op journal — the store is rebuilt from peers via anti-entropy, so a
-//!   lone tab's history does not survive a reload (yet);
+//! * a signed-op journal in IndexedDB, keyed by the room topic hex, rather than
+//!   the desktop file journal (`src/room/journal.rs`): the store is seeded from
+//!   it on start and it grows on every admitted op, so a lone tab keeps its
+//!   history across a reload. It is additive to gossip + anti-entropy — peers
+//!   still converge exactly as before;
 //! * no native MIDI — the browser keeps Web MIDI, so MIDI commands are
 //!   acknowledged and ignored;
 //! * relay-only reachability (see [`crate::net::browser`]).
 
 use std::{
     cell::{Cell, RefCell},
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     rc::Rc,
     time::Duration,
 };
@@ -43,7 +46,7 @@ use crate::{
         SyncOutcome, SyncStoreAccess, WalkieIdentity, drive_initiator, drive_responder,
     },
     room::{
-        ops::{AuthorId, SignedOp, SigningKey, WalkieOp, verify_signed_op_for_topic},
+        ops::{AuthorId, OpId, SignedOp, SigningKey, WalkieOp, verify_signed_op_for_topic},
         presence::{PresenceBody, SignedPresence},
         store::{RoomStore, RoomView},
     },
@@ -292,12 +295,20 @@ impl BrowserHost {
         self.stop_active_room().await;
 
         let topic_string = config.topic.to_string();
+        // The IndexedDB journal key. `to_string()` and `to_hex()` are the same
+        // hex here, but name the key by its contract: keyed by room topic hex.
+        let topic_hex = config.topic.to_hex();
         let presence_topic = *config.topic.as_bytes();
         let bootstrap = config.bootstrap.as_ref().map(|address| address.id);
 
-        // No journal in a browser: an empty store, converged via gossip +
-        // anti-entropy once the first peer appears.
+        // Signed-op journal: rather than converge from empty, seed the store
+        // from this room's IndexedDB journal so a solo reload keeps its history
+        // with no peer present, then grow the journal on every admitted op.
+        // Additive to gossip + anti-entropy; a read/write failure just falls
+        // back to the old empty-then-converge behavior.
         let store = Rc::new(RefCell::new(RoomStore::new()));
+        let journal = Rc::new(RefCell::new(RoomJournal::new(topic_hex.clone())));
+        rehydrate_from_journal(&store, &journal, &topic_hex, &topic_string, self).await;
 
         let mut network = BrowserRoomNetwork::bind(self.identity.iroh_secret(), config)
             .await
@@ -386,6 +397,7 @@ impl BrowserHost {
             let alive = alive.clone();
             let presence_order = presence_order.clone();
             let signing_key = signing_key.clone();
+            let journal = journal.clone();
             let mut shutdown_tx = Some(shutdown_tx);
             spawn_local(async move {
                 let mut local_presence_session = 0_u64;
@@ -393,9 +405,16 @@ impl BrowserHost {
                 loop {
                     match control_rx.next().await {
                         Some(RoomControl::Commit { op, response }) => {
-                            let result =
-                                commit_room_op(&store, &signing_key, &topic, op, &handle, &host)
-                                    .await;
+                            let result = commit_room_op(
+                                &store,
+                                &signing_key,
+                                &topic,
+                                op,
+                                &handle,
+                                &host,
+                                &journal,
+                            )
+                            .await;
                             let _ = response.send(
                                 result.map(|accepted_sequence| CommandAck { accepted_sequence }),
                             );
@@ -477,6 +496,7 @@ impl BrowserHost {
             let topic = topic_string.clone();
             let peers = peers.clone();
             let presence_order = presence_order.clone();
+            let journal = journal.clone();
             let mut shutdown_rx = shutdown_rx;
             let rendezvous_guard = rendezvous;
             spawn_local(async move {
@@ -526,6 +546,7 @@ impl BrowserHost {
                             spawn_repair(
                                 host.clone(),
                                 store.clone(),
+                                journal.clone(),
                                 topic.clone(),
                                 repair,
                                 false,
@@ -554,6 +575,7 @@ impl BrowserHost {
                                     Ok(repair) => spawn_repair(
                                         host.clone(),
                                         store.clone(),
+                                        journal.clone(),
                                         topic.clone(),
                                         repair,
                                         true,
@@ -597,11 +619,15 @@ impl BrowserHost {
                                                 "received a valid operation through a forwarding neighbor",
                                             );
                                         }
+                                        let id = verified.id();
                                         let view = {
                                             let mut store = store.borrow_mut();
                                             store.ingest_verified(verified);
                                             store.view()
                                         };
+                                        // Admitted (verified + kept): journal the
+                                        // verbatim bytes so a solo reload keeps it.
+                                        journal_admit(&journal, id, bytes);
                                         host.apply_room_view(view);
                                     }
                                     Err(error) => host
@@ -1125,6 +1151,118 @@ impl BrowserHost {
     }
 }
 
+/// A room's local signed-op journal: the in-memory mirror of what is persisted
+/// to IndexedDB under the room topic hex. Additive and behavior-preserving — it
+/// seeds the store on start and grows on every admitted op so a lone reloader
+/// keeps their history; it never touches op semantics, gossip, or RBSR.
+///
+/// Deduped by op id, so re-noting a known op (duplicate gossip, a repair that
+/// re-delivers what we already hold) is a no-op. Its lifetime is the room's:
+/// each room owns one keyed to its own topic, so switching rooms cannot
+/// cross-contaminate.
+struct RoomJournal {
+    /// The room topic hex — the IndexedDB key this journal persists under.
+    topic_hex: String,
+    /// Op ids already recorded, for idempotent notes.
+    known: BTreeSet<OpId>,
+    /// Verbatim signed-op wire bytes, in admit order — exactly what each author
+    /// produced, so a rehydrated op is byte-identical for anti-entropy.
+    records: Vec<Vec<u8>>,
+}
+
+impl RoomJournal {
+    fn new(topic_hex: String) -> Self {
+        Self {
+            topic_hex,
+            known: BTreeSet::new(),
+            records: Vec::new(),
+        }
+    }
+
+    /// Record an admitted op's verbatim bytes. Idempotent by op id: returns
+    /// `true` iff the op was newly added (so the caller should persist), `false`
+    /// if it was already journaled.
+    fn note(&mut self, id: OpId, wire_bytes: Vec<u8>) -> bool {
+        if !self.known.insert(id) {
+            return false;
+        }
+        self.records.push(wire_bytes);
+        true
+    }
+}
+
+/// Persist the journal's current records to IndexedDB off the hot path. A write
+/// failure is logged and swallowed — the journal is a best-effort local cache
+/// backstopped by anti-entropy, so it must never block or fail room activity.
+fn persist_journal(journal: &Rc<RefCell<RoomJournal>>) {
+    let (topic_hex, records) = {
+        let journal = journal.borrow();
+        (journal.topic_hex.clone(), journal.records.clone())
+    };
+    spawn_local(async move {
+        if let Err(error) = super::storage::set_op_journal(&topic_hex, &records).await {
+            web_sys::console::warn_1(
+                &format!("op journal write failed (history may not survive reload): {error}")
+                    .into(),
+            );
+        }
+    });
+}
+
+/// Note one admitted op and persist iff it was new. Used by the single-op admit
+/// paths (local commit, one gossip frame).
+fn journal_admit(journal: &Rc<RefCell<RoomJournal>>, id: OpId, wire_bytes: Vec<u8>) {
+    if journal.borrow_mut().note(id, wire_bytes) {
+        persist_journal(journal);
+    }
+}
+
+/// Seed the store (and the in-memory journal mirror) from the IndexedDB journal
+/// before the network comes up, so the projection paints restored state with no
+/// peer present. Malformed or unverifiable records are skipped; the store dedups
+/// and strict-defers, so replay is idempotent and order-independent.
+async fn rehydrate_from_journal(
+    store: &Rc<RefCell<RoomStore>>,
+    journal: &Rc<RefCell<RoomJournal>>,
+    topic_hex: &str,
+    verify_topic: &str,
+    host: &BrowserHost,
+) {
+    let records = super::storage::get_op_journal(topic_hex).await;
+    if records.is_empty() {
+        return;
+    }
+    let mut restored = 0usize;
+    let mut skipped = 0usize;
+    {
+        let mut store = store.borrow_mut();
+        let mut journal = journal.borrow_mut();
+        for bytes in records {
+            let Ok(signed) = SignedOp::from_wire_bytes(&bytes) else {
+                skipped += 1;
+                continue;
+            };
+            let Ok(verified) = verify_signed_op_for_topic(&signed, verify_topic) else {
+                skipped += 1;
+                continue;
+            };
+            let id = verified.id();
+            store.ingest_verified(verified);
+            journal.note(id, bytes);
+            restored += 1;
+        }
+    }
+    host.emit_diagnostic(
+        "journal_restored",
+        &format!("restored {restored} operation(s) from the local journal ({skipped} skipped)"),
+    );
+    // If any records were dropped, rewrite the compacted journal so the on-disk
+    // blob stays clean; harmless if everything was valid (identical bytes).
+    if skipped > 0 {
+        persist_journal(journal);
+    }
+}
+
 /// Dial a peer and open the one bi-stream a repair session runs over.
 async fn dial_repair(
     handle: &BrowserNetHandle,
@@ -1147,6 +1285,7 @@ async fn dial_repair(
 fn spawn_repair(
     host: Rc<BrowserHost>,
     store: Rc<RefCell<RoomStore>>,
+    journal: Rc<RefCell<RoomJournal>>,
     topic: String,
     repair: BrowserIncomingRepair,
     initiator: bool,
@@ -1155,7 +1294,7 @@ fn spawn_repair(
         let endpoint_id = repair.endpoint_id;
         let telemetry_connection = repair.connection.clone();
         let stream = repair.stream.owning(repair.connection);
-        match run_repair_session(stream, initiator, store, topic, host.clone()).await {
+        match run_repair_session(stream, initiator, store, journal, topic, host.clone()).await {
             Ok(ingested) => {
                 if let Some(rtt) = telemetry_connection.rtt(iroh::endpoint::PathId::ZERO) {
                     host.update_peer_rtt(endpoint_id, rtt);
@@ -1184,6 +1323,7 @@ fn spawn_repair(
 /// session.
 struct BrowserSyncStore {
     store: Rc<RefCell<RoomStore>>,
+    journal: Rc<RefCell<RoomJournal>>,
     host: Rc<BrowserHost>,
 }
 
@@ -1198,14 +1338,17 @@ impl SyncStoreAccess for BrowserSyncStore {
         pairs: &[(EntryHash, Vec<u8>)],
         source: &mut RoomSyncSource,
     ) -> SyncApply {
-        let (admitted, lifted, view) = {
+        let (admitted, lifted, view, journal_dirty) = {
             let mut store = self.store.borrow_mut();
+            let mut journal = self.journal.borrow_mut();
             // The session's admitted set: every hash verified and KEPT (lifted
             // or parked). Undecodable or unverifiable pairs are left out, which
-            // is what makes them eligible to be asked for again. No journal in
-            // a browser, so "kept" needs no durability gate.
+            // is what makes them eligible to be asked for again. Every admitted
+            // op is also noted in the journal (idempotent by op id) so a solo
+            // reload keeps repair-delivered history.
             let mut admitted = Vec::new();
             let mut lifted = Vec::new();
+            let mut journal_dirty = false;
             for (wire_hash, bytes) in pairs {
                 let Ok(signed) = SignedOp::from_wire_bytes(bytes) else {
                     continue;
@@ -1214,6 +1357,7 @@ impl SyncStoreAccess for BrowserSyncStore {
                     continue;
                 };
                 let id = verified.id();
+                journal_dirty |= journal.note(id, bytes.clone());
                 if let Some(entry) = store.lifted_entry(id) {
                     admitted.push(entry);
                     continue;
@@ -1232,8 +1376,12 @@ impl SyncStoreAccess for BrowserSyncStore {
             }
             source.absorb(&store, &lifted);
             let view = store.view();
-            (admitted, lifted, view)
+            (admitted, lifted, view, journal_dirty)
         };
+        // One IndexedDB write per session, not per op.
+        if journal_dirty {
+            persist_journal(&self.journal);
+        }
         if !lifted.is_empty() {
             self.host.apply_room_view(view);
         }
@@ -1250,11 +1398,13 @@ async fn run_repair_session(
     stream: IrohSyncStream,
     initiator: bool,
     store: Rc<RefCell<RoomStore>>,
+    journal: Rc<RefCell<RoomJournal>>,
     topic: String,
     host: Rc<BrowserHost>,
 ) -> Result<usize, String> {
     let mut access = BrowserSyncStore {
         store,
+        journal,
         host: host.clone(),
     };
     let limits = SyncLimits::default();
@@ -1287,6 +1437,7 @@ async fn commit_room_op(
     op: WalkieOp,
     handle: &BrowserNetHandle,
     host: &Rc<BrowserHost>,
+    journal: &Rc<RefCell<RoomJournal>>,
 ) -> Result<u64, AppError> {
     let (signed, view) = {
         let mut store = store.borrow_mut();
@@ -1295,6 +1446,11 @@ async fn commit_room_op(
     };
     match signed.to_wire_bytes() {
         Ok(bytes) => {
+            // Admitted (a just-committed op is always kept): journal the verbatim
+            // bytes before broadcast so history survives a solo reload.
+            if let Ok(verified) = verify_signed_op_for_topic(&signed, topic) {
+                journal_admit(journal, verified.id(), bytes.clone());
+            }
             if let Err(error) = handle.broadcast(bytes).await {
                 host.emit_diagnostic(
                     "gossip_broadcast",

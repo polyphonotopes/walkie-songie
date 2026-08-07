@@ -288,3 +288,145 @@ pub async fn set_room_state(room_name: &str, state: &[u8]) -> Result<(), String>
 
     rx.await.map_err(|_| "Channel closed")?
 }
+
+// ---------------------------------------------------------------------------
+// Signed-op journal
+//
+// A per-room, additive cache of the room's admitted signed ops, keyed by the
+// room topic hex. It seeds the `RoomStore` on start so a solo reload keeps its
+// history, and grows on every admitted op. It is stored as ONE blob per topic
+// under the existing settings object store (same simple get/put path as
+// `get_room_state`/`set_room_state`), framed as length-prefixed records that
+// mirror the native file journal: `u32-le length ++ verbatim signed-op wire
+// bytes` per record. A read/write failure degrades gracefully — the store just
+// starts empty and reconverges via gossip + anti-entropy, exactly as before.
+// ---------------------------------------------------------------------------
+
+/// The settings-store key holding a room's signed-op journal blob.
+#[cfg(feature = "browser-net")]
+fn op_journal_key(topic_hex: &str) -> String {
+    format!("opjournal:{topic_hex}")
+}
+
+/// Frame verbatim signed-op wire records into a single blob.
+#[cfg(feature = "browser-net")]
+fn encode_op_journal(records: &[Vec<u8>]) -> Vec<u8> {
+    let total: usize = records.iter().map(|record| record.len() + 4).sum();
+    let mut out = Vec::with_capacity(total);
+    for record in records {
+        out.extend_from_slice(&(record.len() as u32).to_le_bytes());
+        out.extend_from_slice(record);
+    }
+    out
+}
+
+/// Recover verbatim signed-op wire records from a journal blob. A torn tail
+/// (partial length or record) simply stops parsing — the completed prefix is
+/// returned and anti-entropy backfills the rest.
+#[cfg(feature = "browser-net")]
+fn decode_op_journal(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let mut records = Vec::new();
+    let mut offset = 0usize;
+    while offset + 4 <= bytes.len() {
+        let length = u32::from_le_bytes(
+            bytes[offset..offset + 4]
+                .try_into()
+                .expect("checked four bytes"),
+        ) as usize;
+        offset += 4;
+        let Some(end) = offset.checked_add(length) else {
+            break;
+        };
+        if end > bytes.len() {
+            break;
+        }
+        records.push(bytes[offset..end].to_vec());
+        offset = end;
+    }
+    records
+}
+
+/// Load a byte blob from the settings store, or `None` on absence/failure.
+#[cfg(feature = "browser-net")]
+async fn get_bytes(key: &str) -> Option<Vec<u8>> {
+    let db = open_db().await.ok()?;
+
+    let transaction = db.transaction_with_str(STORE_NAME).ok()?;
+    let store: IdbObjectStore = transaction.object_store(STORE_NAME).ok()?;
+
+    let request = store.get(&JsValue::from_str(key)).ok()?;
+
+    let (tx, rx) = futures::channel::oneshot::channel();
+    let tx = std::cell::RefCell::new(Some(tx));
+
+    let onsuccess = Closure::once(Box::new(move |event: web_sys::Event| {
+        let target = event.target().unwrap();
+        let request: IdbRequest = target.unchecked_into();
+        let result = request.result().ok();
+        let bytes = result.and_then(|v| {
+            if v.is_undefined() || v.is_null() {
+                return None;
+            }
+            let arr = js_sys::Uint8Array::new(&v);
+            Some(arr.to_vec())
+        });
+        if let Some(tx) = tx.borrow_mut().take() {
+            let _ = tx.send(bytes);
+        }
+    }) as Box<dyn FnOnce(_)>);
+    request.set_onsuccess(Some(onsuccess.as_ref().unchecked_ref()));
+    onsuccess.forget();
+
+    rx.await.ok().flatten()
+}
+
+/// Write a byte blob to the settings store under `key`.
+#[cfg(feature = "browser-net")]
+async fn set_bytes(key: &str, bytes: &[u8]) -> Result<(), String> {
+    let db = open_db().await?;
+
+    let transaction = db
+        .transaction_with_str_and_mode(STORE_NAME, web_sys::IdbTransactionMode::Readwrite)
+        .map_err(|_| "Failed to create transaction")?;
+    let store: IdbObjectStore = transaction
+        .object_store(STORE_NAME)
+        .map_err(|_| "Failed to get store")?;
+
+    let arr = js_sys::Uint8Array::from(bytes);
+    let request = store
+        .put_with_key(&arr, &JsValue::from_str(key))
+        .map_err(|_| "Failed to put")?;
+
+    let (tx, rx) = futures::channel::oneshot::channel();
+    let tx = std::cell::RefCell::new(Some(tx));
+
+    let onsuccess = Closure::once(Box::new(move |_event: web_sys::Event| {
+        if let Some(tx) = tx.borrow_mut().take() {
+            let _ = tx.send(Ok(()));
+        }
+    }) as Box<dyn FnOnce(_)>);
+    request.set_onsuccess(Some(onsuccess.as_ref().unchecked_ref()));
+    onsuccess.forget();
+
+    rx.await.map_err(|_| "Channel closed")?
+}
+
+/// Load a room's journaled signed-op wire records, keyed by the room topic hex.
+/// Each entry is the exact verbatim bytes an author signed. Returns an empty
+/// vec on absence or any failure — the caller then starts from an empty store.
+#[cfg(feature = "browser-net")]
+pub async fn get_op_journal(topic_hex: &str) -> Vec<Vec<u8>> {
+    match get_bytes(&op_journal_key(topic_hex)).await {
+        Some(blob) => decode_op_journal(&blob),
+        None => Vec::new(),
+    }
+}
+
+/// Persist a room's signed-op journal, keyed by the room topic hex. `records`
+/// are the verbatim signed-op wire bytes in admit order. An error is returned
+/// so the caller can log and continue; the journal is a best-effort local
+/// cache and never blocks room entry.
+#[cfg(feature = "browser-net")]
+pub async fn set_op_journal(topic_hex: &str, records: &[Vec<u8>]) -> Result<(), String> {
+    set_bytes(&op_journal_key(topic_hex), &encode_op_journal(records)).await
+}
