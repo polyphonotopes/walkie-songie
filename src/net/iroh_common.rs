@@ -10,7 +10,7 @@
 
 use std::{fmt, str::FromStr, time::Duration};
 
-use iroh::{EndpointAddr, EndpointId, RelayMode, RelayUrl};
+use iroh::{EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode, RelayUrl};
 use iroh_gossip::TopicId;
 use iroh_tickets::{ParseError as TicketParseError, Ticket, endpoint::EndpointTicket};
 use serde::{Deserialize, Serialize};
@@ -123,7 +123,18 @@ impl Default for RelayPolicy {
 impl RelayPolicy {
     pub(crate) fn to_iroh(&self) -> Result<RelayMode, NativeNetError> {
         match self {
-            Self::Production => Ok(RelayMode::custom([parse_relay(PRODUCTION_RELAY_URL)?])),
+            Self::Production => {
+                // Primary home relay is the self-hosted, token-restricted relay.
+                // n0 is intentionally NOT mixed into this map: its relays don't
+                // mesh with ours, so a peer that landed on an n0 home would never
+                // meet a peer on ours. True n0 fallback belongs at the app level
+                // (re-bind with `N0Development` only when this relay is down).
+                let mut relay: RelayConfig = parse_relay(PRODUCTION_RELAY_URL)?.into();
+                if let Some(token) = relay_auth_token() {
+                    relay = relay.with_auth_token(token);
+                }
+                Ok(RelayMode::Custom(RelayMap::from_iter([relay])))
+            }
             Self::N0Development => Ok(RelayMode::Default),
             Self::Disabled => Ok(RelayMode::Disabled),
             Self::Custom(urls) if urls.is_empty() => Err(NativeNetError::InvalidRelay(
@@ -135,6 +146,23 @@ impl RelayPolicy {
                 .collect::<Result<Vec<_>, _>>()
                 .map(RelayMode::custom),
         }
+    }
+}
+
+/// Bearer token authenticating this client to the self-hosted production relay.
+///
+/// Injected at build time via the `WALKIE_RELAY_TOKEN` environment variable so
+/// the value is never committed to source. On native, iroh sends it as an
+/// `Authorization: Bearer` header; under wasm it rides as a `?token=` query
+/// parameter (browsers can't set WebSocket upgrade headers). Unset or empty
+/// yields `None`, and the restricted relay rejects the client as "not
+/// authorized". The token is a soft gate — it ships in the built artifact; see
+/// `docs/research/zk-relay-attestation.md` for the stronger Origin/attestation
+/// path.
+fn relay_auth_token() -> Option<&'static str> {
+    match option_env!("WALKIE_RELAY_TOKEN") {
+        Some(token) if !token.is_empty() => Some(token),
+        _ => None,
     }
 }
 
