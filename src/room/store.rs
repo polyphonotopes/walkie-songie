@@ -19,9 +19,16 @@
 //! Signature verification happens once, at ingest, against a [`VerifiedOp`];
 //! reads never re-verify.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
+// `ReachIndex` (the Θ(N²) kernel ancestor index) and the kernel `register`
+// resolver are now used ONLY by the `#[cfg(test)]` reference projection
+// (`view_reference`), which pins the cheap `Reach`-based `view()` bit-for-bit
+// against them. Production `view()` never materializes an ancestor closure.
+#[cfg(test)]
 use hhhs_core::cover::ReachIndex;
+#[cfg(test)]
 use hhhs_core::register;
 use hhhs_core::{AppendOutcome, DagRead, Entry, EntryHash, MemDagStore, Position};
 
@@ -436,10 +443,24 @@ impl RoomStore {
     }
 
     /// Materialize the room read model from the current DAG.
+    ///
+    /// The causal semantics are exactly those the `with_*` folds document; the
+    /// only performance-relevant choice here is the ancestry backend. Where this
+    /// used to build a whole-DAG [`ReachIndex`] — materializing a per-node
+    /// ancestor `BTreeSet` (Θ(N²) time and RAM) on EVERY call — it now builds a
+    /// lazy [`Reach`] (O(N + E) `prevs` adjacency) that answers the same
+    /// `is_ancestor`/register queries by reverse walk, memoized per call. The
+    /// projected [`RoomView`] is bit-for-bit identical (a `#[cfg(test)]`
+    /// equivalence test pins `view()` against [`Self::view_reference`]).
     pub fn view(&self) -> RoomView {
-        let snapshot = self.dag.snapshot();
-        let reach = ReachIndex::new(&snapshot);
+        self.project(&Reach::new(&self.dag))
+    }
 
+    /// The projection itself, generic over the ancestry backend. Both the
+    /// production [`Self::view`] (cheap [`Reach`]) and the reference
+    /// [`Self::view_reference`] (kernel [`ReachIndex`]) run this SAME code, so
+    /// the only thing that can differ between them is `is_ancestor`/`resolve`.
+    fn project<R: CausalPast>(&self, reach: &R) -> RoomView {
         RoomView {
             pitches: BTreeSet::new(),
             pitch_authors: BTreeMap::new(),
@@ -448,16 +469,166 @@ impl RoomStore {
             pieces_locked: false,
             available_emojis: None,
         }
-        .with_registers(self, &reach)
-        .with_pitches(self, &reach)
-        .with_pieces(self, &reach)
+        .with_registers(self, reach)
+        .with_pitches(self, reach)
+        .with_pieces(self, reach)
+    }
+
+    /// The PRE-CHANGE projection: the identical fold driven by the kernel
+    /// [`ReachIndex`] and [`hhhs_core::register::resolve`]. Retained as the
+    /// reference oracle the equivalence tests assert `view()` equals for
+    /// thousands of random histories, so any drift in the cheap `Reach` backend
+    /// is caught directly against the kernel it replaced.
+    #[cfg(test)]
+    pub(crate) fn view_reference(&self) -> RoomView {
+        let snapshot = self.dag.snapshot();
+        self.project(&ReachIndex::new(&snapshot))
+    }
+}
+
+/// The ONE causal question the room projection asks of the DAG: "is `a`
+/// strictly in the causal past of `b`?" — plus the register tiebreak that is a
+/// pure function of it.
+///
+/// `view()` consumes exactly this and nothing else of a reachability oracle (no
+/// ancestor enumeration, no covers), so abstracting it lets the SAME projection
+/// run on two ancestry backends: the cheap lazy [`Reach`] in production, and the
+/// kernel [`ReachIndex`] in the `#[cfg(test)]` reference. Equivalence of the two
+/// views is then a direct assertion rather than a re-derivation.
+trait CausalPast {
+    /// Strict causal ancestry: `true` iff `a` is a transitive `prevs`-ancestor
+    /// of `b`, present-only, and never reflexive (`is_ancestor(x, x) == false`).
+    /// Must agree with [`ReachIndex::is_ancestor`] for every pair.
+    fn is_ancestor(&self, a: &EntryHash, b: &EntryHash) -> bool;
+
+    /// The last-writer-wins register winner over `candidates`, resolved
+    /// identically to [`hhhs_core::register::resolve`]: drop any candidate that
+    /// is a strict causal ancestor of another (superseded), then break the
+    /// remaining mutually-concurrent maxima by the MAXIMUM raw-bytes
+    /// [`EntryHash`]. `None` iff `candidates` is empty.
+    ///
+    /// The default is the kernel rule expressed over [`Self::is_ancestor`], so a
+    /// backend whose `is_ancestor` matches the kernel resolves registers
+    /// identically to the kernel — no separate resolver to keep in sync.
+    fn resolve(&self, candidates: &BTreeSet<EntryHash>) -> Option<EntryHash> {
+        candidates
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                !candidates
+                    .iter()
+                    .any(|other| other != candidate && self.is_ancestor(candidate, other))
+            })
+            .max_by(|a, b| a.as_bytes().cmp(b.as_bytes()))
+    }
+}
+
+/// A cheap, lazy causal-ancestry oracle over the store's append-only op DAG.
+///
+/// It answers `is_ancestor(a, b)` with the SAME strict, present-only semantics
+/// as [`hhhs_core::cover::ReachIndex::is_ancestor`], but WITHOUT the Θ(N²) space
+/// `ReachIndex::new` pays to memoize a full ancestor `BTreeSet` for every node.
+/// Instead it keeps only the `prevs` adjacency — O(N + E), one pass over the
+/// snapshot — and answers each query by a reverse walk from `b` back through
+/// parent edges, short-circuiting when `a` is reached.
+///
+/// A per-instance memo caches, on first touch of a given `b`, that `b`'s full
+/// strict ancestor set, so repeated queries with the same `b` (the shape every
+/// call site has: one remover checked against many adds, one register candidate
+/// checked against the rest) walk `b`'s past at most once. The memo lives only
+/// for the [`RoomStore::view`] call that owns the `Reach` and is dropped with
+/// it; nothing Θ(N²) survives the call, and only the `b`s actually queried are
+/// ever materialized — a `view()` with no removes/registers materializes none.
+///
+/// Present-only, exactly as the kernel: an edge is followed only when its target
+/// is itself a present node (`parents.contains_key`). Walkie's lift path never
+/// admits a dangling `prevs` (a lift defers until every prev is present), so
+/// this never actually prunes for the store — but it keeps the answer identical
+/// to `ReachIndex` for any snapshot, which is what the oracle test asserts.
+struct Reach {
+    /// entry -> its causal parents (`header.prevs`). Keys are exactly the
+    /// present nodes, so a hash absent as a key is an absent (dangling) node.
+    parents: BTreeMap<EntryHash, Vec<EntryHash>>,
+    /// `b` -> `b`'s full strict, present-only ancestor set. Filled lazily; a
+    /// query is `memo[b].contains(a)`.
+    memo: RefCell<BTreeMap<EntryHash, BTreeSet<EntryHash>>>,
+}
+
+impl Reach {
+    /// Build the `prevs` adjacency in one pass over `dag`. O(N + E) time and
+    /// space — never the ancestor closure. The transient `Entry` clones from
+    /// [`DagRead::entries_topo`] are dropped as their `prevs` are extracted, so
+    /// this retains strictly less than the old `dag.snapshot()` + `ReachIndex`.
+    fn new(dag: &impl DagRead) -> Reach {
+        let parents = dag
+            .entries_topo()
+            .into_iter()
+            .map(|entry| (entry.hash(), entry.header.prevs.0.iter().copied().collect()))
+            .collect();
+        Reach {
+            parents,
+            memo: RefCell::new(BTreeMap::new()),
+        }
+    }
+
+    /// `b`'s strict, present-only ancestor set by reverse BFS over `parents`.
+    /// Excludes `b` itself (the walk starts from `b`'s parents), and follows an
+    /// edge only to a present target — matching `ReachIndex::ancestors(b)`.
+    fn ancestors_of(&self, b: &EntryHash) -> BTreeSet<EntryHash> {
+        let mut acc: BTreeSet<EntryHash> = BTreeSet::new();
+        let mut stack: Vec<EntryHash> = Vec::new();
+        if let Some(seed) = self.parents.get(b) {
+            for prev in seed {
+                if self.parents.contains_key(prev) && acc.insert(*prev) {
+                    stack.push(*prev);
+                }
+            }
+        }
+        while let Some(node) = stack.pop() {
+            if let Some(prevs) = self.parents.get(&node) {
+                for prev in prevs {
+                    if self.parents.contains_key(prev) && acc.insert(*prev) {
+                        stack.push(*prev);
+                    }
+                }
+            }
+        }
+        acc
+    }
+}
+
+impl CausalPast for Reach {
+    fn is_ancestor(&self, a: &EntryHash, b: &EntryHash) -> bool {
+        if let Some(history) = self.memo.borrow().get(b) {
+            return history.contains(a);
+        }
+        let history = self.ancestors_of(b);
+        let answer = history.contains(a);
+        self.memo.borrow_mut().insert(*b, history);
+        answer
+    }
+}
+
+/// The kernel `ReachIndex` as a [`CausalPast`] backend for the `#[cfg(test)]`
+/// reference projection. `is_ancestor` forwards to the kernel; `resolve`
+/// forwards to the REAL [`hhhs_core::register::resolve`] (not the trait
+/// default), so `view_reference` is the genuine pre-change behavior and the
+/// equivalence test has teeth.
+#[cfg(test)]
+impl CausalPast for ReachIndex {
+    fn is_ancestor(&self, a: &EntryHash, b: &EntryHash) -> bool {
+        ReachIndex::is_ancestor(self, a, b)
+    }
+
+    fn resolve(&self, candidates: &BTreeSet<EntryHash>) -> Option<EntryHash> {
+        register::resolve(candidates, self)
     }
 }
 
 impl RoomView {
     /// Pitches: content-keyed ADD-WINS. An add is live iff no same-key remove
     /// causally observed it (`is_ancestor(add, remove)`).
-    fn with_pitches(mut self, store: &RoomStore, reach: &ReachIndex) -> Self {
+    fn with_pitches<R: CausalPast>(mut self, store: &RoomStore, reach: &R) -> Self {
         let Some(active_tuning) = self
             .tuning
             .as_ref()
@@ -526,7 +697,7 @@ impl RoomView {
     ///   past; a move/remove *concurrent* with a lock (neither observed the other)
     ///   still applies — you cannot retroactively freeze an op you did not
     ///   causally precede. `PutPiece` is never suppressed.
-    fn with_pieces(mut self, store: &RoomStore, reach: &ReachIndex) -> Self {
+    fn with_pieces<R: CausalPast>(mut self, store: &RoomStore, reach: &R) -> Self {
         let Some(active_tuning) = self
             .tuning
             .as_ref()
@@ -576,7 +747,7 @@ impl RoomView {
                 .copied()
                 .filter(|write| reach.is_ancestor(write, op))
                 .collect();
-            register::resolve(&observed, reach).is_some_and(|winner| {
+            reach.resolve(&observed).is_some_and(|winner| {
                 matches!(
                     &store.decoded[&winner].op,
                     WalkieOp::SetConfig {
@@ -629,7 +800,8 @@ impl RoomView {
             }
 
             // Position = the register winner among the surviving adds' pitches.
-            let pitch = register::resolve(&surviving, reach)
+            let pitch = reach
+                .resolve(&surviving)
                 .map(|winner| match &store.decoded[&winner].op {
                     WalkieOp::PutPiece { pitch, .. } | WalkieOp::MovePiece { pitch, .. } => *pitch,
                     _ => unreachable!("a surviving add is a PutPiece or MovePiece"),
@@ -651,7 +823,7 @@ impl RoomView {
 
     /// Tuning / config: cross-author registers resolved by causal maxima then
     /// max raw-bytes entry hash. Each config field is resolved independently.
-    fn with_registers(mut self, store: &RoomStore, reach: &ReachIndex) -> Self {
+    fn with_registers<R: CausalPast>(mut self, store: &RoomStore, reach: &R) -> Self {
         let mut tuning_writes: BTreeSet<EntryHash> = BTreeSet::new();
         let mut locked_writes: BTreeSet<EntryHash> = BTreeSet::new();
         let mut emoji_writes: BTreeSet<EntryHash> = BTreeSet::new();
@@ -675,13 +847,15 @@ impl RoomView {
             }
         }
 
-        self.tuning = register::resolve(&tuning_writes, reach)
+        self.tuning = reach
+            .resolve(&tuning_writes)
             .map(|winner| match &store.decoded[&winner].op {
                 WalkieOp::SetTuning { definition } => definition.clone(),
                 _ => unreachable!("tuning candidate is a SetTuning"),
             })
             .or_else(|| Some(TuningDefinition::twelve_tet()));
-        self.pieces_locked = register::resolve(&locked_writes, reach)
+        self.pieces_locked = reach
+            .resolve(&locked_writes)
             .map(|winner| match &store.decoded[&winner].op {
                 WalkieOp::SetConfig {
                     pieces_locked: Some(locked),
@@ -690,7 +864,7 @@ impl RoomView {
                 _ => unreachable!("locked candidate carries pieces_locked"),
             })
             .unwrap_or(false);
-        self.available_emojis = register::resolve(&emoji_writes, reach).map(|winner| match &store
+        self.available_emojis = reach.resolve(&emoji_writes).map(|winner| match &store
             .decoded[&winner]
             .op
         {
@@ -1797,5 +1971,260 @@ mod tests {
         let store_rev = ingest_in_order(&ops, &reversed);
         assert_eq!(store_rev.ops_root(), store.ops_root());
         assert_eq!(store_rev.sync_root(), store.sync_root());
+    }
+}
+
+// =====================================================================
+// Correctness gate for the cheap `Reach` ancestry backend.
+//
+// The whole optimization rests on ONE claim: the lazy `Reach::is_ancestor`
+// (and the register `resolve` derived from it) answers IDENTICALLY to the
+// kernel `hhhs_core::cover::ReachIndex` it replaced, for every DAG. These
+// tests hammer that claim over thousands of seeded-random causal histories:
+//
+//   1. `reach_is_ancestor_matches_kernel_oracle` — for ALL (a, b) pairs.
+//   2. `resolve_matches_kernel_register`          — over random candidate sets.
+//   3. `view_equals_reference_and_oracle`         — the whole projection, i.e.
+//      `view()` (cheap `Reach`) == `view_reference()` (kernel `ReachIndex` +
+//      real `register::resolve`) == the INDEPENDENT op-graph `oracle`.
+//
+// The generator covers every op kind and, by stamping random `observed`
+// horizons drawn from prior ops, manufactures forks, deep chains, add-wins
+// races, piece lifecycles (put/move/remove/unremove), and locked/tuning
+// registers — the adversarial concurrency the semantics turn on.
+// =====================================================================
+#[cfg(test)]
+mod reach_equiv {
+    use std::collections::BTreeSet;
+
+    use hhhs_core::cover::ReachIndex;
+    use hhhs_core::{DagRead, EntryHash, register};
+
+    use super::super::ops::{OpId, VerifiedOp, WalkieOp};
+    use super::super::test_support::{
+        Peer, oracle, tet_definition, tet_degree, tet_pitch, tuning_with_step,
+    };
+    use super::{CausalPast, Reach, RoomStore};
+
+    /// A tiny deterministic splitmix64 PRNG, so every case is reproducible from
+    /// its seed and the whole suite is byte-stable across runs.
+    struct Rng(u64);
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03)
+        }
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn upto(&mut self, n: usize) -> usize {
+            if n == 0 { 0 } else { (self.next() % n as u64) as usize }
+        }
+        fn pct(&mut self, p: u64) -> bool {
+            self.next() % 100 < p
+        }
+    }
+
+    fn pick(ids: &[OpId], rng: &mut Rng) -> Option<OpId> {
+        if ids.is_empty() {
+            None
+        } else {
+            Some(ids[rng.upto(ids.len())])
+        }
+    }
+
+    /// A seeded-random causal history over `authors` peers and `steps` ops.
+    ///
+    /// Each op's `observed` horizon is a random subset of PRIOR op hashes, so
+    /// concurrency and forks arise naturally; piece/remove references target
+    /// already-created ids so lifecycles are exercised. Emitted in a valid
+    /// causal order (every reference precedes its use), so ingest never parks.
+    fn random_history(seed: u64, authors: usize, steps: usize) -> Vec<VerifiedOp> {
+        let mut rng = Rng::new(seed);
+        let mut peers: Vec<Peer> = (0..authors)
+            .map(|i| Peer::new(&[(i + 1) as u8; 32]))
+            .collect();
+        let emojis = ["🌵", "🎵", "🎹", "🎸"];
+
+        let mut out: Vec<VerifiedOp> = Vec::with_capacity(steps);
+        let mut op_hashes: Vec<[u8; 32]> = Vec::new();
+        let mut piece_ids: Vec<OpId> = Vec::new();
+        let mut remove_ids: Vec<OpId> = Vec::new();
+
+        for step in 0..steps {
+            let author = rng.upto(authors);
+
+            // Random observed horizon from prior ops (fork/concurrency source).
+            let mut observed: Vec<[u8; 32]> = Vec::new();
+            for h in &op_hashes {
+                if observed.len() >= 4 {
+                    break;
+                }
+                if rng.pct(28) {
+                    observed.push(*h);
+                }
+            }
+
+            // Degrees are drawn from a SMALL keyspace so add/remove races land
+            // on the same key (the add-wins path that runs `is_ancestor`).
+            let op = match rng.upto(10) {
+                0 | 1 => WalkieOp::AddDegree {
+                    pitch: tet_degree(rng.upto(3) as u16),
+                },
+                2 => WalkieOp::RemoveDegree {
+                    pitch: tet_degree(rng.upto(3) as u16),
+                },
+                3 => WalkieOp::PutPiece {
+                    emoji: emojis[rng.upto(emojis.len())].into(),
+                    pitch: tet_pitch(60 + rng.upto(5) as i32),
+                },
+                4 => match pick(&piece_ids, &mut rng) {
+                    Some(piece) => WalkieOp::MovePiece {
+                        piece,
+                        pitch: tet_pitch(60 + rng.upto(7) as i32),
+                    },
+                    None => WalkieOp::AddDegree { pitch: tet_degree(0) },
+                },
+                5 => match pick(&piece_ids, &mut rng) {
+                    Some(piece) => WalkieOp::RemovePiece { piece },
+                    None => WalkieOp::AddDegree { pitch: tet_degree(1) },
+                },
+                6 => match pick(&remove_ids, &mut rng) {
+                    Some(remove) => WalkieOp::UnremovePiece { remove },
+                    None => WalkieOp::AddDegree { pitch: tet_degree(2) },
+                },
+                7 => WalkieOp::SetConfig {
+                    pieces_locked: Some(rng.pct(50)),
+                    available_emojis: None,
+                },
+                8 => WalkieOp::SetConfig {
+                    pieces_locked: None,
+                    available_emojis: Some(emojis[rng.upto(emojis.len())].into()),
+                },
+                _ => WalkieOp::SetTuning {
+                    definition: if rng.pct(70) {
+                        tet_definition()
+                    } else {
+                        tuning_with_step(500 + 100 * rng.upto(3) as u16)
+                    },
+                },
+            };
+
+            let signed = peers[author].sign(1_000 + step as u64, observed, op.clone());
+            match &op {
+                WalkieOp::PutPiece { .. } => piece_ids.push(signed.id()),
+                WalkieOp::RemovePiece { .. } => remove_ids.push(signed.id()),
+                _ => {}
+            }
+            op_hashes.push(signed.hash());
+            out.push(signed);
+        }
+        out
+    }
+
+    fn store_of(ops: &[VerifiedOp]) -> RoomStore {
+        let mut store = RoomStore::new();
+        for op in ops {
+            store.ingest_verified(op.clone());
+        }
+        store
+    }
+
+    /// (1) `Reach::is_ancestor` == `ReachIndex::is_ancestor` for EVERY pair, over
+    /// thousands of random DAGs plus a batch of deep (N≈80) ones.
+    #[test]
+    fn reach_is_ancestor_matches_kernel_oracle() {
+        let mut cases = 0usize;
+        for seed in 0..1500u64 {
+            let authors = 2 + (seed as usize % 3);
+            let steps = 5 + (seed as usize % 10);
+            check_pairs(seed, authors, steps, &mut cases);
+        }
+        // Deep chains: exercise long ancestor walks and the memo.
+        for seed in 0..30u64 {
+            check_pairs(seed ^ 0xDEED_BEEF, 2, 60, &mut cases);
+        }
+        assert!(cases > 100_000, "expected a large pair count, got {cases}");
+    }
+
+    fn check_pairs(seed: u64, authors: usize, steps: usize, cases: &mut usize) {
+        let ops = random_history(seed, authors, steps);
+        let store = store_of(&ops);
+        assert_eq!(store.pending_len(), 0, "seed {seed}: all ops lift");
+        let reach = Reach::new(&store.dag);
+        let kernel = ReachIndex::new(&store.dag.snapshot());
+        let hashes: Vec<EntryHash> = store.entry_hashes().into_iter().collect();
+        for a in &hashes {
+            for b in &hashes {
+                assert_eq!(
+                    CausalPast::is_ancestor(&reach, a, b),
+                    ReachIndex::is_ancestor(&kernel, a, b),
+                    "seed {seed}: is_ancestor({}, {}) disagreement",
+                    a.to_hex(),
+                    b.to_hex()
+                );
+                *cases += 1;
+            }
+        }
+    }
+
+    /// (2) The `Reach`-derived register `resolve` == the kernel
+    /// `register::resolve`, over random candidate subsets of each DAG.
+    #[test]
+    fn resolve_matches_kernel_register() {
+        for seed in 0..1500u64 {
+            let ops = random_history(
+                seed ^ 0xA5A5_A5A5,
+                2 + (seed as usize % 3),
+                5 + (seed as usize % 10),
+            );
+            let store = store_of(&ops);
+            let reach = Reach::new(&store.dag);
+            let kernel = ReachIndex::new(&store.dag.snapshot());
+            let hashes: Vec<EntryHash> = store.entry_hashes().into_iter().collect();
+            let mut rng = Rng::new(seed ^ 0x1357_9BDF);
+            for _ in 0..8 {
+                let candidates: BTreeSet<EntryHash> = hashes
+                    .iter()
+                    .copied()
+                    .filter(|_| rng.pct(35))
+                    .collect();
+                assert_eq!(
+                    CausalPast::resolve(&reach, &candidates),
+                    register::resolve(&candidates, &kernel),
+                    "seed {seed}: register resolve disagreement",
+                );
+            }
+        }
+    }
+
+    /// (3) The whole projection: `view()` (cheap `Reach`) is bit-for-bit the
+    /// `view_reference()` (kernel `ReachIndex` + real `register::resolve`) AND
+    /// the INDEPENDENT op-graph `oracle`, over thousands of random histories
+    /// spanning every op kind with concurrent forks.
+    #[test]
+    fn view_equals_reference_and_oracle() {
+        for seed in 0..2000u64 {
+            let authors = 2 + (seed as usize % 3);
+            let steps = 6 + (seed as usize % 12);
+            let ops = random_history(seed, authors, steps);
+            let store = store_of(&ops);
+            assert_eq!(store.pending_len(), 0, "seed {seed}: all ops lift");
+
+            let produced = store.view();
+            assert_eq!(
+                produced,
+                store.view_reference(),
+                "seed {seed}: view() (Reach) != view_reference() (kernel ReachIndex)"
+            );
+            assert_eq!(
+                produced,
+                oracle(&ops),
+                "seed {seed}: view() != independent op-graph oracle"
+            );
+        }
     }
 }

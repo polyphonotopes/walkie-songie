@@ -69,5 +69,19 @@ fn main() {
         let store = support::store_from_ops(&support::linear_ops(n));
         row("view/linear", n, || store.view());
     }
+
+    // Query-heavy view(): one hot key with A adds and R removes, every op from a
+    // distinct author on an empty horizon, so NONE short-circuit — with_pitches
+    // runs all A·R `is_ancestor` verdicts. This is the path the new lazy `Reach`
+    // must serve; it materializes no persistent ancestor closure even here.
+    println!("\n=== reach_mem — query-heavy view() (hot key: every A·R is_ancestor verdict runs) ===");
+    for &(adds, removes) in &[(32usize, 32usize), (64, 64), (100, 100)] {
+        let store = support::store_from_ops(&support::hot_key_ops(adds, removes));
+        row(
+            &format!("view/hot_key[{adds}x{removes}]"),
+            adds + removes,
+            || store.view(),
+        );
+    }
     println!();
 }
