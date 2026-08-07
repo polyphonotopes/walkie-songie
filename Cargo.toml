@@ -69,8 +69,20 @@ browser-net = [
     "dep:iroh-tickets",
     "dep:n0-future",
     "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
     "dep:web-sys",
     "dep:js-sys",
+    # WebRTC-as-an-iroh-custom-transport (M4 direct peering). `iroh-base` names
+    # `CustomAddr`, `n0-watcher` names `Direct`/`Watchable` for `watch_local_addrs`,
+    # and `noq-udp` names `RecvMeta` in `CustomEndpoint::poll_recv` — all three
+    # appear in the iroh `CustomTransport` trait signatures, so the exact versions
+    # iroh 1.0.3 resolves must be direct deps for the types to unify. `send_wrapper`
+    # lets the `!Send` web-sys RTC handles satisfy the traits' `Send + Sync` bound
+    # on single-threaded wasm. See `src/net/webrtc_transport.rs`.
+    "dep:iroh-base",
+    "dep:n0-watcher",
+    "dep:noq-udp",
+    "dep:send_wrapper",
 ]
 native-net = [
     "dep:iroh",
@@ -197,12 +209,27 @@ wasm-bindgen-futures = { version = "0.4", optional = true }
 # (ring compiles to wasm32 with clang as CC_wasm32_unknown_unknown). iroh 1.0.3
 # gates its non-wasm deps out for `target_family = "wasm"`, so this links on
 # wasm32-unknown-unknown. See `src/net/browser.rs`.
-iroh = { version = "=1.0.3", default-features = false, features = ["tls-ring"], optional = true }
+# `unstable-custom-transports` (empty feature — pure API-gating, pulls no native
+# deps) unlocks `Endpoint::add_custom_transport` + the `CustomTransport` trait so
+# the browser can carry iroh's QUIC over a WebRTC data channel and peer directly,
+# off the relay (M4 direct-peering; docs/research/transport-agnostic-direct-peering-design.md).
+iroh = { version = "=1.0.3", default-features = false, features = ["tls-ring", "unstable-custom-transports"], optional = true }
 iroh-gossip = { version = "=0.101.0", default-features = false, features = ["net"], optional = true }
 iroh-tickets = { version = "=1.0.0", optional = true }
 # Runtime seams (spawn/sleep/timeout) that tokio provides on native: on wasm
 # these map to spawn_local + setTimeout. Same version iroh itself uses.
 n0-future = { version = "0.3", optional = true }
+
+# WebRTC custom transport support crates. Pinned to what iroh 1.0.3 resolves so
+# `CustomAddr`, `n0_watcher::Direct`/`Watchable`, and `noq_udp::RecvMeta` (all named
+# in the `CustomTransport`/`CustomEndpoint`/`CustomSender` trait signatures) unify
+# to iroh's own instances. `iroh-base` matches iroh's own feature selection.
+iroh-base = { version = "=1.0.3", default-features = false, features = ["key", "relay"], optional = true }
+n0-watcher = { version = "1.0", optional = true }
+noq-udp = { version = "1.1", default-features = false, optional = true }
+# Makes the `!Send` web-sys RTC handles (RtcPeerConnection/RtcDataChannel) satisfy
+# the transport traits' `Send + Sync` bound; sound because wasm32 is single-threaded.
+send_wrapper = { version = "0.6", optional = true }
 
 gloo-timers = { version = "0.3", features = ["futures"], optional = true }
 web-sys = { version = "0.3", optional = true, features = [
@@ -216,6 +243,10 @@ web-sys = { version = "0.3", optional = true, features = [
     "Navigator", "Clipboard", "Blob", "BlobPropertyBag", "Url",
     "WebSocket",
     "MessagePort", "MessageEvent", "EventTarget", "InputEvent",
+    "RtcPeerConnection", "RtcPeerConnectionState", "RtcPeerConnectionIceEvent",
+    "RtcDataChannel", "RtcDataChannelInit", "RtcDataChannelState", "RtcDataChannelType", "RtcDataChannelEvent",
+    "RtcConfiguration", "RtcSessionDescription", "RtcSessionDescriptionInit", "RtcSdpType",
+    "RtcIceCandidate", "RtcIceCandidateInit",
     "MidiAccess", "MidiInput", "MidiInputMap", "MidiOutput", "MidiOutputMap", "MidiMessageEvent", "MidiOptions",
     "KeyboardEvent", "FocusEvent", "PointerEvent", "DomRect",
     "MutationObserver", "MutationObserverInit", "MutationRecord",

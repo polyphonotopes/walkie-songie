@@ -238,6 +238,12 @@ pub(crate) async fn classify_peer_path(
         }
         match address.addr() {
             iroh::TransportAddr::Ip(_) => return PeerTransportPath::Direct,
+            // A WebRTC custom-transport path is a direct data-channel link (M4);
+            // without this arm iroh's non-IP/relay addresses fall through and a fast
+            // direct browser path would be misreported as `Connecting`. Any custom
+            // path is ours (walkie registers exactly one: WebRTC), so treat it as
+            // Direct — the honest reachability the UI meter should show.
+            iroh::TransportAddr::Custom(_) => return PeerTransportPath::Direct,
             iroh::TransportAddr::Relay(_) => active_relay = true,
             _ => {}
         }

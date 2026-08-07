@@ -37,6 +37,13 @@ const RENDEZVOUS_CHANNEL_PREFIX: &str = "walkie-rdv-v1-";
 const HELLO_KIND: &str = "walkie-hello";
 /// Hello payload version.
 const HELLO_VERSION: u32 = 1;
+/// Discriminator for a WebRTC signaling envelope (SDP offer/answer + ICE) riding
+/// the same channel as hellos. Non-`walkie-rtc` publishers are ignored; a peer that
+/// does not understand it never sees one (it is addressed by endpoint id).
+const RTC_KIND: &str = "walkie-rtc";
+/// WebRTC signaling envelope version.
+#[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+const RTC_VERSION: u32 = 1;
 /// Keepalive re-hello once our relay is known. Also refreshes peers' addressing
 /// and re-advertises us to anyone who joined since our last hello.
 const RE_HELLO_INTERVAL: Duration = Duration::from_secs(30);
@@ -86,6 +93,14 @@ pub struct RendezvousPeering {
     pub gossip_sender: GossipSender,
     /// The address lookup ticket joins already feed; rendezvous feeds it too.
     pub memory_lookup: MemoryLookup,
+    /// Signaling hooks for the browser WebRTC custom transport (M4 direct peering).
+    /// Present only on the browser build; `None` disables the extra pumping so the
+    /// rendezvous loop stays byte-identical to before when WebRTC is not configured.
+    /// The loop routes inbound `walkie-rtc` payloads into `commands` and publishes
+    /// the driver's outbound SDP/ICE, and — on discovering an rtc-capable peer —
+    /// seeds that peer's custom addr into `memory_lookup` and kicks a dial.
+    #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+    pub webrtc: Option<super::webrtc_transport::WebRtcSignalPort>,
 }
 
 // ---------------------------------------------------------------------------
@@ -97,7 +112,13 @@ pub struct RendezvousPeering {
 #[serde(tag = "type", rename_all = "lowercase")]
 enum ClientMessage {
     Subscribe { topics: Vec<String> },
-    Publish { topic: String, data: Hello },
+    /// `data` is an opaque JSON blob the server fans out verbatim. It carries either
+    /// a [`Hello`] or (browser only) a WebRTC signaling envelope, discriminated by
+    /// its `kind` field — so both kinds share the one publish shape.
+    Publish {
+        topic: String,
+        data: serde_json::Value,
+    },
     Pong,
 }
 
@@ -125,6 +146,26 @@ struct Hello {
     /// Home relay url, present once the relay handshake completes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     relay: Option<String>,
+    /// Whether this peer can answer a WebRTC offer (M4 direct peering). Absent means
+    /// "no" — unknown fields are ignored, so this is schema-compatible with older
+    /// peers, which simply never get offered to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rtc: Option<bool>,
+}
+
+/// A WebRTC signaling envelope (browser only). Addressed peer-to-peer over the
+/// fan-out channel: everyone receives it, only `to` acts on it. Discriminated from
+/// [`Hello`] by `kind == "walkie-rtc"`.
+#[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+#[derive(Serialize, Deserialize)]
+struct RtcEnvelope {
+    kind: String,
+    v: u32,
+    /// Sender endpoint id, 64-char lowercase hex.
+    from: String,
+    /// Recipient endpoint id, 64-char lowercase hex.
+    to: String,
+    payload: super::webrtc_transport::RtcPayload,
 }
 
 /// A minimal text-frame WebSocket the [`run_rendezvous`] loop drives. The two
@@ -185,15 +226,22 @@ async fn send_hello<S: SignalStream>(
     // On wasm the endpoint address is relay-only; `relay_urls` filters native's
     // direct addrs out too, so a hello always advertises the relay alone.
     let relay = peering.endpoint.addr().relay_urls().next().cloned();
+    // Advertise WebRTC capability only when the direct-peering transport is wired
+    // in (browser build); a peer only offers to peers that flag `rtc`.
+    #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+    let rtc = peering.webrtc.is_some().then_some(true);
+    #[cfg(not(all(target_arch = "wasm32", feature = "browser-net")))]
+    let rtc = None;
     let hello = Hello {
         kind: HELLO_KIND.to_owned(),
         v: HELLO_VERSION,
         id: our_id.to_string(),
         relay: relay.as_ref().map(|url| url.as_str().to_owned()),
+        rtc,
     };
     let message = ClientMessage::Publish {
         topic: channel.to_owned(),
-        data: hello,
+        data: serde_json::to_value(&hello)?,
     };
     socket.send(serde_json::to_string(&message)?).await?;
     Ok(relay.is_some())
@@ -206,6 +254,9 @@ enum Turn {
     Message(String),
     Closed,
     ReHello,
+    /// The WebRTC driver produced a signaling payload to publish (browser only).
+    #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+    SignalOut(super::webrtc_transport::SignalOut),
 }
 
 /// Drive one signaling session to completion (until the socket closes or errors).
@@ -220,9 +271,16 @@ async fn run_rendezvous<S: SignalStream>(
     on_discovered: &impl Fn(EndpointId),
     joined: &mut HashSet<EndpointId>,
 ) -> Result<(), RendezvousError> {
-    use futures::future::{Either, select};
-
     let our_id = peering.endpoint.id();
+
+    // The WebRTC driver's outbound signaling (browser only). Held here across the
+    // select and restored to the shared slot on any exit (`OutboundGuard`'s `Drop`),
+    // so after a signaling reconnect the next session re-takes it and keeps pumping.
+    #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+    let mut outbound = peering
+        .webrtc
+        .as_ref()
+        .map(|port| OutboundGuard::take(&port.outbound));
 
     let subscribe = ClientMessage::Subscribe {
         topics: vec![channel.to_owned()],
@@ -237,8 +295,12 @@ async fn run_rendezvous<S: SignalStream>(
             RETRY_HELLO_INTERVAL
         };
         // Scope the select so the `recv`/`sleep` futures (the former borrows
-        // `socket`) drop before we send anything below.
+        // `socket`) drop before we send anything below. The browser build adds a
+        // third arm draining the WebRTC driver's outbound signaling; the native
+        // build keeps the original two-way select verbatim.
+        #[cfg(not(all(target_arch = "wasm32", feature = "browser-net")))]
         let turn = {
+            use futures::future::{Either, select};
             let recv = std::pin::pin!(socket.recv());
             let timer = std::pin::pin!(rdv_sleep(interval));
             match select(recv, timer).await {
@@ -249,11 +311,46 @@ async fn run_rendezvous<S: SignalStream>(
                 Either::Right(((), _)) => Turn::ReHello,
             }
         };
+        #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+        let turn = {
+            use futures::FutureExt;
+            let recv = socket.recv().fuse();
+            let timer = rdv_sleep(interval).fuse();
+            let signal = next_outbound(outbound.as_mut().and_then(|guard| guard.rx())).fuse();
+            futures::pin_mut!(recv, timer, signal);
+            futures::select! {
+                message = recv => match message? {
+                    Some(text) => Turn::Message(text),
+                    None => Turn::Closed,
+                },
+                () = timer => Turn::ReHello,
+                out = signal => Turn::SignalOut(out),
+            }
+        };
 
         match turn {
             Turn::Closed => return Ok(()),
             Turn::ReHello => {
                 have_relay = send_hello(socket, channel, peering, our_id).await?;
+            }
+            #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+            Turn::SignalOut(signal) => {
+                // The driver produced an SDP/ICE payload; publish it addressed to
+                // the peer. Everyone on the channel receives it; only `to` acts.
+                if let Ok(to) = EndpointId::from_bytes(&signal.to) {
+                    let envelope = RtcEnvelope {
+                        kind: RTC_KIND.to_owned(),
+                        v: RTC_VERSION,
+                        from: our_id.to_string(),
+                        to: to.to_string(),
+                        payload: signal.payload,
+                    };
+                    let message = ClientMessage::Publish {
+                        topic: channel.to_owned(),
+                        data: serde_json::to_value(&envelope)?,
+                    };
+                    socket.send(serde_json::to_string(&message)?).await?;
+                }
             }
             Turn::Message(text) => {
                 let Ok(message) = serde_json::from_str::<ServerMessage>(&text) else {
@@ -265,6 +362,14 @@ async fn run_rendezvous<S: SignalStream>(
                     }
                     ServerMessage::Other => {}
                     ServerMessage::Publish { data, .. } => {
+                        // Both hellos and WebRTC signaling ride `data`; dispatch on
+                        // `kind`. A `walkie-rtc` envelope goes straight to the driver
+                        // (browser only); anything else is treated as a hello.
+                        if data.get("kind").and_then(|kind| kind.as_str()) == Some(RTC_KIND) {
+                            #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+                            route_rtc_envelope(peering, our_id, data);
+                            continue;
+                        }
                         let Ok(hello) = serde_json::from_value::<Hello>(data) else {
                             continue;
                         };
@@ -285,6 +390,19 @@ async fn run_rendezvous<S: SignalStream>(
                         if let Some(relay) = relay {
                             endpoint_addr = endpoint_addr.with_relay_url(relay);
                         }
+                        // Seed the peer's WebRTC custom addr beside its relay so
+                        // iroh treats the direct path as a candidate and probes it.
+                        // Derived from the id — no need to advertise it on the wire.
+                        // Both relay and custom go into ONE `add_endpoint_info` so a
+                        // later refresh never drops the relay fallback.
+                        #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+                        if peering.webrtc.is_some() && hello.rtc == Some(true) {
+                            endpoint_addr = endpoint_addr.with_addrs([
+                                iroh::TransportAddr::Custom(
+                                    super::webrtc_transport::webrtc_custom_addr(id.as_bytes()),
+                                ),
+                            ]);
+                        }
 
                         if joined.contains(&id) {
                             // Known peer: refresh addressing (relay may have
@@ -303,6 +421,17 @@ async fn run_rendezvous<S: SignalStream>(
                                 );
                             }
                             on_discovered(id);
+                            // Kick the WebRTC handshake for a newly discovered
+                            // rtc-capable peer (browser only). The driver picks the
+                            // role: lower endpoint id offers, the other answers.
+                            #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+                            if hello.rtc == Some(true) {
+                                if let Some(port) = peering.webrtc.as_ref() {
+                                    let _ = port.commands.unbounded_send(
+                                        super::webrtc_transport::Command::Dial(*id.as_bytes()),
+                                    );
+                                }
+                            }
                             // Reply so a newcomer learns us with zero server
                             // state. Only on first sight, else the ping-pong.
                             if let Err(error) =
@@ -321,6 +450,87 @@ async fn run_rendezvous<S: SignalStream>(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// WebRTC signaling helpers (browser only). SDP/ICE rides the same channel as
+// hellos, addressed peer-to-peer; the driver task does the actual RTC work.
+// ---------------------------------------------------------------------------
+
+/// The WebRTC driver's outbound-signaling receiver.
+#[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+type SignalRx = futures::channel::mpsc::UnboundedReceiver<super::webrtc_transport::SignalOut>;
+
+/// Borrows the outbound-signaling receiver out of its shared slot for one signaling
+/// session and restores it on drop. Because the signaling socket reconnects (and so
+/// re-enters [`run_rendezvous`]) while the WebRTC driver — and its sender half —
+/// live on, the receiver must survive a session ending; taking and restoring it
+/// through this guard keeps the pump alive across reconnects.
+#[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+struct OutboundGuard<'a> {
+    slot: &'a std::rc::Rc<std::cell::RefCell<Option<SignalRx>>>,
+    rx: Option<SignalRx>,
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+impl<'a> OutboundGuard<'a> {
+    fn take(slot: &'a std::rc::Rc<std::cell::RefCell<Option<SignalRx>>>) -> Self {
+        let rx = slot.borrow_mut().take();
+        Self { slot, rx }
+    }
+
+    fn rx(&mut self) -> Option<&mut SignalRx> {
+        self.rx.as_mut()
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+impl Drop for OutboundGuard<'_> {
+    fn drop(&mut self) {
+        *self.slot.borrow_mut() = self.rx.take();
+    }
+}
+
+/// Await the next outbound signaling payload, or pend forever if the driver's
+/// sender has no receiver here (WebRTC not configured / already closed) — so this
+/// branch simply never wins the select in that case.
+#[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+async fn next_outbound(rx: Option<&mut SignalRx>) -> super::webrtc_transport::SignalOut {
+    use futures::StreamExt;
+    match rx {
+        Some(rx) => match rx.next().await {
+            Some(signal) => signal,
+            None => std::future::pending().await,
+        },
+        None => std::future::pending().await,
+    }
+}
+
+/// Route an inbound `walkie-rtc` envelope to the WebRTC driver, if it is addressed
+/// to us and well-formed. Unauthenticated, like hellos: a forged payload at worst
+/// yields a failed WebRTC handshake — the QUIC handshake *inside* the data channel
+/// still proves the endpoint key, so nothing above the transport trusts it.
+#[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+fn route_rtc_envelope(peering: &RendezvousPeering, our_id: EndpointId, data: serde_json::Value) {
+    let Some(port) = peering.webrtc.as_ref() else {
+        return;
+    };
+    let Ok(envelope) = serde_json::from_value::<RtcEnvelope>(data) else {
+        return;
+    };
+    if envelope.v != RTC_VERSION || envelope.to != our_id.to_string() {
+        return;
+    }
+    let Ok(from) = envelope.from.parse::<EndpointId>() else {
+        return;
+    };
+    if from == our_id {
+        return; // our own signaling, fanned back to us
+    }
+    let _ = port.commands.unbounded_send(super::webrtc_transport::Command::Signal {
+        from: *from.as_bytes(),
+        payload: envelope.payload,
+    });
 }
 
 /// The reconnecting outer loop. Owns `joined` so a socket drop does not re-spam
@@ -629,23 +839,43 @@ mod tests {
             v: HELLO_VERSION,
             id: "aa".repeat(32),
             relay: Some("https://relay.wondering.xyz/".to_owned()),
+            rtc: Some(true),
         };
         let message = ClientMessage::Publish {
             topic: rendezvous_channel(RoomTopic::from_room_name("quiet-cactus-song")),
-            data: hello,
+            data: serde_json::to_value(&hello).unwrap(),
         };
         let json = serde_json::to_string(&message).unwrap();
         assert!(json.contains("\"type\":\"publish\""));
         assert!(json.contains("\"kind\":\"walkie-hello\""));
+        assert!(json.contains("\"rtc\":true"));
 
         // The server echoes `data` verbatim; we must decode our own publish.
         let echoed: ServerMessage = serde_json::from_str(&json).unwrap();
         let ServerMessage::Publish { data, .. } = echoed else {
             panic!("expected a publish");
         };
+        // Dispatch key the loop reads before choosing hello vs webrtc.
+        assert_eq!(data.get("kind").and_then(|k| k.as_str()), Some(HELLO_KIND));
         let decoded: Hello = serde_json::from_value(data).unwrap();
         assert_eq!(decoded.id, "aa".repeat(32));
         assert_eq!(decoded.relay.as_deref(), Some("https://relay.wondering.xyz/"));
+        assert_eq!(decoded.rtc, Some(true));
+    }
+
+    #[test]
+    fn hello_without_rtc_flag_omits_the_field_and_defaults_to_none() {
+        let hello = Hello {
+            kind: HELLO_KIND.to_owned(),
+            v: HELLO_VERSION,
+            id: "bb".repeat(32),
+            relay: None,
+            rtc: None,
+        };
+        let json = serde_json::to_string(&hello).unwrap();
+        assert!(!json.contains("rtc"));
+        let decoded: Hello = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.rtc, None);
     }
 
     #[test]

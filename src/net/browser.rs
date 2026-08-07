@@ -13,7 +13,7 @@
 //!   queues are `futures` channels — everything here is single-threaded and
 //!   `!Send` by construction.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use futures::{SinkExt, StreamExt, TryStreamExt, channel::mpsc};
 use iroh::{
@@ -76,6 +76,10 @@ pub struct BrowserNetHandle {
     endpoint: Endpoint,
     gossip_sender: GossipSender,
     memory_lookup: MemoryLookup,
+    /// Signaling hooks for the WebRTC custom transport (M4 direct peering). Handed
+    /// to the rendezvous loop via [`Self::rendezvous_peering`], which pumps the
+    /// SDP/ICE handshake over the existing signaling channel.
+    webrtc: super::webrtc_transport::WebRtcSignalPort,
 }
 
 impl BrowserNetHandle {
@@ -155,6 +159,7 @@ impl BrowserNetHandle {
             endpoint: self.endpoint.clone(),
             gossip_sender: self.gossip_sender.clone(),
             memory_lookup: self.memory_lookup.clone(),
+            webrtc: Some(self.webrtc.clone()),
         }
     }
 }
@@ -185,10 +190,22 @@ impl BrowserRoomNetwork {
         let (mut events_tx, events) = mpsc::channel(EVENT_QUEUE_DEPTH);
         let (repairs_tx, repairs) = mpsc::channel(REPAIR_QUEUE_DEPTH);
 
+        // WebRTC custom transport (M4 direct peering). Built BEFORE the endpoint so
+        // it can be registered on the builder; the endpoint id is the public half of
+        // the secret key, known here without consuming it. The relay path is
+        // untouched — this only ADDS a candidate direct path, which iroh's default
+        // path selector (custom = primary, relay = backup) prefers once it is up,
+        // and falls back off automatically if it never connects. The signaling port
+        // rides to the rendezvous loop via `rendezvous_peering`.
+        let local_id = *secret_key.public().as_bytes();
+        let (webrtc_transport, webrtc_port) =
+            super::webrtc_transport::WebRtcTransport::new(local_id);
+
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(secret_key)
             .alpns(vec![GOSSIP_ALPN.to_vec(), RBSR_ALPN.to_vec()])
             .relay_mode(relay_mode)
+            .add_custom_transport(Arc::new(webrtc_transport))
             .clear_address_lookup()
             .address_lookup(memory.clone())
             // Re-add iroh's built-in pkarr discovery that `presets::N0` installs
@@ -301,6 +318,7 @@ impl BrowserRoomNetwork {
                 endpoint,
                 gossip_sender,
                 memory_lookup: memory,
+                webrtc: webrtc_port,
             },
             router,
             events,

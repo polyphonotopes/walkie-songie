@@ -41,6 +41,13 @@ pub mod rendezvous;
 #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
 pub mod browser;
 
+// WebRTC-as-an-iroh-custom-transport: the browser direct-peering carrier (M4). Sits
+// BELOW the iroh `Endpoint` (a `CustomTransport`), so it adds a direct path beside
+// the relay without changing anything above the endpoint; the relay stays as
+// discovery + fallback. Browser/wasm only — native direct is already iroh UDP+mDNS.
+#[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+pub mod webrtc_transport;
+
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-net"))]
 pub use identity::FileSeedStore;
 pub use identity::{MemorySeedStore, SeedStore, WalkieIdentity};
@@ -73,6 +80,12 @@ pub use repair::TokioTimer;
 #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
 pub use browser::{
     BrowserIncomingRepair, BrowserNetHandle, BrowserRoomInbound, BrowserRoomNetwork, BrowserTimer,
+};
+
+#[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+pub use webrtc_transport::{
+    Command as WebRtcCommand, RtcPayload, SignalOut as WebRtcSignalOut, WEBRTC_TRANSPORT_ID,
+    WebRtcSignalPort, WebRtcTransport, webrtc_custom_addr,
 };
 
 pub use sync::{
