@@ -12,6 +12,27 @@ name = "walkie-songie-plugin"
 path = "src/plugin_main.rs"
 required-features = ["plugin"]
 
+# Performance benchmark suite (docs/research/performance-benchmark-suite.md).
+# All native, feature-free, exercising the embeddable core (fold + ops + RBSR).
+[[bench]]
+name = "fold"
+harness = false
+
+[[bench]]
+name = "ops"
+harness = false
+
+[[bench]]
+name = "rbsr"
+harness = false
+
+# dhat heap-profiling harness for the Θ(N²) ReachIndex closure + view() RAM.
+# Its own `fn main()` installs `dhat::Alloc` as the global allocator, so it must
+# stay a separate binary from the criterion benches.
+[[bench]]
+name = "reach_mem"
+harness = false
+
 [features]
 default = []
 core = []
@@ -116,6 +137,12 @@ futures-signals = "0.3"
 [dev-dependencies]
 walkie-songie = { path = ".", default-features = false, features = ["test-support"] }
 hhhs-core = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "bd23d4e9785f5d0b7bb458d148cab92d130b356e" }
+# Benchmark suite (M0). criterion: native micro-benchmarks; dhat: heap profiling
+# for the reach/view RAM harness; postcard: the real RBSR wire codec, for
+# byte-accurate reconciliation-size reporting.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+dhat = "0.3"
+postcard = { version = "1", features = ["alloc"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.32", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "io-util"] }
@@ -201,3 +228,15 @@ panic = "abort"
 
 [profile.release.package."*"]
 opt-level = "z"
+
+# Crypto hot paths run on every op (sign/verify + blake3 op-id/domain hashing) and
+# are catastrophically slow at opt-level="z": ed25519 verify benchmarked ~4.75ms/op
+# size-optimized (vs ~75us sign). These crates are tiny, so speed-optimizing just
+# them costs little wasm bundle size while making verify ~50-95x faster on native
+# AND in the shipped wasm. Specific-package profiles override the "*" glob above.
+[profile.release.package.curve25519-dalek]
+opt-level = 3
+[profile.release.package.ed25519-dalek]
+opt-level = 3
+[profile.release.package.blake3]
+opt-level = 3
