@@ -9,12 +9,12 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use dominator::{clone, html, Dom};
+use dominator::{Dom, clone, html};
 use futures_signals::signal::SignalExt as _;
-use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use web_sys::js_sys::Reflect;
+use wasm_bindgen::prelude::*;
 use web_sys::HtmlElement;
+use web_sys::js_sys::Reflect;
 
 use crate::tuning::{PitchClass, Tuning};
 
@@ -67,7 +67,9 @@ fn show_delete_hole() {
         return;
     }
 
-    let Some(keyboard) = get_keyboard() else { return };
+    let Some(keyboard) = get_keyboard() else {
+        return;
+    };
 
     // Create hole element
     let hole: HtmlElement = document.create_element("div").unwrap().unchecked_into();
@@ -155,9 +157,7 @@ pub fn update_tuning(tuning: &Tuning) {
 /// For 12-TET, uses standard piano layout.
 /// For other tunings, uses pie mode (no raised keys).
 pub fn compute_raised_notes(tuning: &Tuning) -> Vec<u8> {
-    let count = tuning.pitch_class_count();
-
-    if count == 12 {
+    if tuning.supports_standard_note_names() {
         // Standard piano: C# D# F# G# A# = indices 1, 3, 6, 8, 10
         vec![1, 3, 6, 8, 10]
     } else {
@@ -185,7 +185,7 @@ pub fn sync_active_pitches(state: &Arc<AppState>) {
     let toggle_notes: Vec<u8> = room
         .shared_pitches()
         .iter()
-        .map(|pc| pc.index())
+        .filter_map(|pc| u8::try_from(pc.index()).ok())
         .collect();
     sync_toggle_overlays(&toggle_notes);
 
@@ -206,7 +206,7 @@ pub fn sync_active_pitches(state: &Arc<AppState>) {
     let voice_notes: Vec<u8> = room
         .all_voice_pitch_classes()
         .iter()
-        .map(|pc| pc.index())
+        .filter_map(|pc| u8::try_from(pc.index()).ok())
         .collect();
     sync_voice_overlays(&voice_notes);
 
@@ -251,10 +251,19 @@ fn sync_clef_indicators(pitches: &[i32], _pc_count: i32) {
     };
 
     // Get or create all elements upfront
-    let bass_line = get_or_create(".bass-clef-indicator-line", "clef-line bass-clef-indicator-line");
+    let bass_line = get_or_create(
+        ".bass-clef-indicator-line",
+        "clef-line bass-clef-indicator-line",
+    );
     let bass_clef = get_or_create(".bass-clef-indicator", "clef-indicator bass-clef-indicator");
-    let treble_line = get_or_create(".treble-clef-indicator-line", "clef-line treble-clef-indicator-line");
-    let treble_clef = get_or_create(".treble-clef-indicator", "clef-indicator treble-clef-indicator");
+    let treble_line = get_or_create(
+        ".treble-clef-indicator-line",
+        "clef-line treble-clef-indicator-line",
+    );
+    let treble_clef = get_or_create(
+        ".treble-clef-indicator",
+        "clef-indicator treble-clef-indicator",
+    );
 
     if pitches.is_empty() {
         // Hide all by adding hidden class
@@ -269,22 +278,30 @@ fn sync_clef_indicators(pitches: &[i32], _pc_count: i32) {
     let max_pitch = *pitches.iter().max().unwrap();
 
     // Update bass clef
-    bass_line.set_attribute("data-pitch", &min_pitch.to_string()).ok();
+    bass_line
+        .set_attribute("data-pitch", &min_pitch.to_string())
+        .ok();
     bass_line.set_attribute("data-radius", "0.5").ok();
     bass_line.class_list().remove_1("hidden").ok();
 
-    bass_clef.set_attribute("data-pitch", &min_pitch.to_string()).ok();
+    bass_clef
+        .set_attribute("data-pitch", &min_pitch.to_string())
+        .ok();
     bass_clef.set_attribute("data-radius", "1.1").ok();
     bass_clef.set_text_content(Some(BASS_CLEF));
     bass_clef.class_list().remove_1("hidden").ok();
 
     // Update treble clef (only if different from bass)
     if max_pitch != min_pitch {
-        treble_line.set_attribute("data-pitch", &max_pitch.to_string()).ok();
+        treble_line
+            .set_attribute("data-pitch", &max_pitch.to_string())
+            .ok();
         treble_line.set_attribute("data-radius", "0.5").ok();
         treble_line.class_list().remove_1("hidden").ok();
 
-        treble_clef.set_attribute("data-pitch", &max_pitch.to_string()).ok();
+        treble_clef
+            .set_attribute("data-pitch", &max_pitch.to_string())
+            .ok();
         treble_clef.set_attribute("data-radius", "1.1").ok();
         treble_clef.set_text_content(Some(TREBLE_CLEF));
         treble_clef.class_list().remove_1("hidden").ok();
@@ -332,7 +349,8 @@ fn sync_toggle_overlays(notes: &[u8]) {
             el.set_class_name("toggle-overlay");
             el.set_attribute("data-key-overlay", &key_index.to_string())
                 .ok();
-            el.set_attribute("data-overlay-pattern", "toggle-lines").ok();
+            el.set_attribute("data-overlay-pattern", "toggle-lines")
+                .ok();
             kb.append_child(&el).ok();
         }
     }
@@ -445,7 +463,9 @@ fn sync_voice_overlays(notes: &[u8]) {
             // Create shout emoji indicator
             let indicator = document.create_element("div").unwrap();
             indicator.set_class_name("voice-indicator");
-            indicator.set_attribute("data-key", &key_index.to_string()).ok();
+            indicator
+                .set_attribute("data-key", &key_index.to_string())
+                .ok();
             indicator.set_text_content(Some("🗣️"));
             kb.append_child(&indicator).ok();
         }
@@ -634,11 +654,11 @@ pub fn pitch_keyboard(state: Arc<AppState>) -> Dom {
 
 /// Set up efficient piece synchronization that only updates changed pieces.
 fn setup_piece_sync(state: Arc<AppState>, keyboard_el: web_sys::HtmlElement) {
+    use futures::{StreamExt, future::ready};
+    use futures_signals::signal::{SignalExt, from_stream};
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::rc::Rc;
-    use futures::{future::ready, StreamExt};
-    use futures_signals::signal::{from_stream, SignalExt};
 
     // Track existing piece elements by ID
     let piece_elements: Rc<RefCell<HashMap<String, web_sys::HtmlElement>>> =
@@ -657,7 +677,16 @@ fn setup_piece_sync(state: Arc<AppState>, keyboard_el: web_sys::HtmlElement) {
 
     let state_for_stream = state.clone();
     let state_stream = events
-        .filter(|e| ready(e.affects_pieces() || matches!(e, crate::room::RoomEvent::PiecesLockChanged { .. } | crate::room::RoomEvent::FullStateSync { .. })))
+        .filter(|e| {
+            ready(
+                e.affects_pieces()
+                    || matches!(
+                        e,
+                        crate::room::RoomEvent::PiecesLockChanged { .. }
+                            | crate::room::RoomEvent::FullStateSync { .. }
+                    ),
+            )
+        })
         .map(move |_| {
             let room = state_for_stream.room.lock_ref();
             let tuning = state_for_stream.tuning.lock_ref();
@@ -669,8 +698,8 @@ fn setup_piece_sync(state: Arc<AppState>, keyboard_el: web_sys::HtmlElement) {
         });
 
     let full_stream = futures::stream::once(ready(initial_pieces)).chain(state_stream);
-    let pieces_signal = from_stream(full_stream)
-        .map(|opt| opt.unwrap_or_else(|| (vec![], 12, false)));
+    let pieces_signal =
+        from_stream(full_stream).map(|opt| opt.unwrap_or_else(|| (vec![], 12, false)));
 
     let piece_elements_clone = piece_elements.clone();
     let state_clone = state.clone();
@@ -678,60 +707,62 @@ fn setup_piece_sync(state: Arc<AppState>, keyboard_el: web_sys::HtmlElement) {
 
     wasm_bindgen_futures::spawn_local(async move {
         // Process each pieces change
-        pieces_signal.for_each(move |(pieces, pitch_count, pieces_locked)| {
-            // Sync pieces_locked to AppState
-            if state_clone.pieces_locked.get() != pieces_locked {
-                state_clone.pieces_locked.set(pieces_locked);
-            }
-
-            let mut elements = piece_elements_clone.borrow_mut();
-
-            // Build set of current piece IDs
-            let current_ids: std::collections::HashSet<String> =
-                pieces.iter().map(|p| p.id.clone()).collect();
-
-            // Remove pieces that no longer exist
-            let to_remove: Vec<String> = elements
-                .keys()
-                .filter(|id| !current_ids.contains(*id))
-                .cloned()
-                .collect();
-            for id in to_remove {
-                if let Some(el) = elements.remove(&id) {
-                    el.remove();
+        pieces_signal
+            .for_each(move |(pieces, pitch_count, pieces_locked)| {
+                // Sync pieces_locked to AppState
+                if state_clone.pieces_locked.get() != pieces_locked {
+                    state_clone.pieces_locked.set(pieces_locked);
                 }
-            }
 
-            // Add or update pieces
-            for piece in pieces {
-                let pitch_class = piece.pitch.rem_euclid(pitch_count as i32);
-                let key_index = LEFTMOST_KEY + pitch_class;
+                let mut elements = piece_elements_clone.borrow_mut();
 
-                if let Some(el) = elements.get(&piece.id) {
-                    // Piece exists - just update data-key if pitch changed
-                    let current_key = el
-                        .get_attribute("data-key")
-                        .and_then(|s| s.parse::<i32>().ok())
-                        .unwrap_or(-1);
-                    if current_key != key_index {
-                        // Ensure no data-pitch (pieces use data-key for discrete positioning)
-                        el.remove_attribute("data-pitch").ok();
-                        el.set_attribute("data-key", &key_index.to_string()).ok();
-                        el.set_attribute("data-original-pitch", &piece.pitch.to_string())
-                            .ok();
+                // Build set of current piece IDs
+                let current_ids: std::collections::HashSet<String> =
+                    pieces.iter().map(|p| p.id.clone()).collect();
+
+                // Remove pieces that no longer exist
+                let to_remove: Vec<String> = elements
+                    .keys()
+                    .filter(|id| !current_ids.contains(*id))
+                    .cloned()
+                    .collect();
+                for id in to_remove {
+                    if let Some(el) = elements.remove(&id) {
+                        el.remove();
                     }
-                } else {
-                    // New piece - create element
-                    let el = create_piece_element(&piece.id, piece.pitch, key_index, &piece.emoji);
-                    keyboard_el_clone.append_child(&el).ok();
-                    elements.insert(piece.id.clone(), el);
                 }
-            }
 
-            // Return a ready future (for_each needs FnMut -> Future)
-            async {}
-        })
-        .await;
+                // Add or update pieces
+                for piece in pieces {
+                    let pitch_class = piece.pitch.rem_euclid(pitch_count as i32);
+                    let key_index = LEFTMOST_KEY + pitch_class;
+
+                    if let Some(el) = elements.get(&piece.id) {
+                        // Piece exists - just update data-key if pitch changed
+                        let current_key = el
+                            .get_attribute("data-key")
+                            .and_then(|s| s.parse::<i32>().ok())
+                            .unwrap_or(-1);
+                        if current_key != key_index {
+                            // Ensure no data-pitch (pieces use data-key for discrete positioning)
+                            el.remove_attribute("data-pitch").ok();
+                            el.set_attribute("data-key", &key_index.to_string()).ok();
+                            el.set_attribute("data-original-pitch", &piece.pitch.to_string())
+                                .ok();
+                        }
+                    } else {
+                        // New piece - create element
+                        let el =
+                            create_piece_element(&piece.id, piece.pitch, key_index, &piece.emoji);
+                        keyboard_el_clone.append_child(&el).ok();
+                        elements.insert(piece.id.clone(), el);
+                    }
+                }
+
+                // Return a ready future (for_each needs FnMut -> Future)
+                async {}
+            })
+            .await;
     });
 }
 
@@ -954,6 +985,7 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
 
         // Only remove piece if dropped on hole (not on click)
         if dropped_on_hole && !state_up.pieces_locked.get() {
+            state_up.remove_native_piece(&piece_id);
             state_up.room.lock_mut().remove_piece(&piece_id);
             // Reset styling before removal triggers UI update
             piece_el.remove_attribute("data-dragging").ok();
@@ -1003,6 +1035,7 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
                 if state_up.room.lock_ref().has_piece_at(new_pitch) {
                     start_pitch // Can't move there
                 } else {
+                    state_up.move_native_piece(&piece_id, new_pitch);
                     state_up.room.lock_mut().move_piece(&piece_id, new_pitch);
                     new_pitch
                 }
@@ -1124,7 +1157,9 @@ fn setup_keyboard_drop_handlers(state: Arc<AppState>) {
 
         // Get the dropped emoji
         let Some(dt) = e.data_transfer() else { return };
-        let Ok(emoji) = dt.get_data("text/plain") else { return };
+        let Ok(emoji) = dt.get_data("text/plain") else {
+            return;
+        };
         if emoji.is_empty() {
             return;
         }
@@ -1147,8 +1182,11 @@ fn setup_keyboard_drop_handlers(state: Arc<AppState>) {
             return;
         }
 
-        // Add the piece to the CRDT (events emitted automatically)
-        state_drop.room.lock_mut().add_piece(pitch, &emoji);
+        state_drop.put_native_piece(emoji.clone(), pitch);
+        // Optimistic legacy view; the native snapshot replaces it once signed.
+        if !state_drop.native_backend {
+            state_drop.room.lock_mut().add_piece(pitch, &emoji);
+        }
 
         // Sync UI
         sync_active_pitches(&state_drop);
@@ -1162,10 +1200,9 @@ fn setup_keyboard_drop_handlers(state: Arc<AppState>) {
 /// Call this from component on pointerdown.
 pub fn start_emoji_drag(emoji: String, pointer_id: i32, x: i32, y: i32) {
     EMOJI_DRAGS.with(|drags| {
-        drags.borrow_mut().insert(
-            pointer_id,
-            EmojiDragState { emoji },
-        );
+        drags
+            .borrow_mut()
+            .insert(pointer_id, EmojiDragState { emoji });
     });
 
     // Create ghost element
@@ -1173,23 +1210,34 @@ pub fn start_emoji_drag(emoji: String, pointer_id: i32, x: i32, y: i32) {
         let ghost: HtmlElement = document.create_element("div").unwrap().unchecked_into();
         ghost.set_id("emoji-drag-ghost");
         ghost.set_class_name("emoji-drag-ghost");
-        let emoji_text = EMOJI_DRAGS.with(|drags| {
-            drags.borrow().get(&pointer_id).map(|d| d.emoji.clone())
-        });
+        let emoji_text =
+            EMOJI_DRAGS.with(|drags| drags.borrow().get(&pointer_id).map(|d| d.emoji.clone()));
         if let Some(e) = emoji_text {
             ghost.set_text_content(Some(&e));
         }
-        ghost.style().set_property("left", &format!("{}px", x - 20)).ok();
-        ghost.style().set_property("top", &format!("{}px", y - 20)).ok();
-        ghost.set_attribute("data-pointer-id", &pointer_id.to_string()).ok();
+        ghost
+            .style()
+            .set_property("left", &format!("{}px", x - 20))
+            .ok();
+        ghost
+            .style()
+            .set_property("top", &format!("{}px", y - 20))
+            .ok();
+        ghost
+            .set_attribute("data-pointer-id", &pointer_id.to_string())
+            .ok();
         document.body().unwrap().append_child(&ghost).ok();
     }
 }
 
 /// Set up document-level handlers for emoji drags from picker.
 fn setup_emoji_drag_handlers(state: Arc<AppState>) {
-    let Some(window) = web_sys::window() else { return };
-    let Some(document) = window.document() else { return };
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Some(document) = window.document() else {
+        return;
+    };
 
     // Pointermove - update ghost position
     let on_move = Closure::<dyn Fn(web_sys::PointerEvent)>::new(move |e: web_sys::PointerEvent| {
@@ -1210,11 +1258,18 @@ fn setup_emoji_drag_handlers(state: Arc<AppState>) {
             .and_then(|d| d.get_element_by_id("emoji-drag-ghost"))
         {
             let ghost: HtmlElement = ghost.unchecked_into();
-            ghost.style().set_property("left", &format!("{}px", e.client_x() - 20)).ok();
-            ghost.style().set_property("top", &format!("{}px", e.client_y() - 20)).ok();
+            ghost
+                .style()
+                .set_property("left", &format!("{}px", e.client_x() - 20))
+                .ok();
+            ghost
+                .style()
+                .set_property("top", &format!("{}px", e.client_y() - 20))
+                .ok();
         }
     });
-    let _ = document.add_event_listener_with_callback("pointermove", on_move.as_ref().unchecked_ref());
+    let _ =
+        document.add_event_listener_with_callback("pointermove", on_move.as_ref().unchecked_ref());
     on_move.forget();
 
     // Pointerup - drop emoji on keyboard
@@ -1251,8 +1306,10 @@ fn setup_emoji_drag_handlers(state: Arc<AppState>) {
             return;
         }
 
-        // Add piece at absolute MIDI pitch (key 0 = middle C = 60)
-        state_up.room.lock_mut().add_piece(pitch, &drag.emoji);
+        state_up.put_native_piece(drag.emoji.clone(), pitch);
+        if !state_up.native_backend {
+            state_up.room.lock_mut().add_piece(pitch, &drag.emoji);
+        }
         sync_active_pitches(&state_up);
         state_up.sync_midi_toggle_output();
     });
@@ -1260,18 +1317,20 @@ fn setup_emoji_drag_handlers(state: Arc<AppState>) {
     on_up.forget();
 
     // Pointercancel - clean up
-    let on_cancel = Closure::<dyn Fn(web_sys::PointerEvent)>::new(move |e: web_sys::PointerEvent| {
-        let pointer_id = e.pointer_id();
-        EMOJI_DRAGS.with(|drags| drags.borrow_mut().remove(&pointer_id));
+    let on_cancel =
+        Closure::<dyn Fn(web_sys::PointerEvent)>::new(move |e: web_sys::PointerEvent| {
+            let pointer_id = e.pointer_id();
+            EMOJI_DRAGS.with(|drags| drags.borrow_mut().remove(&pointer_id));
 
-        if let Some(ghost) = web_sys::window()
-            .and_then(|w| w.document())
-            .and_then(|d| d.get_element_by_id("emoji-drag-ghost"))
-        {
-            ghost.remove();
-        }
-    });
-    let _ = document.add_event_listener_with_callback("pointercancel", on_cancel.as_ref().unchecked_ref());
+            if let Some(ghost) = web_sys::window()
+                .and_then(|w| w.document())
+                .and_then(|d| d.get_element_by_id("emoji-drag-ghost"))
+            {
+                ghost.remove();
+            }
+        });
+    let _ = document
+        .add_event_listener_with_callback("pointercancel", on_cancel.as_ref().unchecked_ref());
     on_cancel.forget();
 }
 
@@ -1329,11 +1388,16 @@ fn setup_keyboard_events(state: Arc<AppState>) {
 
                         // Toggle the pitch class (manual/toggle mode)
                         let mut room = state_click.room.lock_mut();
-                        room.toggle_pitch(pc);
+                        let active = room.toggle_pitch(pc);
 
                         // Also clear any voice at this pitch class
                         let voice_cleared = room.clear_voice_at_pitch_class(pc);
                         drop(room);
+                        if state_click.native_backend {
+                            state_click.toggle_native_degree(pc);
+                        } else {
+                            state_click.set_native_degree(pc, active);
+                        }
 
                         if voice_cleared {
                             // Also clear local voice state if it was ours

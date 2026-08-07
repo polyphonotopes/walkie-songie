@@ -13,9 +13,9 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 
 use async_channel::{Receiver, Sender};
-use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::{spawn_local, JsFuture};
+use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{MidiAccess, MidiInput, MidiMessageEvent, MidiOutput};
 
 /// MIDI channel for toggle set (pitch classes).
@@ -123,20 +123,13 @@ impl MidiOutputState {
     /// Sync toggle set notes with current state (send offs for removed, ons for added).
     pub fn sync_toggle_notes(&mut self, current: &HashSet<u8>) {
         // Send note-offs for notes no longer in set
-        let to_remove: Vec<u8> = self
-            .toggle_notes
-            .difference(current)
-            .copied()
-            .collect();
+        let to_remove: Vec<u8> = self.toggle_notes.difference(current).copied().collect();
         for note in to_remove {
             self.toggle_note_off(note);
         }
 
         // Send note-ons for new notes
-        let to_add: Vec<u8> = current
-            .difference(&self.toggle_notes)
-            .copied()
-            .collect();
+        let to_add: Vec<u8> = current.difference(&self.toggle_notes).copied().collect();
         for note in to_add {
             self.toggle_note_on(note);
         }
@@ -265,9 +258,8 @@ impl MidiManager {
         let navigator = window.navigator();
 
         // Check if Web MIDI is supported
-        let request_midi_access =
-            js_sys::Reflect::get(&navigator, &"requestMIDIAccess".into())
-                .map_err(|_| "Web MIDI not supported")?;
+        let request_midi_access = js_sys::Reflect::get(&navigator, &"requestMIDIAccess".into())
+            .map_err(|_| "Web MIDI not supported")?;
 
         if !request_midi_access.is_function() {
             return Err("Web MIDI not available".to_string());
@@ -289,11 +281,14 @@ impl MidiManager {
         self.enumerate_devices(&midi_access)?;
 
         self.access = Some(midi_access);
-        web_sys::console::log_1(&format!(
-            "Web MIDI initialized: {} inputs, {} outputs available",
-            self.available_inputs.len(),
-            self.available_outputs.len()
-        ).into());
+        web_sys::console::log_1(
+            &format!(
+                "Web MIDI initialized: {} inputs, {} outputs available",
+                self.available_inputs.len(),
+                self.available_outputs.len()
+            )
+            .into(),
+        );
 
         Ok(())
     }
@@ -307,9 +302,8 @@ impl MidiManager {
         let navigator = window.navigator();
 
         // Check if Web MIDI is supported
-        let request_midi_access =
-            js_sys::Reflect::get(&navigator, &"requestMIDIAccess".into())
-                .map_err(|_| "Web MIDI not supported")?;
+        let request_midi_access = js_sys::Reflect::get(&navigator, &"requestMIDIAccess".into())
+            .map_err(|_| "Web MIDI not supported")?;
 
         if !request_midi_access.is_function() {
             return Err("Web MIDI not available".to_string());
@@ -341,11 +335,14 @@ impl MidiManager {
 
         self.access = Some(midi_access);
 
-        web_sys::console::log_1(&format!(
-            "Web MIDI initialized with hot-plug: {} inputs, {} outputs",
-            self.available_inputs.len(),
-            self.available_outputs.len()
-        ).into());
+        web_sys::console::log_1(
+            &format!(
+                "Web MIDI initialized with hot-plug: {} inputs, {} outputs",
+                self.available_inputs.len(),
+                self.available_outputs.len()
+            )
+            .into(),
+        );
 
         // Trigger initial callback so UI updates
         on_devices_changed();
@@ -434,7 +431,11 @@ impl MidiManager {
     }
 
     /// Connect to a specific input device by ID.
-    fn connect_input_by_id(&mut self, midi_access: &MidiAccess, device_id: &str) -> Result<(), String> {
+    fn connect_input_by_id(
+        &mut self,
+        midi_access: &MidiAccess,
+        device_id: &str,
+    ) -> Result<(), String> {
         let inputs = midi_access.inputs();
         let input_iterator = js_sys::try_iter(&inputs)
             .map_err(|_| "Failed to iterate MIDI inputs")?
@@ -444,11 +445,15 @@ impl MidiManager {
 
         for input_entry in input_iterator {
             let input_entry = input_entry.map_err(|_| "Invalid input entry")?;
-            let input_array: js_sys::Array = input_entry.dyn_into().map_err(|_| "Invalid input array")?;
+            let input_array: js_sys::Array =
+                input_entry.dyn_into().map_err(|_| "Invalid input array")?;
             let id = input_array.get(0).as_string().unwrap_or_default();
 
             if id == device_id {
-                let midi_input: MidiInput = input_array.get(1).dyn_into().map_err(|_| "Invalid MIDI input")?;
+                let midi_input: MidiInput = input_array
+                    .get(1)
+                    .dyn_into()
+                    .map_err(|_| "Invalid MIDI input")?;
                 let name = midi_input.name().unwrap_or_else(|| "Unknown".to_string());
                 web_sys::console::log_1(&format!("MIDI input connected: {}", name).into());
 
@@ -476,7 +481,8 @@ impl MidiManager {
                             }
                         }
                     }
-                }) as Box<dyn FnMut(MidiMessageEvent)>);
+                })
+                    as Box<dyn FnMut(MidiMessageEvent)>);
 
                 midi_input.set_onmidimessage(Some(onmidimessage.as_ref().unchecked_ref()));
                 self._input_closures.push(onmidimessage);
@@ -488,7 +494,11 @@ impl MidiManager {
     }
 
     /// Connect to a specific output device by ID.
-    fn connect_output_by_id(&mut self, midi_access: &MidiAccess, device_id: &str) -> Result<(), String> {
+    fn connect_output_by_id(
+        &mut self,
+        midi_access: &MidiAccess,
+        device_id: &str,
+    ) -> Result<(), String> {
         let outputs = midi_access.outputs();
         let output_iterator = js_sys::try_iter(&outputs)
             .map_err(|_| "Failed to iterate MIDI outputs")?
@@ -496,14 +506,21 @@ impl MidiManager {
 
         for output_entry in output_iterator {
             let output_entry = output_entry.map_err(|_| "Invalid output entry")?;
-            let output_array: js_sys::Array = output_entry.dyn_into().map_err(|_| "Invalid output array")?;
+            let output_array: js_sys::Array = output_entry
+                .dyn_into()
+                .map_err(|_| "Invalid output array")?;
             let id = output_array.get(0).as_string().unwrap_or_default();
 
             if id == device_id {
-                let midi_output: MidiOutput = output_array.get(1).dyn_into().map_err(|_| "Invalid MIDI output")?;
+                let midi_output: MidiOutput = output_array
+                    .get(1)
+                    .dyn_into()
+                    .map_err(|_| "Invalid MIDI output")?;
                 let name = midi_output.name().unwrap_or_else(|| "Unknown".to_string());
                 web_sys::console::log_1(&format!("MIDI output connected: {}", name).into());
-                self.output.borrow_mut().set_output(Some(midi_output), Some(name));
+                self.output
+                    .borrow_mut()
+                    .set_output(Some(midi_output), Some(name));
                 return Ok(());
             }
         }
@@ -532,13 +549,10 @@ impl MidiManager {
 
         for input_entry in input_iterator {
             let input_entry = input_entry.map_err(|_| "Invalid input entry")?;
-            let input_array: js_sys::Array = input_entry
-                .dyn_into()
-                .map_err(|_| "Invalid input array")?;
+            let input_array: js_sys::Array =
+                input_entry.dyn_into().map_err(|_| "Invalid input array")?;
             let input_value = input_array.get(1);
-            let midi_input: MidiInput = input_value
-                .dyn_into()
-                .map_err(|_| "Invalid MIDI input")?;
+            let midi_input: MidiInput = input_value.dyn_into().map_err(|_| "Invalid MIDI input")?;
 
             let name = midi_input.name().unwrap_or_else(|| "Unknown".to_string());
             web_sys::console::log_1(&format!("MIDI input found: {}", name).into());
@@ -597,9 +611,8 @@ impl MidiManager {
                 .dyn_into()
                 .map_err(|_| "Invalid output array")?;
             let output_value = output_array.get(1);
-            let midi_output: MidiOutput = output_value
-                .dyn_into()
-                .map_err(|_| "Invalid MIDI output")?;
+            let midi_output: MidiOutput =
+                output_value.dyn_into().map_err(|_| "Invalid MIDI output")?;
 
             let name = midi_output.name().unwrap_or_else(|| "Unknown".to_string());
             web_sys::console::log_1(&format!("MIDI output connected: {}", name).into());
@@ -643,33 +656,20 @@ where
     let callback = Rc::new(on_devices_changed);
 
     spawn_local(async move {
-        let result = manager_clone.borrow_mut().init_with_callback(callback).await;
+        let result = manager_clone
+            .borrow_mut()
+            .init_with_callback(callback)
+            .await;
         if let Err(e) = result {
             web_sys::console::warn_1(&format!("MIDI init warning: {}", e).into());
         }
     });
 }
 
-/// Convert a pitch class (0-N) to a MIDI note number.
-/// Uses middle octave (C4 = 60 for 12-TET).
-pub fn pitch_class_to_midi_note(pitch_class: u8, pitch_count: u8) -> u8 {
-    // For 12-TET, this gives notes 60-71 (C4-B4)
-    // For other tunings, we map proportionally to the same octave range
-    if pitch_count == 12 {
-        60 + pitch_class
-    } else {
-        // Map to roughly the same frequency range
-        // 60 is middle C (~261.6 Hz)
-        60 + (pitch_class * 12 / pitch_count)
-    }
-}
-
-/// Convert a MIDI note to a pitch class.
-pub fn midi_note_to_pitch_class(note: u8, pitch_count: u8) -> u8 {
-    if pitch_count == 12 {
-        note % 12
-    } else {
-        // Map proportionally
-        note % pitch_count
-    }
+/// Map a standard 12-TET degree into the C4 MIDI octave.
+///
+/// Arbitrary tunings require MPE/pitch bend in the native backend; silently
+/// folding them into twelve notes is forbidden.
+pub fn pitch_class_to_midi_note(pitch_class: u16, pitch_count: u16) -> Option<u8> {
+    (pitch_count == 12 && pitch_class < 12).then_some(60 + pitch_class as u8)
 }

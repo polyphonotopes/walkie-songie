@@ -3,11 +3,10 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::*;
 use web_sys::{
-    AudioContext, AudioProcessingEvent, MediaStream, MediaStreamConstraints,
-    ScriptProcessorNode,
+    AudioContext, AudioProcessingEvent, MediaStream, MediaStreamConstraints, ScriptProcessorNode,
 };
 
 /// Buffer size for ScriptProcessorNode (power of 2, 256-16384).
@@ -38,10 +37,7 @@ impl WebAudioInput {
 
     /// Request microphone access and start audio capture.
     /// Raw samples are pushed to the provided buffer for ML processing.
-    pub async fn start(
-        &mut self,
-        sample_buffer: Rc<RefCell<Vec<f32>>>,
-    ) -> Result<(), JsValue> {
+    pub async fn start(&mut self, sample_buffer: Rc<RefCell<Vec<f32>>>) -> Result<(), JsValue> {
         if self.running {
             return Ok(());
         }
@@ -123,7 +119,6 @@ impl WebAudioInput {
         self._callback = None;
         self.running = false;
     }
-
 }
 
 impl Drop for WebAudioInput {

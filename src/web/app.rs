@@ -5,27 +5,33 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use dominator::{clone, events, html, Dom};
-use futures_signals::signal::{Mutable, SignalExt};
+use dominator::{Dom, html};
+use futures_signals::signal::Mutable;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 use web_time::Instant;
 
-use futures::{future::ready, StreamExt};
+use futures::{StreamExt, future::ready};
 use futures_signals::signal::from_stream;
 
+use crate::client::{
+    AppEvent, AppEventEnvelope, AppSnapshot, ClientCommand, DiscoverySource, MidiPortSnapshot,
+    PeerPath,
+};
 use crate::pitch::{PitchDetectorConfig, PitchEvent, SwiftF0Detector};
-use crate::room::{RoomEvent, RoomState};
-use crate::tuning::{PitchClass, Tuning};
+use crate::room::{Piece, RoomEvent, RoomState};
+use crate::tuning::{PitchClass, TunedDegree, TunedPeriodicPitch, Tuning, TuningDefinition};
 
 use crate::words::generate_room_name;
 
 use super::audio::WebAudioInput;
-use super::components::{emoji_picker, info_panel, lock_button, midi_settings, pitch_display, room_header_button, room_overlay, tuning_editor, voice_button};
+use super::components::{
+    clear_button, emoji_picker, info_panel, lock_button, midi_settings, pitch_display,
+    room_header_button, room_overlay, tuning_editor, voice_button,
+};
 use super::keyboard::{pitch_keyboard, sync_active_pitches};
-use super::midi::{MidiManager, pitch_class_to_midi_note, midi_note_to_pitch_class};
-use super::libp2p_sync::start_libp2p_room_sync;
-use super::voice_conditioner::{VoiceConditioner, ConditionerOutput};
+use super::midi::{MidiManager, pitch_class_to_midi_note};
+use super::voice_conditioner::{ConditionerOutput, VoiceConditioner};
 
 /// How long a confident pitch "lingers" when confidence drops (in milliseconds).
 const PITCH_LINGER_MS: u64 = 500;
@@ -44,6 +50,29 @@ const STABILITY_DURATION_MS: u64 = 100;
 /// Application state.
 /// Uses Rc for wasm (single-threaded), Arc would work too but Rc is simpler.
 pub struct AppState {
+    /// True when a signed-RoomStore host is authoritative — either the Tauri
+    /// runtime or the in-page browser iroh host. In these modes the Yrs state
+    /// below is only a rendering adapter.
+    pub native_backend: bool,
+    /// True when that host is the in-page browser iroh host
+    /// (`web::browser_host`): commands stay in this tab and MIDI stays Web MIDI.
+    pub browser_host: bool,
+    /// Last ordered snapshot received from the native runtime.
+    pub native_snapshot: Mutable<Option<AppSnapshot>>,
+    /// Highest accepted native event sequence.
+    pub native_sequence: Mutable<u64>,
+    /// Native MIDI ports rendered by the existing settings component.
+    pub native_midi_inputs: Mutable<Vec<MidiPortSnapshot>>,
+    pub native_midi_outputs: Mutable<Vec<MidiPortSnapshot>>,
+    /// Human-readable Iroh path/discovery state for the room overlay.
+    pub native_status: Mutable<String>,
+    /// Current shareable native room ticket.
+    pub room_ticket: Mutable<Option<String>>,
+    /// Stable non-zero presence session for the current press/hold gesture.
+    voice_session: Rc<RefCell<u64>>,
+    /// Last preview sent to Tauri, used to coalesce detector-rate updates while
+    /// still refreshing the 1.5-second signed lease.
+    last_native_voice: Rc<RefCell<Option<(Instant, TunedPeriodicPitch)>>>,
     /// Room state with CRDT synchronization (manual/clicked pitches).
     pub room: Mutable<RoomState>,
     /// Current tuning system.
@@ -57,7 +86,7 @@ pub struct AppState {
     /// Voice-committed pitch (single slot, separate from manual pitches).
     pub voice_pitch: Mutable<Option<PitchClass>>,
     /// Rolling confidence accumulator per pitch class during voice input.
-    pub pitch_votes: Rc<RefCell<HashMap<u8, f64>>>,
+    pub pitch_votes: Rc<RefCell<HashMap<u16, f64>>>,
     /// Currently "locked" pitch (last high-confidence detection).
     pub locked_pitch: Rc<RefCell<Option<PitchClass>>>,
     /// When the locked pitch was last confirmed with high confidence.
@@ -120,8 +149,31 @@ impl AppState {
         let config = PitchDetectorConfig::default();
         let swiftf0 = SwiftF0Detector::new(config.sample_rate);
         let conditioner = VoiceConditioner::new(config.sample_rate as f32);
+        let voice_session = (js_sys::Date::now() as u64).max(1);
+
+        let tauri = super::native_bridge::is_available();
+        // Without Tauri, the browser-net build hosts the signed room in-page;
+        // otherwise the tab is the offline legacy Yrs fallback.
+        let browser_host = !tauri && cfg!(feature = "browser-net");
 
         Arc::new(Self {
+            native_backend: tauri || browser_host,
+            browser_host,
+            native_snapshot: Mutable::new(None),
+            native_sequence: Mutable::new(0),
+            native_midi_inputs: Mutable::new(Vec::new()),
+            native_midi_outputs: Mutable::new(Vec::new()),
+            native_status: Mutable::new(
+                if browser_host {
+                    "Waiting for peers via the relay…"
+                } else {
+                    "Searching this room with mDNS…"
+                }
+                .to_owned(),
+            ),
+            room_ticket: Mutable::new(None),
+            voice_session: Rc::new(RefCell::new(voice_session)),
+            last_native_voice: Rc::new(RefCell::new(None)),
             room: Mutable::new(room),
             tuning: Mutable::new(tuning),
             voice_active: Mutable::new(false),
@@ -158,8 +210,268 @@ impl AppState {
         })
     }
 
+    /// True only inside the Tauri webview (the host is out-of-process).
+    pub fn tauri_backend(&self) -> bool {
+        self.native_backend && !self.browser_host
+    }
+
+    fn dispatch_native(&self, command: ClientCommand) {
+        if !self.native_backend {
+            return;
+        }
+        let status = self.native_status.clone();
+        let on_error = move |error: String| {
+            status.set(format!("⚠ {error}"));
+        };
+        #[cfg(feature = "browser-net")]
+        if self.browser_host {
+            super::browser_host::dispatch(command, on_error);
+            return;
+        }
+        super::native_bridge::dispatch(command, on_error);
+    }
+
+    fn current_native_pitch(&self, pitch_class: PitchClass) -> Option<TunedDegree> {
+        TunedDegree::new(&self.tuning.lock_ref(), pitch_class.index()).ok()
+    }
+
+    fn native_periodic_pitch(&self, absolute_pitch: i32) -> Option<TunedPeriodicPitch> {
+        let tuning = self.tuning.lock_ref();
+        let degree_count = i32::try_from(tuning.pitch_class_count()).ok()?;
+        let absolute_degree = absolute_pitch.checked_sub(60)?;
+        let degree = u16::try_from(absolute_degree.rem_euclid(degree_count)).ok()?;
+        let period = absolute_degree.div_euclid(degree_count);
+        TunedPeriodicPitch::new(&tuning, degree, period).ok()
+    }
+
+    pub fn set_native_degree(&self, pitch_class: PitchClass, active: bool) {
+        let Some(pitch) = self.current_native_pitch(pitch_class) else {
+            return;
+        };
+        self.dispatch_native(if active {
+            ClientCommand::AddDegree { pitch }
+        } else {
+            ClientCommand::RemoveDegree { pitch }
+        });
+    }
+
+    pub fn toggle_native_degree(&self, pitch_class: PitchClass) {
+        let Some(pitch) = self.current_native_pitch(pitch_class) else {
+            return;
+        };
+        self.dispatch_native(ClientCommand::ToggleDegree { pitch });
+    }
+
+    pub fn put_native_piece(&self, emoji: String, absolute_pitch: i32) {
+        if let Some(pitch) = self.native_periodic_pitch(absolute_pitch) {
+            self.dispatch_native(ClientCommand::PutPiece { emoji, pitch });
+        }
+    }
+
+    pub fn move_native_piece(&self, piece_id: &str, absolute_pitch: i32) {
+        let Some(piece) = parse_op_id(piece_id) else {
+            return;
+        };
+        if let Some(pitch) = self.native_periodic_pitch(absolute_pitch) {
+            self.dispatch_native(ClientCommand::MovePiece { piece, pitch });
+        }
+    }
+
+    pub fn remove_native_piece(&self, piece_id: &str) {
+        if let Some(piece) = parse_op_id(piece_id) {
+            self.dispatch_native(ClientCommand::RemovePiece { piece });
+        }
+    }
+
+    pub fn set_native_pieces_locked(&self, locked: bool) {
+        self.dispatch_native(ClientCommand::SetRoomConfig {
+            pieces_locked: Some(locked),
+            available_emojis: None,
+        });
+    }
+
+    pub fn clear_native_musical_state(&self) {
+        let Some(snapshot) = self.native_snapshot.get_cloned() else {
+            return;
+        };
+        for pitch in snapshot.active_degrees {
+            self.dispatch_native(ClientCommand::RemoveDegree { pitch });
+        }
+        for piece in snapshot.pieces {
+            self.dispatch_native(ClientCommand::RemovePiece { piece: piece.id });
+        }
+        self.send_native_voice(None);
+    }
+
+    pub fn set_native_tuning(&self, scl: String) {
+        match TuningDefinition::new(scl, None) {
+            Ok(definition) => self.dispatch_native(ClientCommand::SetTuning { definition }),
+            Err(error) => self.scl_error.set(Some(error.to_string())),
+        }
+    }
+
+    fn send_native_voice(&self, pitch: Option<TunedPeriodicPitch>) {
+        if let Some(pitch) = pitch {
+            let now = Instant::now();
+            if let Some((last_at, last_pitch)) = *self.last_native_voice.borrow() {
+                let elapsed = now.duration_since(last_at).as_millis() as u64;
+                if (last_pitch == pitch && elapsed < 750) || elapsed < 50 {
+                    return;
+                }
+            }
+            *self.last_native_voice.borrow_mut() = Some((now, pitch));
+        } else {
+            *self.last_native_voice.borrow_mut() = None;
+        }
+        self.dispatch_native(ClientCommand::SetVoicePreview {
+            session: *self.voice_session.borrow(),
+            pitch,
+        });
+    }
+
+    /// Apply one strictly ordered runtime event, then re-project the complete
+    /// snapshot into the legacy UI model.
+    pub fn apply_native_event(self: &Arc<Self>, envelope: AppEventEnvelope) {
+        if envelope.sequence <= self.native_sequence.get() {
+            return;
+        }
+        self.native_sequence.set(envelope.sequence);
+
+        {
+            let mut current = self.native_snapshot.lock_mut();
+            match envelope.event {
+                AppEvent::Snapshot { snapshot } => *current = Some(snapshot),
+                event => {
+                    let Some(snapshot) = current.as_mut() else {
+                        web_sys::console::warn_1(
+                            &"native delta arrived before the initial snapshot".into(),
+                        );
+                        return;
+                    };
+                    apply_native_delta(snapshot, event);
+                }
+            }
+        }
+        self.project_native_snapshot();
+    }
+
+    fn project_native_snapshot(self: &Arc<Self>) {
+        let Some(snapshot) = self.native_snapshot.get_cloned() else {
+            return;
+        };
+
+        if let Some(room_name) = snapshot.room_name.clone() {
+            self.room_name.set(room_name.clone());
+            self.room_input.set(room_name);
+        }
+        self.room_ticket.set(snapshot.room_ticket.clone());
+
+        if let Some(definition) = snapshot.tuning.as_ref() {
+            match definition.validate("room tuning") {
+                Ok(tuning) => {
+                    self.tuning.set(tuning.clone());
+                    self.scl_error.set(None);
+                    super::keyboard::update_tuning(&tuning);
+                }
+                Err(error) => self.scl_error.set(Some(error.to_string())),
+            }
+        }
+
+        // MIDI ports live in the snapshot only when the host owns MIDI (Tauri).
+        // The in-page browser host reports `native_midi: false` and Web MIDI
+        // keeps managing these fields — overwriting them with the snapshot's
+        // empty lists would wipe the user's device selection on every event.
+        if snapshot.capabilities.native_midi {
+            self.native_midi_inputs.set(snapshot.midi_inputs.clone());
+            self.native_midi_outputs.set(snapshot.midi_outputs.clone());
+            self.midi_input_id.set(
+                snapshot
+                    .midi_inputs
+                    .iter()
+                    .find(|port| port.selected)
+                    .map(|port| port.id.clone()),
+            );
+            self.midi_output_id.set(
+                snapshot
+                    .midi_outputs
+                    .iter()
+                    .find(|port| port.selected)
+                    .map(|port| port.id.clone()),
+            );
+            self.midi_devices_version
+                .set(self.midi_devices_version.get().wrapping_add(1));
+        }
+
+        let connected = snapshot
+            .peers
+            .iter()
+            .find(|peer| matches!(peer.path, PeerPath::Direct | PeerPath::Relayed));
+        self.iroh_peer_id
+            .set(connected.map(|peer| peer.endpoint_id.clone()));
+        self.native_status.set(native_status(&snapshot));
+
+        let tuning = self.tuning.lock_ref();
+        let degree_count = i64::try_from(tuning.pitch_class_count()).unwrap_or(1);
+        let pitches: Vec<_> = snapshot
+            .active_degrees
+            .iter()
+            .filter(|pitch| pitch.tuning_id == tuning.id())
+            .map(|pitch| PitchClass::from(pitch.degree))
+            .collect();
+        let pieces: Vec<_> = snapshot
+            .pieces
+            .iter()
+            .filter(|piece| piece.pitch.tuning_id == tuning.id())
+            .filter_map(|piece| {
+                let pitch = i64::from(piece.pitch.pitch.period())
+                    .checked_mul(degree_count)?
+                    .checked_add(i64::from(piece.pitch.pitch.degree().index()))?
+                    .checked_add(60)?;
+                Some(Piece {
+                    id: piece.id.to_hex(),
+                    pitch: i32::try_from(pitch).ok()?,
+                    emoji: piece.emoji.clone(),
+                })
+            })
+            .collect();
+        let voices: Vec<_> = snapshot
+            .voices
+            .iter()
+            .filter_map(|voice| {
+                let pitch = voice.pitch?;
+                if pitch.tuning_id != tuning.id() {
+                    return None;
+                }
+                let absolute = i64::from(pitch.pitch.period())
+                    .checked_mul(degree_count)?
+                    .checked_add(i64::from(pitch.pitch.degree().index()))?
+                    .checked_add(60)?;
+                Some((
+                    voice.author.to_hex(),
+                    i32::try_from(absolute).ok(),
+                    Some(PitchClass::from(pitch.pitch.degree())),
+                ))
+            })
+            .collect();
+        drop(tuning);
+
+        self.pieces_locked.set(snapshot.pieces_locked);
+        self.room.lock_mut().replace_native_projection(
+            &pitches,
+            &pieces,
+            &voices,
+            snapshot.pieces_locked,
+            snapshot.available_emojis.as_deref(),
+        );
+        sync_active_pitches(self);
+    }
+
     /// Handle pitch detection event from SwiftF0, applying conditioner modifier.
-    pub fn on_pitch_event(self: &Arc<Self>, event: PitchEvent, conditioner_output: &ConditionerOutput) {
+    pub fn on_pitch_event(
+        self: &Arc<Self>,
+        event: PitchEvent,
+        conditioner_output: &ConditionerOutput,
+    ) {
         // Apply confidence modifier from conditioner
         let modified_confidence = event.confidence * conditioner_output.confidence_modifier as f64;
         let modified_event = PitchEvent {
@@ -176,10 +488,9 @@ impl AppState {
 
         // Calibrate reference level if we have a confident pitch
         if event.hz.is_some() && event.confidence > 0.6 {
-            self.conditioner.borrow_mut().calibrate_reference(
-                conditioner_output.rms_db,
-                event.confidence,
-            );
+            self.conditioner
+                .borrow_mut()
+                .calibrate_reference(conditioner_output.rms_db, event.confidence);
         }
 
         if self.voice_active.get() && conditioner_output.gate_open {
@@ -209,9 +520,15 @@ impl AppState {
         if let Some(hz) = event.hz {
             // Quantize the detected pitch
             let tuning = self.tuning.lock_ref();
-            let result = tuning.quantize(hz);
+            let Ok(result) = tuning.quantize(hz) else {
+                return;
+            };
             let pc = result.pitch_class;
             let absolute_pitch = result.absolute_pitch;
+            let native_pitch = TunedPeriodicPitch {
+                tuning_id: tuning.id(),
+                pitch: result.periodic_pitch,
+            };
             let pitch_count = tuning.pitch_class_count() as i16;
             drop(tuning);
 
@@ -223,8 +540,11 @@ impl AppState {
                 let fifth_interval = (pitch_count * 7 / 12) as i16;
                 let fourth_interval = (pitch_count * 5 / 12) as i16;
 
-                if diff == fifth_interval || diff == fourth_interval ||
-                   diff == pitch_count - fifth_interval || diff == pitch_count - fourth_interval {
+                if diff == fifth_interval
+                    || diff == fourth_interval
+                    || diff == pitch_count - fifth_interval
+                    || diff == pitch_count - fourth_interval
+                {
                     // Likely harmonic confusion - require higher confidence
                     confidence_threshold + HARMONIC_REJECTION_BOOST
                 } else {
@@ -276,7 +596,10 @@ impl AppState {
                     self.voice_pitch.set(Some(pc));
 
                     // Sync to CRDT for P2P (events emitted automatically) - preserve octave info
-                    self.room.lock_mut().set_voice(Some(absolute_pitch), Some(pc));
+                    self.room
+                        .lock_mut()
+                        .set_voice(Some(absolute_pitch), Some(pc));
+                    self.send_native_voice(Some(native_pitch));
 
                     // Sync keyboard (voice pitch -> lit/green, manual -> pressed/red)
                     sync_active_pitches(self);
@@ -321,6 +644,9 @@ impl AppState {
 
         self.voice_active.set(true);
         self.committed_pitch.set(None);
+        let next_session = self.voice_session.borrow().wrapping_add(1).max(1);
+        *self.voice_session.borrow_mut() = next_session;
+        self.send_native_voice(None);
 
         // Clear accumulated votes and lock state from previous session
         self.pitch_votes.borrow_mut().clear();
@@ -346,7 +672,9 @@ impl AppState {
                 match WebAudioInput::new() {
                     Ok(audio) => *audio_ref = Some(audio),
                     Err(e) => {
-                        web_sys::console::error_1(&format!("Failed to create audio: {:?}", e).into());
+                        web_sys::console::error_1(
+                            &format!("Failed to create audio: {:?}", e).into(),
+                        );
                         self.voice_active.set(false);
                         return;
                     }
@@ -386,10 +714,10 @@ impl AppState {
                             // Small delay to batch samples (~50ms)
                             let promise = js_sys::Promise::new(&mut |resolve, _| {
                                 let window = web_sys::window().unwrap();
-                                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                                    &resolve,
-                                    50,
-                                );
+                                let _ = window
+                                    .set_timeout_with_callback_and_timeout_and_arguments_0(
+                                        &resolve, 50,
+                                    );
                             });
                             let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
                         }
@@ -427,6 +755,14 @@ impl AppState {
 
         // Commit the detected pitch to the voice_pitch slot (single, replaces previous)
         self.voice_pitch.set(self.committed_pitch.get());
+        if self.native_backend {
+            if let Some(pitch) = self.committed_pitch.get() {
+                self.set_native_degree(pitch, true);
+            }
+            self.send_native_voice(None);
+            self.room.lock_mut().set_voice(None, None);
+            self.voice_pitch.set(None);
+        }
 
         // Re-sync keyboard (voice pitch -> lit/green, manual -> pressed/red)
         sync_active_pitches(self);
@@ -439,6 +775,11 @@ impl AppState {
 
     /// Set the selected MIDI input device.
     pub fn set_midi_input(self: &Arc<Self>, device_id: Option<String>) {
+        if self.tauri_backend() {
+            self.midi_input_id.set(device_id.clone());
+            self.dispatch_native(ClientCommand::SelectMidiInput { port_id: device_id });
+            return;
+        }
         if let Ok(mut midi) = self.midi.try_borrow_mut() {
             if let Err(e) = midi.select_input(device_id.clone()) {
                 web_sys::console::warn_1(&format!("Failed to select MIDI input: {}", e).into());
@@ -450,6 +791,11 @@ impl AppState {
 
     /// Set the selected MIDI output device.
     pub fn set_midi_output(self: &Arc<Self>, device_id: Option<String>) {
+        if self.tauri_backend() {
+            self.midi_output_id.set(device_id.clone());
+            self.dispatch_native(ClientCommand::SelectMidiOutput { port_id: device_id });
+            return;
+        }
         if let Ok(mut midi) = self.midi.try_borrow_mut() {
             if let Err(e) = midi.select_output(device_id.clone()) {
                 web_sys::console::warn_1(&format!("Failed to select MIDI output: {}", e).into());
@@ -472,39 +818,71 @@ impl AppState {
 
     /// Set the room name and update the URL hash.
     pub fn set_room_name(&self, name: String) {
-        set_url_hash(&name);
-        self.room_name.set(name.clone());
-        self.room_input.set(name);
+        let room_name = name.split('@').next().unwrap_or(&name).to_owned();
+        set_url_hash(&room_name);
+        self.room_name.set(room_name.clone());
+        self.room_input.set(room_name.clone());
+        self.dispatch_native(ClientCommand::EnterRoom { room_name });
+    }
+
+    pub fn enter_room_or_ticket(&self, input: String) {
+        if let Some(room_name) = crate::words::parse_room_input(&input) {
+            self.set_room_name(room_name);
+        } else if self.native_backend && !input.trim().is_empty() {
+            self.room_input.set(input.clone());
+            self.dispatch_native(ClientCommand::JoinTicket {
+                ticket: input.trim().to_owned(),
+            });
+        }
     }
 
     /// Poll MIDI input and route note events to toggle set.
     pub fn poll_midi_input(self: &Arc<Self>) {
-        let pitch_count = self.tuning.lock_ref().pitch_class_count() as u8;
-
+        // Tauri owns MIDI natively; the browser (offline OR in-page host) polls
+        // Web MIDI here.
+        if self.tauri_backend() {
+            return;
+        }
         while let Some(event) = MidiManager::poll_input() {
-            // Convert MIDI note to pitch class
-            let pc = midi_note_to_pitch_class(event.note, pitch_count);
-            let pitch_class = PitchClass::new(pc);
+            // MIDI input is 12-TET frequency data, even when the active room
+            // tuning is not. Quantize the frequency; never reduce modulo the
+            // room's degree count.
+            let hz = 440.0 * 2.0_f64.powf((f64::from(event.note) - 69.0) / 12.0);
+            let Ok(result) = self.tuning.lock_ref().quantize(hz) else {
+                continue;
+            };
+            let pitch_class = result.pitch_class;
 
-            // Route to toggle set: note-on adds, note-off removes
-            {
-                let mut room = self.room.lock_mut();
-                if event.is_note_on {
-                    room.add_pitch(pitch_class);
-                } else {
-                    room.remove_pitch(pitch_class);
+            if self.browser_host {
+                // The signed store is authoritative: route note-on/off as
+                // durable degree commands; the projection updates the UI.
+                self.set_native_degree(pitch_class, event.is_note_on);
+            } else {
+                // Route to toggle set: note-on adds, note-off removes
+                {
+                    let mut room = self.room.lock_mut();
+                    if event.is_note_on {
+                        room.add_pitch(pitch_class);
+                    } else {
+                        room.remove_pitch(pitch_class);
+                    }
                 }
-            }
 
-            // Sync MIDI output and keyboard display
-            self.sync_midi_toggle_output();
-            sync_active_pitches(self);
+                // Sync MIDI output and keyboard display
+                self.sync_midi_toggle_output();
+                sync_active_pitches(self);
+            }
         }
     }
 
     /// Update MIDI output for toggle set changes.
     /// Call this whenever the toggle set or pieces change.
     pub fn sync_midi_toggle_output(self: &Arc<Self>) {
+        // Web MIDI output stays live in browser-host mode: the projection keeps
+        // the Yrs render adapter fresh, and this reads from it.
+        if self.tauri_backend() {
+            return;
+        }
         // Skip if MIDI output is disabled
         if !self.midi_output_enabled() {
             return;
@@ -512,14 +890,14 @@ impl AppState {
 
         let room = self.room.lock_ref();
         let local_peer = room.local_peer_id();
-        let pitch_count = self.tuning.lock_ref().pitch_class_count() as u8;
+        let pitch_count = self.tuning.lock_ref().pitch_class_count() as u16;
 
         // Get current pitch classes from local peer's set
         let mut current_notes: std::collections::HashSet<u8> =
             if let Some(set) = room.all_peer_sets().get(local_peer) {
                 set.pitch_classes
                     .iter()
-                    .map(|pc| pitch_class_to_midi_note(pc.index(), pitch_count))
+                    .filter_map(|pc| pitch_class_to_midi_note(pc.index(), pitch_count))
                     .collect()
             } else {
                 std::collections::HashSet::new()
@@ -543,22 +921,26 @@ impl AppState {
     /// Update MIDI output for voice pitch changes.
     /// Call this whenever the voice pitch changes.
     pub fn sync_midi_voice_output(self: &Arc<Self>) {
+        if self.tauri_backend() {
+            return;
+        }
         // Skip if MIDI output is disabled
         if !self.midi_output_enabled() {
             return;
         }
 
-        let voice_pitch = self.voice_pitch.get();
-        let pitch_count = self.tuning.lock_ref().pitch_class_count() as u8;
+        let (absolute_pitch, voice_pitch) = self.room.lock_ref().local_voice();
+        let pitch_count = self.tuning.lock_ref().pitch_class_count() as u16;
 
         if let Ok(midi) = self.midi.try_borrow() {
             let mut output = midi.output.borrow_mut();
 
-            if let Some(pc) = voice_pitch {
-                // Convert pitch class to MIDI note (with octave info)
-                // For voice, we use the actual detected pitch if available
-                // Otherwise fall back to middle octave
-                let note = pitch_class_to_midi_note(pc.index(), pitch_count);
+            if let Some(note) = absolute_pitch.and_then(|pitch| u8::try_from(pitch).ok()) {
+                // Preserve the detected periodic position in standard 12-TET.
+                output.voice_note_on(note);
+            } else if let Some(pc) = voice_pitch
+                && let Some(note) = pitch_class_to_midi_note(pc.index(), pitch_count)
+            {
                 output.voice_note_on(note);
             } else {
                 // No voice pitch - clear voice notes
@@ -587,64 +969,240 @@ impl AppState {
 
     /// Process accumulated samples through SwiftF0 (async).
     /// Called from audio callback via spawn_local.
+    ///
+    /// Uses fixed-size chunks to maintain consistent timing for the voice conditioner,
+    /// which assumes ~2048-sample frames for its EMA coefficients.
     pub async fn process_swiftf0(self: &Arc<Self>) {
         if !self.swiftf0_ready.get() || !self.voice_active.get() {
             return;
         }
 
-        // Take samples from the buffer
-        let samples: Vec<f32> = {
-            let mut buffer = self.swiftf0_buffer.borrow_mut();
-            if buffer.len() < 1024 {
-                return; // Not enough samples
+        // Process in fixed chunks to maintain consistent conditioner timing
+        const CHUNK_SIZE: usize = 2048;
+        const MAX_CHUNKS_PER_CALL: usize = 2; // Limit to prevent blocking too long
+
+        let mut chunks_processed = 0;
+
+        loop {
+            if chunks_processed >= MAX_CHUNKS_PER_CALL {
+                break;
             }
-            std::mem::take(&mut *buffer)
-        };
 
-        // Run voice conditioner
-        let conditioner_output = {
-            let mut conditioner = self.conditioner.borrow_mut();
-            conditioner.decay_reference(); // Slow decay each frame
-            conditioner.process(&samples)
-        };
-
-        // Update gate state for UI
-        self.gate_open.set(conditioner_output.gate_open);
-
-        // Only run pitch detection if gate is open
-        if !conditioner_output.gate_open {
-            // Gate closed - clear continuous pitch display
-            self.continuous_hz.set(None);
-            self.final_confidence.set(0.0);
-
-            // Clear voice pitch and MIDI when gate closes (real-time voice following)
-            if self.voice_pitch.get().is_some() {
-                self.voice_pitch.set(None);
-                self.room.lock_mut().set_voice(None, None);
-                self.sync_midi_voice_output();
-            }
-            return;
-        }
-
-        // Run async inference on conditioned samples
-        let result = {
-            let mut swiftf0 = self.swiftf0.borrow_mut();
-            swiftf0.detect(&conditioner_output.samples).await
-        };
-
-        // Emit pitch event if we got a result
-        if let Some((hz, confidence)) = result {
-            let event = PitchEvent {
-                hz: Some(hz),
-                confidence,
+            // Extract exactly one chunk (or break if not enough samples)
+            let samples: Option<Vec<f32>> = {
+                let mut buffer = self.swiftf0_buffer.borrow_mut();
+                if buffer.len() >= CHUNK_SIZE {
+                    Some(buffer.drain(..CHUNK_SIZE).collect())
+                } else {
+                    None
+                }
             };
-            self.on_pitch_event(event, &conditioner_output);
-        } else {
-            // No pitch detected even though gate is open
-            self.continuous_hz.set(None);
-            self.final_confidence.set(0.0);
+
+            let Some(samples) = samples else { break };
+            chunks_processed += 1;
+
+            // Run voice conditioner on fixed-size chunk
+            let conditioner_output = {
+                let mut conditioner = self.conditioner.borrow_mut();
+                conditioner.decay_reference();
+                conditioner.process(&samples)
+            };
+
+            // Update gate state for UI
+            self.gate_open.set(conditioner_output.gate_open);
+
+            // Only run pitch detection if gate is open
+            if !conditioner_output.gate_open {
+                self.continuous_hz.set(None);
+                self.final_confidence.set(0.0);
+
+                if self.voice_pitch.get().is_some() {
+                    self.voice_pitch.set(None);
+                    self.room.lock_mut().set_voice(None, None);
+                    self.send_native_voice(None);
+                    self.sync_midi_voice_output();
+                }
+                continue; // Process next chunk without inference
+            }
+
+            // Run async inference on conditioned samples
+            let result = {
+                let mut swiftf0 = self.swiftf0.borrow_mut();
+                swiftf0.detect(&conditioner_output.samples).await
+            };
+
+            // Emit pitch event if we got a result
+            if let Some((hz, confidence)) = result {
+                let event = PitchEvent {
+                    hz: Some(hz),
+                    confidence,
+                };
+                self.on_pitch_event(event, &conditioner_output);
+            } else {
+                self.continuous_hz.set(None);
+                self.final_confidence.set(0.0);
+            }
         }
     }
+}
+
+fn apply_native_delta(snapshot: &mut AppSnapshot, event: AppEvent) {
+    match event {
+        AppEvent::Snapshot {
+            snapshot: replacement,
+        } => *snapshot = replacement,
+        AppEvent::RoomChanged {
+            room_name,
+            room_topic,
+            ticket,
+        } => {
+            snapshot.room_name = room_name;
+            snapshot.room_topic = room_topic;
+            snapshot.room_ticket = ticket;
+        }
+        AppEvent::TuningChanged { definition } => {
+            snapshot.tuning_id = Some(definition.id);
+            snapshot.tuning = Some(definition);
+        }
+        AppEvent::DegreeAdded { pitch, .. } => {
+            if !snapshot.active_degrees.contains(&pitch) {
+                snapshot.active_degrees.push(pitch);
+                snapshot.active_degrees.sort();
+            }
+        }
+        AppEvent::DegreeRemoved { pitch } => {
+            snapshot.active_degrees.retain(|current| *current != pitch);
+        }
+        AppEvent::PieceUpserted { piece } => {
+            if let Some(current) = snapshot
+                .pieces
+                .iter_mut()
+                .find(|current| current.id == piece.id)
+            {
+                *current = piece;
+            } else {
+                snapshot.pieces.push(piece);
+                snapshot.pieces.sort_by_key(|piece| piece.id);
+            }
+        }
+        AppEvent::PieceRemoved { piece } => {
+            snapshot.pieces.retain(|current| current.id != piece);
+        }
+        AppEvent::RoomConfigChanged {
+            pieces_locked,
+            available_emojis,
+        } => {
+            snapshot.pieces_locked = pieces_locked;
+            snapshot.available_emojis = available_emojis;
+        }
+        AppEvent::VoiceUpdated { voice } => {
+            if let Some(current) = snapshot
+                .voices
+                .iter_mut()
+                .find(|current| current.author == voice.author)
+            {
+                *current = voice;
+            } else {
+                snapshot.voices.push(voice);
+                snapshot.voices.sort_by_key(|voice| voice.author);
+            }
+        }
+        AppEvent::VoiceExpired { author, session } => snapshot
+            .voices
+            .retain(|voice| voice.author != author || voice.session != session),
+        AppEvent::PeerUpdated { peer } => {
+            if let Some(current) = snapshot
+                .peers
+                .iter_mut()
+                .find(|current| current.author == peer.author)
+            {
+                *current = peer;
+            } else {
+                snapshot.peers.push(peer);
+                snapshot.peers.sort_by_key(|peer| peer.author);
+            }
+        }
+        AppEvent::PeerRemoved { author } => {
+            snapshot.peers.retain(|peer| peer.author != author);
+        }
+        AppEvent::MidiPortsChanged { inputs, outputs } => {
+            snapshot.midi_inputs = inputs;
+            snapshot.midi_outputs = outputs;
+        }
+        AppEvent::Diagnostic { code, message } => {
+            web_sys::console::warn_1(&format!("[native:{code}] {message}").into());
+        }
+    }
+}
+
+fn native_status(snapshot: &AppSnapshot) -> String {
+    if snapshot.room_topic.is_none() {
+        return "Not in a room".to_owned();
+    }
+    let direct = snapshot
+        .peers
+        .iter()
+        .find(|peer| peer.path == PeerPath::Direct);
+    let relayed = snapshot
+        .peers
+        .iter()
+        .find(|peer| peer.path == PeerPath::Relayed);
+    let connecting = snapshot
+        .peers
+        .iter()
+        .filter(|peer| peer.path == PeerPath::Connecting)
+        .count();
+    let discovery = |source: DiscoverySource| match source {
+        DiscoverySource::Mdns => "mDNS",
+        DiscoverySource::Ticket => "ticket",
+        DiscoverySource::Gossip => "gossip",
+        DiscoverySource::AddressLookup => "address lookup",
+    };
+    let sync = |synchronized: bool| {
+        if synchronized {
+            "synchronized"
+        } else {
+            "reconciling"
+        }
+    };
+    let rtt = |round_trip_ms: Option<u32>| {
+        round_trip_ms
+            .map(|value| format!(", {value} ms"))
+            .unwrap_or_default()
+    };
+
+    if let Some(peer) = direct {
+        format!(
+            "✓ Direct via {}, {}{}",
+            discovery(peer.discovery),
+            sync(peer.synchronized),
+            rtt(peer.round_trip_ms)
+        )
+    } else if let Some(peer) = relayed {
+        format!(
+            "↗ Relayed via {}, {}; direct hole punch unavailable{}",
+            discovery(peer.discovery),
+            sync(peer.synchronized),
+            rtt(peer.round_trip_ms)
+        )
+    } else if connecting > 0 {
+        format!("⏳ Connecting to {connecting} discovered peer(s)…")
+    } else if snapshot.capabilities.mdns {
+        "⏳ Searching this room with mDNS and relay discovery…".to_owned()
+    } else {
+        "⏳ Waiting for peers via the relay (share the ticket or link)…".to_owned()
+    }
+}
+
+fn parse_op_id(value: &str) -> Option<crate::room::ops::OpId> {
+    if value.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0_u8; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(crate::room::ops::OpId(bytes))
 }
 
 /// Render the main application.
@@ -753,7 +1311,9 @@ fn render_app(state: Arc<AppState>) -> Dom {
                         .class("page")
                         .class("settings-page")
                         .children(&mut [
+                            tuning_editor(state.clone()),
                             midi_settings(state.clone()),
+                            clear_button(state.clone()),
                         ])
                     }),
                 ])
@@ -841,7 +1401,12 @@ fn compute_active_pitches_data(
     // Add all pitches from room result (toggle mode pitches)
     for pc in &room_result.pitch_classes {
         let is_voice = local_voice_pc == Some(*pc);
-        active.push((tuning.note_name(*pc).to_string(), is_voice, false, pc.index() as i32));
+        active.push((
+            tuning.note_name(*pc).to_string(),
+            is_voice,
+            false,
+            pc.index() as i32,
+        ));
     }
 
     // Add pieces with octave info
@@ -914,9 +1479,8 @@ pub fn run_app() {
     tracing_wasm::set_as_global_default_with_config(
         tracing_wasm::WASMLayerConfigBuilder::new()
             .set_max_level(tracing::Level::INFO)
-            .build()
+            .build(),
     );
-
 
     // Initialize app asynchronously (to load peer ID from IndexedDB)
     spawn_local(async {
@@ -926,50 +1490,87 @@ pub fn run_app() {
 
 /// Initialize the application (async to support IndexedDB).
 async fn init_app() {
-    // Load or generate peer ID from IndexedDB
-    let peer_id = super::storage::get_or_create_peer_id().await;
+    let tauri = super::native_bridge::is_available();
+    // Native identity lives in Tauri app data. The browser identifier is used
+    // only by the legacy rendering adapter in that mode (the in-page host's
+    // cryptographic identity is a separate IndexedDB seed; see browser_host).
+    let peer_id = if tauri {
+        "native-ui".to_owned()
+    } else {
+        super::storage::get_or_create_peer_id().await
+    };
 
     // Create application state
     let state = AppState::new(peer_id);
 
-    // Initialize MIDI with hot-plug support
-    let midi_manager = state.midi.clone();
-    let midi_version = state.midi_devices_version.clone();
-    super::midi::init_midi_with_callback(midi_manager.clone(), move || {
-        // Re-enumerate devices and bump version to trigger UI update
-        if let Ok(mut midi) = midi_manager.try_borrow_mut() {
-            midi.refresh_devices();
+    if state.tauri_backend() {
+        let event_state = state.clone();
+        if let Err(error) = super::native_bridge::register_events(move |event| {
+            event_state.apply_native_event(event);
+        })
+        .await
+        {
+            web_sys::console::error_1(
+                &format!("could not register native event channel: {error:?}").into(),
+            );
         }
-        midi_version.set(midi_version.get() + 1);
-    });
+        state.dispatch_native(ClientCommand::ListMidiPorts);
+    } else {
+        // Any browser (offline OR in-page host) retains Web MIDI and hot-plug.
+        let midi_manager = state.midi.clone();
+        let midi_version = state.midi_devices_version.clone();
+        super::midi::init_midi_with_callback(midi_manager.clone(), move || {
+            if let Ok(mut midi) = midi_manager.try_borrow_mut() {
+                midi.refresh_devices();
+            }
+            midi_version.set(midi_version.get() + 1);
+        });
+
+        // Stand up the in-page iroh host BEFORE the EnterRoom dispatch below,
+        // and feed its ordered events through the same apply seam Tauri uses.
+        #[cfg(feature = "browser-net")]
+        if state.browser_host {
+            let event_state = state.clone();
+            if let Err(error) = super::browser_host::init(move |event| {
+                event_state.apply_native_event(event);
+            })
+            .await
+            {
+                web_sys::console::error_1(
+                    &format!("could not start browser networking: {error}").into(),
+                );
+                state
+                    .native_status
+                    .set(format!("⚠ browser networking unavailable: {error}"));
+            }
+        }
+    }
 
     // Initialize room name (from URL or generate new) and sync to hash
     // room_topic may include @peer-id for bootstrapping
     let room_topic = get_or_generate_room_name();
     // Extract just the room name for display/state (strip @peer-id if present)
-    let room_name = room_topic.split('@').next().unwrap_or(&room_topic).to_string();
+    let room_name = room_topic
+        .split('@')
+        .next()
+        .unwrap_or(&room_topic)
+        .to_string();
     state.set_room_name(room_name.clone());
 
-    // Load saved room state from IndexedDB (before P2P sync)
-    if let Some(saved_state) = super::storage::get_room_state(&room_name).await {
-        web_sys::console::log_1(&format!("Loading saved room state ({} bytes)", saved_state.len()).into());
-        if let Err(e) = state.room.lock_mut().load_state(&saved_state) {
-            web_sys::console::warn_1(&format!("Failed to load saved state: {}", e).into());
+    // Native operation history is recovered from the app-data journal. IndexedDB
+    // remains only for the standalone browser fallback.
+    if !state.native_backend {
+        if let Some(saved_state) = super::storage::get_room_state(&room_name).await {
+            web_sys::console::log_1(
+                &format!("Loading saved room state ({} bytes)", saved_state.len()).into(),
+            );
+            if let Err(e) = state.room.lock_mut().load_state(&saved_state) {
+                web_sys::console::warn_1(&format!("Failed to load saved state: {}", e).into());
+            }
         }
-        // Events are emitted by load_state, triggering UI updates automatically
     }
 
-    // Start P2P sync for the room
-    // Pass full room_topic (including @peer-id if present) to signaller
-    let room_for_sync = state.room.clone();
-    let iroh_peer_id = state.iroh_peer_id.clone();
-
-    // Start libp2p sync (WebRTC + gossipsub via circuit relay)
-    start_libp2p_room_sync(
-        room_for_sync,
-        room_topic,
-        iroh_peer_id,
-    );
+    let _room_topic = room_topic;
 
     // Initialize SwiftF0 ML model in background
     let state_for_init = state.clone();
@@ -977,37 +1578,37 @@ async fn init_app() {
         state_for_init.init_swiftf0().await;
     });
 
-    // Start MIDI input polling loop
-    let state_for_midi = state.clone();
-    spawn_local(async move {
-        loop {
-            state_for_midi.poll_midi_input();
+    if !state.tauri_backend() {
+        // Browser Web MIDI still uses its callback queue.
+        let state_for_midi = state.clone();
+        spawn_local(async move {
+            loop {
+                state_for_midi.poll_midi_input();
 
-            // Poll at ~60Hz
-            let promise = js_sys::Promise::new(&mut |resolve, _| {
-                let window = web_sys::window().unwrap();
-                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                    &resolve,
-                    16,
-                );
-            });
-            let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
-        }
-    });
+                let promise = js_sys::Promise::new(&mut |resolve, _| {
+                    let window = web_sys::window().unwrap();
+                    let _ =
+                        window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 16);
+                });
+                let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+            }
+        });
+    }
 
     // Subscribe to room events for UI updates and state persistence
     let state_for_events = state.clone();
-    let room_name_for_events = state.room_name.get_cloned();
     spawn_local(async move {
         // Get event stream from room
         let events = state_for_events.room.lock_ref().events();
 
         // Process each event
-        events.for_each(|event| {
-            // Handle the event
-            handle_room_event(&state_for_events, &event, &room_name_for_events);
-            async {}
-        }).await;
+        events
+            .for_each(|event| {
+                // Handle the event
+                handle_room_event(&state_for_events, &event);
+                async {}
+            })
+            .await;
     });
 
     // Mount the app to the DOM
@@ -1025,7 +1626,7 @@ fn update_graph_highlights(_state: &Arc<AppState>) {
 }
 
 /// Handle a room event - update UI, MIDI, and persist state.
-fn handle_room_event(state: &Arc<AppState>, event: &RoomEvent, room_name: &str) {
+fn handle_room_event(state: &Arc<AppState>, event: &RoomEvent) {
     // Log event for debugging
     web_sys::console::log_1(&format!("[RoomEvent] {:?}", event).into());
 
@@ -1057,9 +1658,13 @@ fn handle_room_event(state: &Arc<AppState>, event: &RoomEvent, room_name: &str) 
         update_graph_highlights(state);
     }
 
-    // Persist state to IndexedDB on any change
+    if state.native_backend {
+        return;
+    }
+
+    // Persist standalone-browser state to IndexedDB on any change.
     let state_bytes = state.room.lock_ref().encode_state_as_update();
-    let room_name = room_name.to_string();
+    let room_name = state.room_name.get_cloned();
     spawn_local(async move {
         if let Err(e) = super::storage::set_room_state(&room_name, &state_bytes).await {
             web_sys::console::warn_1(&format!("Failed to save room state: {}", e).into());

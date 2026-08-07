@@ -38,9 +38,9 @@ pub const TREBLE_CLEF: char = '\u{1D11E}'; // 𝄞
 /// Source of a note (for display purposes)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoteSource {
-    Voice,              // From voice input (shows 🗣️)
-    Piece(String),      // From a piece with its emoji
-    Toggle,             // From toggle mode (no emoji)
+    Voice,         // From voice input (shows 🗣️)
+    Piece(String), // From a piece with its emoji
+    Toggle,        // From toggle mode (no emoji)
 }
 
 impl NoteSource {

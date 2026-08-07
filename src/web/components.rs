@@ -2,13 +2,13 @@
 
 use std::sync::Arc;
 
-use dominator::{clone, events, html, Dom};
+use dominator::{Dom, clone, events, html};
 use futures_signals::signal::SignalExt;
 use wasm_bindgen::JsCast;
-use web_sys::{HtmlTextAreaElement, HtmlInputElement};
+use web_sys::{HtmlInputElement, HtmlTextAreaElement};
 
-use crate::tuning::{parse_scl, Tuning};
-use crate::words::{generate_room_name, generate_room_qr_svg, is_valid_room_input, parse_room_input};
+use crate::tuning::{Tuning, parse_scl};
+use crate::words::{generate_room_name, generate_room_qr_svg};
 
 use super::app::AppState;
 use super::keyboard::{start_emoji_drag, sync_active_pitches, update_tuning};
@@ -50,6 +50,7 @@ pub fn clear_button(state: Arc<AppState>) -> Dom {
         .class("clear-button")
         .text("🌊 Clear")
         .event(clone!(state => move |_: events::Click| {
+            state.clear_native_musical_state();
             // Clear both manual pitches and voice pitch
             {
                 let mut room = state.room.lock_mut();
@@ -80,6 +81,7 @@ pub fn lock_button(state: Arc<AppState>) -> Dom {
             state.pieces_locked.set(new_locked);
             // Persist to CRDT
             state.room.lock_mut().set_pieces_locked(new_locked);
+            state.set_native_pieces_locked(new_locked);
         }))
     })
 }
@@ -88,7 +90,9 @@ pub fn lock_button(state: Arc<AppState>) -> Dom {
 /// Drag the displayed emoji onto keyboard keys to add pieces.
 pub fn emoji_picker(state: Arc<AppState>) -> Dom {
     // Signal that updates on emoji index changes
-    let emoji_signal = state.selected_emoji_idx.signal()
+    let emoji_signal = state
+        .selected_emoji_idx
+        .signal()
         .map(clone!(state => move |idx| {
             let emojis = state.room.lock_ref().available_emojis();
             let count = emojis.len();
@@ -199,14 +203,16 @@ pub fn pitch_display(state: Arc<AppState>) -> Dom {
                                     Some(e) if e.hz.is_some() => {
                                         let hz = e.hz.unwrap();
                                         let tuning = state.tuning.lock_ref();
-                                        let result = tuning.quantize(hz);
-                                        format!(
-                                            "{} ({:.1} Hz, {}{:.0}¢)",
-                                            tuning.note_name(result.pitch_class),
-                                            hz,
-                                            if result.cents_deviation >= 0.0 { "+" } else { "" },
-                                            result.cents_deviation
-                                        )
+                                        match tuning.quantize(hz) {
+                                            Ok(result) => format!(
+                                                "{} ({:.1} Hz, {}{:.0}¢)",
+                                                tuning.note_name(result.pitch_class),
+                                                hz,
+                                                if result.cents_deviation >= 0.0 { "+" } else { "" },
+                                                result.cents_deviation
+                                            ),
+                                            Err(_) => String::new(),
+                                        }
                                     }
                                     _ => "".to_string(),
                                 })
@@ -309,10 +315,8 @@ pub fn room_overlay(state: Arc<AppState>) -> Dom {
                         .event(clone!(state => move |e: events::KeyDown| {
                             if e.key() == "Enter" {
                                 let input = state.room_input.get_cloned();
-                                if !input.is_empty() && is_valid_room_input(&input) {
-                                    if let Some(room_name) = parse_room_input(&input) {
-                                        state.set_room_name(room_name);
-                                    }
+                                if !input.is_empty() {
+                                    state.enter_room_or_ticket(input);
                                 }
                             }
                         }))
@@ -324,13 +328,16 @@ pub fn room_overlay(state: Arc<AppState>) -> Dom {
                         .children(&mut [
                             html!("button", {
                                 .class("room-action-btn")
-                                .text("📋 Copy Link")
+                                .text_signal(state.room_ticket.signal_cloned().map(|ticket| {
+                                    if ticket.is_some() { "📋 Copy Ticket" } else { "📋 Copy Link" }
+                                }))
                                 .event(clone!(state => move |_: events::Click| {
                                     let room = state.room_name.get_cloned();
                                     if let Some(window) = web_sys::window() {
-                                        // Use full base URL with hash for room name
-                                        let base = "https://polyphonotopes.github.io/walkie-songie";
-                                        let link = format!("{}#{}", base, room);
+                                        let link = state.room_ticket.get_cloned().unwrap_or_else(|| {
+                                            let base = "https://polyphonotopes.github.io/walkie-songie";
+                                            format!("{}#{}", base, room)
+                                        });
                                         let clipboard = window.navigator().clipboard();
                                         let _ = clipboard.write_text(&link);
                                     }
@@ -351,9 +358,13 @@ pub fn room_overlay(state: Arc<AppState>) -> Dom {
                     html!("div", {
                         .class("peer-status")
                         .class_signal("connected", state.iroh_peer_id.signal_cloned().map(|p| p.is_some()))
-                        .text_signal(state.iroh_peer_id.signal_cloned().map(|p| {
-                            if p.is_some() { "✓ Connected" } else { "⏳ Connecting..." }.to_string()
-                        }))
+                        .text_signal(if state.native_backend {
+                            state.native_status.signal_cloned().boxed()
+                        } else {
+                            state.iroh_peer_id.signal_cloned().map(|p| {
+                                if p.is_some() { "✓ Connected" } else { "⏳ Connecting..." }.to_string()
+                            }).boxed()
+                        })
                     }),
 
                     // QR Code (always visible)
@@ -410,14 +421,19 @@ pub fn tuning_editor(state: Arc<AppState>) -> Dom {
                                     let content = textarea.value();
                                     // Try to parse and update tuning
                                     match parse_scl(&content) {
-                                        Ok(cents) => {
-                                            let tuning = Tuning::from_scl("Custom".to_string(), cents);
-                                            state.tuning.set(tuning.clone());
-                                            state.scl_error.set(None);
-                                            // Update room SCL
-                                            state.room.lock_mut().set_tuning_scl(&content);
-                                            // Update keyboard display
-                                            update_tuning(&tuning);
+                                        Ok(scale) => {
+                                            match Tuning::from_scl("Custom".to_string(), scale, None) {
+                                                Ok(tuning) => {
+                                                    state.tuning.set(tuning.clone());
+                                                    state.scl_error.set(None);
+                                                    state.set_native_tuning(content.clone());
+                                                    // Update standalone-browser room SCL
+                                                    state.room.lock_mut().set_tuning_scl(&content);
+                                                    // Update keyboard display
+                                                    update_tuning(&tuning);
+                                                }
+                                                Err(e) => state.scl_error.set(Some(e.to_string())),
+                                            }
                                         }
                                         Err(e) => {
                                             state.scl_error.set(Some(format!("{}", e)));
@@ -451,6 +467,7 @@ pub fn tuning_editor(state: Arc<AppState>) -> Dom {
                             state.tuning.set(tuning.clone());
                             state.scl_error.set(None);
                             update_tuning(&tuning);
+                            state.set_native_tuning(crate::tuning::TWELVE_TET_SCL.to_owned());
                         }))
                     }),
                 ])
@@ -478,6 +495,7 @@ pub fn midi_settings(state: Arc<AppState>) -> Dom {
                     html!("select", {
                         .attr("id", "midi-input-select")
                         .class("midi-select")
+                        .prop_signal("value", state.midi_input_id.signal_cloned().map(|id| id.unwrap_or_default()))
                         .event(clone!(state => move |e: events::Change| {
                             if let Some(target) = e.target() {
                                 if let Ok(select) = target.dyn_into::<web_sys::HtmlSelectElement>() {
@@ -495,18 +513,23 @@ pub fn midi_settings(state: Arc<AppState>) -> Dom {
                         ])
                         .children_signal_vec(
                             state.midi_devices_version.signal().map(clone!(state => move |_| {
-                                if let Ok(midi) = state.midi.try_borrow() {
-                                    midi.available_inputs.iter().map(|dev| {
-                                        let id = dev.id.clone();
-                                        let name = dev.name.clone();
+                                let devices: Vec<(String, String)> = if state.tauri_backend() {
+                                    state.native_midi_inputs.lock_ref().iter()
+                                        .map(|dev| (dev.id.clone(), dev.name.clone()))
+                                        .collect()
+                                } else if let Ok(midi) = state.midi.try_borrow() {
+                                    midi.available_inputs.iter()
+                                        .map(|dev| (dev.id.clone(), dev.name.clone()))
+                                        .collect()
+                                } else {
+                                    vec![]
+                                };
+                                devices.into_iter().map(|(id, name)| {
                                         html!("option", {
                                             .attr("value", &id)
                                             .text(&name)
                                         })
                                     }).collect::<Vec<_>>()
-                                } else {
-                                    vec![]
-                                }
                             })).to_signal_vec()
                         )
                     }),
@@ -522,6 +545,7 @@ pub fn midi_settings(state: Arc<AppState>) -> Dom {
                     html!("select", {
                         .attr("id", "midi-output-select")
                         .class("midi-select")
+                        .prop_signal("value", state.midi_output_id.signal_cloned().map(|id| id.unwrap_or_default()))
                         .event(clone!(state => move |e: events::Change| {
                             if let Some(target) = e.target() {
                                 if let Ok(select) = target.dyn_into::<web_sys::HtmlSelectElement>() {
@@ -539,18 +563,23 @@ pub fn midi_settings(state: Arc<AppState>) -> Dom {
                         ])
                         .children_signal_vec(
                             state.midi_devices_version.signal().map(clone!(state => move |_| {
-                                if let Ok(midi) = state.midi.try_borrow() {
-                                    midi.available_outputs.iter().map(|dev| {
-                                        let id = dev.id.clone();
-                                        let name = dev.name.clone();
+                                let devices: Vec<(String, String)> = if state.tauri_backend() {
+                                    state.native_midi_outputs.lock_ref().iter()
+                                        .map(|dev| (dev.id.clone(), dev.name.clone()))
+                                        .collect()
+                                } else if let Ok(midi) = state.midi.try_borrow() {
+                                    midi.available_outputs.iter()
+                                        .map(|dev| (dev.id.clone(), dev.name.clone()))
+                                        .collect()
+                                } else {
+                                    vec![]
+                                };
+                                devices.into_iter().map(|(id, name)| {
                                         html!("option", {
                                             .attr("value", &id)
                                             .text(&name)
                                         })
                                     }).collect::<Vec<_>>()
-                                } else {
-                                    vec![]
-                                }
                             })).to_signal_vec()
                         )
                     }),
@@ -564,8 +593,8 @@ pub fn midi_settings(state: Arc<AppState>) -> Dom {
 /// Shows matching pitch class set names, bass note with solfege, treble note with solfege.
 pub fn info_panel(state: Arc<AppState>) -> Dom {
     use super::solfege::{BASS_CLEF, TREBLE_CLEF};
-    use futures::stream::StreamExt;
     use futures::future::ready;
+    use futures::stream::StreamExt;
     use futures_signals::signal::from_stream;
 
     // Create signal from room events
@@ -756,15 +785,25 @@ struct NoteDisplayInfo {
 /// Compute info panel data from room state
 fn compute_info_panel_data(
     room: &crate::room::RoomState,
-    _tuning: &crate::tuning::Tuning,
+    tuning: &crate::tuning::Tuning,
 ) -> InfoPanelData {
     use super::graph::find_matching_scale_names;
-    use super::solfege::{analyze_range, NoteSource};
+    use super::solfege::{NoteSource, analyze_range};
     use crate::room::snapshot_active_pitches;
+
+    // Graph/mode/solfège analysis is factual only for the standard 12-TET
+    // mapping it was written for.
+    if !tuning.supports_standard_note_names() {
+        return InfoPanelData::default();
+    }
 
     // Use canonical unified pitch classes (includes toggles + pieces + voice)
     let snapshot = snapshot_active_pitches(room);
-    let pitch_classes: Vec<u8> = snapshot.unified_pitch_classes().into_iter().collect();
+    let pitch_classes: Vec<u8> = snapshot
+        .unified_pitch_classes()
+        .into_iter()
+        .filter_map(|pitch| u8::try_from(pitch).ok())
+        .collect();
 
     // Find matching scales
     let scale_names = find_matching_scale_names(&pitch_classes);

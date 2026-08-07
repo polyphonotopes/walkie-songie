@@ -36,18 +36,18 @@ pub struct VoiceConditionerConfig {
 impl Default for VoiceConditionerConfig {
     fn default() -> Self {
         Self {
-            noise_floor_tau: 1.0,         // 1 second time constant
-            gate_open_db: 9.0,            // Open at noise + 9dB
-            gate_close_db: 3.0,           // Close at noise + 3dB (6dB hysteresis)
-            gate_hold_time: 0.05,         // 50ms hold before closing
-            agc_target_dbfs: -12.0,       // Target -12dBFS
-            agc_attack: 0.01,             // 10ms attack
-            agc_release: 0.3,             // 300ms release
-            ref_boost_range_db: 3.0,      // Boost if within 3dB of reference
+            noise_floor_tau: 1.0,             // 1 second time constant
+            gate_open_db: 9.0,                // Open at noise + 9dB
+            gate_close_db: 3.0,               // Close at noise + 3dB (6dB hysteresis)
+            gate_hold_time: 0.05,             // 50ms hold before closing
+            agc_target_dbfs: -12.0,           // Target -12dBFS
+            agc_attack: 0.01,                 // 10ms attack
+            agc_release: 0.3,                 // 300ms release
+            ref_boost_range_db: 3.0,          // Boost if within 3dB of reference
             ref_attenuate_threshold_db: 12.0, // Attenuate if >12dB below reference
-            ref_adapt_up_rate: 0.1,       // Slow upward adaptation
-            ref_decay_down_rate: 0.001,   // Very slow downward decay
-            initial_activation_db: -24.0, // Require strong signal (-24dBFS) to activate
+            ref_adapt_up_rate: 0.1,           // Slow upward adaptation
+            ref_decay_down_rate: 0.001,       // Very slow downward decay
+            initial_activation_db: -24.0,     // Require strong signal (-24dBFS) to activate
         }
     }
 }
