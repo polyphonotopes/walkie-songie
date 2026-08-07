@@ -6,27 +6,23 @@
     <title>Walkie Songie</title>
     <meta name="description" content="P2P collaborative music application for real-time musical collaboration">
     <meta name="theme-color" content="#99bc66">
-    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="Walkie Songie">
     <link rel="manifest" href="manifest.webmanifest">
     <link rel="icon" type="image/svg+xml" href="icon.svg">
     <link rel="apple-touch-icon" href="icon.svg">
-    <link data-trunk rel="css" href="assets/colors.css">
-    <link data-trunk rel="css" href="assets/style.css">
-    <link data-trunk rel="copy-file" href="assets/all-around-keyboard.esm.min.js">
-    <link data-trunk rel="copy-file" href="assets/onnx-bridge.js">
-    <link data-trunk rel="copy-file" href="assets/swiftf0.onnx">
-    <link data-trunk rel="copy-file" href="assets/manifest.webmanifest">
-    <link data-trunk rel="copy-file" href="assets/icon.svg">
-    <link data-trunk rel="copy-file" href="assets/sw.js">
+    <link rel="stylesheet" href="colors.css">
+    <link rel="stylesheet" href="style.css">
 </head>
 <body>
+    <div id="loading" style="position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:var(--bg-primary,#1a1a2e);z-index:9999">
+        <div style="width:40px;height:40px;border:3px solid rgba(255,255,255,0.2);border-top-color:#99bc66;border-radius:50%;animation:spin 1s linear infinite"></div>
+        <style>@keyframes spin{to{transform:rotate(360deg)}}</style>
+    </div>
     <script type="module" src="all-around-keyboard.esm.min.js"></script>
     <script>
         // Register service worker
-        // Tauri owns executable code and persistence; never let a previously
-        // installed browser service worker shadow the bundled frontend.
         if ('serviceWorker' in navigator && !window.__TAURI_INTERNALS__ && !window.__TAURI__) {
             window.addEventListener('load', () => {
                 navigator.serviceWorker.register('sw.js')
@@ -35,7 +31,11 @@
             });
         }
     </script>
-    <!-- Skip wasm-opt via trunk - Cargo profile does LTO/strip/opt-level=z -->
-    <link data-trunk rel="rust" data-target-name="walkie_songie" data-wasm-opt="0" data-cargo-features="web-ui" />
+    <script type="module">
+        import init, * as wasm from './walkie_songie.js';
+        await init();
+        window.wasmBindings = wasm;
+        document.getElementById('loading')?.remove();
+    </script>
 </body>
 </html>
