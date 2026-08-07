@@ -14,7 +14,6 @@ pub struct WalkieSongieParams {
     pub channel_address: Mutex<String>,
 
     // === MIDI Output Enable/Disable ===
-
     /// Enable unified pitch class output (toggles + pieces + voice as pitch classes).
     #[id = "pitch_classes_enabled"]
     pub pitch_classes_enabled: BoolParam,
@@ -28,7 +27,6 @@ pub struct WalkieSongieParams {
     pub pieces_enabled: BoolParam,
 
     // === MIDI Channel Routing (1-16 displayed, 0-15 internal) ===
-
     /// MIDI channel for pitch class output (1-16).
     #[id = "pitch_classes_channel"]
     pub pitch_classes_channel: IntParam,
@@ -57,11 +55,7 @@ impl Default for WalkieSongieParams {
                 1,
                 IntRange::Linear { min: 1, max: 16 },
             ),
-            voice_channel: IntParam::new(
-                "Voice Channel",
-                2,
-                IntRange::Linear { min: 1, max: 16 },
-            ),
+            voice_channel: IntParam::new("Voice Channel", 2, IntRange::Linear { min: 1, max: 16 }),
             pieces_channel: IntParam::new(
                 "Pieces Channel",
                 3,

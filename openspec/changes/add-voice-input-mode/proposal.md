@@ -1,5 +1,10 @@
 # Change: Add Voice Input Mode
 
+> **Status (2026-07-30): desktop implementation superseded by
+> `pivot-to-tauri-iroh`.** The user workflow and local WebAudio/SwiftF0
+> processing remain relevant. Tuning, pitch projection, shared voice presence,
+> and durable state now follow the validated native-runtime design in the pivot.
+
 ## Why
 Musicians need a natural way to input pitches by singing. The current system only has P2P connectivity but no way to actually share musical content. Voice input lets users sing a tone, see real-time feedback with a closeness indicator, and commit it to a shared pitch class set. The environment involves phone mics in rooms with speaker playback, requiring adaptive noise handling.
 

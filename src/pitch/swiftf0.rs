@@ -2,20 +2,20 @@
 //!
 //! Uses onnxruntime-web via JavaScript bridge for full ONNX operator support.
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "web-ui"))]
 use crate::web::onnx_bridge;
 
 /// SwiftF0 model expects 16kHz audio
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "web-ui"))]
 const SWIFTF0_SAMPLE_RATE: u32 = 16000;
 
 /// Minimum samples needed for inference
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "web-ui"))]
 const MIN_SAMPLES: usize = 1024;
 
 /// SwiftF0 pitch detector using onnxruntime-web.
 pub struct SwiftF0Detector {
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", feature = "web-ui"))]
     buffer_16k: Vec<f32>,
     #[allow(dead_code)] // Used in wasm builds
     input_sample_rate: u32,
@@ -27,7 +27,7 @@ impl SwiftF0Detector {
     /// Create a new SwiftF0 detector.
     pub fn new(input_sample_rate: u32) -> Self {
         Self {
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(all(target_arch = "wasm32", feature = "web-ui"))]
             buffer_16k: Vec::with_capacity(MIN_SAMPLES * 4),
             input_sample_rate,
             initialized: false,
@@ -35,7 +35,7 @@ impl SwiftF0Detector {
     }
 
     /// Initialize the ONNX model (async, call once).
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", feature = "web-ui"))]
     pub async fn init(&mut self) -> Result<(), String> {
         match onnx_bridge::init_swiftf0().await {
             Ok(_) => {
@@ -51,24 +51,24 @@ impl SwiftF0Detector {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(all(target_arch = "wasm32", feature = "web-ui")))]
     pub async fn init(&mut self) -> Result<(), String> {
-        Err("SwiftF0 only available on wasm".to_string())
+        Err("SwiftF0 requires the wasm32 web-ui feature".to_string())
     }
 
     /// Check if ready.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", feature = "web-ui"))]
     pub fn is_ready(&self) -> bool {
         self.initialized && onnx_bridge::is_model_ready()
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(all(target_arch = "wasm32", feature = "web-ui")))]
     pub fn is_ready(&self) -> bool {
         false
     }
 
     /// Simple downsampling from input rate to 16kHz.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", feature = "web-ui"))]
     fn downsample(&self, samples: &[f32]) -> Vec<f32> {
         let ratio = self.input_sample_rate / SWIFTF0_SAMPLE_RATE;
         if ratio <= 1 {
@@ -78,7 +78,7 @@ impl SwiftF0Detector {
     }
 
     /// Process audio samples and detect pitch (async).
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", feature = "web-ui"))]
     pub async fn detect(&mut self, samples: &[f32]) -> Option<(f64, f64)> {
         if !self.is_ready() {
             return None;
@@ -106,18 +106,18 @@ impl SwiftF0Detector {
         pitch_result.map(|r| (r.hz, r.confidence))
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(all(target_arch = "wasm32", feature = "web-ui")))]
     pub async fn detect(&mut self, _samples: &[f32]) -> Option<(f64, f64)> {
         None
     }
 
     /// Reset the detector state.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", feature = "web-ui"))]
     pub fn reset(&mut self) {
         self.buffer_16k.clear();
     }
 
     /// Reset the detector state (no-op on non-wasm).
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(all(target_arch = "wasm32", feature = "web-ui")))]
     pub fn reset(&mut self) {}
 }

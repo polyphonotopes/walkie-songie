@@ -1,5 +1,10 @@
 # Proposal: Add Channel UI and Web MIDI
 
+> **Status (2026-07-30): desktop implementation superseded by
+> `pivot-to-tauri-iroh`.** Preserve the room and performance UX goals, but route
+> networking and MIDI through the Tauri backend. Browser MIDI remains optional
+> adapter behavior rather than the primary desktop path.
+
 ## Summary
 Add a room/channel management UI for sharing and joining collaborative sessions, plus Web MIDI I/O for integrating with external instruments and DAWs.
 

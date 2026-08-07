@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::Sender;
 use nih_plug::prelude::*;
-use nih_plug_egui::{create_egui_editor, egui, EguiState};
+use nih_plug_egui::{EguiState, create_egui_editor, egui};
 
 use crate::words::{generate_room_name, parse_room_input};
 
@@ -78,7 +78,14 @@ impl Editor for WalkieSongieEditor {
             EditorState::default(),
             |_, _| {},
             move |egui_ctx, _setter, state| {
-                draw_editor(egui_ctx, state, &params, &connected_peers, &peer_id, &net_tx);
+                draw_editor(
+                    egui_ctx,
+                    state,
+                    &params,
+                    &connected_peers,
+                    &peer_id,
+                    &net_tx,
+                );
             },
         );
 
@@ -129,7 +136,11 @@ fn draw_editor(
                     "Connecting...".to_string()
                 }
             } else {
-                format!("{} peer{} connected", peers, if peers == 1 { "" } else { "s" })
+                format!(
+                    "{} peer{} connected",
+                    peers,
+                    if peers == 1 { "" } else { "s" }
+                )
             };
             ui.label(status_text);
             ui.add_space(8.0);
@@ -149,7 +160,10 @@ fn draw_editor(
             ui.horizontal(|ui| {
                 ui.label("Share:");
                 if ui.small_button("📋 Copy Link").clicked() {
-                    let url = format!("https://polyphonotopes.github.io/walkie-songie/#{}", shareable);
+                    let url = format!(
+                        "https://polyphonotopes.github.io/walkie-songie/#{}",
+                        shareable
+                    );
                     ctx.copy_text(url);
                 }
             });
@@ -181,13 +195,19 @@ fn draw_editor(
             ui.horizontal(|ui| {
                 let response = ui.text_edit_singleline(&mut state.channel_input);
 
-                if ui.button("Join").clicked() || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                if ui.button("Join").clicked()
+                    || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                {
                     let input = state.channel_input.trim();
                     if input.is_empty() {
                         state.error_message = Some("Enter a channel or paste URL".to_string());
                     } else if let Some(room_with_peer) = parse_room_input(input) {
                         // Extract just the room name (before @) for storing
-                        let room_name = room_with_peer.split('@').next().unwrap_or(&room_with_peer).to_string();
+                        let room_name = room_with_peer
+                            .split('@')
+                            .next()
+                            .unwrap_or(&room_with_peer)
+                            .to_string();
                         params.set_channel(room_name);
                         state.error_message = None;
 
@@ -240,12 +260,16 @@ fn generate_qr_texture(ctx: &egui::Context, channel: &str) -> Option<egui::Textu
     use qrcode::QrCode;
 
     // Create URL for the QR code
-    let url = format!("https://polyphonotopes.github.io/walkie-songie/#{}", channel);
+    let url = format!(
+        "https://polyphonotopes.github.io/walkie-songie/#{}",
+        channel
+    );
 
     let code = QrCode::new(url.as_bytes()).ok()?;
 
     // Convert QR to pixel data
-    let qr_image = code.render::<image::Luma<u8>>()
+    let qr_image = code
+        .render::<image::Luma<u8>>()
         .min_dimensions(256, 256)
         .max_dimensions(256, 256)
         .build();

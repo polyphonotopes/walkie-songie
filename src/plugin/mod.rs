@@ -30,8 +30,8 @@ use crossbeam_channel::{Receiver, Sender};
 use nih_plug::prelude::*;
 
 use crate::room::{
-    PitchClassDelta, PitchDelta, RoomState,
-    piece_pitch_deltas, unified_pitch_class_deltas, voice_pitch_deltas,
+    PitchClassDelta, PitchDelta, RoomState, piece_pitch_deltas, unified_pitch_class_deltas,
+    voice_pitch_deltas,
 };
 use crate::tuning::PitchClass;
 use crate::words::generate_room_name;
@@ -194,7 +194,10 @@ impl Plugin for WalkieSongiePlugin {
                         if !self.local_pitch_classes[pc as usize] {
                             self.local_pitch_classes[pc as usize] = true;
                             if let Some(tx) = &self.net_tx {
-                                let _ = tx.try_send(NetCommand::SetPitchClass { pitch_class: pc, on: true });
+                                let _ = tx.try_send(NetCommand::SetPitchClass {
+                                    pitch_class: pc,
+                                    on: true,
+                                });
                             }
                         }
                     } else if channel == voice_channel {
@@ -212,7 +215,10 @@ impl Plugin for WalkieSongiePlugin {
                         if self.local_pitch_classes[pc as usize] {
                             self.local_pitch_classes[pc as usize] = false;
                             if let Some(tx) = &self.net_tx {
-                                let _ = tx.try_send(NetCommand::SetPitchClass { pitch_class: pc, on: false });
+                                let _ = tx.try_send(NetCommand::SetPitchClass {
+                                    pitch_class: pc,
+                                    on: false,
+                                });
                             }
                         }
                     } else if channel == voice_channel {
@@ -345,21 +351,17 @@ impl Plugin for WalkieSongiePlugin {
 
 impl ClapPlugin for WalkieSongiePlugin {
     const CLAP_ID: &'static str = "xyz.wondering.walkie-songie";
-    const CLAP_DESCRIPTION: Option<&'static str> = Some("P2P collaborative music - join channels with QR codes");
+    const CLAP_DESCRIPTION: Option<&'static str> =
+        Some("P2P collaborative music - join channels with QR codes");
     const CLAP_MANUAL_URL: Option<&'static str> = None;
     const CLAP_SUPPORT_URL: Option<&'static str> = None;
-    const CLAP_FEATURES: &'static [ClapFeature] = &[
-        ClapFeature::Utility,
-        ClapFeature::NoteEffect,
-    ];
+    const CLAP_FEATURES: &'static [ClapFeature] = &[ClapFeature::Utility, ClapFeature::NoteEffect];
 }
 
 impl Vst3Plugin for WalkieSongiePlugin {
     const VST3_CLASS_ID: [u8; 16] = *b"walkiesongierust";
-    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
-        Vst3SubCategory::Tools,
-        Vst3SubCategory::Fx,
-    ];
+    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] =
+        &[Vst3SubCategory::Tools, Vst3SubCategory::Fx];
 }
 
 /// Networking thread - handles all P2P communication off the audio thread.
@@ -395,13 +397,13 @@ async fn run_networking_loop(
     evt_tx: Sender<NetEvent>,
     initial_channel: String,
 ) -> anyhow::Result<()> {
+    use futures::StreamExt;
     use libp2p::{
+        Multiaddr, SwarmBuilder,
         gossipsub::{self, IdentTopic, MessageAuthenticity},
         identify,
-        swarm::{SwarmEvent, NetworkBehaviour},
-        Multiaddr, SwarmBuilder,
+        swarm::{NetworkBehaviour, SwarmEvent},
     };
-    use futures::StreamExt;
 
     plog!("=== Networking loop starting (libp2p) ===");
 
@@ -413,7 +415,10 @@ async fn run_networking_loop(
     };
 
     // Extract just the room name (strip any existing @peer-id suffix)
-    let room_name = initial_channel.split('@').next().unwrap_or(&initial_channel);
+    let room_name = initial_channel
+        .split('@')
+        .next()
+        .unwrap_or(&initial_channel);
     let topic = IdentTopic::new(format!("walkie-songie/{}", room_name));
 
     plog!("Room name: {}, topic: {}", room_name, topic);
@@ -451,7 +456,10 @@ async fn run_networking_loop(
                 key.public(),
             ));
 
-            Behaviour { gossipsub, identify }
+            Behaviour {
+                gossipsub,
+                identify,
+            }
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(std::time::Duration::from_secs(60)))
         .build();
@@ -471,7 +479,11 @@ async fn run_networking_loop(
 
     // Create CRDT peer ID and room state (wrapped in Arc<Mutex<>> for stream access)
     let crdt_peer_id = format!("peer-{}", uuid::Uuid::new_v4());
-    let _ = evt_tx.send(NetEvent::PeerIdAssigned(format!("{}@{}", room_name, &crdt_peer_id[5..13])));
+    let _ = evt_tx.send(NetEvent::PeerIdAssigned(format!(
+        "{}@{}",
+        room_name,
+        &crdt_peer_id[5..13]
+    )));
 
     plog!("Creating RoomState with peer_id: {}", crdt_peer_id);
     let room = Arc::new(RwLock::new(RoomState::new(crdt_peer_id.clone())));
@@ -496,8 +508,13 @@ async fn run_networking_loop(
     loop {
         loop_count += 1;
         if loop_count % 312 == 0 {
-            plog!("Heartbeat: {} loops, {} crdt_peers, connected={}, uptime {:?}",
-                loop_count, room.read().unwrap().all_peer_sets().len(), connected_to_relay, loop_start.elapsed());
+            plog!(
+                "Heartbeat: {} loops, {} crdt_peers, connected={}, uptime {:?}",
+                loop_count,
+                room.read().unwrap().all_peer_sets().len(),
+                connected_to_relay,
+                loop_start.elapsed()
+            );
         }
 
         // Process commands from plugin (non-blocking)
@@ -507,7 +524,10 @@ async fn run_networking_loop(
                 return Ok(());
             }
             Ok(NetCommand::JoinChannel(new_channel)) => {
-                plog!("Channel switch requested to {} (not implemented)", new_channel);
+                plog!(
+                    "Channel switch requested to {} (not implemented)",
+                    new_channel
+                );
             }
             Ok(NetCommand::SetPitchClass { pitch_class, on }) => {
                 plog!("Local change: SetPitchClass {} = {}", pitch_class, on);
