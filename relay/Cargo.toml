@@ -1,0 +1,24 @@
+[package]
+name = "walkie-relay"
+version = "0.1.0"
+edition = "2021"
+description = "Origin-gated iroh relay for walkie-songie (admits browser clients by Origin allowlist, no shared token)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "walkie-relay"
+path = "src/main.rs"
+
+[dependencies]
+# The relay server lives behind the `server` feature.
+iroh-relay = { version = "1.0.3", features = ["server"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+http = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+
+[profile.release]
+# Small, fast-linking build; the relay is I/O bound so codegen-units cost little.
+opt-level = 2

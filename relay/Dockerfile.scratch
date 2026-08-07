@@ -1,0 +1,12 @@
+# Deploy image for the wondering.xyz VPS (1 core, ~450 MiB RAM — too small to
+# compile the iroh-relay tree). Assembles a scratch container from a PREBUILT
+# static musl `walkie-relay` binary. Build the binary on a capable host with
+# `nix develop -c cargo build --release --target x86_64-unknown-linux-musl`
+# (see flake.nix), copy it next to this file, then `docker compose build`.
+#
+# Mirrors how the original image shipped n0's released static relay binary.
+FROM scratch
+COPY walkie-relay /usr/local/bin/walkie-relay
+# Same non-root uid the previous relay image used; numeric uid needs no passwd.
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/walkie-relay"]

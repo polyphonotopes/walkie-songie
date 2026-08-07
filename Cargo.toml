@@ -52,6 +52,7 @@ test-support = []
 
 [workspace]
 members = ["xtask", "src-tauri"]
+exclude = ["relay"]
 resolver = "3"
 
 [dependencies]
