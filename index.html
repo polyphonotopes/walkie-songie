@@ -6,24 +6,28 @@
     <title>Walkie Songie</title>
     <meta name="description" content="P2P collaborative music application for real-time musical collaboration">
     <meta name="theme-color" content="#99bc66">
-    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="Walkie Songie">
     <link rel="manifest" href="manifest.webmanifest">
     <link rel="icon" type="image/svg+xml" href="icon.svg">
     <link rel="apple-touch-icon" href="icon.svg">
-    <link rel="stylesheet" href="colors.css">
-    <link rel="stylesheet" href="style.css">
-</head>
+    <link rel="stylesheet" href="/walkie-songie/colors-1dad9d56b6b7cadc.css" integrity="sha384-lkAgGCZH/8nCtMHT5RwtcsdemQH8ecow/h9QCV1HJ0TYjOYnCTyNVPiaOrIT1S1o"/>
+    <link rel="stylesheet" href="/walkie-songie/style-c7740a226620abcc.css" integrity="sha384-yODbsV3HCg+AOcAo3BxYFvurS5jqfR0MpKCT8oC4jcD7yziht3e94TGmPsxdWJb2"/>
+    
+    
+    
+    
+    
+    
+<link rel="modulepreload" href="/walkie-songie/walkie-songie-5d8974f2054b09eb.js" crossorigin="anonymous" integrity="sha384-8pp6ZLtzWcK+42+J/E5MK+CA5Q2ywAUpJymFcM/sJ3+LLvw/xu83+r6KjuHFVek1"><link rel="modulepreload" href="/walkie-songie/snippets/walkie-songie-54ae4c155955ba2c/assets/onnx-bridge.js" crossorigin="anonymous" integrity="sha384-4rSCaxzU8VwksA1m9YOAgpO41pZnx9yCizN3ObDAIJHPqm51bxWCz1lfE/6VV1p+"><link rel="modulepreload" href="/walkie-songie/snippets/walkie-songie-54ae4c155955ba2c/inline0.js" crossorigin="anonymous" integrity="sha384-GCMsVXoXWpwe5MBnn3AK6gd+6y4tFDR7nEZmqblFVigYpnAUQ0W5szRWDpWF2rpo"><link rel="preload" href="/walkie-songie/walkie-songie-5d8974f2054b09eb_bg.wasm" crossorigin="anonymous" integrity="sha384-8RYsRvaHHXc+d3CKDeimk95hbN8WdVnv1IdO3Wbw8loaeAVVmtNCMhH2jbn9JjkR" as="fetch" type="application/wasm"></head>
 <body>
-    <div id="loading" style="position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:var(--bg-primary,#1a1a2e);z-index:9999">
-        <div style="width:40px;height:40px;border:3px solid rgba(255,255,255,0.2);border-top-color:#99bc66;border-radius:50%;animation:spin 1s linear infinite"></div>
-        <style>@keyframes spin{to{transform:rotate(360deg)}}</style>
-    </div>
     <script type="module" src="all-around-keyboard.esm.min.js"></script>
     <script>
         // Register service worker
-        if ('serviceWorker' in navigator) {
+        // Tauri owns executable code and persistence; never let a previously
+        // installed browser service worker shadow the bundled frontend.
+        if ('serviceWorker' in navigator && !window.__TAURI_INTERNALS__ && !window.__TAURI__) {
             window.addEventListener('load', () => {
                 navigator.serviceWorker.register('sw.js')
                     .then(reg => console.log('SW registered:', reg.scope))
@@ -31,11 +35,18 @@
             });
         }
     </script>
-    <script type="module">
-        import init, * as wasm from './walkie_songie.js';
-        await init();
-        window.wasmBindings = wasm;
-        document.getElementById('loading')?.remove();
-    </script>
+    <!-- Skip wasm-opt via trunk - Cargo profile does LTO/strip/opt-level=z -->
+    
+<script type="module">
+import init, * as bindings from '/walkie-songie/walkie-songie-5d8974f2054b09eb.js';
+const wasm = await init({ module_or_path: '/walkie-songie/walkie-songie-5d8974f2054b09eb_bg.wasm' });
+
+
+window.wasmBindings = bindings;
+
+
+dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
+
+</script>
 </body>
 </html>
