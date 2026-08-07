@@ -6,7 +6,7 @@ dist = "dist"
 # wasm-opt disabled - Cargo profile handles LTO/strip/opt-level=z
 
 # wasm-bindgen needs to match the version in Cargo.lock
-wasm_bindgen = "0.2.106"
+wasm_bindgen = "0.2.126"
 
 [watch]
 # Files to ignore during watch mode

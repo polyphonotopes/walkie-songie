@@ -1,7 +1,8 @@
 [package]
 name = "xtask"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.97.1"
 
 [dependencies]
 nih_plug_xtask = { git = "https://github.com/robbert-vdh/nih-plug.git" }

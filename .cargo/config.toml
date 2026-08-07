@@ -1,2 +1,7 @@
 [alias]
 xtask = "run --package xtask --release --"
+
+# getrandom 0.3 needs an explicit backend for the browser; wasm_js uses
+# `crypto.getRandomValues`. Applies to every wasm32-unknown-unknown build.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", "getrandom_backend=\"wasm_js\""]

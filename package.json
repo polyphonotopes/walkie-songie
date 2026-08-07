@@ -1,0 +1,14 @@
+{
+  "name": "walkie-songie-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.33.0",
+  "scripts": {
+    "tauri": "tauri",
+    "desktop:dev": "tauri dev",
+    "desktop:build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.4"
+  }
+}
