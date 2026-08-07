@@ -460,17 +460,6 @@ impl RoomState {
         self.notify();
     }
 
-    /// Toggle a pitch class in the shared set.
-    pub fn toggle_pitch(&mut self, pc: PitchClass) -> bool {
-        if self.contains_pitch(pc) {
-            self.remove_pitch(pc);
-            false
-        } else {
-            self.add_pitch(pc);
-            true
-        }
-    }
-
     /// Set a single pitch class (clears others).
     pub fn set_single_pitch(&mut self, pc: PitchClass) {
         let mut txn = self.doc.transact_mut();
@@ -1293,20 +1282,6 @@ mod tests {
         assert_eq!(state.local_voice(), (None, None));
         assert!(state.pieces_locked());
         assert_eq!(state.available_emojis(), vec!["🎻", "🪕"]);
-    }
-
-    #[test]
-    fn test_yrs_toggle() {
-        let mut state = RoomState::new("peer1".to_string());
-
-        assert!(state.toggle_pitch(PitchClass(7))); // Added
-        let sets = state.all_peer_sets();
-        // Pitches are now shared, not per-peer
-        assert!(sets["shared"].contains(PitchClass(7)));
-
-        assert!(!state.toggle_pitch(PitchClass(7))); // Removed
-        let sets = state.all_peer_sets();
-        assert!(!sets["shared"].contains(PitchClass(7)));
     }
 
     #[test]

@@ -23,7 +23,7 @@ use walkie_songie::{
         FileSeedStore, IrohSyncStream, NativeNetworkEvent, NativeRoomNetwork,
         NativeRoomNetworkConfig, NativeRoomTicket, PeerTransportPath, RelayPolicy, RoomInbound,
         RoomSyncSource, RoomTopic, SyncApply, SyncLimits, SyncOutcome, SyncStoreAccess, TokioTimer,
-        WalkieIdentity, drive_initiator, drive_responder,
+        WalkieIdentity, drive_initiator, drive_responder, spawn_rendezvous,
     },
     room::{
         journal::FileOpJournal,
@@ -156,21 +156,6 @@ impl AppRuntime {
                 self.validate_degree(pitch)?;
                 self.submit_durable(WalkieOp::AddDegree { pitch }).await
             }
-            ClientCommand::ToggleDegree { pitch } => {
-                self.validate_degree(pitch)?;
-                let author = self.identity.author_id();
-                let present = self
-                    .lock()?
-                    .pitch_authors
-                    .get(&pitch)
-                    .is_some_and(|authors| authors.contains(&author));
-                self.submit_durable(if present {
-                    WalkieOp::RemoveDegree { pitch }
-                } else {
-                    WalkieOp::AddDegree { pitch }
-                })
-                .await
-            }
             ClientCommand::RemoveDegree { pitch } => {
                 self.validate_degree(pitch)?;
                 self.submit_durable(WalkieOp::RemoveDegree { pitch }).await
@@ -281,6 +266,25 @@ impl AppRuntime {
         let ticket = network.settle_ticket(Duration::from_millis(750)).await;
         let ticket_string = ticket.to_string();
 
+        // ---- topic rendezvous: auto-peer everyone in this room by code ----
+        // Room-NAME path only (no bootstrap ticket); additive to the ticket
+        // flow. This also gives native cross-network peering — mDNS is LAN-only.
+        // Discovered ids flow to the room loop below, which seeds the peer map
+        // (the rendezvous task itself already fed MemoryLookup + gossip).
+        let (rendezvous_guard, mut rendezvous_rx) = if bootstrap.is_none() {
+            let (rdv_tx, rdv_rx) = mpsc::channel::<iroh::EndpointId>(64);
+            let handle = spawn_rendezvous(
+                network.rendezvous_peering(),
+                config.topic,
+                move |endpoint_id| {
+                    let _ = rdv_tx.try_send(endpoint_id);
+                },
+            );
+            (Some(handle), Some(rdv_rx))
+        } else {
+            (None, None)
+        };
+
         let (control, mut control_rx) = mpsc::channel(64);
         let runtime = self.clone();
         let signing_key = self.identity.signing_key();
@@ -288,6 +292,9 @@ impl AppRuntime {
         let presence_topic = *config.topic.as_bytes();
         let midi_events = self.lock_midi()?.service.input_events();
         let task = tauri::async_runtime::spawn(async move {
+            // Own the rendezvous task for the room's lifetime; dropping it when
+            // this task ends (below) aborts the signaling connection.
+            let _rendezvous_guard = rendezvous_guard;
             let mut local_presence_session = 0_u64;
             let mut local_presence_sequence = 0_u64;
             // author -> (session, sequence, issued_at_ms, local_expires_at_ms)
@@ -490,6 +497,36 @@ impl AppRuntime {
                                     false,
                                 );
                             }
+                        }
+                    }
+                    // Topic-rendezvous discovery. Seed the peer map like an mDNS
+                    // discovery; the rendezvous task already fed MemoryLookup +
+                    // gossip join_peers. The `pending` branch is inert when this
+                    // is a ticket join (no rendezvous); latching the receiver to
+                    // `None` on close keeps a drained channel from spinning.
+                    discovered = async {
+                        match rendezvous_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending::<Option<iroh::EndpointId>>().await,
+                        }
+                    } => {
+                        match discovered {
+                            Some(endpoint_id) => {
+                                let inserted = !peers.contains_key(&endpoint_id);
+                                peers.entry(endpoint_id).or_insert((
+                                    DiscoverySource::AddressLookup,
+                                    PeerPath::Connecting,
+                                ));
+                                if inserted {
+                                    runtime.update_peer(
+                                        endpoint_id,
+                                        DiscoverySource::AddressLookup,
+                                        PeerPath::Connecting,
+                                        false,
+                                    );
+                                }
+                            }
+                            None => rendezvous_rx = None,
                         }
                     }
                     // Repair arrives on its OWN bounded queue inside

@@ -986,7 +986,12 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
         // Only remove piece if dropped on hole (not on click)
         if dropped_on_hole && !state_up.pieces_locked.get() {
             state_up.remove_native_piece(&piece_id);
-            state_up.room.lock_mut().remove_piece(&piece_id);
+            // Optimistic legacy view; connected modes let the signed store's
+            // projection be the sole writer (an owner-gated remove that the
+            // store rejects then leaves the piece in place, by construction).
+            if !state_up.native_backend {
+                state_up.room.lock_mut().remove_piece(&piece_id);
+            }
             // Reset styling before removal triggers UI update
             piece_el.remove_attribute("data-dragging").ok();
             piece_el.style().remove_property("position").ok();
@@ -1024,20 +1029,23 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
 
         let final_key = end_key.or(vector_key);
 
-        // Check if we have a valid drop target and compute new pitch
-        let new_pitch = if let Some(end_key) = final_key {
+        // Check if we have a valid drop target and compute the intended pitch.
+        let intended_pitch = if let Some(end_key) = final_key {
             let delta = shortest_delta(start_pc, end_key, pc_count);
 
             if delta.abs() <= MAX_DRAG_SEMITONES && delta != 0 {
-                // Valid move - update CRDT
-                let new_pitch = start_pitch + delta;
+                let target_pitch = start_pitch + delta;
                 // Don't allow moving to a key that already has a piece
-                if state_up.room.lock_ref().has_piece_at(new_pitch) {
+                if state_up.room.lock_ref().has_piece_at(target_pitch) {
                     start_pitch // Can't move there
                 } else {
-                    state_up.move_native_piece(&piece_id, new_pitch);
-                    state_up.room.lock_mut().move_piece(&piece_id, new_pitch);
-                    new_pitch
+                    state_up.move_native_piece(&piece_id, target_pitch);
+                    // Optimistic legacy view; connected modes let the signed
+                    // store's projection be the sole writer.
+                    if !state_up.native_backend {
+                        state_up.room.lock_mut().move_piece(&piece_id, target_pitch);
+                    }
+                    target_pitch
                 }
             } else {
                 start_pitch // No change
@@ -1046,8 +1054,27 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
             start_pitch // No drop target
         };
 
+        // Position the element. OFFLINE (`!native_backend`) the local view is
+        // authoritative, so the intended pitch positions the piece. CONNECTED
+        // (`native_backend`) the signed store is the sole writer: read the
+        // piece's *projected* position — the owner's key for an owner-gated
+        // rejected move (so it snaps back), the new key for an accepted one —
+        // never the locally-guessed pitch, so the DOM cannot diverge from the
+        // store. Accepted moves then re-arrive as a projection update via
+        // `setup_piece_sync`.
+        let display_pitch = if state_up.native_backend {
+            state_up
+                .room
+                .lock_ref()
+                .get_piece(&piece_id)
+                .map(|piece| piece.pitch)
+                .unwrap_or(intended_pitch)
+        } else {
+            intended_pitch
+        };
+
         // Update the piece position
-        let pitch_class = new_pitch.rem_euclid(pc_count);
+        let pitch_class = display_pitch.rem_euclid(pc_count);
         let key_index = LEFTMOST_KEY + pitch_class;
 
         // Reset styling
@@ -1064,7 +1091,7 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
             .set_attribute("data-key", &key_index.to_string())
             .ok();
         piece_el
-            .set_attribute("data-original-pitch", &new_pitch.to_string())
+            .set_attribute("data-original-pitch", &display_pitch.to_string())
             .ok();
 
         // Defer removing fixed positioning until after MutationObserver runs
@@ -1386,18 +1413,37 @@ fn setup_keyboard_events(state: Arc<AppState>) {
                         let pc = PitchClass::new(note);
                         drop(tuning);
 
-                        // Toggle the pitch class (manual/toggle mode)
-                        let mut room = state_click.room.lock_mut();
-                        let active = room.toggle_pitch(pc);
+                        // Derive an absolute, idempotent intent from the
+                        // projected presence — never a toggle involution.
+                        let voice_cleared = if state_click.native_backend {
+                            // Connected: the projection of the authoritative
+                            // store is the ONLY writer for pitch presence.
+                            // Read the currently-projected presence and
+                            // dispatch an absolute intent (on → RemoveDegree,
+                            // off → AddDegree). No optimistic local write —
+                            // the projection paints the result.
+                            let present = state_click.degree_is_active(pc);
+                            state_click.set_native_degree(pc, !present);
 
-                        // Also clear any voice at this pitch class
-                        let voice_cleared = room.clear_voice_at_pitch_class(pc);
-                        drop(room);
-                        if state_click.native_backend {
-                            state_click.toggle_native_degree(pc);
+                            // Voice presence is host-side; clear the local echo.
+                            let mut room = state_click.room.lock_mut();
+                            room.clear_voice_at_pitch_class(pc)
                         } else {
+                            // Offline: the local `room` adapter IS the
+                            // authoritative state, so it stays the writer.
+                            let mut room = state_click.room.lock_mut();
+                            let active = if room.contains_pitch(pc) {
+                                room.remove_pitch(pc);
+                                false
+                            } else {
+                                room.add_pitch(pc);
+                                true
+                            };
+                            let voice_cleared = room.clear_voice_at_pitch_class(pc);
+                            drop(room);
                             state_click.set_native_degree(pc, active);
-                        }
+                            voice_cleared
+                        };
 
                         if voice_cleared {
                             // Also clear local voice state if it was ours

@@ -255,11 +255,18 @@ impl AppState {
         });
     }
 
-    pub fn toggle_native_degree(&self, pitch_class: PitchClass) {
+    /// Presence of a pitch class in the projected (authoritative) snapshot —
+    /// the exact set `apply_room_view` computed and the projection paints.
+    /// The tap handler reads this to derive an absolute, idempotent intent
+    /// (`AddDegree`/`RemoveDegree`) instead of a store-blind toggle involution.
+    pub fn degree_is_active(&self, pitch_class: PitchClass) -> bool {
         let Some(pitch) = self.current_native_pitch(pitch_class) else {
-            return;
+            return false;
         };
-        self.dispatch_native(ClientCommand::ToggleDegree { pitch });
+        self.native_snapshot
+            .lock_ref()
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.active_degrees.contains(&pitch))
     }
 
     pub fn put_native_piece(&self, emoji: String, absolute_pitch: i32) {

@@ -49,10 +49,6 @@ pub enum ClientCommand {
     AddDegree {
         pitch: TunedDegree,
     },
-    /// Toggle only the local author's contribution for this degree.
-    ToggleDegree {
-        pitch: TunedDegree,
-    },
     RemoveDegree {
         pitch: TunedDegree,
     },

@@ -207,22 +207,6 @@ impl BrowserHost {
                 self.validate_degree(pitch)?;
                 self.submit_durable(WalkieOp::AddDegree { pitch }).await
             }
-            ClientCommand::ToggleDegree { pitch } => {
-                self.validate_degree(pitch)?;
-                let author = self.identity.author_id();
-                let present = self
-                    .state
-                    .borrow()
-                    .pitch_authors
-                    .get(&pitch)
-                    .is_some_and(|authors| authors.contains(&author));
-                self.submit_durable(if present {
-                    WalkieOp::RemoveDegree { pitch }
-                } else {
-                    WalkieOp::AddDegree { pitch }
-                })
-                .await
-            }
             ClientCommand::RemoveDegree { pitch } => {
                 self.validate_degree(pitch)?;
                 self.submit_durable(WalkieOp::RemoveDegree { pitch }).await
@@ -325,7 +309,11 @@ impl BrowserHost {
                 .with_detail(error.to_string())
             })?;
         let handle = network.handle();
-        let ticket = handle.settle_ticket(Duration::from_millis(750)).await;
+        // Wait up to ~5s (iroh's NET_REPORT_TIMEOUT guidance) for the home relay
+        // handshake so the emitted ticket carries a real relay address. On wasm
+        // the endpoint address is relay-only and empty until then; a 750ms wait
+        // routinely lost the race and shipped an undialable, address-less ticket.
+        let ticket = handle.settle_ticket(Duration::from_millis(5000)).await;
         let ticket_string = ticket.to_string();
 
         let (control, mut control_rx) = mpsc::channel(64);
@@ -348,6 +336,44 @@ impl BrowserHost {
                 false,
             );
         }
+
+        // ---- topic rendezvous: auto-peer everyone in this room by code ----
+        // Only the room-NAME path (no bootstrap ticket). Additive — the ticket
+        // flow is untouched. Each discovered id is seeded as AddressLookup /
+        // Connecting; the rendezvous itself feeds iroh's MemoryLookup + gossip
+        // join_peers, and iroh resolves the relay address from the hello.
+        let rendezvous = if bootstrap.is_none() {
+            let peers_for_rdv = peers.clone();
+            let host_for_rdv = self.clone();
+            Some(crate::net::spawn_rendezvous(
+                handle.rendezvous_peering(),
+                handle.topic(),
+                move |endpoint_id| {
+                    let inserted = {
+                        let mut peers = peers_for_rdv.borrow_mut();
+                        if peers.contains_key(&endpoint_id) {
+                            false
+                        } else {
+                            peers.insert(
+                                endpoint_id,
+                                (DiscoverySource::AddressLookup, PeerPath::Connecting),
+                            );
+                            true
+                        }
+                    };
+                    if inserted {
+                        host_for_rdv.update_peer(
+                            endpoint_id,
+                            DiscoverySource::AddressLookup,
+                            PeerPath::Connecting,
+                            false,
+                        );
+                    }
+                },
+            ))
+        } else {
+            None
+        };
 
         let signing_key = self.identity.signing_key();
 
@@ -452,8 +478,13 @@ impl BrowserHost {
             let peers = peers.clone();
             let presence_order = presence_order.clone();
             let mut shutdown_rx = shutdown_rx;
+            let rendezvous_guard = rendezvous;
             spawn_local(async move {
                 use futures::FutureExt;
+
+                // Own the rendezvous task for the room's lifetime; dropping this
+                // on shutdown (loop exit below) aborts it.
+                let _rendezvous_guard = rendezvous_guard;
 
                 /// One turn of the inbound loop: either the room was told to
                 /// shut down, or the network produced (or ended) its stream.

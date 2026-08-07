@@ -1014,6 +1014,97 @@ mod tests {
         assert_parity(&ops);
     }
 
+    /// W17 — the drag-divergence scenario at the data layer: A owns a piece,
+    /// non-owner B moves it, and BOTH peers ingest BOTH ops (in opposite
+    /// orders). Every store — including B's, whose own view never showed the
+    /// move — converges on the owner's position. So any UI that displayed B's
+    /// move was showing state without data; the data was never the bug
+    /// (docs/research/reactive-effectful-ui-adapter-design.md §1, §6.1).
+    #[test]
+    fn w17_non_owner_move_converges_to_owner_position() {
+        let mut a = Peer::new(&SEED_A);
+        let mut b = Peer::new(&SEED_B);
+        let put = a.sign(
+            1,
+            vec![],
+            PutPiece {
+                emoji: "🌵".into(),
+                pitch: tet_pitch(60),
+            },
+        );
+        let piece = put.id();
+        // B is not the owner; it moves A's piece while observing the put.
+        let b_mov = b.sign(
+            2,
+            vec![put.hash()],
+            MovePiece {
+                piece,
+                pitch: tet_pitch(64),
+            },
+        );
+        let ops = vec![put, b_mov];
+
+        // Two independent peers ingest the same ops in opposite orders (the
+        // reversed order also exercises strict deferral of the move).
+        let store_a = ingest_in_order(&ops, &[0, 1]);
+        let store_b = ingest_in_order(&ops, &[1, 0]);
+
+        assert_eq!(store_a.view(), store_b.view(), "peers converge");
+        assert_eq!(entryhash_set(&store_a), entryhash_set(&store_b));
+        for (name, store) in [("A", &store_a), ("B", &store_b)] {
+            let view = store.view();
+            let held = &view.pieces[&piece];
+            assert_eq!(
+                held.pitch,
+                tet_pitch(60),
+                "{name} holds the owner's position, not B's move"
+            );
+        }
+        assert_parity(&ops);
+    }
+
+    /// The mechanism behind the drag divergence: an owner-gated-rejected op
+    /// produces ZERO view delta, so a diff-driven projection has no correction
+    /// to emit. Any snap-back must therefore come from *rendering the
+    /// projection*, never from a view event that will never fire
+    /// (docs/research/reactive-effectful-ui-adapter-design.md §1.3, §6.2).
+    #[test]
+    fn non_owner_move_produces_no_view_delta() {
+        // B's store ingests A's put, then commits B's own (non-owner) move.
+        let mut a = Peer::new(&SEED_A);
+        let put = a.sign(
+            1,
+            vec![],
+            PutPiece {
+                emoji: "🌵".into(),
+                pitch: tet_pitch(60),
+            },
+        );
+        let piece = put.id();
+
+        let mut store = RoomStore::new();
+        store.ingest_verified(put);
+        let before = store.view();
+
+        let b_key = signing_key_from_seed(&SEED_B);
+        store.commit(
+            &b_key,
+            TOPIC,
+            2,
+            MovePiece {
+                piece,
+                pitch: tet_pitch(64),
+            },
+        );
+
+        assert_eq!(
+            store.view(),
+            before,
+            "inert op => zero delta => a diff-driven projection has nothing to \
+             say; snap-back must come from rendering the projection"
+        );
+    }
+
     #[test]
     fn concurrent_set_tuning_uses_register_rule() {
         let mut a = Peer::new(&SEED_A);
