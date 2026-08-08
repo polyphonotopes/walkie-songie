@@ -105,7 +105,10 @@ test-support = []
 
 [workspace]
 members = ["xtask", "src-tauri", "crates/tutti-core"]
-exclude = ["relay"]
+# tutti-amy links the AMY C synthesizer via a `cc` build.rs (see
+# docs/research/tutti-amy-esp32-leaf.md, Stage 1). Excluded like `relay/` so the
+# normal walkie build/CI never pulls the C toolchain.
+exclude = ["relay", "tutti-amy"]
 resolver = "3"
 
 [dependencies]
