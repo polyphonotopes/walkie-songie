@@ -67,7 +67,7 @@
 //!   * **per-channel remove-policies** — here remove is always OPEN; the algebra's
 //!     other remove-constraints (owner-only lifecycle, lease-expiry) are not built;
 //!   * **precondition / void engine** — HHS3 at-use preconditions, all-or-nothing
-//!     bundles, recursive drop-on-void (hhhs-core has no void engine yet).
+//!     bundles, recursive drop-on-void (hhhs has no void engine yet).
 //!
 //! Determinism note: all randomness is a seeded SplitMix64 (below). No `Date::now`,
 //! no `rand` — permutations are reproducible, so a convergence failure is a bug.

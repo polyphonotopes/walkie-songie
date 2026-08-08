@@ -1,4 +1,4 @@
-//! [`Store<L>`]: lift verified p2panda ops into an hhhs-core causal DAG and fold
+//! [`Store<L>`]: lift verified p2panda ops into an hhhs causal DAG and fold
 //! the domain read model HHHS-natively.
 //!
 //! Every [`VerifiedOpG`] is deterministically lifted to a kernel [`Entry`] whose
@@ -22,16 +22,16 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
-use hhhs_core::{AppendOutcome, DagRead, Entry, EntryHash, MemDagStore, Position};
+use hhhs::{AppendOutcome, DagRead, Entry, EntryHash, MemDagStore, Position};
 
 // The kernel `ReachIndex` ancestor closure and `register` resolver back only the
 // reference projection ([`Store::view_reference`]) and its `CausalPast` bridge,
 // which exist for a downstream crate's equivalence tests (feature `test-support`).
 // Production `view()` never materializes an ancestor closure.
 #[cfg(any(test, feature = "test-support"))]
-use hhhs_core::cover::ReachIndex;
+use hhhs::cover::ReachIndex;
 #[cfg(any(test, feature = "test-support"))]
-use hhhs_core::register;
+use hhhs::register;
 
 use crate::ops::{
     AuthorId, LogHead, OpId, OpLanguage, SignedOp, SigningKey, VerifiedOpG, VersionedOpG,
@@ -463,7 +463,7 @@ impl<L: OpLanguage> Store<L> {
     }
 
     /// The reference projection: the identical [`OpLanguage::fold`], but driven by
-    /// the kernel [`ReachIndex`] and [`hhhs_core::register::resolve`] instead of
+    /// the kernel [`ReachIndex`] and [`hhhs::register::resolve`] instead of
     /// the cheap [`Reach`]. Provided (feature `test-support`) as the oracle a
     /// downstream crate's equivalence tests assert `view()` equals — so any drift
     /// in the cheap backend is caught directly against the kernel it replaced.
@@ -529,7 +529,7 @@ pub trait CausalPast {
     fn is_ancestor(&self, a: &EntryHash, b: &EntryHash) -> bool;
 
     /// The last-writer-wins register winner over `candidates`, resolved
-    /// identically to [`hhhs_core::register::resolve`]: drop any candidate that is
+    /// identically to [`hhhs::register::resolve`]: drop any candidate that is
     /// a strict causal ancestor of another (superseded), then break the remaining
     /// mutually-concurrent maxima by the MAXIMUM raw-bytes [`EntryHash`]. `None`
     /// iff `candidates` is empty.
@@ -553,7 +553,7 @@ pub trait CausalPast {
 /// A cheap, lazy causal-ancestry oracle over the store's append-only op DAG.
 ///
 /// It answers `is_ancestor(a, b)` with the SAME strict, present-only semantics as
-/// [`hhhs_core::cover::ReachIndex::is_ancestor`], but WITHOUT the Θ(N²) space
+/// [`hhhs::cover::ReachIndex::is_ancestor`], but WITHOUT the Θ(N²) space
 /// `ReachIndex::new` pays to memoize a full ancestor `BTreeSet` for every node.
 /// Instead it keeps only the `prevs` adjacency — O(N + E), one pass over the
 /// snapshot — and answers each query by a reverse walk from `b` back through
@@ -633,7 +633,7 @@ impl CausalPast for Reach {
 
 /// The kernel `ReachIndex` as a [`CausalPast`] backend for the reference
 /// projection (feature `test-support`). `is_ancestor` forwards to the kernel;
-/// `resolve` forwards to the REAL [`hhhs_core::register::resolve`] (not the trait
+/// `resolve` forwards to the REAL [`hhhs::register::resolve`] (not the trait
 /// default), so [`Store::view_reference`] is the genuine kernel behavior and a
 /// downstream equivalence test has teeth.
 #[cfg(any(test, feature = "test-support"))]

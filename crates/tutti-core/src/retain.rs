@@ -15,7 +15,7 @@
 
 use std::collections::BTreeSet;
 
-use hhhs_core::EntryHash;
+use hhhs::EntryHash;
 
 use crate::ops::OpLanguage;
 use crate::store::FoldCtx;

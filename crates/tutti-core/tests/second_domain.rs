@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 // Fix #1 (closed): `EntryHash` — the KEY type of `FoldCtx::decoded()` and the
 // argument type of `is_ancestor`/`resolve` — is now re-exported by tutti-core, so
 // a downstream domain names the fold's candidate key through `tutti_core` WITHOUT
-// a direct, rev-pinned `hhhs-core` dependency. This whole file spells it via
+// a direct, rev-pinned `hhhs` dependency. This whole file spells it via
 // `tutti_core::EntryHash`; the `entry_hash_nameable_via_tutti_core` test pins it.
 use tutti_core::EntryHash;
 
@@ -522,7 +522,7 @@ fn kv_frame_and_verify_share_the_payload_ceiling() {
 
 // ===========================================================================
 // Fix #1 — `EntryHash` is nameable through `tutti_core`, so a downstream fold
-// collects `BTreeSet<EntryHash>` candidates without a direct hhhs-core rev pin.
+// collects `BTreeSet<EntryHash>` candidates without a direct hhhs rev pin.
 // ===========================================================================
 
 #[test]
@@ -532,9 +532,9 @@ fn entry_hash_nameable_via_tutti_core() {
     let hashes: BTreeSet<tutti_core::EntryHash> = Store::<KvLang>::new().entry_hashes();
     assert!(hashes.is_empty());
 
-    // And it is the very same type hhhs-core defines — a re-export, not a newtype
-    // (this fn only type-checks if `tutti_core::EntryHash == hhhs_core::EntryHash`).
-    fn _same_type(h: tutti_core::EntryHash) -> hhhs_core::EntryHash {
+    // And it is the very same type hhhs defines — a re-export, not a newtype
+    // (this fn only type-checks if `tutti_core::EntryHash == hhhs::EntryHash`).
+    fn _same_type(h: tutti_core::EntryHash) -> hhhs::EntryHash {
         h
     }
     let _ = _same_type;

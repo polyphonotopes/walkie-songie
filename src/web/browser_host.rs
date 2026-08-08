@@ -28,7 +28,7 @@ use futures::{
     SinkExt, StreamExt,
     channel::{mpsc, oneshot},
 };
-use hhhs_core::EntryHash;
+use hhhs::EntryHash;
 use wasm_bindgen_futures::spawn_local;
 use web_time::{SystemTime, UNIX_EPOCH};
 

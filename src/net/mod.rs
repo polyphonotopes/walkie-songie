@@ -255,7 +255,7 @@ pub trait SyncStream {
 /// The seam every backend implements.
 ///
 /// No `Send`/`Sync` bounds anywhere: browser backends hold `!Send` JS handles,
-/// and — like `hhhs_core::sync_session::EntrySource` — one session lives
+/// and — like `hhhs::sync_session::EntrySource` — one session lives
 /// entirely inside one task. Async methods are `impl Future`, so the trait is
 /// not dyn-compatible; runtime mode selection is an enum over the concrete
 /// backends, not `Box<dyn Transport>`.

@@ -20,7 +20,7 @@
 //! iterator `sync_root_of` consumes makes skew between the two commitments
 //! structurally impossible.
 
-use hhhs_core::EntryHash;
+use hhhs::EntryHash;
 use radix_immutable::{BytesKeyConverter, Proof, Trie};
 
 /// The `ops_root` trie: key = 32-byte entry hash, value = `()` (presence only).

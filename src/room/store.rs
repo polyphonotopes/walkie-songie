@@ -16,7 +16,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hhhs_core::EntryHash;
+use hhhs::EntryHash;
 
 use crate::room::ops::{AuthorId, OpId, WalkieLang, WalkieOp};
 use crate::tuning::{TunedDegree, TunedPeriodicPitch, TuningDefinition};
@@ -1422,7 +1422,7 @@ mod tests {
 //
 // The whole optimization rests on ONE claim: the lazy `Reach::is_ancestor`
 // (and the register `resolve` derived from it) answers IDENTICALLY to the
-// kernel `hhhs_core::cover::ReachIndex` it replaced, for every DAG. These
+// kernel `hhhs::cover::ReachIndex` it replaced, for every DAG. These
 // tests hammer that claim over thousands of seeded-random causal histories:
 //
 //   1. `reach_is_ancestor_matches_kernel_oracle` — for ALL (a, b) pairs.
@@ -1440,8 +1440,8 @@ mod tests {
 mod reach_equiv {
     use std::collections::BTreeSet;
 
-    use hhhs_core::cover::ReachIndex;
-    use hhhs_core::{DagRead, EntryHash, register};
+    use hhhs::cover::ReachIndex;
+    use hhhs::{DagRead, EntryHash, register};
 
     use super::super::ops::{OpId, VerifiedOp, WalkieOp};
     use super::super::test_support::{

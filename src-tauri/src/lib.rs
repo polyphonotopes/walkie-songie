@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use hhhs_core::EntryHash;
+use hhhs::EntryHash;
 use iroh::endpoint::Connection;
 use tauri::{Manager, ipc::Channel};
 use tokio::sync::{mpsc, oneshot};

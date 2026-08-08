@@ -27,7 +27,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use hhhs_core::EntryHash;
+use hhhs::EntryHash;
 
 use crate::store::FoldCtx;
 

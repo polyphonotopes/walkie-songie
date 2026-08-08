@@ -21,8 +21,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use hhhs_core::cover::ReachIndex;
-use hhhs_core::{DagRead, GrowthEpoch};
+use hhhs::cover::ReachIndex;
+use hhhs::{DagRead, GrowthEpoch};
 
 use tutti_core::{
     AuthorId, CausalPast, EntryHash, FoldCtx, LogHead, OpId, OpLanguage, SignedOp, SigningKey,

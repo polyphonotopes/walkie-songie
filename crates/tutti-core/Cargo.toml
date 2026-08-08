@@ -24,7 +24,7 @@ p2panda-core = "0.7"
 # The strategy-agnostic causal kernel tutti-core sits ATOP: opaque-payload DAG with
 # fixed entry identity, reachability cover, causal-maxima registers. Pinned to the
 # exact rev + `wire` feature walkie uses so entry hashes unify across the extraction.
-hhhs-core = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "bd23d4e9785f5d0b7bb458d148cab92d130b356e", features = ["wire"] }
+hhhs = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "567ce238a24633a478f8086785d493db8e8abeb8", features = ["serde"] }
 # Convergence digest + Merkle commitments.
 blake3 = "=1.8.5"
 # Canonical blake3-256 radix trie for `ops_root`/`prove_op` (feature `merkle`).

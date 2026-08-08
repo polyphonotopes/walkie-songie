@@ -2,11 +2,11 @@
 //! algorithm, today.
 //!
 //! This is the executable spec for the sync layer (HHHS H6). It builds a
-//! [`hhhs_core::reconciliation::Index`] per peer over the peer's `entry_hashes()`
+//! [`hhhs_sync::reconciliation::Index`] per peer over the peer's `entry_hashes()`
 //! (sort key = the 32-byte entry hash, which already satisfies the RBSR
 //! op-hash-suffix invariant and makes the index injective), then drives
-//! [`opening`](hhhs_core::reconciliation::opening) /
-//! [`respond`](hhhs_core::reconciliation::respond) to a fixpoint. On each terminal
+//! [`opening`](hhhs_sync::reconciliation::opening) /
+//! [`respond`](hhhs_sync::reconciliation::respond) to a fixpoint. On each terminal
 //! `Items` message it transfers the sender's VERBATIM `SignedOp` bytes for the ids
 //! the receiver lacks and re-ingests them through the production ingress
 //! (`ingest_verified`).
@@ -14,7 +14,7 @@
 //! Causal completion: an advertised op is transferred together with its full
 //! causal past (its `backlink` + `observed` predecessors, walked over the op
 //! graph). This is the role of the kernel's
-//! [`completion_plan`](hhhs_core::reconciliation::completion_plan): it guarantees a
+//! [`completion_plan`](hhhs_sync::reconciliation::completion_plan): it guarantees a
 //! transferred op LIFTS immediately rather than parking behind a predecessor that
 //! lives in a different RBSR range — which keeps the round count at the RBSR tree
 //! depth instead of stalling one range while another slowly delivers its parents.
@@ -24,8 +24,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hhhs_core::SortKey;
-use hhhs_core::reconciliation::{self, Config, Index, Message};
+use hhhs_sync::SortKey;
+use hhhs_sync::reconciliation::{self, Config, Index, Message};
 
 use walkie_songie::room::ops::{OpId, VerifiedOp};
 use walkie_songie::room::store::RoomStore;

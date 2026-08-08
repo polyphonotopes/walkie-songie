@@ -1,11 +1,11 @@
 //! **tutti-core** — the domain-agnostic reconciling signed-op substrate.
 //!
-//! This crate is the band that sits ATOP `hhhs-core` and below any music (or
+//! This crate is the band that sits ATOP `hhhs` and below any music (or
 //! other) app: the signed, per-author, topic-bound op envelope with
 //! verification-at-ingress; the deterministic lift of verbatim signed bytes into
 //! the kernel causal DAG (strict deferral + drain, dual `OpId ↔ EntryHash` maps,
 //! per-author heads); and the pure causal fold seam ([`OpLanguage`] + [`FoldCtx`])
-//! a downstream domain instantiates once. It owns exactly what `hhhs-core`
+//! a downstream domain instantiates once. It owns exactly what `hhhs`
 //! deliberately does not: signatures, authorship, topic binding, wire framing.
 //!
 //! It carries **no domain alphabet, no domain fold rule, and no UI**. Walkie-songie
@@ -22,7 +22,7 @@
 //! `L::View: Canonical`), presence-lease and journal extraction, and the
 //! `tutti-testkit` split — all left walkie-side to keep a clean compile.
 //!
-//! Dependency posture (leaf-safe): `p2panda-core` + `hhhs-core` + `blake3` +
+//! Dependency posture (leaf-safe): `p2panda-core` + `hhhs` + `blake3` +
 //! `serde` (+ optional `radix_immutable` under `merkle`) — all wasm-safe, no
 //! tokio, no iroh, no web-sys.
 
@@ -45,8 +45,8 @@ pub use store::{CausalPast, DecodedOp, FoldCtx, Reach, Store, sync_root_of};
 pub use windowed::{Compaction, WindowedDag, WindowedReach, WindowedStore};
 
 /// The kernel's opaque-payload entry identity, re-exported so a downstream domain
-/// names it through `tutti_core` and never takes a direct, rev-pinned `hhhs-core`
+/// names it through `tutti_core` and never takes a direct, rev-pinned `hhhs`
 /// dependency purely to spell it. It is the key type of [`FoldCtx::decoded`] and
 /// the argument to [`FoldCtx::is_ancestor`]/[`FoldCtx::resolve`], so a domain
 /// `fold` cannot collect its `BTreeSet<EntryHash>` candidates without naming it.
-pub use hhhs_core::EntryHash;
+pub use hhhs::EntryHash;

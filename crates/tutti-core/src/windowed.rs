@@ -1,7 +1,7 @@
 //! M3.0 — the bounded window — plus **M3.1 monotone-shadowing compaction**
 //! (`docs/vision/windowed-store-design.md` §7 "M3.0"/"M3.1", §6.1, §3, §2.4-2.6).
 //!
-//! Two types, mirroring the kernel's own [`MemDagStore`](hhhs_core::MemDagStore)
+//! Two types, mirroring the kernel's own [`MemDagStore`](hhhs::MemDagStore)
 //! vs [`Store<L>`](crate::Store) split (design §6.1):
 //!
 //! - [`WindowedDag`] — the L-free kernel piece: a bounded suffix window of a causal
@@ -59,10 +59,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use hhhs_core::{DagRead, Entry, EntryHash, GrowthEpoch, Position};
+use hhhs::{DagRead, Entry, EntryHash, GrowthEpoch, Position};
 
 #[cfg(any(test, feature = "test-support"))]
-use hhhs_core::cover::ReachIndex;
+use hhhs::cover::ReachIndex;
 
 use crate::ops::{AuthorId, LogHead, OpId, OpLanguage, SignedOp, SigningKey, VerifiedOpG};
 use crate::store::{
@@ -277,7 +277,7 @@ impl CausalPast for PackedReach<'_> {
 /// Entries older than the window are simply not present (§1.3: present-only is
 /// already the kernel doctrine, so a truncated DAG is a legal [`DagRead`] value).
 /// While `N ≤ W` no entry has ever been evicted, so the window holds the entire DAG
-/// and is exactly a [`MemDagStore`](hhhs_core::MemDagStore); the bitset reach is then
+/// and is exactly a [`MemDagStore`](hhhs::MemDagStore); the bitset reach is then
 /// the whole causal history, exact for every pair.
 ///
 /// **Completeness invariant.** [`WindowedDag::is_complete`] is `true` iff the window
@@ -431,7 +431,7 @@ impl WindowedDag {
         evicted
     }
 
-    /// The bounded-window [`DagDelta::appended_since`](hhhs_core::DagDelta) contract
+    /// The bounded-window [`DagDelta::appended_since`](hhhs::DagDelta) contract
     /// (dag.rs:228-235), provided inherently.
     ///
     /// `Some(window suffix)` — entries admitted after `since`, in admission order —
@@ -535,7 +535,7 @@ impl DagRead for WindowedDag {
 
 /// Heads of the retained window: entries not referenced as a `prev` by any *retained*
 /// entry. Present-only, so a window edge whose successor references an evicted entry
-/// is unaffected. Mirrors `hhhs_core::dag::frontier_of`.
+/// is unaffected. Mirrors `hhhs::dag::frontier_of`.
 fn frontier_of(entries: &BTreeMap<EntryHash, Entry>) -> Position {
     let referenced: BTreeSet<EntryHash> = entries
         .values()
@@ -552,7 +552,7 @@ fn frontier_of(entries: &BTreeMap<EntryHash, Entry>) -> Position {
 
 /// Deterministic topological order over the retained entries (predecessors before
 /// successors, ties by entry hash), counting only *present* `prevs` — so cut-dangling
-/// `prevs` are legal (§1.3, mirroring `hhhs_core::dag::topo_of`).
+/// `prevs` are legal (§1.3, mirroring `hhhs::dag::topo_of`).
 fn topo_of(entries: &BTreeMap<EntryHash, Entry>) -> Vec<Entry> {
     let present: BTreeSet<EntryHash> = entries.keys().copied().collect();
     let mut indeg: BTreeMap<EntryHash, usize> = BTreeMap::new();
@@ -1261,7 +1261,7 @@ impl<L: OpLanguage> WindowedStore<L> {
         signed
     }
 
-    /// The bounded-window [`DagDelta::appended_since`](hhhs_core::DagDelta) contract,
+    /// The bounded-window [`DagDelta::appended_since`](hhhs::DagDelta) contract,
     /// forwarded from the backing [`WindowedDag`]: `Some` inside the window, `None`
     /// past its boundary (§1.3, §7).
     pub fn appended_since(&self, since: GrowthEpoch) -> Option<Vec<Entry>> {

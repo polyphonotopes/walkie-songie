@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hhhs_core::{Digest, EntryHash, Header, Position, entry_hash};
+use hhhs::{Digest, EntryHash, Header, Position, entry_hash};
 
 use super::ops::WalkieOp::*;
 use super::ops::{

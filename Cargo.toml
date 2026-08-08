@@ -155,8 +155,9 @@ tutti-core = { path = "crates/tutti-core" }
 # p2panda-core and HHHS are wasm-safe (no tokio/iroh); the native networking
 # stack (p2panda-net) and browser iroh transport are added target-gated below.
 p2panda-core = "0.7"
-hhhs-core = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "bd23d4e9785f5d0b7bb458d148cab92d130b356e", features = ["wire"] }
-hhhs-reactive = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "bd23d4e9785f5d0b7bb458d148cab92d130b356e" }
+hhhs = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "567ce238a24633a478f8086785d493db8e8abeb8" }
+hhhs-sync = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "567ce238a24633a478f8086785d493db8e8abeb8", features = ["wire"] }
+hhhs-reactive = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "567ce238a24633a478f8086785d493db8e8abeb8" }
 # futures-signals drives the HHHS reactive read model (room::mirror) on ALL targets
 # (native plugin + wasm UI); dominator (wasm-only, below) consumes the same signals.
 futures-signals = "0.3"
@@ -167,7 +168,7 @@ futures-signals = "0.3"
 
 # L0 integration-test harness (tests/). The self dev-dep forces the `test-support`
 # feature on for the out-of-crate test crates (which cannot see `#[cfg(test)]`), and
-# `hhhs-core` lets the reconcile driver name the RBSR reconciliation types directly.
+# `hhhs-sync` lets the reconcile driver name the RBSR reconciliation types directly.
 [dev-dependencies]
 walkie-songie = { path = ".", default-features = false, features = ["test-support"] }
 # Enables tutti-core's reference-oracle surface (`Store::view_reference`,
@@ -175,7 +176,7 @@ walkie-songie = { path = ".", default-features = false, features = ["test-suppor
 # `reach_equiv` equivalence tests. As a dev-dependency it is unified into the
 # `cargo test` build only, so a plain `cargo build` keeps tutti-core lean.
 tutti-core = { path = "crates/tutti-core", features = ["test-support"] }
-hhhs-core = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "bd23d4e9785f5d0b7bb458d148cab92d130b356e" }
+hhhs-sync = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "567ce238a24633a478f8086785d493db8e8abeb8" }
 # Benchmark suite (M0). criterion: native micro-benchmarks; dhat: heap profiling
 # for the reach/view RAM harness; postcard: the real RBSR wire codec, for
 # byte-accurate reconciliation-size reporting.

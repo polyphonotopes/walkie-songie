@@ -1,6 +1,6 @@
 //! Transport-neutral HHHS anti-entropy driver (transport-design §2.6 / §3.4).
 //!
-//! Drives [`hhhs_core::sync_session::SyncSession`] to completion over any
+//! Drives [`hhhs_sync::sync_session::SyncSession`] to completion over any
 //! [`SyncStream`], for both halves: the initiator (dialled via
 //! [`Transport::open_sync`](super::Transport::open_sync)) and the responder
 //! (accepted from [`TransportEvent::SyncRequested`](super::TransportEvent)).
@@ -37,10 +37,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use futures::future::{Either, select};
-use hhhs_core::{
+use hhhs_sync::{
     EntryHash, SortKey,
     reconciliation::{Config, Index, SessionHello},
-    strategy::StrategyId,
+    StrategyId,
     sync_session::{
         EntrySource, SessionBudget, SessionError, SessionStatus, SyncMessage, SyncSession,
     },
@@ -805,8 +805,8 @@ mod tests {
     use crate::net::{Transport, TransportEvent};
     use crate::room::ops::{MAX_EMOJI_PALETTE_BYTES, WalkieOp, signing_key_from_seed};
     use crate::tuning::{TunedDegree, Tuning, TuningDefinition};
-    use hhhs_core::encoding::Digest;
-    use hhhs_core::reconciliation::{KeyRange, Message};
+    use hhhs_sync::Digest;
+    use hhhs_sync::reconciliation::{KeyRange, Message};
 
     const TOPIC: &str = "sync-driver-test";
 
