@@ -6,9 +6,19 @@ and cited. Grounding: walkie-songie at HEAD (`src/room/ops.rs`,
 `src/room/store.rs`, `src/web/app.rs`, `src/web/browser_host.rs`,
 `src/tuning/`, `src/room/presence.rs`), the companion designs
 (`docs/research/ui-state-coupling-design.md`,
-`docs/research/reactive-rollback-api-design.md`), and the HHS3 corpus
+`docs/research/reactive-rollback-api-design.md`,
+`docs/research/nice-plug-migration.md`), the HHS3 corpus
 (`/laboratory/fe-stuff/hhs3-ts`,
-`/laboratory/fe-stuff/misc/hhs3-riffcat-relation-2026-07-17/`).
+`/laboratory/fe-stuff/misc/hhs3-riffcat-relation-2026-07-17/`), and
+riff-cat (`/laboratory/fe-stuff/riff-catalog` — the Lean law files and the
+cubical music instance).
+
+**Contents:** §0 the stuck note · §1 the reframe · §2 the primitive ·
+§3 the incumbents (§3.1 channels, reimagined + the constraint algebra) ·
+§4 five what-ifs ·
+§5 the bridge to today · §6 the substrate contract (§6.6 the leaf
+profile) · §7 provable lenses · §8 time-sensitive facets · §9 the
+MIDI/DAW bridge · §10 naming it · §11 open questions.
 
 ---
 
@@ -442,6 +452,142 @@ facet and temporal work of §5.2; axis 5 needs capability machinery walkie
 does not carry — HHS3 has it (`hhs3-ts`, Santi's tree, is the source of
 truth), but importing it is a real project, not a weekend.
 
+#### The channel constraint algebra
+
+Look back at the policies this document has been reciting one at a time:
+notes are **shared-clear** (anyone silences, kills only the causal past),
+pieces are **owner-gated** (non-owner ops stored but inert), voice is a
+**per-author single leased register**, tuning is a **room-wide causal
+register**. Those were not four ad-hoc rulings. They are four points in a
+small algebra, and naming the algebra is what turns "channel" from a
+routing concept into a governance concept:
+
+**a channel = an address space × a membership policy × a projection.**
+
+The address space is §3.1's axes (topic, author, facet, time slice); the
+projection is how it renders (§7 lenses, §9 edges); and the membership
+policy — who may add, who may remove, what a holding's lifetime is — is
+built from a primitive kit that already exists as the fold-combinator
+layer of the tutti crate design (`docs/vision/tutti-crate-architecture.md`
+§3.2: `add_wins_set` with per-key holders, `causal_register`,
+`owner_seq_objects` beside `shared_objects`, and the generic lease
+envelope). The policy zoo, each entry with its worked case:
+
+| policy | worked case | machinery | status |
+|---|---|---|---|
+| **add-only** | annotation/dedication channels; the CALM-pure fragment (grant-only is the theory's own example) | `add_wins_set` with no remove classifier — the degenerate kit case | trivial composition, today |
+| **shared observed-remove** ("shared-clear") | **notes**: anyone resolves a sounding degree; the remove kills only what it observed | `store.rs:435-450`; decided deliberately in `ui-state-coupling-design.md` §4.4 | shipping |
+| **owner-gated** | **pieces**: only the creator's move/remove take effect; others' ops stay durable and inert | `owner_seq_objects` (`store.rs:454-551`) — and the kit keeps `shared_objects` beside it so the choice is a one-line swap, not an architecture | shipping |
+| **causal register** | **tuning/config**: one value per channel, causal maxima + deterministic tiebreak | `causal_register` (`store.rs:553-605`) | shipping |
+| **per-author leased register** | **voice** — the canonical worked case: per-author, monophonic, sequence-resolved, 1.5 s lease, deliberately never durable | `presence.rs:1-30` | shipping |
+| **TTL/expiry** | the lease dimension applied to any channel: sustain as renewal, decay as expiry (§2.3, §8.1) | the lease envelope generalized over its body payload | voice today; generic envelope designed |
+| **threshold-as-verdict** | "this degree sounds once ≥ k authors hold it"; "the modulation takes effect once a majority endorsed it" | a pure fold predicate over `AddWins::holders` — walkie's `pitch_authors` counted | today, as view-side rule — and honestly *not* commit-time consensus (§6.4): the verdict flips deterministically as endorsements arrive; nobody voted |
+| **capability-gated / ocap** | "only cap-holders write the score channel"; attenuated grants ("add but not retract", "degrees 0–11 only"); revocation that beats a racing writer | HHS3 capability rows + at-use preconditions, all-or-nothing bundles, recursive drop-on-void (`hhs3-deep-core-fable.md` §1, §3) | roadmap — see below |
+
+**Add and remove are independent axes.** The table reads as single
+labels, but a channel's membership policy is really a *pair* — an
+add-constraint × a remove-constraint, each drawn from the zoo on its own.
+Walkie's channels already occupy three distinct cells of that matrix:
+notes are (open add × shared observed-remove); pieces are (open add ×
+owner-only lifecycle); voice is (author-only add — you can only set your
+own register — × author-or-lease-expiry remove). And the cell none of
+them occupies yet is the canonical example of why the axes must be
+separable: **only certain devices may add to a channel; anyone may
+remove.** A stage rig where the instruments alone put notes on the
+surface but any performer — or front-of-house — can silence one is
+(device-gated add × shared observed-remove): the gate keeps the surface
+curated, the open remove keeps it socially safe, and neither constraint
+needs to know the other exists. This separability is most of what makes
+device-scoped controls (below) expressive rather than merely locked.
+
+The headline, and it deserves its own paragraph: **this is rich access
+control with zero coordination, because every policy is a deterministic
+function of the op-set.** A violating op does not bounce, block, or fork
+the room — it *voids*: it stays in history, signed and attributable, and
+every honest replica computes the same "no effect" verdict for it at every
+horizon (the owner-gate already works exactly this way — `store.rs`
+stores the non-owner's move and gives it nothing). Gate a channel with an
+HHS3-style precondition and the same shape scales up: the precondition is
+re-evaluated at-use as history merges, a violating bundle falls
+all-or-nothing, and convergence is never in the blast radius because
+nothing was ever coordinated in the first place. Eventual consistency is
+not a ceiling on expressiveness — the constraint algebra lives *inside*
+it.
+
+Three compositions make the algebra more than a menu:
+
+- **Policies are channel data, not deployment config.** Axis 3 made the
+  channel a reconciling document; its membership policy belongs in that
+  document — a causal register holding the channel's own rules, so a room
+  can *become* owner-gated by an op, with history. (rdb's slogan transfers
+  verbatim: authority is the schema, not the message.)
+- **Policies compose with facet-anchoring** (§7.4): a gate whose
+  precondition factors through a coarse facet is provably stable under
+  every transformation the facet cannot see — an ownership rule anchored
+  at set-class survives transposition by construction. Constraint algebra
+  × lens tower = policies that are not just convergent but *invariant*.
+- **A lens can be part of the policy: coercion on add.** Take the §7
+  tower and apply it at *entry* instead of at render: a "PCS channel"
+  coerces any absolute pitch added into its pitch class (mod the period,
+  at ingress); a set-class channel coerces every add to its prime form —
+  a surface on which C major and A minor are literally the same gesture.
+  The channel's full shape becomes
+  **address × (add × remove policy) × coercion lens × render**, and the
+  consistency bill for the coercion is zero: a proved refinement (§7.2)
+  is a pure function, and a pure function composed in front of a
+  deterministic fold is just another deterministic fold (§7.3) — a
+  coerced channel converges exactly like an uncoerced one. Mechanically
+  it is even cheap: the fold kit's `classify` closures
+  (`tutti-crate-architecture.md` §3.2) are precisely the hook a coercion
+  composes into. This is the ambitious end of the algebra — a clean
+  composition, not near-term work, and the honest cost is the proof
+  discipline (§7.5's n-generic prime form), not the plumbing. But it is
+  the exact point where the constraint algebra and the lens tower meet:
+  the channel finishes its journey from a 4-bit routing tag to a typed,
+  governed, provably-projected musical surface.
+
+Honesty reflex: the top six rows are shipping walkie code or one-line kit
+compositions over it. The capability/precondition rows are roadmap — the
+Rust kernel deliberately has no void/precondition engine yet (the crate
+design says so outright: verdict semantics beyond the fold are hhhs-core
+future work, aligned to Santi's `hhs3-ts` as the source of truth). The
+algebra's *frame* costs nothing today; its strongest gates are honest IOUs.
+
+#### Device-specific controls
+
+Now point the algebra at hardware. Under the substrate contract, a device
+is not a port or a driver — **a device is a keypair** (contract (a)), which
+means a device is an *author*, which by axis 2 means a device is a
+*channel*. A hardware controller, an ESP-32 leaf (§6.6), a stage piano:
+each owns an authorship layer, and its physical controls map onto ops in
+that layer — a key press is an absolute intent on the device's degree
+channel (§9.1's lift, shipping at `app.rs:866`), a knob turn is a lease
+frame while moving and committed control points on release (§8.1's two
+tiers), a sensor is a continuous facet with the device as its sole author.
+
+The per-device constraints are just rows of the table above, instantiated
+with a device key:
+
+- **Device-locked write** is owner-gating where the owner is the device:
+  only ops signed by the device's key take effect on its channel — the
+  pieces combinator verbatim, pointed at hardware. The §6.6 grid becomes
+  precise: each ESP-32 node owner-gates its own three holdings while the
+  room's union set stays shared-clear — two policies, one room, zero
+  friction, because policies are per-channel, not per-room.
+- **Capability-granted control** is the roadmap row with a body: the
+  device mints a cap and hands it over, so *others may drive it* — the
+  gallery hands tonight's audience an attenuated cap to the installation's
+  LED channel ("add only, degrees 0–11, expires at close"), and revocation
+  is a barrier that deterministically beats a racing writer
+  (`hhs3-deep-core-fable.md` §3). A MIDI-CC-to-facet bridge (§9.1) under a
+  granted cap is remote automation with an audit trail.
+
+And the reason this beats a MIDI channel assignment chart deserves
+saying plainly: the device's identity, its authority, and its history are
+all the *same object* — signed ops in the log. Unplug the controller for a
+week; its channel, its holdings' provenance, and whatever caps it granted
+are still there, reconciled, when it returns.
+
 ### 3.2 What is genuinely new
 
 The genuinely new thing in the hot-set paradigm is the combination, not any
@@ -555,7 +701,7 @@ supersession — algorithmic co-performance with an audit trail.
    with a progression index; or round boundaries (potluck's
    `StartNewRound` pattern — an append-only read-model boundary,
    `reactive-rollback-api-design.md` §6.3) as bar lines. This is the
-   paradigm's biggest open design, and §8 flags its cultural risk.
+   paradigm's biggest open design, and §11 flags its cultural risk.
 2. **Continuous facets.** Weight, expression residue, register — each an
    append-only schema evolution (`ops.rs:27-29`) plus a decision about which
    tier it lives on (durable vs leased). The tier decision is the design
@@ -1203,9 +1349,10 @@ session, has a better name: eventual consonance.
 - **Expression bandwidth wants to destroy the log.** MPE-grade continuous
   inflection at signed-op granularity would bloat a permanent history with
   data nobody replays. The durable/leased split is the answer in principle
-  — expression rides presence, promotion to history is deliberate — but
-  "which facts deserve to be forever" is a per-facet editorial judgment the
-  protocol can host and cannot make.
+  — expression rides presence, promotion to history is deliberate — and
+  §8 works it out as generators-not-streams. What stays genuinely open is
+  the editorial half: "which facts deserve to be forever" is a per-facet
+  judgment the protocol can host and cannot make.
 - **Grow-only means forever, and forever is heavy.** A lifetime of jams on
   an append-only log meets no pruning story that preserves the time-travel
   promise. Checkpointing, partial replication, or facet-graded logs (the
