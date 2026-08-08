@@ -46,7 +46,12 @@ use crate::ops::{
 /// The `MAGIC` is `L::ENTRY_FRAME_MAGIC`, so it fully determines the lifted entry
 /// hash — the golden entry-hash vector pins it. Bumping the magic changes every
 /// [`EntryHash`], so it is a schema pin.
-fn frame_signed<L: OpLanguage>(signed: &SignedOp) -> Vec<u8> {
+///
+/// `pub(crate)` so the leaf-profile [`crate::windowed::WindowedStore`] lifts with
+/// the byte-identical framing — a windowed leaf and a full peer MUST produce the
+/// same [`EntryHash`] for the same op or convergence breaks
+/// (windowed-store-design.md §4.1).
+pub(crate) fn frame_signed<L: OpLanguage>(signed: &SignedOp) -> Vec<u8> {
     let mut out = Vec::with_capacity(
         L::ENTRY_FRAME_MAGIC.len() + 16 + signed.header.len() + signed.payload.len(),
     );
@@ -62,7 +67,10 @@ fn frame_signed<L: OpLanguage>(signed: &SignedOp) -> Vec<u8> {
 /// entry's payload. A total inverse of the deterministic framing above, so a
 /// round-trip through the DAG payload is lossless — this is what lets the store
 /// re-emit the exact bytes an author signed for anti-entropy transfer.
-fn unframe_signed<L: OpLanguage>(bytes: &[u8]) -> SignedOp {
+///
+/// `pub(crate)` so [`crate::windowed::WindowedStore`] serves the same cut-scoped
+/// RBSR surface (`signed_ops`/`repair_record`, windowed-store-design.md §1.2).
+pub(crate) fn unframe_signed<L: OpLanguage>(bytes: &[u8]) -> SignedOp {
     let mut pos = L::ENTRY_FRAME_MAGIC.len();
     let read_len = |bytes: &[u8], pos: usize| -> usize {
         let mut buf = [0u8; 8];
@@ -124,6 +132,20 @@ pub struct DecodedOp<L: OpLanguage> {
 }
 
 impl<L: OpLanguage> DecodedOp<L> {
+    /// Assemble a decoded record. `pub(crate)` so [`crate::windowed::WindowedStore`]
+    /// populates its own retained-op map with the identical record shape
+    /// [`Store::try_lift`] builds — the fold cannot tell the two stores apart
+    /// (windowed-store-design.md §2.2: "the fold code does not change; it iterates a
+    /// decoded map that happens to be residue ∪ window").
+    pub(crate) fn new(author: AuthorId, op: L::Op, ts_ms: u64, seq: u64) -> Self {
+        Self {
+            author,
+            op,
+            ts_ms,
+            seq,
+        }
+    }
+
     /// The verified author of this op.
     pub fn author(&self) -> AuthorId {
         self.author
@@ -656,6 +678,36 @@ impl<'a, L: OpLanguage> FoldCtx<'a, L> {
         Self {
             decoded: &store.decoded,
             entry_to_source: &store.entry_to_source,
+            reach,
+        }
+    }
+
+    /// A fold context assembled directly from its parts — the decoded op-set, the
+    /// entry→op-id map, and an ancestry backend — rather than from a [`Store`]
+    /// (windowed-store-design.md §6.2 delta 1: "`FoldCtx` construction is hardwired
+    /// to `&Store<L>`; wanted: a public constructor over the parts").
+    ///
+    /// This is what lets a SECOND store type drive the byte-identical `L::fold`: the
+    /// leaf-profile [`crate::windowed::WindowedStore`] folds its retained-op map
+    /// through this constructor with the boundary-aware
+    /// [`crate::windowed::WindowedReach`] backend, so windowed-vs-full equivalence is
+    /// *structural* — the same fold code, only the [`CausalPast`] backend differs
+    /// (§3.5). Additive: [`FoldCtx::new`] and [`Store::view`] are unchanged.
+    ///
+    /// The caller owns the fence: `L::fold` reads `is_ancestor` present-only over
+    /// whatever `reach` answers, so passing a reach that cannot see a decoded op's
+    /// full causal past yields a silently wrong view. [`Store::view`] pairs `decoded`
+    /// with a whole-history [`Reach`]; [`crate::windowed::WindowedStore::view`] pairs
+    /// its window with a window-complete [`crate::windowed::WindowedReach`] and
+    /// refuses to fold a truncated window (§1.3's foot-gun, §6.2 delta 6).
+    pub fn over(
+        decoded: &'a BTreeMap<EntryHash, DecodedOp<L>>,
+        entry_to_source: &'a BTreeMap<EntryHash, OpId>,
+        reach: Box<dyn CausalPast + 'a>,
+    ) -> Self {
+        Self {
+            decoded,
+            entry_to_source,
             reach,
         }
     }
