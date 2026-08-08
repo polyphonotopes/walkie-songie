@@ -7611,6 +7611,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tutti-core"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "getrandom 0.2.16",
+ "hhhs-core",
+ "p2panda-core",
+ "radix_immutable",
+ "serde",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "typeid"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7902,6 +7915,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-wasm",
+ "tutti-core",
  "unicode-segmentation",
  "uuid 1.19.0",
  "walkie-songie",

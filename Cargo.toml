@@ -40,7 +40,7 @@ core = []
 # radix_immutable trie, BESIDE RBSR (never replacing it). Pulls in the wasm-safe
 # `radix_immutable` crate with its `merkle` feature (blake3-256). Enabled by the
 # normal build (`default`); a `--no-default-features` leaf profile drops it.
-merkle = ["dep:radix_immutable"]
+merkle = ["dep:radix_immutable", "tutti-core/merkle"]
 web-ui = [
     "dep:wasm-bindgen",
     "dep:wasm-bindgen-futures",
@@ -104,7 +104,7 @@ plugin = ["dep:nih_plug", "dep:nih_plug_egui", "dep:crossbeam-channel", "dep:egu
 test-support = []
 
 [workspace]
-members = ["xtask", "src-tauri"]
+members = ["xtask", "src-tauri", "crates/tutti-core"]
 exclude = ["relay"]
 resolver = "3"
 
@@ -141,6 +141,13 @@ radix_immutable = { path = "/laboratory/radix_immutable", features = ["merkle"],
 # CRDT (legacy — being replaced by p2panda signed op-log + HHHS)
 yrs = "0.21"
 
+# The domain-agnostic reconciling signed-op substrate (tutti extraction Track-D
+# step 3): the signed envelope + verification, the DAG lift/deferral/heads
+# machinery, the `Store<L>`/`FoldCtx`/`OpLanguage` fold seam, and the generic
+# `ops_root` Merkle layer. `src/room/` re-exports it so `WalkieLang` is the sole
+# instantiation and no external call site moves. Wasm-safe (no tokio/iroh).
+tutti-core = { path = "crates/tutti-core" }
+
 # P2P rewrite: signed operation log (p2panda-core) + HHHS causal read model.
 # p2panda-core and HHHS are wasm-safe (no tokio/iroh); the native networking
 # stack (p2panda-net) and browser iroh transport are added target-gated below.
@@ -160,6 +167,11 @@ futures-signals = "0.3"
 # `hhhs-core` lets the reconcile driver name the RBSR reconciliation types directly.
 [dev-dependencies]
 walkie-songie = { path = ".", default-features = false, features = ["test-support"] }
+# Enables tutti-core's reference-oracle surface (`Store::view_reference`,
+# `Store::dag`, the kernel-`ReachIndex` `CausalPast` backend) for the in-crate
+# `reach_equiv` equivalence tests. As a dev-dependency it is unified into the
+# `cargo test` build only, so a plain `cargo build` keeps tutti-core lean.
+tutti-core = { path = "crates/tutti-core", features = ["test-support"] }
 hhhs-core = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "bd23d4e9785f5d0b7bb458d148cab92d130b356e" }
 # Benchmark suite (M0). criterion: native micro-benchmarks; dhat: heap profiling
 # for the reach/view RAM harness; postcard: the real RBSR wire codec, for

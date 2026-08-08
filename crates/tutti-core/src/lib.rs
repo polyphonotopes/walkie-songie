@@ -1,0 +1,41 @@
+//! **tutti-core** — the domain-agnostic reconciling signed-op substrate.
+//!
+//! This crate is the band that sits ATOP `hhhs-core` and below any music (or
+//! other) app: the signed, per-author, topic-bound op envelope with
+//! verification-at-ingress; the deterministic lift of verbatim signed bytes into
+//! the kernel causal DAG (strict deferral + drain, dual `OpId ↔ EntryHash` maps,
+//! per-author heads); and the pure causal fold seam ([`OpLanguage`] + [`FoldCtx`])
+//! a downstream domain instantiates once. It owns exactly what `hhhs-core`
+//! deliberately does not: signatures, authorship, topic binding, wire framing.
+//!
+//! It carries **no domain alphabet, no domain fold rule, and no UI**. Walkie-songie
+//! is the first instantiation: it supplies `WalkieOp`, its `walkie_fold`, and
+//! `RoomView`, and names the store as `Store<WalkieLang>`. The extraction is
+//! **byte-compatible by construction** — the framing magics, size ladder, CBOR
+//! envelope and fold semantics are unchanged, so the golden entry-hash vector and
+//! the L0 convergence suite hold unmodified against `Store<WalkieLang>`.
+//!
+//! This is **tutti extraction Track-D step 3**: the mechanical relocation of the
+//! now-generic substrate out of walkie's `src/room/` into this crate. Steps 1+2
+//! genericized the envelope and store in place over an `OpLanguage`; this step
+//! moved them. Deliberately still parked here: the domain `state_root` (needs
+//! `L::View: Canonical`), presence-lease and journal extraction, and the
+//! `tutti-testkit` split — all left walkie-side to keep a clean compile.
+//!
+//! Dependency posture (leaf-safe): `p2panda-core` + `hhhs-core` + `blake3` +
+//! `serde` (+ optional `radix_immutable` under `merkle`) — all wasm-safe, no
+//! tokio, no iroh, no web-sys.
+
+pub mod ops;
+pub mod store;
+
+#[cfg(feature = "merkle")]
+pub mod merkle;
+
+pub use ops::{
+    AuthorId, LogHead, MAX_OBSERVED_OPS, MAX_SIGNED_HEADER_BYTES, MAX_SIGNED_OP_WIRE_BYTES,
+    MAX_SIGNED_PAYLOAD_BYTES, MAX_TOPIC_BYTES, OpId, OpLanguage, OpVerifyError, SIGNED_OP_WIRE_MAGIC,
+    SignedOp, SignedOpWireError, SigningKey, VerifiedOpG, VerifyingKey, VersionedOpG,
+    sign_versioned_op, signing_key_from_seed, verify_signed_op_in,
+};
+pub use store::{CausalPast, DecodedOp, FoldCtx, Reach, Store, sync_root_of};

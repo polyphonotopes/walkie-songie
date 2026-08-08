@@ -1,179 +1,58 @@
-//! The signed operation format — walkie-songie's durable, gossiped op log (v3).
+//! Walkie-songie's op alphabet ([`WalkieOp`]) and its [`OpLanguage`]
+//! instantiation ([`WalkieLang`]) — the domain half of the signed-op layer.
 //!
-//! This replaces the `yrs` (Yjs) state-CRDT with a **signed, per-author append-only
-//! operation log** built on `p2panda-core`. Every musical contribution — a pitch
-//! toggle, an emoji piece, a tuning, or room-config change — becomes a
-//! [`WalkieOp`] wrapped in a [`VersionedOp`] envelope, CBOR-encoded as a p2panda
-//! `Body`, and signed by the author's Ed25519 key via `Header::sign`. Verification
-//! runs `validate_operation`, so who contributed which note is cryptographically
-//! established.
-//!
-//! These signed ops are the source of truth; the HHHS causal-DAG mirror
-//! (`room::store`) lifts them into a read model. Design mirrors `potluck-ops::signed`.
+//! The generic signed envelope (versioned/verified op types, sign/verify,
+//! wire framing + size ladder, `AuthorId`/`OpId`/`LogHead`) now lives in
+//! [`tutti_core`] (tutti extraction Track-D step 3). This module keeps only what
+//! is music: the [`WalkieOp`] alphabet, its wire validation, the schema/framing
+//! consts, and the thin walkie-facing sign/verify wrappers that fix
+//! `L = WalkieLang`. Everything else is **re-exported** from `tutti_core` so
+//! every external call site keeps its `crate::room::ops::…` spelling unchanged.
 //!
 //! ## v3 alphabet
-//! The op alphabet is shaped for HHHS-native materialization:
 //! - **Degrees** are a content-keyed add-wins set keyed by [`TunedDegree`]. A
 //!   `RemoveDegree` supersedes only the adds in its causal past; a concurrent add
 //!   survives.
 //! - **Pieces** are graph-shaped and SHARED: identity is the *op id* of the
-//!   `PutPiece` that created them, so two peers creating "the same" piece
-//!   concurrently are simply two pieces. `MovePiece`/`RemovePiece`/`UnremovePiece`
-//!   reference that [`OpId`]; ANY author's ops take effect, resolved by
-//!   cross-author observed-remove and a causal-maxima position register. The
+//!   `PutPiece` that created them; `MovePiece`/`RemovePiece`/`UnremovePiece`
+//!   reference that [`OpId`]. ANY author's ops take effect, resolved by cross-
+//!   author observed-remove and a causal-maxima position register. The
 //!   `PutPiece` author is attribution only; `pieces_locked` is the consent gate.
 //! - **Tuning/config** are room-wide registers resolved by causal maxima.
-//! - **Voice preview** is deliberately absent. It is signed, sequenced, leased
-//!   presence and never enters durable history.
+//! - **Voice preview** is deliberately absent: it is signed, sequenced, leased
+//!   presence (`room::presence`) and never enters durable history.
 //!
-//! **Evolution discipline:** append variants to [`WalkieOp`], never reorder them, add
-//! fields only as `#[serde(default)]`, and bump [`OP_SCHEMA_VERSION`] when the payload
-//! shape changes.
+//! **Evolution discipline:** append variants to [`WalkieOp`], never reorder them,
+//! add fields only as `#[serde(default)]`, and bump [`OP_SCHEMA_VERSION`] when the
+//! payload shape changes.
 //!
 //! **wasm timestamps:** `ts_micros` must be author-supplied. On wasm pass
-//! `js_sys::Date::now() as u64 * 1000`; never call p2panda's `Timestamp::now()`
-//! (it uses `SystemTime::now()`, which panics on `wasm32`).
+//! `js_sys::Date::now() as u64 * 1000`; never call p2panda's `Timestamp::now()`.
 
-use p2panda_core::cbor::{DecodeError, decode_cbor, encode_cbor};
-use p2panda_core::{Body, Hash, Header, Operation, OperationError, validate_operation};
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
+use tutti_core::FoldCtx;
 
-use crate::room::store::FoldCtx;
 use crate::tuning::{MAX_SCALE_DEGREES, TunedDegree, TunedPeriodicPitch, TuningDefinition};
 
-/// Re-exported so the rest of the crate names the key types through `room::ops` and
-/// never takes a direct `p2panda-core` dependency. `SigningKey::from_bytes` is
-/// infallible — any 32 bytes are a valid Ed25519 seed.
-pub use p2panda_core::{SigningKey, VerifyingKey};
+/// The substrate envelope, verification, and identities — re-exported so the rest
+/// of walkie names them through `room::ops` and never takes a direct
+/// `tutti_core`/`p2panda-core` dependency. Fixed `L = WalkieLang` spellings
+/// ([`VersionedOp`], [`VerifiedOp`]) and the walkie wrappers are below.
+pub use tutti_core::{
+    AuthorId, LogHead, MAX_OBSERVED_OPS, MAX_SIGNED_HEADER_BYTES, MAX_SIGNED_OP_WIRE_BYTES,
+    MAX_SIGNED_PAYLOAD_BYTES, MAX_TOPIC_BYTES, OpId, OpLanguage, OpVerifyError, SignedOp,
+    SignedOpWireError, SigningKey, VerifiedOpG, VerifyingKey, VersionedOpG, sign_versioned_op,
+    signing_key_from_seed, verify_signed_op_in,
+};
 
-/// The current op-payload schema version.
+/// The current op-payload schema version (walkie domain).
 pub const OP_SCHEMA_VERSION: u16 = 3;
-/// Largest legal signed payload.
-///
-/// This is the ROOT of the size ladder, not a free parameter. Everything that
-/// has to carry one op — the gossip message cap
-/// ([`MAX_GOSSIP_MESSAGE_BYTES`](crate::net::native::MAX_GOSSIP_MESSAGE_BYTES)),
-/// the journal record cap, and above all the anti-entropy frame cap
-/// ([`MAX_SYNC_FRAME_BYTES`](crate::net::sync::MAX_SYNC_FRAME_BYTES)) — is
-/// derived from [`MAX_SIGNED_OP_WIRE_BYTES`] below and asserted at compile time.
-///
-/// It was 2 MiB, which is larger than the 1 MiB sync frame cap was: an op that
-/// verified, gossiped and lifted could then never be re-served by anti-entropy,
-/// because `bytes_with_closure` must include the requested hash whatever the
-/// budget says. One such op permanently poisoned sync for the whole room — every
-/// session that requested it died with `FrameTooLarge`, forever, and peers that
-/// missed the gossip stayed silently divergent.
-pub const MAX_SIGNED_PAYLOAD_BYTES: usize = 1024 * 1024;
-pub const MAX_OBSERVED_OPS: usize = 4096;
-pub const MAX_TOPIC_BYTES: usize = 256;
-pub const MAX_EMOJI_BYTES: usize = 256;
-pub const MAX_EMOJI_PALETTE_BYTES: usize = 16 * 1024;
+/// Absolute period bound for a tuned pitch — a domain well-formedness cap.
 pub const MAX_ABS_PERIOD: i32 = 1_000_000;
-const SIGNED_OP_WIRE_MAGIC: &[u8] = b"walkie.signed-op/3\0";
-pub const MAX_SIGNED_HEADER_BYTES: usize = 64 * 1024;
-
-/// Largest possible [`SignedOp::to_wire_bytes`] output for a legal op — the unit
-/// every carrying layer must be able to move whole. Anti-entropy has no way to
-/// split one op across frames, so a transport cap below this is a permanent
-/// convergence failure, not a slow path.
-pub const MAX_SIGNED_OP_WIRE_BYTES: usize =
-    SIGNED_OP_WIRE_MAGIC.len() + 8 + MAX_SIGNED_HEADER_BYTES + MAX_SIGNED_PAYLOAD_BYTES;
-
-/// The domain seam for the signed-op envelope (**tutti extraction, Track-D
-/// step 1**).
-///
-/// `ops.rs` is being factored toward a reusable `tutti-core` substrate. This,
-/// the first and safest step, genericizes only the **envelope** — the
-/// versioned/verified op types ([`VersionedOpG`], [`VerifiedOpG`]) and their
-/// sign/verify path — *in place*, over an `L: OpLanguage`. Walkie is the first
-/// (and today only) instantiation, [`WalkieLang`], and every currently-public
-/// name is re-exported as an alias fixed at `WalkieLang`, so no call site
-/// outside this module moves.
-///
-/// Step 1 carried only the envelope members; **step 2** (store/fold
-/// genericization, tutti extraction Track-D) adds the read model
-/// ([`OpLanguage::View`]) and the deterministic fold ([`OpLanguage::fold`]) over
-/// the causal indexes packaged by [`FoldCtx`] (defined in [`crate::room::store`]
-/// beside [`Store`](crate::room::store::Store)). Walkie's fold is
-/// [`crate::room::store::walkie_fold`]; the view is bit-for-bit the pre-
-/// extraction projection.
-///
-/// Every associated const is wired to walkie's CURRENT literal value, so the
-/// serialized signed bytes and the lifted entry hashes are byte-for-byte
-/// unchanged across the extraction. The golden entry-hash vector in
-/// [`crate::room::store`] is the hard gate that proves it.
-pub trait OpLanguage: Sized + 'static {
-    /// The domain alphabet. CBOR via serde; evolution discipline is walkie's,
-    /// now stated generically: append variants, never reorder, add fields only
-    /// as `#[serde(default)]`, and bump [`OpLanguage::SCHEMA_VERSION`] on a
-    /// payload-shape change.
-    type Op: Serialize + DeserializeOwned + Clone + PartialEq;
-
-    /// The op-payload schema version stamped into every envelope
-    /// (walkie: [`OP_SCHEMA_VERSION`]).
-    const SCHEMA_VERSION: u16;
-    /// Framing tag prefixed to the verbatim signed bytes when they become a
-    /// kernel entry payload (walkie: `b"walkie.hhhs.signed-op/1"`). Consumed by
-    /// [`Store`](crate::room::store::Store)'s lift framing (tutti extraction
-    /// Track-D step 2), so it fully determines the lifted entry hash — the
-    /// golden entry-hash vector pins that it is byte-for-byte walkie's literal.
-    const ENTRY_FRAME_MAGIC: &'static [u8];
-    /// Generation marker on the length-delimited signed-op wire frame
-    /// (walkie: [`SIGNED_OP_WIRE_MAGIC`]).
-    const WIRE_MAGIC: &'static [u8];
-    /// Root of the size ladder — the largest legal signed payload
-    /// (walkie: [`MAX_SIGNED_PAYLOAD_BYTES`]).
-    const MAX_PAYLOAD_BYTES: usize;
-
-    /// Domain wire validation — bounds and well-formedness, run once at ingress
-    /// inside [`verify_signed_op_in`].
-    fn validate_wire(op: &Self::Op) -> Result<(), String>;
-
-    /// The materialized read model this language folds to (tutti extraction
-    /// Track-D step 2). The `Canonical` bound — the byte encoding `state_root`
-    /// commits to — is a later step and deliberately omitted here.
-    type View: Default + Clone + PartialEq;
-
-    /// THE deterministic fold: a pure function of the decoded op-set and its
-    /// causal indexes ([`FoldCtx`]). Two peers with equal verified op-sets MUST
-    /// return equal views (contract property (b)). Walkie composes it from
-    /// register → add-wins → object folds; see
-    /// [`crate::room::store::walkie_fold`].
-    fn fold(ctx: &FoldCtx<'_, Self>) -> Self::View;
-}
-
-/// A 32-byte author identity — the Ed25519 verifying-key bytes. Doubles as the peer's
-/// stable id across the app.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct AuthorId(pub [u8; 32]);
-
-impl AuthorId {
-    pub fn to_hex(&self) -> String {
-        hex32(&self.0)
-    }
-}
-
-/// A p2panda operation id — `blake3(header bytes)` of a signed op. Used as the stable,
-/// cross-peer identity for a piece (the id of the `PutPiece` that created it) and as
-/// the causal-horizon references an op carries in [`VersionedOp::observed`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct OpId(pub [u8; 32]);
-
-impl OpId {
-    pub fn to_hex(&self) -> String {
-        hex32(&self.0)
-    }
-}
-
-fn hex32(bytes: &[u8; 32]) -> String {
-    use std::fmt::Write;
-    bytes.iter().fold(String::with_capacity(64), |mut s, b| {
-        let _ = write!(&mut s, "{b:02x}");
-        s
-    })
-}
+/// Largest emoji string on a piece.
+pub const MAX_EMOJI_BYTES: usize = 256;
+/// Largest room-wide emoji palette.
+pub const MAX_EMOJI_PALETTE_BYTES: usize = 16 * 1024;
 
 /// The domain operation (v3). Materialization semantics live in `room::store`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,20 +89,19 @@ pub enum WalkieOp {
 }
 
 /// Walkie-songie's instantiation of [`OpLanguage`] — the first (and today only)
-/// `L` (tutti Track-D step 1). Every associated const is walkie's CURRENT
-/// literal, so genericizing the envelope is wire-invisible: signed bytes and
-/// entry hashes are byte-for-byte unchanged.
+/// `L`. Every associated const is walkie's literal value, so the substrate is
+/// wire-invisible: signed bytes and entry hashes are byte-for-byte unchanged.
 pub struct WalkieLang;
 
 impl OpLanguage for WalkieLang {
     type Op = WalkieOp;
-    /// The room read model. Materialization is walkie-facing and lives beside
-    /// it in [`crate::room::store`]; `fold` delegates there.
+    /// The room read model. Materialization is walkie-facing and lives beside it
+    /// in [`crate::room::store`]; `fold` delegates there.
     type View = crate::room::store::RoomView;
 
     const SCHEMA_VERSION: u16 = OP_SCHEMA_VERSION;
     const ENTRY_FRAME_MAGIC: &'static [u8] = b"walkie.hhhs.signed-op/1";
-    const WIRE_MAGIC: &'static [u8] = SIGNED_OP_WIRE_MAGIC;
+    const WIRE_MAGIC: &'static [u8] = tutti_core::SIGNED_OP_WIRE_MAGIC;
     const MAX_PAYLOAD_BYTES: usize = MAX_SIGNED_PAYLOAD_BYTES;
 
     fn validate_wire(op: &WalkieOp) -> Result<(), String> {
@@ -284,340 +162,18 @@ impl OpLanguage for WalkieLang {
     }
 }
 
-/// The signed-op envelope: the exact struct CBOR-encoded into the p2panda `Body`.
-///
-/// Generic over the [`OpLanguage`] `L` (tutti Track-D step 1). Walkie names it
-/// through the [`VersionedOp`] alias, which fixes `L = WalkieLang` and therefore
-/// `op: WalkieOp`; the CBOR layout — field order, the `default`/`skip` attrs,
-/// and the schema version stamped by [`VersionedOpG::current`] — is identical to
-/// the pre-extraction struct, so every signed byte is unchanged.
-///
-/// `Serialize`/`Deserialize` are derived with an explicit `#[serde(bound)]` so
-/// they constrain `L::Op` (guaranteed by [`OpLanguage`]) rather than the marker
-/// `L`; `Clone`/`PartialEq`/`Eq`/`Debug` are hand-written for the same reason.
-#[derive(Serialize, Deserialize)]
-#[serde(bound(
-    serialize = "L::Op: Serialize",
-    deserialize = "L::Op: DeserializeOwned"
-))]
-pub struct VersionedOpG<L: OpLanguage> {
-    pub version: u16,
-    /// Author-stamped time in microseconds since the epoch (display/tiebreak-of-last-
-    /// resort only; ordering is causal, never wall-clock).
-    pub ts_micros: u64,
-    /// The room topic this op is bound to, preventing replay into another room.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub topic: Option<String>,
-    /// The op ids this author had already accepted when signing — its causal horizon
-    /// beyond its own log. The HHHS mirror lifts these into an
-    /// entry's predecessors, which is what makes cross-author causality (add-wins
-    /// supersession, register recency) expressible at all. Stamped from the store
-    /// frontier on every commit.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub observed: Vec<[u8; 32]>,
-    pub op: L::Op,
-}
-
 /// Walkie's signed-op envelope — [`VersionedOpG`] fixed at [`WalkieLang`]. Every
 /// call site keeps the pre-extraction spelling `VersionedOp`.
 pub type VersionedOp = VersionedOpG<WalkieLang>;
 
-impl<L: OpLanguage> Clone for VersionedOpG<L> {
-    fn clone(&self) -> Self {
-        Self {
-            version: self.version,
-            ts_micros: self.ts_micros,
-            topic: self.topic.clone(),
-            observed: self.observed.clone(),
-            op: self.op.clone(),
-        }
-    }
-}
-
-impl<L: OpLanguage> PartialEq for VersionedOpG<L> {
-    fn eq(&self, other: &Self) -> bool {
-        self.version == other.version
-            && self.ts_micros == other.ts_micros
-            && self.topic == other.topic
-            && self.observed == other.observed
-            && self.op == other.op
-    }
-}
-
-impl<L: OpLanguage> Eq for VersionedOpG<L> where L::Op: Eq {}
-
-impl<L: OpLanguage> std::fmt::Debug for VersionedOpG<L>
-where
-    L::Op: std::fmt::Debug,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("VersionedOp")
-            .field("version", &self.version)
-            .field("ts_micros", &self.ts_micros)
-            .field("topic", &self.topic)
-            .field("observed", &self.observed)
-            .field("op", &self.op)
-            .finish()
-    }
-}
-
-impl<L: OpLanguage> VersionedOpG<L> {
-    pub fn current(op: L::Op, ts_micros: u64) -> Self {
-        Self {
-            version: L::SCHEMA_VERSION,
-            ts_micros,
-            topic: None,
-            observed: Vec::new(),
-            op,
-        }
-    }
-
-    pub fn current_for_topic(op: L::Op, ts_micros: u64, topic: &str) -> Self {
-        Self {
-            version: L::SCHEMA_VERSION,
-            ts_micros,
-            topic: Some(topic.to_string()),
-            observed: Vec::new(),
-            op,
-        }
-    }
-
-    /// Attach the causal horizon (op ids this author has observed).
-    pub fn observing(mut self, observed: impl IntoIterator<Item = [u8; 32]>) -> Self {
-        self.observed = observed.into_iter().collect();
-        self
-    }
-
-    /// Whether this build can apply the op as-is (peer isn't ahead on schema).
-    pub fn is_supported(&self) -> bool {
-        self.version == L::SCHEMA_VERSION
-    }
-}
-
-/// The head of an author's op log: the seq_num the *next* op must carry and the hash
-/// of the current head op (its backlink).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LogHead {
-    pub next_seq: u64,
-    pub backlink: Option<[u8; 32]>,
-}
-
-impl LogHead {
-    pub fn genesis() -> Self {
-        Self {
-            next_seq: 0,
-            backlink: None,
-        }
-    }
-}
-
-impl Default for LogHead {
-    fn default() -> Self {
-        Self::genesis()
-    }
-}
-
-/// A signed op on the wire: the exact bytes the author signed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SignedOp {
-    /// CBOR of the signed `Header<()>`.
-    pub header: Vec<u8>,
-    /// CBOR of the [`VersionedOp`] (the p2panda `Body` bytes).
-    pub payload: Vec<u8>,
-}
-
-impl SignedOp {
-    /// Stable length-delimited gossip/persistence frame containing the verbatim
-    /// header and payload bytes. Verification still happens after decoding.
-    pub fn to_wire_bytes(&self) -> Result<Vec<u8>, SignedOpWireError> {
-        validate_wire_lengths(self.header.len(), self.payload.len())?;
-        let mut output = Vec::with_capacity(
-            SIGNED_OP_WIRE_MAGIC.len() + 8 + self.header.len() + self.payload.len(),
-        );
-        output.extend_from_slice(SIGNED_OP_WIRE_MAGIC);
-        output.extend_from_slice(&(self.header.len() as u32).to_le_bytes());
-        output.extend_from_slice(&(self.payload.len() as u32).to_le_bytes());
-        output.extend_from_slice(&self.header);
-        output.extend_from_slice(&self.payload);
-        Ok(output)
-    }
-
-    pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self, SignedOpWireError> {
-        let prefix = SIGNED_OP_WIRE_MAGIC.len();
-        if bytes.len() < prefix + 8 || &bytes[..prefix] != SIGNED_OP_WIRE_MAGIC {
-            return Err(SignedOpWireError::InvalidMagic);
-        }
-        let header_len =
-            u32::from_le_bytes(bytes[prefix..prefix + 4].try_into().expect("fixed slice")) as usize;
-        let payload_len = u32::from_le_bytes(
-            bytes[prefix + 4..prefix + 8]
-                .try_into()
-                .expect("fixed slice"),
-        ) as usize;
-        validate_wire_lengths(header_len, payload_len)?;
-        let expected = prefix
-            .checked_add(8)
-            .and_then(|length| length.checked_add(header_len))
-            .and_then(|length| length.checked_add(payload_len))
-            .ok_or(SignedOpWireError::LengthMismatch)?;
-        if bytes.len() != expected {
-            return Err(SignedOpWireError::LengthMismatch);
-        }
-        let header_start = prefix + 8;
-        let payload_start = header_start + header_len;
-        Ok(Self {
-            header: bytes[header_start..payload_start].to_vec(),
-            payload: bytes[payload_start..].to_vec(),
-        })
-    }
-}
-
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum SignedOpWireError {
-    #[error("signed operation frame has an invalid generation marker")]
-    InvalidMagic,
-    #[error("signed operation frame lengths do not match its bytes")]
-    LengthMismatch,
-    #[error("signed header is {actual} bytes; maximum is {max}")]
-    HeaderTooLarge { actual: usize, max: usize },
-    #[error("signed payload is {actual} bytes; maximum is {max}")]
-    PayloadTooLarge { actual: usize, max: usize },
-}
-
-fn validate_wire_lengths(header_len: usize, payload_len: usize) -> Result<(), SignedOpWireError> {
-    if header_len > MAX_SIGNED_HEADER_BYTES {
-        return Err(SignedOpWireError::HeaderTooLarge {
-            actual: header_len,
-            max: MAX_SIGNED_HEADER_BYTES,
-        });
-    }
-    if payload_len > MAX_SIGNED_PAYLOAD_BYTES {
-        return Err(SignedOpWireError::PayloadTooLarge {
-            actual: payload_len,
-            max: MAX_SIGNED_PAYLOAD_BYTES,
-        });
-    }
-    Ok(())
-}
-
-/// A successfully verified op. Fields are **private**: the only constructor is
-/// [`verify_signed_op_in`] (walkie enters through [`verify_signed_op`]), so a
-/// store write that takes a `VerifiedOp` cannot be handed unverified data — the
-/// capability invariant survives genericization intact.
-///
-/// Generic over the [`OpLanguage`] `L` (tutti Track-D step 1); walkie uses the
-/// [`VerifiedOp`] alias at [`WalkieLang`]. `Clone`/`Debug` are hand-written so
-/// they constrain `L::Op` rather than the marker `L`.
-pub struct VerifiedOpG<L: OpLanguage> {
-    author: AuthorId,
-    payload: L::Op,
-    topic: Option<String>,
-    observed: Vec<[u8; 32]>,
-    timestamp_ms: u64,
-    seq_num: u64,
-    backlink: Option<[u8; 32]>,
-    hash: [u8; 32],
-    header_bytes: Vec<u8>,
-    payload_bytes: Vec<u8>,
-}
-
-/// Walkie's verified op — [`VerifiedOpG`] fixed at [`WalkieLang`]. Every call
-/// site keeps the pre-extraction spelling `VerifiedOp`.
+/// Walkie's verified op — [`VerifiedOpG`] fixed at [`WalkieLang`]. Every call site
+/// keeps the pre-extraction spelling `VerifiedOp`.
 pub type VerifiedOp = VerifiedOpG<WalkieLang>;
-
-impl<L: OpLanguage> Clone for VerifiedOpG<L> {
-    fn clone(&self) -> Self {
-        Self {
-            author: self.author,
-            payload: self.payload.clone(),
-            topic: self.topic.clone(),
-            observed: self.observed.clone(),
-            timestamp_ms: self.timestamp_ms,
-            seq_num: self.seq_num,
-            backlink: self.backlink,
-            hash: self.hash,
-            header_bytes: self.header_bytes.clone(),
-            payload_bytes: self.payload_bytes.clone(),
-        }
-    }
-}
-
-impl<L: OpLanguage> std::fmt::Debug for VerifiedOpG<L>
-where
-    L::Op: std::fmt::Debug,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("VerifiedOp")
-            .field("author", &self.author)
-            .field("payload", &self.payload)
-            .field("topic", &self.topic)
-            .field("observed", &self.observed)
-            .field("timestamp_ms", &self.timestamp_ms)
-            .field("seq_num", &self.seq_num)
-            .field("backlink", &self.backlink)
-            .field("hash", &self.hash)
-            .field("header_bytes", &self.header_bytes)
-            .field("payload_bytes", &self.payload_bytes)
-            .finish()
-    }
-}
-
-impl<L: OpLanguage> VerifiedOpG<L> {
-    pub fn author(&self) -> AuthorId {
-        self.author
-    }
-    pub fn payload(&self) -> &L::Op {
-        &self.payload
-    }
-    pub fn topic(&self) -> Option<&str> {
-        self.topic.as_deref()
-    }
-    /// The op ids this author had observed when signing (its causal horizon).
-    pub fn observed(&self) -> &[[u8; 32]] {
-        &self.observed
-    }
-    pub fn timestamp_ms(&self) -> u64 {
-        self.timestamp_ms
-    }
-    pub fn seq_num(&self) -> u64 {
-        self.seq_num
-    }
-    pub fn backlink(&self) -> Option<[u8; 32]> {
-        self.backlink
-    }
-    /// The operation id (`blake3(header bytes)`).
-    pub fn hash(&self) -> [u8; 32] {
-        self.hash
-    }
-    /// This op's id as an [`OpId`] (stable, cross-peer).
-    pub fn id(&self) -> OpId {
-        OpId(self.hash)
-    }
-    /// The verbatim signed bytes, for durable persistence / rebroadcast / HHHS lift.
-    pub fn signed(&self) -> SignedOp {
-        SignedOp {
-            header: self.header_bytes.clone(),
-            payload: self.payload_bytes.clone(),
-        }
-    }
-    /// The log head *after* this op — what the author's next op signs against.
-    pub fn advanced_head(&self) -> LogHead {
-        LogHead {
-            next_seq: self.seq_num + 1,
-            backlink: Some(self.hash),
-        }
-    }
-}
-
-/// Build a signing key from a 32-byte seed.
-pub fn signing_key_from_seed(seed: &[u8; 32]) -> SigningKey {
-    SigningKey::from_bytes(seed)
-}
 
 /// Sign one op bound to a room topic, stamping its observed causal horizon.
 ///
-/// `observed` is the set of op ids this author had accepted at signing time (the store
-/// frontier). It is load-bearing: the HHHS mirror lifts it into the entry's
+/// `observed` is the set of op ids this author had accepted at signing time (the
+/// store frontier). It is load-bearing: the HHHS mirror lifts it into the entry's
 /// predecessors so cross-author causality is expressible.
 pub fn sign_op_for_topic_observing(
     signing_key: &SigningKey,
@@ -644,165 +200,11 @@ pub fn sign_op(
     sign_versioned_op(signing_key, head, VersionedOp::current(op, ts_micros))
 }
 
-/// The general signing primitive behind the helpers above.
-///
-/// Generic over the [`OpLanguage`] `L` (tutti Track-D step 1) — it only CBOR-
-/// encodes the envelope, so the signed bytes are a pure function of
-/// `L::Op`'s serialization. Walkie's `sign_op`/`sign_op_for_topic_observing`
-/// call it with a [`VersionedOp`] (`L = WalkieLang`), which infers unchanged.
-pub fn sign_versioned_op<L: OpLanguage>(
-    signing_key: &SigningKey,
-    head: &LogHead,
-    versioned: VersionedOpG<L>,
-) -> (SignedOp, LogHead) {
-    let payload = encode_cbor(&versioned).expect("VersionedOp is always CBOR-encodable");
-    let body = Body::new(&payload);
-
-    let mut header: Header<()> = Header {
-        version: 1,
-        verifying_key: signing_key.verifying_key(),
-        signature: None,
-        payload_size: body.size(),
-        payload_hash: Some(body.hash()),
-        // p2panda-core 0.7's `seq_num` is a `u32`; our `LogHead` keeps `u64`. Guard the
-        // narrowing rather than silently truncating a pathological log.
-        seq_num: u32::try_from(head.next_seq).expect("op-log seq_num exceeds u32::MAX"),
-        backlink: head.backlink.map(Hash::from_bytes),
-        extensions: (),
-    };
-    header.sign(signing_key);
-
-    let hash = header.hash();
-    let signed = SignedOp {
-        header: header.to_bytes(),
-        payload,
-    };
-    let advanced = LogHead {
-        next_seq: head.next_seq + 1,
-        backlink: Some(*hash.as_bytes()),
-    };
-    (signed, advanced)
-}
-
-/// Why a [`SignedOp`] failed verification.
-#[derive(Debug)]
-pub enum OpVerifyError {
-    /// The header bytes did not CBOR-decode to a `Header<()>`.
-    HeaderDecode(DecodeError),
-    /// p2panda's `validate_operation` rejected it — bad signature, wrong version,
-    /// payload hash/size mismatch, or a structural seq/backlink rule.
-    Invalid(OperationError),
-    /// The header verified, but the payload did not CBOR-decode to a [`VersionedOp`].
-    PayloadDecode(DecodeError),
-    /// A well-formed op from a peer on a newer schema than this build can apply.
-    UnsupportedVersion(u16),
-    /// The signed payload exceeds a configured resource bound.
-    PayloadTooLarge { actual: usize, max: usize },
-    /// The signature is valid, but the domain payload is invalid or excessive.
-    InvalidDomain(String),
-    /// A room-scoped read required a topic, but the signed body did not carry one.
-    MissingTopic,
-    /// The signed body belongs to another room topic.
-    TopicMismatch { expected: String, actual: String },
-}
-
-impl std::fmt::Display for OpVerifyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OpVerifyError::HeaderDecode(e) => write!(f, "header decode failed: {e}"),
-            OpVerifyError::Invalid(e) => write!(f, "operation invalid: {e}"),
-            OpVerifyError::PayloadDecode(e) => write!(f, "payload decode failed: {e}"),
-            OpVerifyError::UnsupportedVersion(v) => write!(f, "unsupported op version: {v}"),
-            OpVerifyError::PayloadTooLarge { actual, max } => {
-                write!(f, "signed payload is {actual} bytes; maximum is {max}")
-            }
-            OpVerifyError::InvalidDomain(error) => {
-                write!(f, "signed domain payload is invalid: {error}")
-            }
-            OpVerifyError::MissingTopic => write!(f, "signed operation is missing its room topic"),
-            OpVerifyError::TopicMismatch { expected, actual } => {
-                write!(
-                    f,
-                    "signed operation belongs to topic {actual}, expected {expected}"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for OpVerifyError {}
-
-/// Verify a signed op. Pure: checks the signature and internal consistency, but NOT
-/// log continuity against a stored head (that is store state — see [`LogHead`]). Run
-/// identically at every peer's ingress.
-///
-/// Walkie's concrete entry point — the `L = WalkieLang` instantiation of the
-/// generic [`verify_signed_op_in`] (tutti Track-D step 1). The concrete return
-/// type keeps every external call site's spelling and inference unchanged.
+/// Verify a signed op. Walkie's concrete entry point — the `L = WalkieLang`
+/// instantiation of the generic [`verify_signed_op_in`]. The concrete return type
+/// keeps every external call site's spelling and inference unchanged.
 pub fn verify_signed_op(signed: &SignedOp) -> Result<VerifiedOp, OpVerifyError> {
     verify_signed_op_in::<WalkieLang>(signed)
-}
-
-/// The generic verification core over any [`OpLanguage`] `L` (tutti Track-D
-/// step 1). Byte-for-byte equivalent to the pre-extraction walkie verify: the
-/// payload-size cap is `L::MAX_PAYLOAD_BYTES` (walkie: [`MAX_SIGNED_PAYLOAD_BYTES`]),
-/// the schema gate is `L::SCHEMA_VERSION`, and domain well-formedness is
-/// `L::validate_wire`. The topic/horizon caps stay walkie module constants; they
-/// are not envelope-defining and are deferred with the rest of the seam.
-pub fn verify_signed_op_in<L: OpLanguage>(
-    signed: &SignedOp,
-) -> Result<VerifiedOpG<L>, OpVerifyError> {
-    if signed.payload.len() > L::MAX_PAYLOAD_BYTES {
-        return Err(OpVerifyError::PayloadTooLarge {
-            actual: signed.payload.len(),
-            max: L::MAX_PAYLOAD_BYTES,
-        });
-    }
-    let header: Header<()> =
-        decode_cbor(signed.header.as_slice()).map_err(OpVerifyError::HeaderDecode)?;
-
-    let hash = header.hash();
-    let body = Body::from(signed.payload.clone());
-    let operation = Operation {
-        hash,
-        header: header.clone(),
-        body: Some(body),
-    };
-    validate_operation(&operation).map_err(OpVerifyError::Invalid)?;
-
-    let versioned: VersionedOpG<L> =
-        decode_cbor(signed.payload.as_slice()).map_err(OpVerifyError::PayloadDecode)?;
-    if !versioned.is_supported() {
-        return Err(OpVerifyError::UnsupportedVersion(versioned.version));
-    }
-    if versioned
-        .topic
-        .as_ref()
-        .is_some_and(|topic| topic.len() > MAX_TOPIC_BYTES)
-    {
-        return Err(OpVerifyError::InvalidDomain(format!(
-            "room topic exceeds {MAX_TOPIC_BYTES} UTF-8 bytes"
-        )));
-    }
-    if versioned.observed.len() > MAX_OBSERVED_OPS {
-        return Err(OpVerifyError::InvalidDomain(format!(
-            "causal horizon exceeds {MAX_OBSERVED_OPS} operations"
-        )));
-    }
-    L::validate_wire(&versioned.op).map_err(OpVerifyError::InvalidDomain)?;
-
-    Ok(VerifiedOpG {
-        author: AuthorId(*header.verifying_key.as_bytes()),
-        timestamp_ms: versioned.ts_micros / 1_000,
-        payload: versioned.op,
-        topic: versioned.topic,
-        observed: versioned.observed,
-        seq_num: header.seq_num as u64,
-        backlink: header.backlink.map(|h| *h.as_bytes()),
-        hash: *hash.as_bytes(),
-        header_bytes: signed.header.clone(),
-        payload_bytes: signed.payload.clone(),
-    })
 }
 
 /// Verify a signed op and require it to be bound to `expected_topic`.
@@ -825,6 +227,7 @@ pub fn verify_signed_op_for_topic(
 mod tests {
     use super::*;
     use crate::tuning::{TunedDegree, TunedPeriodicPitch, Tuning};
+    use p2panda_core::{Header, OperationError, cbor::decode_cbor};
 
     const SEED_A: [u8; 32] = [7u8; 32];
     const SEED_B: [u8; 32] = [9u8; 32];

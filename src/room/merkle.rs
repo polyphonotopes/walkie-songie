@@ -1,87 +1,36 @@
-//! Additive Merkle commitment / proof layer for [`RoomStore`] (feature `merkle`).
+//! Walkie's `state_root` — a canonical Merkle commitment to the projected
+//! [`RoomView`] (feature `merkle`).
 //!
-//! Two roots stand **beside** the anti-entropy machinery, never replacing it:
+//! [`state_root_of`] is a canonical Merkle over the projected `RoomView`, a pure
+//! function of the view's fields. Leaf grammar documented on [`state_trie`].
 //!
-//! * [`ops_root_of`] — a canonical [`radix_immutable`] Merkle trie keyed by the
-//!   **entry hash** of every lifted op. Its input is exactly
-//!   `RoomStore::entry_to_source.keys()` — the *same* identity set
-//!   [`sync_root_of`](super::store::sync_root_of) digests — so the two
-//!   commitments can never skew (the "one entry set, one capture" invariant of
-//!   `docs/research/reconciliation-tree-fit.md` risk 3). Root equality iff
-//!   entry-set equality, **plus** O(log n) inclusion / non-inclusion proofs
-//!   ([`RoomStore::prove_op`](super::store::RoomStore::prove_op) +
-//!   standalone [`radix_immutable::verify`]).
-//! * [`state_root_of`] — a canonical Merkle over the projected
-//!   [`RoomView`](super::store::RoomView), a pure function of the view's fields.
-//!   Leaf grammar documented on [`state_trie`].
+//! The domain-agnostic `ops_root`/`prove_op` (over the entry-hash identity set)
+//! moved to [`tutti_core`] (tutti extraction Track-D step 3) — they name no
+//! domain, so they are generic `Store<L>` methods there. `state_root` stays here
+//! because it folds `RoomView`: hoisting it onto `Store<L>` needs an
+//! `L::View: Canonical` bound that is not wired yet, so it is deferred with the
+//! rest of tutti-core's Merkle work.
 //!
 //! ## What this layer does NOT touch
 //!
-//! RBSR (`src/net/sync.rs`), the gossip path, the per-session salted-XOR range
-//! fingerprints, and `sync_root`/`sync_root_of` are all **unchanged**. `ops_root`
-//! is a strictly stronger digest than `sync_root` (adds proofs), so `sync_root`
-//! is *superseded for proofs* — but it remains the value the RBSR session
-//! cross-checks on `Done`, and is not removed here. See the deprecation note on
-//! [`RoomStore::sync_root`](super::store::RoomStore::sync_root).
+//! RBSR, the gossip path, the salted-XOR range fingerprints, and `sync_root` are
+//! all unchanged; the roots stand BESIDE the anti-entropy machinery.
 //!
 //! ## Recompute, not incremental
 //!
-//! Both roots are recomputed on demand from the store's existing maps rather than
-//! maintained in a persistent trie field. At room scale this is microseconds
-//! (immutable-trie inserts are ~200 ns each), and — decisively — recomputing
-//! `ops_root` from the same `entry_to_source.keys()` iterator that `sync_root_of`
-//! consumes makes skew between the two commitments *structurally impossible*.
-//! Should score-sized logs ever make this profile hot, a persistent
-//! structurally-shared trie updated on lift is a drop-in (the crate is immutable
-//! and built for exactly that), with no change to these roots' byte format.
+//! The root is recomputed on demand from the view rather than maintained in a
+//! persistent trie field. At room scale this is microseconds; should score-sized
+//! logs make it hot, a persistent structurally-shared trie is a drop-in with no
+//! change to the root's byte format.
 
-use hhhs_core::EntryHash;
-use radix_immutable::{BytesKeyConverter, Proof, Trie};
+use radix_immutable::{BytesKeyConverter, Trie};
 
 use super::store::RoomView;
 use crate::tuning::{TunedDegree, TunedPeriodicPitch};
 
-/// The `ops_root` trie: key = 32-byte entry hash, value = `()` (presence only).
-///
-/// Presence-only leaves (`ValueToBytes for () == b""`) suffice because the key
-/// *is* the op's cryptographic identity; the value carries no extra information.
-pub type OpsTrie = Trie<[u8; 32], (), BytesKeyConverter<[u8; 32]>>;
-
 /// The `state_root` trie: byte keys (section-tagged, see [`state_trie`]) → byte
 /// values (canonical field encodings).
 pub type StateTrie = Trie<Vec<u8>, Vec<u8>, BytesKeyConverter<Vec<u8>>>;
-
-/// Build the `ops_root` trie from an entry-hash identity set.
-///
-/// Feed it `entry_to_source.keys()` so the committed set is byte-for-byte the set
-/// `sync_root_of` digests. Insertion order is irrelevant — the trie shape (and
-/// thus the root) is a pure function of the final key set.
-pub fn ops_trie<'a>(hashes: impl IntoIterator<Item = &'a EntryHash>) -> OpsTrie {
-    let mut trie = OpsTrie::new_bytes_key();
-    for hash in hashes {
-        trie = trie.insert(*hash.as_bytes(), ());
-    }
-    trie
-}
-
-/// The `ops_root`: a canonical blake3-256 Merkle commitment to the entry-hash set.
-pub fn ops_root_of<'a>(hashes: impl IntoIterator<Item = &'a EntryHash>) -> [u8; 32] {
-    ops_trie(hashes).merkle_root()
-}
-
-/// An inclusion / non-inclusion proof for `entry` against `ops_root_of(hashes)`.
-///
-/// Verify standalone (no store) with
-/// `radix_immutable::verify(&root, entry.as_bytes(), Some(&[]), &proof)` for an
-/// inclusion (the `()` value encodes to empty bytes), or
-/// `radix_immutable::verify(&root, entry.as_bytes(), None, &proof)` for a
-/// non-inclusion.
-pub fn prove_op<'a>(
-    hashes: impl IntoIterator<Item = &'a EntryHash>,
-    entry: &EntryHash,
-) -> Proof {
-    ops_trie(hashes).prove(entry.as_bytes())
-}
 
 // --- state_root canonical view encoding --------------------------------------
 
@@ -112,8 +61,8 @@ fn tuned_pitch_bytes(pitch: &TunedPeriodicPitch) -> Vec<u8> {
 
 /// Build the `state_root` trie: one leaf per view fact, section-tagged so leaves
 /// from different facets share no key space. The trie is a canonical Merkle over
-/// its sorted `(key, value)` leaves, so the root is a pure, deterministic
-/// function of the [`RoomView`] alone.
+/// its sorted `(key, value)` leaves, so the root is a pure, deterministic function
+/// of the [`RoomView`] alone.
 ///
 /// Leaf grammar (`key -> value`, all integers little-endian, lengths fixed-width
 /// except the trailing variable-length UTF-8 fields):
@@ -121,15 +70,15 @@ fn tuned_pitch_bytes(pitch: &TunedPeriodicPitch) -> Vec<u8> {
 /// * config — `[SEC_CONFIG, b'T'] -> tuning_id(32)` (omitted when `tuning` is
 ///   `None`); `[SEC_CONFIG, b'L'] -> [pieces_locked as u8]`;
 ///   `[SEC_CONFIG, b'E'] -> available_emojis (UTF-8)` (omitted when `None`).
-///   Committing the 32-byte `TuningId` binds the full tuning: the id *is*
-///   blake3 of the canonical Scala/KBM bytes.
+///   Committing the 32-byte `TuningId` binds the full tuning: the id *is* blake3
+///   of the canonical Scala/KBM bytes.
 /// * pitches — `[SEC_PITCHES] ‖ tuned_degree_bytes(d) -> concat of the sorted
 ///   32-byte holder AuthorIds`. The key set is exactly `view.pitches` (an
 ///   invariant of `view()`: `pitches == pitch_authors.keys()`), so encoding
 ///   `pitch_authors` captures both fields.
 /// * pieces — `[SEC_PIECES] ‖ piece_id(32) -> owner(32) ‖ tuned_pitch_bytes(38)
-///   ‖ emoji (UTF-8, trailing)`. Fixed-width prefix + trailing emoji is
-///   injective in `(owner, pitch, emoji)`.
+///   ‖ emoji (UTF-8, trailing)`. Fixed-width prefix + trailing emoji is injective
+///   in `(owner, pitch, emoji)`.
 pub fn state_trie(view: &RoomView) -> StateTrie {
     let mut trie = StateTrie::new_bytes_key();
 

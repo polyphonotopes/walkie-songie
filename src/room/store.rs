@@ -1,715 +1,42 @@
-//! `RoomStore`: lift verified p2panda ops into an hhhs-core causal DAG and
-//! materialize the room read model HHHS-natively.
+//! Walkie's room read model: the [`WalkieLang`] fold over `tutti_core`'s generic
+//! signed-op store.
 //!
-//! Every [`VerifiedOp`] is deterministically lifted to a kernel [`Entry`] whose
-//! payload is the **verbatim framed signed bytes** of the op, and whose `prevs`
-//! are the entries that lift the op's `backlink` and each of its `observed`
-//! op ids. Because the payload and the prev set are both pure functions of the
-//! signed op, the resulting [`EntryHash`] is identical on every peer regardless
-//! of the order ops arrive — which is what makes cross-peer convergence hold.
+//! The lift/deferral/heads machinery, the `Store<L>` container, and the causal
+//! [`FoldCtx`] seam now live in [`tutti_core`] (tutti extraction Track-D step 3);
+//! `RoomStore` is `tutti_core::Store<WalkieLang>`. What stays here is the music:
+//! [`walkie_fold`] and the `with_*` builders that materialize a [`RoomView`] —
+//! pitches are a content-keyed add-wins set resolved by causal ancestry, pieces
+//! are SHARED (cross-author observed-remove for lifecycle plus a causal-maxima
+//! position register; owner is attribution, `pieces_locked` is the consent gate),
+//! and tuning/config are cross-author registers resolved by causal maxima.
 //!
-//! The read model ([`RoomView`]) is then computed HHHS-natively: pitches are a
-//! content-keyed add-wins set resolved by causal ancestry
-//! ([`ReachIndex`](hhhs_core::cover::ReachIndex)), voice is a per-author
-//! seq-register, pieces are SHARED — cross-author observed-remove for lifecycle
-//! plus a causal-maxima position register (owner is attribution, `pieces_locked`
-//! is the consent gate) — and tuning/config are cross-author registers resolved
-//! by [`register::resolve`](hhhs_core::register::resolve).
-//!
-//! Signature verification happens once, at ingest, against a [`VerifiedOp`];
-//! reads never re-verify.
+//! The fold reads the decoded op-set through the public [`FoldCtx`] surface
+//! ([`FoldCtx::decoded`], [`FoldCtx::op_id`], [`FoldCtx::is_ancestor`],
+//! [`FoldCtx::resolve`]) — the domain never touches the store's private indexes.
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
-// `ReachIndex` (the Θ(N²) kernel ancestor index) and the kernel `register`
-// resolver are now used ONLY by the `#[cfg(test)]` reference projection
-// (`view_reference`), which pins the cheap `Reach`-based `view()` bit-for-bit
-// against them. Production `view()` never materializes an ancestor closure.
-#[cfg(test)]
-use hhhs_core::cover::ReachIndex;
-#[cfg(test)]
-use hhhs_core::register;
-use hhhs_core::{AppendOutcome, DagRead, Entry, EntryHash, MemDagStore, Position};
+use hhhs_core::EntryHash;
 
-use super::ops::{
-    AuthorId, LogHead, OpId, OpLanguage, SignedOp, SigningKey, VerifiedOpG, VersionedOpG,
-    WalkieLang, WalkieOp, sign_versioned_op, verify_signed_op_in,
-};
+use crate::room::ops::{AuthorId, OpId, WalkieLang, WalkieOp};
 use crate::tuning::{TunedDegree, TunedPeriodicPitch, TuningDefinition};
 
-/// Deterministically frame a signed op into an entry payload:
-/// `MAGIC ++ len(header) ++ header ++ len(payload) ++ payload` (u64 little-endian
-/// lengths). A pure function of the signed op — never of any decoded record — so
-/// the entry hash matches byte-for-byte across peers.
-///
-/// The `MAGIC` is `L::ENTRY_FRAME_MAGIC` (tutti extraction Track-D step 2). For
-/// [`WalkieLang`] that is `b"walkie.hhhs.signed-op/1"`, the pre-extraction store
-/// literal, so lifted entry hashes are byte-for-byte unchanged — the golden
-/// vector pins it. Bumping the magic changes every [`EntryHash`], so it is a
-/// schema pin.
-fn frame_signed<L: OpLanguage>(signed: &SignedOp) -> Vec<u8> {
-    let mut out = Vec::with_capacity(
-        L::ENTRY_FRAME_MAGIC.len() + 16 + signed.header.len() + signed.payload.len(),
-    );
-    out.extend_from_slice(L::ENTRY_FRAME_MAGIC);
-    out.extend_from_slice(&(signed.header.len() as u64).to_le_bytes());
-    out.extend_from_slice(&signed.header);
-    out.extend_from_slice(&(signed.payload.len() as u64).to_le_bytes());
-    out.extend_from_slice(&signed.payload);
-    out
-}
+/// The generic substrate types, re-exported so `RoomStore` and the sync layer name
+/// them through `room::store` unchanged. [`Reach`]/[`CausalPast`] back the
+/// equivalence tests; [`sync_root_of`] is the convergence digest the RBSR session
+/// cross-checks; [`Store`]/[`FoldCtx`]/[`DecodedOp`] are the store + fold seam.
+pub use tutti_core::{CausalPast, DecodedOp, FoldCtx, Reach, Store, sync_root_of};
 
-/// Inverse of [`frame_signed`]: recover the verbatim [`SignedOp`] from a lifted
-/// entry's payload. A total inverse of the deterministic framing above, so a
-/// round-trip through the DAG payload is lossless — this is what lets the store
-/// re-emit the exact bytes an author signed for anti-entropy transfer. Reads the
-/// same `L::ENTRY_FRAME_MAGIC` prefix `frame_signed` wrote.
-fn unframe_signed<L: OpLanguage>(bytes: &[u8]) -> SignedOp {
-    let mut pos = L::ENTRY_FRAME_MAGIC.len();
-    let read_len = |bytes: &[u8], pos: usize| -> usize {
-        let mut buf = [0u8; 8];
-        buf.copy_from_slice(&bytes[pos..pos + 8]);
-        u64::from_le_bytes(buf) as usize
-    };
-    let header_len = read_len(bytes, pos);
-    pos += 8;
-    let header = bytes[pos..pos + header_len].to_vec();
-    pos += header_len;
-    let payload_len = read_len(bytes, pos);
-    pos += 8;
-    let payload = bytes[pos..pos + payload_len].to_vec();
-    SignedOp { header, payload }
-}
-
-/// Domain tag for [`sync_root_of`], so a convergence digest can never be
-/// confused with an entry hash or an op frame.
-const SYNC_ROOT_MAGIC: &[u8] = b"walkie.hhhs.sync-root/1";
-
-/// The canonical convergence digest over an entry-hash identity set.
-///
-/// `hashes` MUST be in ascending order — every caller feeds it a `BTreeMap`/
-/// `BTreeSet` iterator, which is. The digest is over the identity set alone, so
-/// two peers agree iff they hold exactly the same lifted entries, independent of
-/// arrival order or anything parked.
-///
-/// One definition, used by both [`RoomStore::sync_root`] and the sync layer's
-/// snapshot, so the value a peer cross-checks on `Done` cannot drift from the
-/// value the local store would compute.
-pub fn sync_root_of<'a>(hashes: impl IntoIterator<Item = &'a EntryHash>) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(SYNC_ROOT_MAGIC);
-    for hash in hashes {
-        hasher.update(hash.as_bytes());
-    }
-    *hasher.finalize().as_bytes()
-}
-
-/// The op contents kept alongside a lifted entry, so reads never re-verify a
-/// signature or re-decode a payload. Generic over the [`OpLanguage`] `L` so `op`
-/// carries the domain alphabet `L::Op` (tutti extraction Track-D step 2).
-struct DecodedOp<L: OpLanguage> {
-    author: AuthorId,
-    op: L::Op,
-    /// Author-stamped time (display / last-resort tiebreak only; unused by the
-    /// causal view but kept per the store contract).
-    #[allow(dead_code)]
-    ts_ms: u64,
-    /// This op's per-author log position. The shared piece fold resolves cross-
-    /// author, so seqs (incomparable across authors) no longer decide anything;
-    /// retained as part of the decoded record.
-    #[allow(dead_code)]
-    seq: u64,
-}
-
-/// The causal-DAG mirror of a room's signed op log plus everything reads need,
-/// generic over the domain [`OpLanguage`] `L` (tutti extraction Track-D step 2:
-/// store + fold genericized in place; the crate move is step 3). Every field is
-/// `L`-threaded but otherwise identical to the pre-extraction store, so the
-/// lifted entry hashes and the projected view are byte-for-byte unchanged.
-/// Walkie names it through the [`RoomStore`] alias (`L = WalkieLang`).
-pub struct Store<L: OpLanguage> {
-    /// The opaque-payload causal DAG. Identity ([`EntryHash`]) is fixed here.
-    dag: MemDagStore,
-    /// p2panda op id -> the entry that lifts it. The resolution table for prevs.
-    source_to_entry: BTreeMap<OpId, EntryHash>,
-    /// entry -> p2panda op id (inverse of `source_to_entry`).
-    entry_to_source: BTreeMap<EntryHash, OpId>,
-    /// entry -> decoded op contents (author, payload, ts, seq).
-    decoded: BTreeMap<EntryHash, DecodedOp<L>>,
-    /// Per-author log head, so the local author can chain new commits.
-    heads: BTreeMap<AuthorId, LogHead>,
-    /// Ops whose `backlink`/`observed` are not all lifted yet — parked until
-    /// their full causal past arrives (strict deferral), then drained.
-    pending: Vec<VerifiedOpG<L>>,
-}
-
-/// Walkie-songie's room store — [`Store`] fixed at [`WalkieLang`]. Every call
-/// site outside `store.rs`/`ops.rs` keeps the pre-extraction spelling
-/// `RoomStore`, so genericizing the store moved no external code.
+/// Walkie-songie's room store — [`Store`] fixed at [`WalkieLang`]. Every call site
+/// outside `store.rs`/`ops.rs` keeps the pre-extraction spelling `RoomStore`.
 pub type RoomStore = Store<WalkieLang>;
 
-/// Hand-written so `Store<L>` is `Default` without a spurious `L: Default` bound
-/// (the marker `L` never impls `Default`); every field defaults independently.
-impl<L: OpLanguage> Default for Store<L> {
-    fn default() -> Self {
-        Self {
-            dag: MemDagStore::default(),
-            source_to_entry: BTreeMap::new(),
-            entry_to_source: BTreeMap::new(),
-            decoded: BTreeMap::new(),
-            heads: BTreeMap::new(),
-            pending: Vec::new(),
-        }
-    }
-}
-
-impl<L: OpLanguage> Store<L> {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Number of lifted (materialized) ops.
-    pub fn len(&self) -> usize {
-        self.source_to_entry.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.source_to_entry.is_empty()
-    }
-
-    /// The entry hashes of every lifted (materialized) op. The RBSR anti-entropy
-    /// index is built from exactly this set, and it is the cross-peer identity set
-    /// convergence is asserted over. Permanent public API: the sync layer needs it.
-    pub fn entry_hashes(&self) -> BTreeSet<EntryHash> {
-        self.entry_to_source.keys().copied().collect()
-    }
-
-    /// The number of ops parked awaiting their causal past (strict deferral). Zero
-    /// after quiescence is the liveness invariant: nothing is stuck behind a
-    /// predecessor that already arrived. Permanent public API.
-    pub fn pending_len(&self) -> usize {
-        self.pending.len()
-    }
-
-    /// Whether an operation is already lifted or is waiting on causal
-    /// predecessors. Persistence and repair use this to avoid journal growth
-    /// from duplicate gossip frames.
-    pub fn knows_op(&self, id: OpId) -> bool {
-        self.source_to_entry.contains_key(&id)
-            || self.pending.iter().any(|pending| pending.id() == id)
-    }
-
-    /// The entry hash lifting op `id`, if that op is already materialized.
-    ///
-    /// `None` for parked and unknown ops alike — a parked op cannot resolve its
-    /// `prevs` yet, so it has no entry hash to report. The sync layer uses this
-    /// to name an already-lifted duplicate delivery in its `admitted` set by
-    /// the hash the store derived, never the hash the wire claimed.
-    pub fn lifted_entry(&self, id: OpId) -> Option<EntryHash> {
-        self.source_to_entry.get(&id).copied()
-    }
-
-    /// The verbatim signed bytes of every lifted op, keyed by the entry hash that
-    /// lifts it. Recovered losslessly from the DAG payloads, so it is exactly the
-    /// bytes each author signed — what an anti-entropy transfer re-ingests on the
-    /// far side. Permanent public API for the sync/reconcile layer.
-    pub fn signed_ops(&self) -> BTreeMap<EntryHash, SignedOp> {
-        self.dag
-            .entries_topo()
-            .into_iter()
-            .map(|entry| (entry.hash(), unframe_signed::<L>(&entry.payload)))
-            .collect()
-    }
-
-    /// A convergence digest over this store's entry-hash identity set.
-    ///
-    /// Carried on `Done` so the two halves cross-check that they actually agree
-    /// (`SessionOutput::root_mismatch`). Without it a session that pruned a
-    /// divergent range — a fingerprint collision, a peer that advertised what it
-    /// could not serve — reports success while the peers have not converged, and
-    /// nothing anywhere notices.
-    ///
-    /// NOTE (M2): [`Self::ops_root`] is a strictly stronger digest over the *same*
-    /// entry-hash set (root equality iff set equality, plus inclusion/exclusion
-    /// proofs), so `sync_root` is **superseded for proofs**. It is intentionally
-    /// NOT removed: it remains the value the RBSR session cross-checks on `Done`.
-    /// Any eventual retirement is a sync-layer decision, not part of this layer.
-    pub fn sync_root(&self) -> [u8; 32] {
-        sync_root_of(self.entry_to_source.keys())
-    }
-
-    /// Signed bytes plus causal predecessors for ONE lifted entry.
-    ///
-    /// Exists so the sync layer can fold newly-lifted entries into its
-    /// `(EntrySource, Index)` pair in O(lifted) instead of rebuilding the whole
-    /// snapshot — [`Self::repair_records`] topo-sorts and re-serializes the
-    /// entire DAG, and the driver used to call it once per `Entries` frame.
-    pub fn repair_record(&self, hash: &EntryHash) -> Option<(SignedOp, Vec<EntryHash>)> {
-        let entry = self.dag.entry(hash)?;
-        Some((
-            unframe_signed::<L>(&entry.payload),
-            entry.header.prevs.0.iter().copied().collect(),
-        ))
-    }
-
-    /// Signed bytes plus causal-entry predecessors for a transport-neutral
-    /// repair snapshot.
-    pub fn repair_records(&self) -> BTreeMap<EntryHash, (SignedOp, Vec<EntryHash>)> {
-        self.dag
-            .entries_topo()
-            .into_iter()
-            .map(|entry| {
-                (
-                    entry.hash(),
-                    (
-                        unframe_signed::<L>(&entry.payload),
-                        entry.header.prevs.0.iter().copied().collect(),
-                    ),
-                )
-            })
-            .collect()
-    }
-
-    /// Which p2panda op id each lifted entry hash lifts. The RBSR index advertises
-    /// entry hashes; this resolves an advertised hash back to its op id (and thence
-    /// its causal predecessors) without re-verifying. Permanent public API for the
-    /// sync/reconcile layer.
-    pub fn lifted_op_ids(&self) -> BTreeMap<EntryHash, OpId> {
-        self.entry_to_source.clone()
-    }
-
-    /// Lift a verified op into the DAG. Deduplicates, advances the author's head,
-    /// and — via strict deferral — parks the op if any referenced op id is not
-    /// yet lifted, draining the pending set after every successful lift.
-    ///
-    /// Returns the entries this call newly LIFTED: the op itself if its causal
-    /// past was complete, plus everything it unblocked. An empty return means the
-    /// op parked. Callers must not treat "accepted" as "materialized" — a parked
-    /// op is not in [`Self::entry_hashes`], is not advertised to peers, and
-    /// cannot be served, so counting it as ingested overstates progress.
-    pub fn ingest_verified(&mut self, op: VerifiedOpG<L>) -> Vec<EntryHash> {
-        let id = op.id();
-        if self.source_to_entry.contains_key(&id) {
-            return Vec::new();
-        }
-        if self.pending.iter().any(|p| p.id() == id) {
-            return Vec::new();
-        }
-        self.advance_head(&op);
-        self.pending.push(op);
-        self.drain_pending()
-    }
-
-    /// Advance (never regress) the author's tracked head to the greatest seq seen.
-    fn advance_head(&mut self, op: &VerifiedOpG<L>) {
-        let advanced = op.advanced_head();
-        let slot = self
-            .heads
-            .entry(op.author())
-            .or_insert_with(LogHead::genesis);
-        if advanced.next_seq > slot.next_seq {
-            *slot = advanced;
-        }
-    }
-
-    /// Resolve an op's `prevs` = `{ lift(backlink) } ∪ { lift(o) : o in observed }`.
-    /// Returns `None` (defer) if ANY referenced op id is not yet lifted — never
-    /// omit a prev, or the entry hash would depend on arrival order.
-    fn resolve_prevs(&self, op: &VerifiedOpG<L>) -> Option<BTreeSet<EntryHash>> {
-        let mut prevs = BTreeSet::new();
-        if let Some(backlink) = op.backlink() {
-            prevs.insert(*self.source_to_entry.get(&OpId(backlink))?);
-        }
-        for observed in op.observed() {
-            prevs.insert(*self.source_to_entry.get(&OpId(*observed))?);
-        }
-        Some(prevs)
-    }
-
-    /// Try to lift one op. Returns the lifted entry hash iff it was appended (or
-    /// already present); `None` (with no mutation) if its causal past is
-    /// incomplete.
-    fn try_lift(&mut self, op: &VerifiedOpG<L>) -> Option<EntryHash> {
-        let prevs = self.resolve_prevs(op)?;
-        let entry = Entry::new(frame_signed::<L>(&op.signed()), Position(prevs));
-        let entry_hash = entry.hash();
-        match self.dag.append(&entry) {
-            AppendOutcome::Appended | AppendOutcome::Duplicate => {}
-            // Unreachable: every prev was resolved from `source_to_entry`, so it is
-            // present in the DAG, and the payload hashes to its own digest.
-            other => {
-                debug_assert!(false, "unexpected append outcome: {other:?}");
-                return None;
-            }
-        }
-        let id = op.id();
-        self.source_to_entry.insert(id, entry_hash);
-        self.entry_to_source.insert(entry_hash, id);
-        self.decoded.insert(
-            entry_hash,
-            DecodedOp {
-                author: op.author(),
-                op: op.payload().clone(),
-                ts_ms: op.timestamp_ms(),
-                seq: op.seq_num(),
-            },
-        );
-        Some(entry_hash)
-    }
-
-    /// Repeatedly attempt to lift parked ops until a full pass makes no progress,
-    /// returning every entry lifted along the way.
-    fn drain_pending(&mut self) -> Vec<EntryHash> {
-        let mut lifted = Vec::new();
-        loop {
-            let parked = std::mem::take(&mut self.pending);
-            let mut still_pending = Vec::with_capacity(parked.len());
-            let mut progressed = false;
-            for op in parked {
-                if let Some(hash) = self.try_lift(&op) {
-                    lifted.push(hash);
-                    progressed = true;
-                } else {
-                    still_pending.push(op);
-                }
-            }
-            self.pending = still_pending;
-            if !progressed {
-                break;
-            }
-        }
-        lifted
-    }
-
-    /// The op ids of the current DAG frontier — the causal horizon a new local op
-    /// should stamp into its `observed`. Deterministic (ascending entry-hash order).
-    pub fn observed_frontier(&self) -> Vec<[u8; 32]> {
-        self.dag
-            .frontier()
-            .0
-            .iter()
-            .filter_map(|entry| self.entry_to_source.get(entry).map(|id| id.0))
-            .collect()
-    }
-
-    /// Author and sign a local op without mutating the in-memory projection.
-    ///
-    /// Durable runtimes use this two-phase surface to fsync the signed bytes
-    /// before ingestion, so a storage failure cannot leave a visible but
-    /// unrecoverable operation.
-    pub fn prepare_commit(
-        &self,
-        key: &SigningKey,
-        topic: &str,
-        ts_micros: u64,
-        op: L::Op,
-    ) -> SignedOp {
-        let author = AuthorId(*key.verifying_key().as_bytes());
-        let head = self
-            .heads
-            .get(&author)
-            .copied()
-            .unwrap_or_else(LogHead::genesis);
-        let observed = self.observed_frontier();
-        // Byte-identical to walkie's `sign_op_for_topic_observing`: it built and
-        // signed exactly this envelope. Inlined so the store is generic over `L`.
-        let versioned =
-            VersionedOpG::<L>::current_for_topic(op, ts_micros, topic).observing(observed);
-        let (signed, _advanced) = sign_versioned_op(key, &head, versioned);
-        signed
-    }
-
-    /// Author, sign, verify, and ingest a new local op, returning the signed bytes
-    /// for gossip. In-memory/test callers use this convenience wrapper; durable
-    /// runtimes should call [`Self::prepare_commit`], persist, then ingest.
-    pub fn commit(
-        &mut self,
-        key: &SigningKey,
-        topic: &str,
-        ts_micros: u64,
-        op: L::Op,
-    ) -> SignedOp {
-        let signed = self.prepare_commit(key, topic, ts_micros, op);
-        let verified = verify_signed_op_in::<L>(&signed).expect("a just-signed op verifies");
-        self.ingest_verified(verified);
-        signed
-    }
-
-    /// Materialize the read model from the current DAG: `L::fold` over the causal
-    /// indexes packaged into a [`FoldCtx`] (tutti extraction Track-D step 2 — the
-    /// fold-over-[`OpLanguage`] seam layered on the M3 fold-over-reach). For
-    /// walkie this runs [`walkie_fold`]; other domains supply their own `fold`.
-    ///
-    /// The ancestry backend is the cheap lazy [`Reach`] (O(N + E) `prevs`
-    /// adjacency, reverse-walk `is_ancestor`, memoized per call) — never the
-    /// whole-DAG [`ReachIndex`] ancestor closure. The projected view is bit-for-
-    /// bit identical to the pre-extraction projection (a `#[cfg(test)]`
-    /// equivalence test pins `view()` against [`Self::view_reference`]).
-    pub fn view(&self) -> L::View {
-        L::fold(&FoldCtx::new(self))
-    }
-
-    /// The PRE-CHANGE projection: the identical `L::fold`, but driven by the
-    /// kernel [`ReachIndex`] and [`hhhs_core::register::resolve`] instead of the
-    /// cheap [`Reach`]. Retained as the reference oracle the equivalence tests
-    /// assert `view()` equals for thousands of random histories, so any drift in
-    /// the cheap backend is caught directly against the kernel it replaced. Only
-    /// the [`CausalPast`] backend behind the [`FoldCtx`] differs.
-    #[cfg(test)]
-    pub(crate) fn view_reference(&self) -> L::View {
-        let snapshot = self.dag.snapshot();
-        L::fold(&FoldCtx::with_reach(
-            self,
-            Box::new(ReachIndex::new(&snapshot)),
-        ))
-    }
-}
-
-/// M2 Merkle commitments (feature `merkle`), pinned to walkie's [`RoomView`].
-///
-/// `ops_root`/`prove_op` commit to the entry-hash identity set alone (already
-/// domain-agnostic), but they are kept BESIDE `state_root` — which folds walkie's
-/// view — so the whole M2 surface stays on `RoomStore` for now; hoisting them
-/// onto `Store<L>` (once `L::View: Canonical` supplies a generic `state_root`) is
-/// deferred with the rest of tutti-core to Track-D step 3. See
-/// [`crate::room::merkle`].
-#[cfg(feature = "merkle")]
-impl Store<WalkieLang> {
-    /// The additive `ops_root`: a canonical blake3-256 Merkle commitment to this
-    /// store's entry-hash identity set, computed over exactly the same
-    /// `entry_to_source.keys()` iterator [`Self::sync_root`] digests (so the two
-    /// can never skew). Strictly stronger than `sync_root`: root equality iff
-    /// entry-set equality, PLUS the proofs [`Self::prove_op`] emits. Beside RBSR,
-    /// never replacing it.
-    pub fn ops_root(&self) -> [u8; 32] {
-        crate::room::merkle::ops_root_of(self.entry_to_source.keys())
-    }
-
-    /// An inclusion (op present) or non-inclusion (op absent) proof for `entry`
-    /// against [`Self::ops_root`]. Verify standalone — no store, no crate state —
-    /// with [`radix_immutable::verify`]: `Some(&[])` demands inclusion (the `()`
-    /// leaf value is empty bytes), `None` demands non-inclusion.
-    ///
-    /// ```ignore
-    /// let root = store.ops_root();
-    /// let proof = store.prove_op(&entry);
-    /// assert!(radix_immutable::verify(&root, entry.as_bytes(), Some(&[]), &proof));
-    /// ```
-    pub fn prove_op(&self, entry: &EntryHash) -> radix_immutable::Proof {
-        crate::room::merkle::prove_op(self.entry_to_source.keys(), entry)
-    }
-
-    /// The additive `state_root`: a canonical blake3-256 Merkle commitment to the
-    /// projected [`RoomView`] (a pure function of the view). Delegates to
-    /// [`RoomView::state_root`] over the current [`Self::view`]. See
-    /// [`crate::room::merkle`] for the canonical leaf grammar.
-    pub fn state_root(&self) -> [u8; 32] {
-        self.view().state_root()
-    }
-}
-
-/// The ONE causal question the room projection asks of the DAG: "is `a`
-/// strictly in the causal past of `b`?" — plus the register tiebreak that is a
-/// pure function of it.
-///
-/// `view()` consumes exactly this and nothing else of a reachability oracle (no
-/// ancestor enumeration, no covers), so abstracting it lets the SAME projection
-/// run on two ancestry backends: the cheap lazy [`Reach`] in production, and the
-/// kernel [`ReachIndex`] in the `#[cfg(test)]` reference. Equivalence of the two
-/// views is then a direct assertion rather than a re-derivation.
-trait CausalPast {
-    /// Strict causal ancestry: `true` iff `a` is a transitive `prevs`-ancestor
-    /// of `b`, present-only, and never reflexive (`is_ancestor(x, x) == false`).
-    /// Must agree with [`ReachIndex::is_ancestor`] for every pair.
-    fn is_ancestor(&self, a: &EntryHash, b: &EntryHash) -> bool;
-
-    /// The last-writer-wins register winner over `candidates`, resolved
-    /// identically to [`hhhs_core::register::resolve`]: drop any candidate that
-    /// is a strict causal ancestor of another (superseded), then break the
-    /// remaining mutually-concurrent maxima by the MAXIMUM raw-bytes
-    /// [`EntryHash`]. `None` iff `candidates` is empty.
-    ///
-    /// The default is the kernel rule expressed over [`Self::is_ancestor`], so a
-    /// backend whose `is_ancestor` matches the kernel resolves registers
-    /// identically to the kernel — no separate resolver to keep in sync.
-    fn resolve(&self, candidates: &BTreeSet<EntryHash>) -> Option<EntryHash> {
-        candidates
-            .iter()
-            .copied()
-            .filter(|candidate| {
-                !candidates
-                    .iter()
-                    .any(|other| other != candidate && self.is_ancestor(candidate, other))
-            })
-            .max_by(|a, b| a.as_bytes().cmp(b.as_bytes()))
-    }
-}
-
-/// A cheap, lazy causal-ancestry oracle over the store's append-only op DAG.
-///
-/// It answers `is_ancestor(a, b)` with the SAME strict, present-only semantics
-/// as [`hhhs_core::cover::ReachIndex::is_ancestor`], but WITHOUT the Θ(N²) space
-/// `ReachIndex::new` pays to memoize a full ancestor `BTreeSet` for every node.
-/// Instead it keeps only the `prevs` adjacency — O(N + E), one pass over the
-/// snapshot — and answers each query by a reverse walk from `b` back through
-/// parent edges, short-circuiting when `a` is reached.
-///
-/// A per-instance memo caches, on first touch of a given `b`, that `b`'s full
-/// strict ancestor set, so repeated queries with the same `b` (the shape every
-/// call site has: one remover checked against many adds, one register candidate
-/// checked against the rest) walk `b`'s past at most once. The memo lives only
-/// for the [`RoomStore::view`] call that owns the `Reach` and is dropped with
-/// it; nothing Θ(N²) survives the call, and only the `b`s actually queried are
-/// ever materialized — a `view()` with no removes/registers materializes none.
-///
-/// Present-only, exactly as the kernel: an edge is followed only when its target
-/// is itself a present node (`parents.contains_key`). Walkie's lift path never
-/// admits a dangling `prevs` (a lift defers until every prev is present), so
-/// this never actually prunes for the store — but it keeps the answer identical
-/// to `ReachIndex` for any snapshot, which is what the oracle test asserts.
-struct Reach {
-    /// entry -> its causal parents (`header.prevs`). Keys are exactly the
-    /// present nodes, so a hash absent as a key is an absent (dangling) node.
-    parents: BTreeMap<EntryHash, Vec<EntryHash>>,
-    /// `b` -> `b`'s full strict, present-only ancestor set. Filled lazily; a
-    /// query is `memo[b].contains(a)`.
-    memo: RefCell<BTreeMap<EntryHash, BTreeSet<EntryHash>>>,
-}
-
-impl Reach {
-    /// Build the `prevs` adjacency in one pass over `dag`. O(N + E) time and
-    /// space — never the ancestor closure. The transient `Entry` clones from
-    /// [`DagRead::entries_topo`] are dropped as their `prevs` are extracted, so
-    /// this retains strictly less than the old `dag.snapshot()` + `ReachIndex`.
-    fn new(dag: &impl DagRead) -> Reach {
-        let parents = dag
-            .entries_topo()
-            .into_iter()
-            .map(|entry| (entry.hash(), entry.header.prevs.0.iter().copied().collect()))
-            .collect();
-        Reach {
-            parents,
-            memo: RefCell::new(BTreeMap::new()),
-        }
-    }
-
-    /// `b`'s strict, present-only ancestor set by reverse BFS over `parents`.
-    /// Excludes `b` itself (the walk starts from `b`'s parents), and follows an
-    /// edge only to a present target — matching `ReachIndex::ancestors(b)`.
-    fn ancestors_of(&self, b: &EntryHash) -> BTreeSet<EntryHash> {
-        let mut acc: BTreeSet<EntryHash> = BTreeSet::new();
-        let mut stack: Vec<EntryHash> = Vec::new();
-        if let Some(seed) = self.parents.get(b) {
-            for prev in seed {
-                if self.parents.contains_key(prev) && acc.insert(*prev) {
-                    stack.push(*prev);
-                }
-            }
-        }
-        while let Some(node) = stack.pop() {
-            if let Some(prevs) = self.parents.get(&node) {
-                for prev in prevs {
-                    if self.parents.contains_key(prev) && acc.insert(*prev) {
-                        stack.push(*prev);
-                    }
-                }
-            }
-        }
-        acc
-    }
-}
-
-impl CausalPast for Reach {
-    fn is_ancestor(&self, a: &EntryHash, b: &EntryHash) -> bool {
-        if let Some(history) = self.memo.borrow().get(b) {
-            return history.contains(a);
-        }
-        let history = self.ancestors_of(b);
-        let answer = history.contains(a);
-        self.memo.borrow_mut().insert(*b, history);
-        answer
-    }
-}
-
-/// The kernel `ReachIndex` as a [`CausalPast`] backend for the `#[cfg(test)]`
-/// reference projection. `is_ancestor` forwards to the kernel; `resolve`
-/// forwards to the REAL [`hhhs_core::register::resolve`] (not the trait
-/// default), so `view_reference` is the genuine pre-change behavior and the
-/// equivalence test has teeth.
-#[cfg(test)]
-impl CausalPast for ReachIndex {
-    fn is_ancestor(&self, a: &EntryHash, b: &EntryHash) -> bool {
-        ReachIndex::is_ancestor(self, a, b)
-    }
-
-    fn resolve(&self, candidates: &BTreeSet<EntryHash>) -> Option<EntryHash> {
-        register::resolve(candidates, self)
-    }
-}
-
-/// The read-only causal indexes a domain [`OpLanguage::fold`] consumes (tutti
-/// extraction Track-D step 2): the decoded op set, the entry↔op-id map, and a
-/// causal-ancestry backend behind [`CausalPast`]. It packages exactly what the
-/// old `project()` handed its `with_*` builders — the decoded index plus a
-/// reach oracle — so a domain `fold` is one ordinary function over these, with
-/// no framework and no facet DSL (staging is just Rust control flow).
-///
-/// The backend is erased behind `dyn CausalPast` so the SAME `fold` runs on
-/// either ancestry backend: the cheap lazy [`Reach`] in production
-/// ([`FoldCtx::new`]) and the kernel [`ReachIndex`] in the `#[cfg(test)]`
-/// reference ([`Store::view_reference`] via [`FoldCtx::with_reach`]). The
-/// decoded/`entry_to_source` fields stay private; walkie's in-module fold reads
-/// them directly, and the generic combinator surface is [`FoldCtx::is_ancestor`]
-/// / [`FoldCtx::resolve`].
-pub struct FoldCtx<'a, L: OpLanguage> {
-    decoded: &'a BTreeMap<EntryHash, DecodedOp<L>>,
-    entry_to_source: &'a BTreeMap<EntryHash, OpId>,
-    reach: Box<dyn CausalPast + 'a>,
-}
-
-impl<'a, L: OpLanguage> FoldCtx<'a, L> {
-    /// The production fold context over `store`: the cheap lazy [`Reach`]
-    /// ancestry backend (O(N + E), memoized per call). This is what
-    /// [`Store::view`] builds.
-    pub fn new(store: &'a Store<L>) -> Self {
-        Self::with_reach(store, Box::new(Reach::new(&store.dag)))
-    }
-
-    /// A fold context over `store` with an explicit ancestry backend. Used by the
-    /// `#[cfg(test)]` reference projection to drive the SAME fold with the kernel
-    /// [`ReachIndex`] instead of the cheap [`Reach`].
-    fn with_reach(store: &'a Store<L>, reach: Box<dyn CausalPast + 'a>) -> Self {
-        Self {
-            decoded: &store.decoded,
-            entry_to_source: &store.entry_to_source,
-            reach,
-        }
-    }
-
-    /// Strict causal ancestry — the ONE reachability question the fold asks:
-    /// `true` iff `a` is strictly in the causal past of `b`. The content-keyed
-    /// add-wins and observed-remove folds are built on exactly this.
-    pub fn is_ancestor(&self, a: &EntryHash, b: &EntryHash) -> bool {
-        self.reach.is_ancestor(a, b)
-    }
-
-    /// The causal-maxima register winner over `candidates` (drop strict
-    /// ancestors, break remaining maxima by max raw-bytes [`EntryHash`]); see
-    /// [`CausalPast::resolve`]. `None` iff `candidates` is empty.
-    pub fn resolve(&self, candidates: &BTreeSet<EntryHash>) -> Option<EntryHash> {
-        self.reach.resolve(candidates)
-    }
-}
-
-/// Walkie's [`OpLanguage::fold`]: the register → add-wins → object composition
-/// that materializes a [`RoomView`] from the causal indexes in `ctx`. This is
-/// exactly the old `project()` body, re-homed beside [`RoomView`] and its
-/// `with_*` builders and reading from a [`FoldCtx`] instead of `(store, reach)`
-/// (tutti extraction Track-D step 2). The register fold runs first so the
-/// tuning-scoped set/object folds can filter by the resolved tuning (the staged
-/// fold — facets are not independent, and the API admits it). The projected view
-/// is bit-for-bit the pre-extraction one.
+/// Walkie's [`OpLanguage::fold`](tutti_core::OpLanguage::fold): the register →
+/// add-wins → object composition that materializes a [`RoomView`] from the causal
+/// indexes in `ctx`. The register fold runs first so the tuning-scoped set/object
+/// folds can filter by the resolved tuning (the staged fold — facets are not
+/// independent, and the API admits it). The projected view is bit-for-bit the
+/// pre-extraction one.
 pub(crate) fn walkie_fold(ctx: &FoldCtx<'_, WalkieLang>) -> RoomView {
     RoomView {
         pitches: BTreeSet::new(),
@@ -737,8 +64,8 @@ impl RoomView {
         };
         let mut adds: BTreeMap<TunedDegree, Vec<EntryHash>> = BTreeMap::new();
         let mut removes: BTreeMap<TunedDegree, Vec<EntryHash>> = BTreeMap::new();
-        for (entry, decoded) in ctx.decoded {
-            match &decoded.op {
+        for (entry, decoded) in ctx.decoded() {
+            match decoded.op() {
                 WalkieOp::AddDegree { pitch } if pitch.validate(&active_tuning).is_ok() => {
                     adds.entry(*pitch).or_default().push(*entry)
                 }
@@ -756,7 +83,7 @@ impl RoomView {
                     .iter()
                     .any(|remove| ctx.is_ancestor(add, remove));
                 if !killed {
-                    authors.insert(ctx.decoded[add].author);
+                    authors.insert(ctx.decoded()[add].author());
                 }
             }
             if !authors.is_empty() {
@@ -771,31 +98,22 @@ impl RoomView {
     /// `Move`/`Remove`/`UnremovePiece` counts. `owner` is attribution only (the
     /// `PutPiece` author), never a gate; `pieces_locked` is the consent gate.
     ///
-    /// This generalizes the per-owner seq register — whose seqs are incomparable
-    /// across authors — to the cross-author machinery the rest of the store
-    /// already uses ([`Self::with_pitches`], [`Self::with_registers`]):
-    ///
     /// * **Lifecycle — observed-remove + add-wins, mirroring degrees.** The
-    ///   `PutPiece` and every valid `MovePiece` of the piece are *adds* (each is a
-    ///   presence-and-position assertion). A `RemovePiece` `R` **kills** exactly
-    ///   the adds in its causal past (`is_ancestor(add, R)`) — so a remove
-    ///   concurrent with an add cannot kill it (add-wins), and a move/put causally
-    ///   *after* a remove resurrects the piece exactly as re-adding a degree does.
-    ///   An `UnremovePiece` `U` **overrides** the remove it observed
-    ///   (`U.remove == R` and `is_ancestor(R, U)`), so that remove kills nothing.
-    ///   The piece is alive iff at least one add survives every effective remove.
-    /// * **Position — a register across ALL authors.** Per-author seqs are
-    ///   incomparable, so concurrent moves are resolved by
-    ///   [`register::resolve`] over the *surviving* adds: causal precedence where
-    ///   comparable, then the max raw-bytes [`EntryHash`] tiebreak — the same
-    ///   deterministic total order tuning/config use. No wall-clock, no seqs.
+    ///   `PutPiece` and every valid `MovePiece` of the piece are *adds*. A
+    ///   `RemovePiece` `R` **kills** exactly the adds in its causal past
+    ///   (`is_ancestor(add, R)`) — so a remove concurrent with an add cannot kill
+    ///   it (add-wins), and a move/put causally *after* a remove resurrects the
+    ///   piece. An `UnremovePiece` `U` **overrides** the remove it observed
+    ///   (`U.remove == R` and `is_ancestor(R, U)`). The piece is alive iff at
+    ///   least one add survives every effective remove.
+    /// * **Position — a register across ALL authors.** Concurrent moves are
+    ///   resolved by [`FoldCtx::resolve`] over the *surviving* adds: causal
+    ///   precedence where comparable, then the max raw-bytes [`EntryHash`]
+    ///   tiebreak. No wall-clock, no seqs.
     /// * **`pieces_locked` — the consent gate, applied per op by causal past.** A
-    ///   `MovePiece`/`RemovePiece`/`UnremovePiece` is suppressed (has no effect)
-    ///   iff the lock register **resolved over that op's causal ancestors** reads
-    ///   `true`. So an op is frozen only once an active lock is in its causal
-    ///   past; a move/remove *concurrent* with a lock (neither observed the other)
-    ///   still applies — you cannot retroactively freeze an op you did not
-    ///   causally precede. `PutPiece` is never suppressed.
+    ///   `Move`/`Remove`/`UnremovePiece` is suppressed iff the lock register
+    ///   resolved over that op's causal ancestors reads `true`. A move/remove
+    ///   *concurrent* with a lock still applies. `PutPiece` is never suppressed.
     fn with_pieces(mut self, ctx: &FoldCtx<'_, WalkieLang>) -> Self {
         let Some(active_tuning) = self
             .tuning
@@ -807,7 +125,7 @@ impl RoomView {
 
         // (put_entry, piece_id, owner, emoji, put_pitch)
         let mut puts: Vec<(EntryHash, OpId, AuthorId, String, TunedPeriodicPitch)> = Vec::new();
-        // (move_entry, target_piece) — pitch is read back from `ctx.decoded`.
+        // (move_entry, target_piece) — pitch is read back from `ctx.decoded()`.
         let mut moves: Vec<(EntryHash, OpId)> = Vec::new();
         // (remove_entry, remove_op_id, target_piece)
         let mut removes: Vec<(EntryHash, OpId, OpId)> = Vec::new();
@@ -816,11 +134,11 @@ impl RoomView {
         // SetConfig writes that carry a `pieces_locked` value (the lock register).
         let mut lock_writes: BTreeSet<EntryHash> = BTreeSet::new();
 
-        for (entry, decoded) in ctx.decoded {
-            let op_id = ctx.entry_to_source[entry];
-            match &decoded.op {
+        for (entry, decoded) in ctx.decoded() {
+            let op_id = ctx.op_id(entry);
+            match decoded.op() {
                 WalkieOp::PutPiece { emoji, pitch } if pitch.validate(&active_tuning).is_ok() => {
-                    puts.push((*entry, op_id, decoded.author, emoji.clone(), *pitch))
+                    puts.push((*entry, op_id, decoded.author(), emoji.clone(), *pitch))
                 }
                 WalkieOp::MovePiece { piece, pitch } if pitch.validate(&active_tuning).is_ok() => {
                     moves.push((*entry, *piece))
@@ -837,9 +155,9 @@ impl RoomView {
             }
         }
 
-        // Whether the pieces-lock register, resolved over ONLY the causal
-        // ancestors of `op`, reads `true`. A move/remove/unremove is suppressed
-        // exactly when this holds — i.e. an active lock sits in its causal past.
+        // Whether the pieces-lock register, resolved over ONLY the causal ancestors
+        // of `op`, reads `true`. A move/remove/unremove is suppressed exactly when
+        // this holds — i.e. an active lock sits in its causal past.
         let locked_as_of = |op: &EntryHash| -> bool {
             let observed: BTreeSet<EntryHash> = lock_writes
                 .iter()
@@ -848,7 +166,7 @@ impl RoomView {
                 .collect();
             ctx.resolve(&observed).is_some_and(|winner| {
                 matches!(
-                    &ctx.decoded[&winner].op,
+                    ctx.decoded()[&winner].op(),
                     WalkieOp::SetConfig {
                         pieces_locked: Some(true),
                         ..
@@ -901,7 +219,7 @@ impl RoomView {
             // Position = the register winner among the surviving adds' pitches.
             let pitch = ctx
                 .resolve(&surviving)
-                .map(|winner| match &ctx.decoded[&winner].op {
+                .map(|winner| match ctx.decoded()[&winner].op() {
                     WalkieOp::PutPiece { pitch, .. } | WalkieOp::MovePiece { pitch, .. } => *pitch,
                     _ => unreachable!("a surviving add is a PutPiece or MovePiece"),
                 })
@@ -920,14 +238,14 @@ impl RoomView {
         self
     }
 
-    /// Tuning / config: cross-author registers resolved by causal maxima then
-    /// max raw-bytes entry hash. Each config field is resolved independently.
+    /// Tuning / config: cross-author registers resolved by causal maxima then max
+    /// raw-bytes entry hash. Each config field is resolved independently.
     fn with_registers(mut self, ctx: &FoldCtx<'_, WalkieLang>) -> Self {
         let mut tuning_writes: BTreeSet<EntryHash> = BTreeSet::new();
         let mut locked_writes: BTreeSet<EntryHash> = BTreeSet::new();
         let mut emoji_writes: BTreeSet<EntryHash> = BTreeSet::new();
-        for (entry, decoded) in ctx.decoded {
-            match &decoded.op {
+        for (entry, decoded) in ctx.decoded() {
+            match decoded.op() {
                 WalkieOp::SetTuning { .. } => {
                     tuning_writes.insert(*entry);
                 }
@@ -948,14 +266,14 @@ impl RoomView {
 
         self.tuning = ctx
             .resolve(&tuning_writes)
-            .map(|winner| match &ctx.decoded[&winner].op {
+            .map(|winner| match ctx.decoded()[&winner].op() {
                 WalkieOp::SetTuning { definition } => definition.clone(),
                 _ => unreachable!("tuning candidate is a SetTuning"),
             })
             .or_else(|| Some(TuningDefinition::twelve_tet()));
         self.pieces_locked = ctx
             .resolve(&locked_writes)
-            .map(|winner| match &ctx.decoded[&winner].op {
+            .map(|winner| match ctx.decoded()[&winner].op() {
                 WalkieOp::SetConfig {
                     pieces_locked: Some(locked),
                     ..
@@ -963,16 +281,15 @@ impl RoomView {
                 _ => unreachable!("locked candidate carries pieces_locked"),
             })
             .unwrap_or(false);
-        self.available_emojis = ctx.resolve(&emoji_writes).map(|winner| match &ctx.decoded
-            [&winner]
-            .op
-        {
-            WalkieOp::SetConfig {
-                available_emojis: Some(emojis),
-                ..
-            } => emojis.clone(),
-            _ => unreachable!("emoji candidate carries available_emojis"),
-        });
+        self.available_emojis = ctx
+            .resolve(&emoji_writes)
+            .map(|winner| match ctx.decoded()[&winner].op() {
+                WalkieOp::SetConfig {
+                    available_emojis: Some(emojis),
+                    ..
+                } => emojis.clone(),
+                _ => unreachable!("emoji candidate carries available_emojis"),
+            });
         self
     }
 }
@@ -1007,11 +324,30 @@ pub struct RoomView {
 impl RoomView {
     /// M2 — the additive `state_root`: a canonical blake3-256 Merkle commitment to
     /// this projected view. A pure, deterministic function of the view's fields;
-    /// see [`crate::room::merkle::state_trie`] for the leaf grammar. `RoomView` is
-    /// the projected room state, so this is the "`RoomState::state_root`" the M2
-    /// spec names.
+    /// see [`crate::room::merkle::state_trie`] for the leaf grammar.
     pub fn state_root(&self) -> [u8; 32] {
         crate::room::merkle::state_root_of(self)
+    }
+}
+
+/// The walkie-facing `state_root` on the store (feature `merkle`).
+///
+/// It commits to the projected [`RoomView`], so it needs `L::View` — it cannot be
+/// a generic `Store<L>` method until `L::View: Canonical` is wired (deferred with
+/// the rest of tutti-core's Merkle work). Provided as a walkie extension trait
+/// rather than an inherent `impl Store<WalkieLang>` because `Store` is a foreign
+/// type; `ops_root`/`prove_op` (entry-hash only, domain-agnostic) ARE inherent on
+/// `Store<L>` in tutti-core and need no trait. Bring this trait into scope to call
+/// `store.state_root()`.
+#[cfg(feature = "merkle")]
+pub trait RoomStoreStateRoot {
+    fn state_root(&self) -> [u8; 32];
+}
+
+#[cfg(feature = "merkle")]
+impl RoomStoreStateRoot for RoomStore {
+    fn state_root(&self) -> [u8; 32] {
+        self.view().state_root()
     }
 }
 
@@ -1464,8 +800,8 @@ mod tests {
         assert_parity(&ops);
     }
 
-    /// Shared-pieces update: a non-owner's move is no longer inert — it produces
-    /// a real view delta (the piece moves), so diff-driven projections update
+    /// Shared-pieces update: a non-owner's move is no longer inert — it produces a
+    /// real view delta (the piece moves), so diff-driven projections update
     /// normally and there is nothing to "snap back". (Flip of the old
     /// `non_owner_move_produces_no_view_delta`.)
     #[test]
@@ -1509,8 +845,8 @@ mod tests {
 
     /// Two DIFFERENT authors move the same piece concurrently (neither observed
     /// the other's move). Ingested in OPPOSITE orders on two stores, both compute
-    /// the identical deterministic position — the cross-author position
-    /// register's entry-hash tiebreak — which is one of the two proposed pitches.
+    /// the identical deterministic position — the cross-author position register's
+    /// entry-hash tiebreak — which is one of the two proposed pitches.
     #[test]
     fn concurrent_moves_by_two_authors_converge_deterministically() {
         let mut a = Peer::new(&SEED_A);
@@ -1804,11 +1140,15 @@ mod tests {
         let baseline_view = baseline.view();
         let baseline_hashes = entryhash_set(&baseline);
         assert_eq!(baseline_view, expected);
-        assert!(baseline.pending.is_empty(), "everything drains");
+        assert_eq!(baseline.pending_len(), 0, "everything drains");
 
         for order in [identity.clone(), reversed, interleave] {
             let store = ingest_in_order(&base, &order);
-            assert!(store.pending.is_empty(), "order {order:?} must fully drain");
+            assert_eq!(
+                store.pending_len(),
+                0,
+                "order {order:?} must fully drain"
+            );
             assert_eq!(
                 store.view(),
                 baseline_view,
@@ -1848,7 +1188,7 @@ mod tests {
         );
 
         let id0 = verify_signed_op(&signed0).unwrap().id();
-        let eh0 = store.source_to_entry[&id0];
+        let eh0 = store.lifted_entry(id0).expect("first op is lifted");
         assert_eq!(
             eh0.to_hex(),
             "9e217937915d7f0969a214c904ab6adb00da97c873d89407d82b7e5bf0bf3568",
@@ -1911,7 +1251,9 @@ mod tests {
     // ---------------------------------------------------------------------
     // M2 — the Merkle commitment / proof layer (ops_root / state_root).
     // ADDITIVE: RBSR, the `sync_root` convergence digest, and view() are all
-    // untouched; these tests only add commitments beside them.
+    // untouched; these tests only add commitments beside them. `ops_root`/
+    // `prove_op` are now generic tutti-core `Store<L>` methods; `state_root` is
+    // the walkie `RoomStoreStateRoot` extension (in scope via `use super::*`).
     // ---------------------------------------------------------------------
 
     #[cfg(feature = "merkle")]
@@ -2089,10 +1431,10 @@ mod tests {
 //      `view()` (cheap `Reach`) == `view_reference()` (kernel `ReachIndex` +
 //      real `register::resolve`) == the INDEPENDENT op-graph `oracle`.
 //
-// The generator covers every op kind and, by stamping random `observed`
-// horizons drawn from prior ops, manufactures forks, deep chains, add-wins
-// races, piece lifecycles (put/move/remove/unremove), and locked/tuning
-// registers — the adversarial concurrency the semantics turn on.
+// `Reach`/`CausalPast`/`Store::view_reference`/`Store::dag` now live in
+// tutti-core; the reference surface is enabled here through the `test-support`
+// dev-dependency. The generator, oracle, and `WalkieLang` projection stay in
+// walkie — this is a walkie-domain gate over the substrate's ancestry backend.
 // =====================================================================
 #[cfg(test)]
 mod reach_equiv {
@@ -2141,8 +1483,8 @@ mod reach_equiv {
     ///
     /// Each op's `observed` horizon is a random subset of PRIOR op hashes, so
     /// concurrency and forks arise naturally; piece/remove references target
-    /// already-created ids so lifecycles are exercised. Emitted in a valid
-    /// causal order (every reference precedes its use), so ingest never parks.
+    /// already-created ids so lifecycles are exercised. Emitted in a valid causal
+    /// order (every reference precedes its use), so ingest never parks.
     fn random_history(seed: u64, authors: usize, steps: usize) -> Vec<VerifiedOp> {
         let mut rng = Rng::new(seed);
         let mut peers: Vec<Peer> = (0..authors)
@@ -2169,8 +1511,8 @@ mod reach_equiv {
                 }
             }
 
-            // Degrees are drawn from a SMALL keyspace so add/remove races land
-            // on the same key (the add-wins path that runs `is_ancestor`).
+            // Degrees are drawn from a SMALL keyspace so add/remove races land on
+            // the same key (the add-wins path that runs `is_ancestor`).
             let op = match rng.upto(10) {
                 0 | 1 => WalkieOp::AddDegree {
                     pitch: tet_degree(rng.upto(3) as u16),
@@ -2255,8 +1597,8 @@ mod reach_equiv {
         let ops = random_history(seed, authors, steps);
         let store = store_of(&ops);
         assert_eq!(store.pending_len(), 0, "seed {seed}: all ops lift");
-        let reach = Reach::new(&store.dag);
-        let kernel = ReachIndex::new(&store.dag.snapshot());
+        let reach = Reach::new(store.dag());
+        let kernel = ReachIndex::new(&store.dag().snapshot());
         let hashes: Vec<EntryHash> = store.entry_hashes().into_iter().collect();
         for a in &hashes {
             for b in &hashes {
@@ -2283,8 +1625,8 @@ mod reach_equiv {
                 5 + (seed as usize % 10),
             );
             let store = store_of(&ops);
-            let reach = Reach::new(&store.dag);
-            let kernel = ReachIndex::new(&store.dag.snapshot());
+            let reach = Reach::new(store.dag());
+            let kernel = ReachIndex::new(&store.dag().snapshot());
             let hashes: Vec<EntryHash> = store.entry_hashes().into_iter().collect();
             let mut rng = Rng::new(seed ^ 0x1357_9BDF);
             for _ in 0..8 {
@@ -2303,9 +1645,9 @@ mod reach_equiv {
     }
 
     /// (3) The whole projection: `view()` (cheap `Reach`) is bit-for-bit the
-    /// `view_reference()` (kernel `ReachIndex` + real `register::resolve`) AND
-    /// the INDEPENDENT op-graph `oracle`, over thousands of random histories
-    /// spanning every op kind with concurrent forks.
+    /// `view_reference()` (kernel `ReachIndex` + real `register::resolve`) AND the
+    /// INDEPENDENT op-graph `oracle`, over thousands of random histories spanning
+    /// every op kind with concurrent forks.
     #[test]
     fn view_equals_reference_and_oracle() {
         for seed in 0..2000u64 {
