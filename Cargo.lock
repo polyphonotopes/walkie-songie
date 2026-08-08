@@ -5613,6 +5613,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 [[package]]
 name = "radix_immutable"
 version = "0.2.0"
+source = "git+https://github.com/micahscopes/radix_immutable.git?rev=a039226abccdd0375a48687ec54aea5f2a20e1fc#a039226abccdd0375a48687ec54aea5f2a20e1fc"
 dependencies = [
  "blake3",
  "once_cell",
@@ -7630,6 +7631,7 @@ dependencies = [
 [[package]]
 name = "tutti-core"
 version = "0.1.0"
+source = "git+https://github.com/polyphonotopes/tutti.git?rev=b3c2982d7819c7acce01e412a3bed6e0e198a85e#b3c2982d7819c7acce01e412a3bed6e0e198a85e"
 dependencies = [
  "blake3",
  "getrandom 0.2.16",
@@ -7644,6 +7646,7 @@ dependencies = [
 [[package]]
 name = "tutti-midi"
 version = "0.1.0"
+source = "git+https://github.com/polyphonotopes/tutti.git?rev=b3c2982d7819c7acce01e412a3bed6e0e198a85e#b3c2982d7819c7acce01e412a3bed6e0e198a85e"
 dependencies = [
  "thiserror 2.0.19",
  "tutti-music",
@@ -7652,18 +7655,12 @@ dependencies = [
 [[package]]
 name = "tutti-music"
 version = "0.1.0"
+source = "git+https://github.com/polyphonotopes/tutti.git?rev=b3c2982d7819c7acce01e412a3bed6e0e198a85e#b3c2982d7819c7acce01e412a3bed6e0e198a85e"
 dependencies = [
  "blake3",
  "serde",
  "thiserror 2.0.19",
  "tutti-core",
-]
-
-[[package]]
-name = "tutti-osc"
-version = "0.1.0"
-dependencies = [
- "tutti-music",
 ]
 
 [[package]]
