@@ -10,28 +10,26 @@
 //!
 //! The read model (`L::View`) is then computed by [`OpLanguage::fold`] over the
 //! causal indexes packaged into a [`FoldCtx`]: the decoded op set, the entry↔op
-//! map, and a causal-ancestry oracle behind [`CausalPast`]. Ancestry in
-//! production is the cheap lazy [`Reach`] (O(N + E) `prevs` adjacency, reverse-
-//! walk `is_ancestor`, memoized per call) — never the whole-DAG [`ReachIndex`]
-//! closure.
+//! map, and a causal-ancestry oracle behind the floor [`Reach`] contract. Ancestry
+//! in production is the cheap lazy [`LazyReach`] (O(N + E) `prevs` adjacency,
+//! reverse-walk `is_ancestor`, memoized per call) — never the whole-DAG kernel
+//! `ReachIndex` closure.
 //!
 //! Signature verification happens once, at ingest, against a [`VerifiedOpG`];
 //! reads never re-verify. None of this names a domain: the alphabet, the fold
 //! rule and the view type are all `L`.
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
-use hhhs::{AppendOutcome, DagRead, Entry, EntryHash, MemDagStore, Position};
+use hhhs_dag::{AppendOutcome, DagRead, Entry, EntryHash, LazyReach, MemDagStore, Position, Reach};
 
-// The kernel `ReachIndex` ancestor closure and `register` resolver back only the
-// reference projection ([`Store::view_reference`]) and its `CausalPast` bridge,
-// which exist for a downstream crate's equivalence tests (feature `test-support`).
-// Production `view()` never materializes an ancestor closure.
+// The kernel `ReachIndex` ancestor closure backs only the reference projection
+// ([`Store::view_reference`]) and this crate's equivalence tests (feature
+// `test-support`); its `Reach` impl (and the `register::resolve` it forwards to) live
+// in `hhhs`. Production `view()` uses the cheap lazy `LazyReach`, never an ancestor
+// closure.
 #[cfg(any(test, feature = "test-support"))]
 use hhhs::cover::ReachIndex;
-#[cfg(any(test, feature = "test-support"))]
-use hhhs::register;
 
 use crate::ops::{
     AuthorId, LogHead, OpId, OpLanguage, SignedOp, SigningKey, VerifiedOpG, VersionedOpG,
@@ -455,19 +453,19 @@ impl<L: OpLanguage> Store<L> {
     /// Materialize the read model from the current DAG: [`OpLanguage::fold`] over
     /// the causal indexes packaged into a [`FoldCtx`].
     ///
-    /// The ancestry backend is the cheap lazy [`Reach`] (O(N + E) `prevs`
+    /// The ancestry backend is the cheap lazy [`LazyReach`] (O(N + E) `prevs`
     /// adjacency, reverse-walk `is_ancestor`, memoized per call) — never the
-    /// whole-DAG [`ReachIndex`] ancestor closure.
+    /// whole-DAG kernel `ReachIndex` ancestor closure.
     pub fn view(&self) -> L::View {
         L::fold(&FoldCtx::new(self))
     }
 
     /// The reference projection: the identical [`OpLanguage::fold`], but driven by
-    /// the kernel [`ReachIndex`] and [`hhhs::register::resolve`] instead of
-    /// the cheap [`Reach`]. Provided (feature `test-support`) as the oracle a
-    /// downstream crate's equivalence tests assert `view()` equals — so any drift
-    /// in the cheap backend is caught directly against the kernel it replaced.
-    /// Only the [`CausalPast`] backend behind the [`FoldCtx`] differs.
+    /// the kernel `ReachIndex` and `hhhs::register::resolve` instead of the cheap
+    /// [`LazyReach`]. Provided (feature `test-support`) as the oracle a downstream
+    /// crate's equivalence tests assert `view()` equals — so any drift in the cheap
+    /// backend is caught directly against the kernel it replaced. Only the [`Reach`]
+    /// backend behind the [`FoldCtx`] differs.
     #[cfg(any(test, feature = "test-support"))]
     pub fn view_reference(&self) -> L::View {
         let snapshot = self.dag.snapshot();
@@ -478,8 +476,8 @@ impl<L: OpLanguage> Store<L> {
     }
 
     /// The underlying causal DAG, read-only. Exposed (feature `test-support`) so a
-    /// downstream crate's equivalence tests can build both a [`Reach`] and a
-    /// kernel [`ReachIndex`] over the same store and assert they agree.
+    /// downstream crate's equivalence tests can build both a [`LazyReach`] and a
+    /// kernel `ReachIndex` over the same store and assert they agree.
     #[cfg(any(test, feature = "test-support"))]
     pub fn dag(&self) -> &MemDagStore {
         &self.dag
@@ -513,168 +511,35 @@ impl<L: OpLanguage> Store<L> {
     }
 }
 
-/// The ONE causal question a domain projection asks of the DAG: "is `a` strictly
-/// in the causal past of `b`?" — plus the register tiebreak that is a pure
-/// function of it.
-///
-/// A domain `fold` consumes exactly this and nothing else of a reachability
-/// oracle (no ancestor enumeration, no covers), so abstracting it lets the SAME
-/// fold run on two ancestry backends: the cheap lazy [`Reach`] in production, and
-/// the kernel [`ReachIndex`] in the reference projection. Equivalence of the two
-/// views is then a direct assertion rather than a re-derivation.
-pub trait CausalPast {
-    /// Strict causal ancestry: `true` iff `a` is a transitive `prevs`-ancestor of
-    /// `b`, present-only, and never reflexive (`is_ancestor(x, x) == false`). Must
-    /// agree with [`ReachIndex::is_ancestor`] for every pair.
-    fn is_ancestor(&self, a: &EntryHash, b: &EntryHash) -> bool;
-
-    /// The last-writer-wins register winner over `candidates`, resolved
-    /// identically to [`hhhs::register::resolve`]: drop any candidate that is
-    /// a strict causal ancestor of another (superseded), then break the remaining
-    /// mutually-concurrent maxima by the MAXIMUM raw-bytes [`EntryHash`]. `None`
-    /// iff `candidates` is empty.
-    ///
-    /// The default is the kernel rule expressed over [`CausalPast::is_ancestor`],
-    /// so a backend whose `is_ancestor` matches the kernel resolves registers
-    /// identically — no separate resolver to keep in sync.
-    fn resolve(&self, candidates: &BTreeSet<EntryHash>) -> Option<EntryHash> {
-        candidates
-            .iter()
-            .copied()
-            .filter(|candidate| {
-                !candidates
-                    .iter()
-                    .any(|other| other != candidate && self.is_ancestor(candidate, other))
-            })
-            .max_by(|a, b| a.as_bytes().cmp(b.as_bytes()))
-    }
-}
-
-/// A cheap, lazy causal-ancestry oracle over the store's append-only op DAG.
-///
-/// It answers `is_ancestor(a, b)` with the SAME strict, present-only semantics as
-/// [`hhhs::cover::ReachIndex::is_ancestor`], but WITHOUT the Θ(N²) space
-/// `ReachIndex::new` pays to memoize a full ancestor `BTreeSet` for every node.
-/// Instead it keeps only the `prevs` adjacency — O(N + E), one pass over the
-/// snapshot — and answers each query by a reverse walk from `b` back through
-/// parent edges, short-circuiting when `a` is reached.
-///
-/// A per-instance memo caches, on first touch of a given `b`, that `b`'s full
-/// strict ancestor set, so repeated queries with the same `b` (the shape every
-/// call site has: one remover checked against many adds, one register candidate
-/// checked against the rest) walk `b`'s past at most once. The memo lives only
-/// for the [`Store::view`] call that owns the `Reach` and is dropped with it;
-/// nothing Θ(N²) survives the call, and only the `b`s actually queried are ever
-/// materialized — a `view()` with no removes/registers materializes none.
-///
-/// Present-only, exactly as the kernel: an edge is followed only when its target
-/// is itself a present node (`parents.contains_key`).
-pub struct Reach {
-    /// entry -> its causal parents (`header.prevs`). Keys are exactly the present
-    /// nodes, so a hash absent as a key is an absent (dangling) node.
-    parents: BTreeMap<EntryHash, Vec<EntryHash>>,
-    /// `b` -> `b`'s full strict, present-only ancestor set. Filled lazily; a query
-    /// is `memo[b].contains(a)`.
-    memo: RefCell<BTreeMap<EntryHash, BTreeSet<EntryHash>>>,
-}
-
-impl Reach {
-    /// Build the `prevs` adjacency in one pass over `dag`. O(N + E) time and space
-    /// — never the ancestor closure.
-    pub fn new(dag: &impl DagRead) -> Reach {
-        let parents = dag
-            .entries_topo()
-            .into_iter()
-            .map(|entry| (entry.hash(), entry.header.prevs.0.iter().copied().collect()))
-            .collect();
-        Reach {
-            parents,
-            memo: RefCell::new(BTreeMap::new()),
-        }
-    }
-
-    /// `b`'s strict, present-only ancestor set by reverse BFS over `parents`.
-    /// Excludes `b` itself (the walk starts from `b`'s parents), and follows an
-    /// edge only to a present target — matching `ReachIndex::ancestors(b)`.
-    fn ancestors_of(&self, b: &EntryHash) -> BTreeSet<EntryHash> {
-        let mut acc: BTreeSet<EntryHash> = BTreeSet::new();
-        let mut stack: Vec<EntryHash> = Vec::new();
-        if let Some(seed) = self.parents.get(b) {
-            for prev in seed {
-                if self.parents.contains_key(prev) && acc.insert(*prev) {
-                    stack.push(*prev);
-                }
-            }
-        }
-        while let Some(node) = stack.pop() {
-            if let Some(prevs) = self.parents.get(&node) {
-                for prev in prevs {
-                    if self.parents.contains_key(prev) && acc.insert(*prev) {
-                        stack.push(*prev);
-                    }
-                }
-            }
-        }
-        acc
-    }
-}
-
-impl CausalPast for Reach {
-    fn is_ancestor(&self, a: &EntryHash, b: &EntryHash) -> bool {
-        if let Some(history) = self.memo.borrow().get(b) {
-            return history.contains(a);
-        }
-        let history = self.ancestors_of(b);
-        let answer = history.contains(a);
-        self.memo.borrow_mut().insert(*b, history);
-        answer
-    }
-}
-
-/// The kernel `ReachIndex` as a [`CausalPast`] backend for the reference
-/// projection (feature `test-support`). `is_ancestor` forwards to the kernel;
-/// `resolve` forwards to the REAL [`hhhs::register::resolve`] (not the trait
-/// default), so [`Store::view_reference`] is the genuine kernel behavior and a
-/// downstream equivalence test has teeth.
-#[cfg(any(test, feature = "test-support"))]
-impl CausalPast for ReachIndex {
-    fn is_ancestor(&self, a: &EntryHash, b: &EntryHash) -> bool {
-        ReachIndex::is_ancestor(self, a, b)
-    }
-
-    fn resolve(&self, candidates: &BTreeSet<EntryHash>) -> Option<EntryHash> {
-        register::resolve(candidates, self)
-    }
-}
-
 /// The read-only causal indexes a domain [`OpLanguage::fold`] consumes: the
-/// decoded op set, the entry↔op-id map, and a causal-ancestry backend behind
-/// [`CausalPast`]. A domain `fold` is one ordinary function over these, with no
-/// framework and no facet DSL (staging is just Rust control flow).
+/// decoded op set, the entry↔op-id map, and a causal-ancestry backend behind the
+/// floor [`Reach`] contract. A domain `fold` is one ordinary function over these,
+/// with no framework and no facet DSL (staging is just Rust control flow).
 ///
-/// The backend is erased behind `dyn CausalPast` so the SAME `fold` runs on
-/// either ancestry backend: the cheap lazy [`Reach`] in production
-/// ([`FoldCtx::new`]) and the kernel [`ReachIndex`] in the reference projection
+/// The backend is erased behind `dyn Reach` so the SAME `fold` runs on either
+/// ancestry backend: the cheap lazy [`LazyReach`] in production ([`FoldCtx::new`])
+/// and the kernel `ReachIndex` in the reference projection
 /// ([`Store::view_reference`]). The decoded op-set and the entry→op map are read
 /// through [`FoldCtx::decoded`] / [`FoldCtx::op_id`]; the ancestry surface is
 /// [`FoldCtx::is_ancestor`] / [`FoldCtx::resolve`].
 pub struct FoldCtx<'a, L: OpLanguage> {
     decoded: &'a BTreeMap<EntryHash, DecodedOp<L>>,
     entry_to_source: &'a BTreeMap<EntryHash, OpId>,
-    reach: Box<dyn CausalPast + 'a>,
+    reach: Box<dyn Reach + 'a>,
 }
 
 impl<'a, L: OpLanguage> FoldCtx<'a, L> {
-    /// The production fold context over `store`: the cheap lazy [`Reach`] ancestry
-    /// backend (O(N + E), memoized per call). This is what [`Store::view`] builds.
+    /// The production fold context over `store`: the cheap lazy [`LazyReach`]
+    /// ancestry backend (O(N + E), memoized per call). This is what [`Store::view`]
+    /// builds.
     pub fn new(store: &'a Store<L>) -> Self {
-        Self::with_reach(store, Box::new(Reach::new(&store.dag)))
+        Self::with_reach(store, Box::new(LazyReach::new(&store.dag)))
     }
 
     /// A fold context over `store` with an explicit ancestry backend. Used by the
-    /// reference projection to drive the SAME fold with the kernel [`ReachIndex`]
-    /// instead of the cheap [`Reach`].
-    fn with_reach(store: &'a Store<L>, reach: Box<dyn CausalPast + 'a>) -> Self {
+    /// reference projection to drive the SAME fold with the kernel `ReachIndex`
+    /// instead of the cheap [`LazyReach`].
+    fn with_reach(store: &'a Store<L>, reach: Box<dyn Reach + 'a>) -> Self {
         Self {
             decoded: &store.decoded,
             entry_to_source: &store.entry_to_source,
@@ -689,21 +554,21 @@ impl<'a, L: OpLanguage> FoldCtx<'a, L> {
     ///
     /// This is what lets a SECOND store type drive the byte-identical `L::fold`: the
     /// leaf-profile [`crate::windowed::WindowedStore`] folds its retained-op map
-    /// through this constructor with the boundary-aware
-    /// [`crate::windowed::WindowedReach`] backend, so windowed-vs-full equivalence is
-    /// *structural* — the same fold code, only the [`CausalPast`] backend differs
-    /// (§3.5). Additive: [`FoldCtx::new`] and [`Store::view`] are unchanged.
+    /// through this constructor with the boundary-aware [`WindowedReach`] backend, so
+    /// windowed-vs-full equivalence is *structural* — the same fold code, only the
+    /// [`Reach`] backend differs (§3.5). Additive: [`FoldCtx::new`] and
+    /// [`Store::view`] are unchanged.
     ///
     /// The caller owns the fence: `L::fold` reads `is_ancestor` present-only over
     /// whatever `reach` answers, so passing a reach that cannot see a decoded op's
     /// full causal past yields a silently wrong view. [`Store::view`] pairs `decoded`
-    /// with a whole-history [`Reach`]; [`crate::windowed::WindowedStore::view`] pairs
-    /// its window with a window-complete [`crate::windowed::WindowedReach`] and
-    /// refuses to fold a truncated window (§1.3's foot-gun, §6.2 delta 6).
+    /// with a whole-history [`LazyReach`]; [`crate::windowed::WindowedStore::view`]
+    /// pairs its window with a window-complete [`WindowedReach`] and refuses to fold a
+    /// truncated window (§1.3's foot-gun, §6.2 delta 6).
     pub fn over(
         decoded: &'a BTreeMap<EntryHash, DecodedOp<L>>,
         entry_to_source: &'a BTreeMap<EntryHash, OpId>,
-        reach: Box<dyn CausalPast + 'a>,
+        reach: Box<dyn Reach + 'a>,
     ) -> Self {
         Self {
             decoded,
@@ -734,7 +599,7 @@ impl<'a, L: OpLanguage> FoldCtx<'a, L> {
 
     /// The causal-maxima register winner over `candidates` (drop strict ancestors,
     /// break remaining maxima by max raw-bytes [`EntryHash`]); see
-    /// [`CausalPast::resolve`]. `None` iff `candidates` is empty.
+    /// [`Reach::resolve`]. `None` iff `candidates` is empty.
     pub fn resolve(&self, candidates: &BTreeSet<EntryHash>) -> Option<EntryHash> {
         self.reach.resolve(candidates)
     }
@@ -744,7 +609,7 @@ impl<'a, L: OpLanguage> FoldCtx<'a, L> {
 mod smoke {
     //! A minimal generic smoke test — NOT the walkie oracle (which stays in
     //! walkie, testing `WalkieLang`). A trivial two-op language exercises the
-    //! lift/commit/view path and the `Reach` ≡ `ReachIndex` equivalence the
+    //! lift/commit/view path and the `LazyReach` ≡ `ReachIndex` equivalence the
     //! substrate rests on, with no domain in sight.
     use super::*;
     use crate::ops::{OpLanguage, signing_key_from_seed};
@@ -800,17 +665,17 @@ mod smoke {
         store.commit(&key, "t", 3, TinyOp::Clear(1));
         assert_eq!(store.pending_len(), 0);
         assert_eq!(store.view(), BTreeSet::from([2]));
-        // Cheap Reach view equals the kernel-ReachIndex reference.
+        // Cheap LazyReach view equals the kernel-ReachIndex reference.
         assert_eq!(store.view(), store.view_reference());
 
-        // Reach ≡ ReachIndex for every pair.
-        let reach = Reach::new(store.dag());
+        // LazyReach ≡ ReachIndex for every pair.
+        let reach = LazyReach::new(store.dag());
         let kernel = ReachIndex::new(&store.dag().snapshot());
         let hashes: Vec<EntryHash> = store.entry_hashes().into_iter().collect();
         for a in &hashes {
             for b in &hashes {
                 assert_eq!(
-                    CausalPast::is_ancestor(&reach, a, b),
+                    Reach::is_ancestor(&reach, a, b),
                     ReachIndex::is_ancestor(&kernel, a, b),
                 );
             }

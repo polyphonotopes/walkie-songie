@@ -10,7 +10,7 @@ tauri-build = { version = "=2.6.3", features = [] }
 
 [dependencies]
 iroh = { version = "=1.0.3" }
-hhhs = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "567ce238a24633a478f8086785d493db8e8abeb8" }
+hhhs = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "5802a25bf783324de321a918e93de88e3934124e" }
 rand = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 tauri = { version = "=2.11.5", features = [] }

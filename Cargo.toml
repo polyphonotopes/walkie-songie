@@ -155,9 +155,9 @@ tutti-core = { path = "crates/tutti-core" }
 # p2panda-core and HHHS are wasm-safe (no tokio/iroh); the native networking
 # stack (p2panda-net) and browser iroh transport are added target-gated below.
 p2panda-core = "0.7"
-hhhs = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "567ce238a24633a478f8086785d493db8e8abeb8" }
-hhhs-sync = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "567ce238a24633a478f8086785d493db8e8abeb8", features = ["wire"] }
-hhhs-reactive = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "567ce238a24633a478f8086785d493db8e8abeb8" }
+hhhs = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "5802a25bf783324de321a918e93de88e3934124e" }
+hhhs-sync = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "5802a25bf783324de321a918e93de88e3934124e", features = ["wire"] }
+hhhs-reactive = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "5802a25bf783324de321a918e93de88e3934124e" }
 # futures-signals drives the HHHS reactive read model (room::mirror) on ALL targets
 # (native plugin + wasm UI); dominator (wasm-only, below) consumes the same signals.
 futures-signals = "0.3"
@@ -176,7 +176,7 @@ walkie-songie = { path = ".", default-features = false, features = ["test-suppor
 # `reach_equiv` equivalence tests. As a dev-dependency it is unified into the
 # `cargo test` build only, so a plain `cargo build` keeps tutti-core lean.
 tutti-core = { path = "crates/tutti-core", features = ["test-support"] }
-hhhs-sync = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "567ce238a24633a478f8086785d493db8e8abeb8" }
+hhhs-sync = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "5802a25bf783324de321a918e93de88e3934124e" }
 # Benchmark suite (M0). criterion: native micro-benchmarks; dhat: heap profiling
 # for the reach/view RAM harness; postcard: the real RBSR wire codec, for
 # byte-accurate reconciliation-size reporting.
@@ -299,3 +299,4 @@ opt-level = 3
 opt-level = 3
 [profile.release.package.blake3]
 opt-level = 3
+

@@ -22,9 +22,11 @@
 //! `L::View: Canonical`), presence-lease and journal extraction, and the
 //! `tutti-testkit` split — all left walkie-side to keep a clean compile.
 //!
-//! Dependency posture (leaf-safe): `p2panda-core` + `hhhs` + `blake3` +
-//! `serde` (+ optional `radix_immutable` under `merkle`) — all wasm-safe, no
-//! tokio, no iroh, no web-sys.
+//! Dependency posture (leaf-safe): production tutti names only the causal floor —
+//! `p2panda-core` + `hhhs-dag` + `blake3` + `serde` (+ optional `radix_immutable`
+//! under `merkle`). The facts front door `hhhs` is a dev / `test-support`-only
+//! dependency (the reference-oracle surface). All wasm-safe, no tokio, no iroh, no
+//! web-sys.
 
 pub mod ops;
 pub mod retain;
@@ -41,12 +43,19 @@ pub use ops::{
     sign_versioned_op, signing_key_from_seed, verify_signed_op_in,
 };
 pub use retain::causal_maxima;
-pub use store::{CausalPast, DecodedOp, FoldCtx, Reach, Store, sync_root_of};
-pub use windowed::{Compaction, WindowedDag, WindowedReach, WindowedStore};
+pub use store::{DecodedOp, FoldCtx, Store, sync_root_of};
+pub use windowed::{Compaction, WindowedStore};
+
+/// The ancestry seam and the bounded-window floor pieces, re-exported from `hhhs-dag`
+/// so every `tutti_core::…` spelling keeps compiling after they sank to the floor:
+/// the [`Reach`] contract + the lazy [`LazyReach`] oracle, and the L-free
+/// [`WindowedDag`]/[`WindowedReach`] the leaf-profile [`WindowedStore`] drives.
+pub use hhhs_dag::reach::{LazyReach, Reach};
+pub use hhhs_dag::windowed::{WindowedDag, WindowedReach};
 
 /// The kernel's opaque-payload entry identity, re-exported so a downstream domain
-/// names it through `tutti_core` and never takes a direct, rev-pinned `hhhs`
+/// names it through `tutti_core` and never takes a direct, rev-pinned `hhhs-dag`
 /// dependency purely to spell it. It is the key type of [`FoldCtx::decoded`] and
 /// the argument to [`FoldCtx::is_ancestor`]/[`FoldCtx::resolve`], so a domain
 /// `fold` cannot collect its `BTreeSet<EntryHash>` candidates without naming it.
-pub use hhhs::EntryHash;
+pub use hhhs_dag::EntryHash;

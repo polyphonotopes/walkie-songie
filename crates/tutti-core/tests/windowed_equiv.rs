@@ -25,7 +25,7 @@ use hhhs::cover::ReachIndex;
 use hhhs::{DagRead, GrowthEpoch};
 
 use tutti_core::{
-    AuthorId, CausalPast, EntryHash, FoldCtx, LogHead, OpId, OpLanguage, SignedOp, SigningKey,
+    AuthorId, EntryHash, FoldCtx, LogHead, OpId, OpLanguage, Reach, SignedOp, SigningKey,
     Store, VerifiedOpG, VersionedOpG, WindowedStore, causal_maxima, sign_versioned_op,
     signing_key_from_seed, verify_signed_op_in,
 };
@@ -559,7 +559,7 @@ fn assert_reach_equiv(windowed: &WindowedStore<WinLang>, full: &Store<WinLang>, 
     for a in &hashes {
         for b in &hashes {
             assert_eq!(
-                CausalPast::is_ancestor(&wreach, a, b),
+                Reach::is_ancestor(&wreach, a, b),
                 ReachIndex::is_ancestor(&kernel, a, b),
                 "{label}: WindowedReach vs ReachIndex is_ancestor disagreement",
             );
@@ -826,7 +826,7 @@ fn assert_compacted_reach_equiv(w: &WindowedStore<WinLang>, full: &Store<WinLang
     for a in &retained {
         for b in &retained {
             assert_eq!(
-                CausalPast::is_ancestor(&wreach, a, b),
+                Reach::is_ancestor(&wreach, a, b),
                 ReachIndex::is_ancestor(&kernel, a, b),
                 "{label}: frozen-summary is_ancestor != kernel ReachIndex over full history",
             );

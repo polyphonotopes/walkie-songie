@@ -22,10 +22,10 @@ use crate::room::ops::{AuthorId, OpId, WalkieLang, WalkieOp};
 use crate::tuning::{TunedDegree, TunedPeriodicPitch, TuningDefinition};
 
 /// The generic substrate types, re-exported so `RoomStore` and the sync layer name
-/// them through `room::store` unchanged. [`Reach`]/[`CausalPast`] back the
-/// equivalence tests; [`sync_root_of`] is the convergence digest the RBSR session
-/// cross-checks; [`Store`]/[`FoldCtx`]/[`DecodedOp`] are the store + fold seam.
-pub use tutti_core::{CausalPast, DecodedOp, FoldCtx, Reach, Store, sync_root_of};
+/// them through `room::store` unchanged. [`Reach`]/[`LazyReach`] back the equivalence
+/// tests; [`sync_root_of`] is the convergence digest the RBSR session cross-checks;
+/// [`Store`]/[`FoldCtx`]/[`DecodedOp`] are the store + fold seam.
+pub use tutti_core::{DecodedOp, FoldCtx, LazyReach, Reach, Store, sync_root_of};
 
 /// Walkie-songie's room store — [`Store`] fixed at [`WalkieLang`]. Every call site
 /// outside `store.rs`/`ops.rs` keeps the pre-extraction spelling `RoomStore`.
@@ -1418,9 +1418,9 @@ mod tests {
 }
 
 // =====================================================================
-// Correctness gate for the cheap `Reach` ancestry backend.
+// Correctness gate for the cheap `LazyReach` ancestry backend.
 //
-// The whole optimization rests on ONE claim: the lazy `Reach::is_ancestor`
+// The whole optimization rests on ONE claim: the lazy `LazyReach::is_ancestor`
 // (and the register `resolve` derived from it) answers IDENTICALLY to the
 // kernel `hhhs::cover::ReachIndex` it replaced, for every DAG. These
 // tests hammer that claim over thousands of seeded-random causal histories:
@@ -1431,10 +1431,10 @@ mod tests {
 //      `view()` (cheap `Reach`) == `view_reference()` (kernel `ReachIndex` +
 //      real `register::resolve`) == the INDEPENDENT op-graph `oracle`.
 //
-// `Reach`/`CausalPast`/`Store::view_reference`/`Store::dag` now live in
-// tutti-core; the reference surface is enabled here through the `test-support`
-// dev-dependency. The generator, oracle, and `WalkieLang` projection stay in
-// walkie — this is a walkie-domain gate over the substrate's ancestry backend.
+// `Reach`/`LazyReach`/`Store::view_reference`/`Store::dag` now live in tutti-core
+// (re-exported from the `hhhs-dag` floor); the reference surface is enabled here
+// through the `test-support` dev-dependency. The generator, oracle, and `WalkieLang`
+// projection stay in walkie — this is a walkie-domain gate over the ancestry backend.
 // =====================================================================
 #[cfg(test)]
 mod reach_equiv {
@@ -1447,7 +1447,7 @@ mod reach_equiv {
     use super::super::test_support::{
         Peer, oracle, tet_definition, tet_degree, tet_pitch, tuning_with_step,
     };
-    use super::{CausalPast, Reach, RoomStore};
+    use super::{LazyReach, Reach, RoomStore};
 
     /// A tiny deterministic splitmix64 PRNG, so every case is reproducible from
     /// its seed and the whole suite is byte-stable across runs.
@@ -1597,13 +1597,13 @@ mod reach_equiv {
         let ops = random_history(seed, authors, steps);
         let store = store_of(&ops);
         assert_eq!(store.pending_len(), 0, "seed {seed}: all ops lift");
-        let reach = Reach::new(store.dag());
+        let reach = LazyReach::new(store.dag());
         let kernel = ReachIndex::new(&store.dag().snapshot());
         let hashes: Vec<EntryHash> = store.entry_hashes().into_iter().collect();
         for a in &hashes {
             for b in &hashes {
                 assert_eq!(
-                    CausalPast::is_ancestor(&reach, a, b),
+                    Reach::is_ancestor(&reach, a, b),
                     ReachIndex::is_ancestor(&kernel, a, b),
                     "seed {seed}: is_ancestor({}, {}) disagreement",
                     a.to_hex(),
@@ -1625,7 +1625,7 @@ mod reach_equiv {
                 5 + (seed as usize % 10),
             );
             let store = store_of(&ops);
-            let reach = Reach::new(store.dag());
+            let reach = LazyReach::new(store.dag());
             let kernel = ReachIndex::new(&store.dag().snapshot());
             let hashes: Vec<EntryHash> = store.entry_hashes().into_iter().collect();
             let mut rng = Rng::new(seed ^ 0x1357_9BDF);
@@ -1636,7 +1636,7 @@ mod reach_equiv {
                     .filter(|_| rng.pct(35))
                     .collect();
                 assert_eq!(
-                    CausalPast::resolve(&reach, &candidates),
+                    Reach::resolve(&reach, &candidates),
                     register::resolve(&candidates, &kernel),
                     "seed {seed}: register resolve disagreement",
                 );
