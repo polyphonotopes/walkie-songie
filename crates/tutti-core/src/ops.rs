@@ -46,14 +46,18 @@ pub const MAX_SIGNED_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub const MAX_OBSERVED_OPS: usize = 4096;
 /// Cap on a bound room-topic string.
 pub const MAX_TOPIC_BYTES: usize = 256;
-/// The generation marker on the length-delimited signed-op wire frame.
+/// The generation marker on the length-delimited signed-op wire frame emitted by
+/// the crate-const framing methods [`SignedOp::to_wire_bytes`] /
+/// [`SignedOp::from_wire_bytes`].
 ///
-/// This is the frame [`SignedOp::to_wire_bytes`] emits. `SignedOp` is NOT generic
-/// over `L` (it is opaque header+payload bytes carried by every transport, the
-/// journal, and RBSR), so its magic is a crate const rather than an
-/// [`OpLanguage`] associated const for now. It retains walkie's literal value so
-/// the wire frame is byte-identical across the tutti extraction; genericizing the
-/// `SignedOp` frame over `L::WIRE_MAGIC` is future work.
+/// `SignedOp` is NOT generic over `L` (it is opaque header+payload bytes carried
+/// by every transport, the journal, and RBSR), so the crate-const framing keeps
+/// this fixed marker. The domain-separating framing
+/// ([`SignedOp::to_wire_bytes_in`] / [`SignedOp::from_wire_bytes_in`]) instead
+/// threads [`OpLanguage::WIRE_MAGIC`], so two tutti domains refuse each other at
+/// the frame. This const is walkie's literal value, and
+/// `WalkieLang::WIRE_MAGIC == SIGNED_OP_WIRE_MAGIC`, so both framing paths produce
+/// byte-identical frames for walkie.
 pub const SIGNED_OP_WIRE_MAGIC: &[u8] = b"walkie.signed-op/3\0";
 pub const MAX_SIGNED_HEADER_BYTES: usize = 64 * 1024;
 
@@ -89,10 +93,13 @@ pub trait OpLanguage: Sized + 'static {
     /// vector pins that it is byte-for-byte the domain's literal. Bumping it
     /// changes every entry hash, so it is a schema pin.
     const ENTRY_FRAME_MAGIC: &'static [u8];
-    /// Generation marker on the length-delimited signed-op wire frame. See
-    /// [`SIGNED_OP_WIRE_MAGIC`] — today `SignedOp` frames with the crate const;
-    /// this associated const declares the domain's intended value for when the
-    /// frame is genericized over `L`.
+    /// Generation marker on the length-delimited signed-op wire frame. Threaded
+    /// by the domain-separating framing [`SignedOp::to_wire_bytes_in`] /
+    /// [`SignedOp::from_wire_bytes_in`], which write it on frame and REJECT a frame
+    /// whose leading magic differs ([`SignedOpWireError::WrongDomain`]) — so two
+    /// tutti domains cannot ingest each other's frames. See [`SIGNED_OP_WIRE_MAGIC`]
+    /// (walkie's literal, and `WalkieLang::WIRE_MAGIC` equals it, so walkie's frame
+    /// is byte-identical).
     const WIRE_MAGIC: &'static [u8];
     /// Root of the size ladder — the largest legal signed payload.
     const MAX_PAYLOAD_BYTES: usize;
@@ -284,13 +291,54 @@ pub struct SignedOp {
 
 impl SignedOp {
     /// Stable length-delimited gossip/persistence frame containing the verbatim
-    /// header and payload bytes. Verification still happens after decoding.
+    /// header and payload bytes, framed with the crate-const marker
+    /// [`SIGNED_OP_WIRE_MAGIC`] and validated against the crate-const payload
+    /// ceiling [`MAX_SIGNED_PAYLOAD_BYTES`]. Verification still happens after
+    /// decoding. This is the fixed-marker frame every walkie transport, the
+    /// journal, and RBSR move; since `WalkieLang::WIRE_MAGIC == SIGNED_OP_WIRE_MAGIC`
+    /// and `WalkieLang::MAX_PAYLOAD_BYTES == MAX_SIGNED_PAYLOAD_BYTES`, it is
+    /// byte-identical to `to_wire_bytes_in::<WalkieLang>`.
     pub fn to_wire_bytes(&self) -> Result<Vec<u8>, SignedOpWireError> {
-        validate_wire_lengths(self.header.len(), self.payload.len())?;
-        let mut output = Vec::with_capacity(
-            SIGNED_OP_WIRE_MAGIC.len() + 8 + self.header.len() + self.payload.len(),
-        );
-        output.extend_from_slice(SIGNED_OP_WIRE_MAGIC);
+        self.frame_with(SIGNED_OP_WIRE_MAGIC, MAX_SIGNED_PAYLOAD_BYTES)
+    }
+
+    pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self, SignedOpWireError> {
+        Self::deframe_with(bytes, SIGNED_OP_WIRE_MAGIC, MAX_SIGNED_PAYLOAD_BYTES)
+    }
+
+    /// The domain-separating frame: writes [`OpLanguage::WIRE_MAGIC`] and validates
+    /// the payload against [`OpLanguage::MAX_PAYLOAD_BYTES`] (fixes #2 + #3 — the
+    /// magic and the size ladder are the domain's, matching what
+    /// [`verify_signed_op_in`] checks). A frame written by domain `L` is refused by
+    /// any domain `L'` whose `WIRE_MAGIC` differs.
+    pub fn to_wire_bytes_in<L: OpLanguage>(&self) -> Result<Vec<u8>, SignedOpWireError> {
+        self.frame_with(L::WIRE_MAGIC, L::MAX_PAYLOAD_BYTES)
+    }
+
+    /// Inverse of [`SignedOp::to_wire_bytes_in`]: deframes with
+    /// [`OpLanguage::WIRE_MAGIC`] and REJECTS a frame whose leading magic differs
+    /// with [`SignedOpWireError::WrongDomain`] — cross-domain frame separation. The
+    /// payload length is bounded by [`OpLanguage::MAX_PAYLOAD_BYTES`].
+    pub fn from_wire_bytes_in<L: OpLanguage>(bytes: &[u8]) -> Result<Self, SignedOpWireError> {
+        Self::deframe_with(bytes, L::WIRE_MAGIC, L::MAX_PAYLOAD_BYTES).map_err(|error| {
+            // A magic mismatch means the frame is well-formed but belongs to another
+            // domain — surface that distinctly from the crate-const path's
+            // `InvalidMagic`.
+            match error {
+                SignedOpWireError::InvalidMagic => SignedOpWireError::WrongDomain,
+                other => other,
+            }
+        })
+    }
+
+    /// Frame `header ++ payload` behind `magic`, validating both against their
+    /// caps. The frame layout (`magic ++ len(header):u32le ++ len(payload):u32le ++
+    /// header ++ payload`) is fixed; only the marker and the payload ceiling vary.
+    fn frame_with(&self, magic: &[u8], max_payload: usize) -> Result<Vec<u8>, SignedOpWireError> {
+        validate_wire_lengths(self.header.len(), self.payload.len(), max_payload)?;
+        let mut output =
+            Vec::with_capacity(magic.len() + 8 + self.header.len() + self.payload.len());
+        output.extend_from_slice(magic);
         output.extend_from_slice(&(self.header.len() as u32).to_le_bytes());
         output.extend_from_slice(&(self.payload.len() as u32).to_le_bytes());
         output.extend_from_slice(&self.header);
@@ -298,9 +346,17 @@ impl SignedOp {
         Ok(output)
     }
 
-    pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self, SignedOpWireError> {
-        let prefix = SIGNED_OP_WIRE_MAGIC.len();
-        if bytes.len() < prefix + 8 || &bytes[..prefix] != SIGNED_OP_WIRE_MAGIC {
+    /// Deframe a `magic`-tagged frame, validating the payload against `max_payload`.
+    /// Returns [`SignedOpWireError::InvalidMagic`] if the leading bytes are not
+    /// `magic`; callers that carry a domain remap that to
+    /// [`SignedOpWireError::WrongDomain`].
+    fn deframe_with(
+        bytes: &[u8],
+        magic: &[u8],
+        max_payload: usize,
+    ) -> Result<Self, SignedOpWireError> {
+        let prefix = magic.len();
+        if bytes.len() < prefix + 8 || &bytes[..prefix] != magic {
             return Err(SignedOpWireError::InvalidMagic);
         }
         let header_len =
@@ -310,7 +366,7 @@ impl SignedOp {
                 .try_into()
                 .expect("fixed slice"),
         ) as usize;
-        validate_wire_lengths(header_len, payload_len)?;
+        validate_wire_lengths(header_len, payload_len, max_payload)?;
         let expected = prefix
             .checked_add(8)
             .and_then(|length| length.checked_add(header_len))
@@ -332,6 +388,11 @@ impl SignedOp {
 pub enum SignedOpWireError {
     #[error("signed operation frame has an invalid generation marker")]
     InvalidMagic,
+    /// The frame is well-formed but its leading magic is not the deframing domain's
+    /// [`OpLanguage::WIRE_MAGIC`] — a frame from another tutti domain. Only the
+    /// domain-threaded [`SignedOp::from_wire_bytes_in`] returns this.
+    #[error("signed operation frame belongs to a different domain")]
+    WrongDomain,
     #[error("signed operation frame lengths do not match its bytes")]
     LengthMismatch,
     #[error("signed header is {actual} bytes; maximum is {max}")]
@@ -340,17 +401,25 @@ pub enum SignedOpWireError {
     PayloadTooLarge { actual: usize, max: usize },
 }
 
-fn validate_wire_lengths(header_len: usize, payload_len: usize) -> Result<(), SignedOpWireError> {
+/// Bound a frame's header (crate-const [`MAX_SIGNED_HEADER_BYTES`]) and payload
+/// (`max_payload` — the crate const for the fixed-marker frame, or
+/// [`OpLanguage::MAX_PAYLOAD_BYTES`] for the domain-threaded frame, so framing and
+/// [`verify_signed_op_in`] agree on the same size ladder).
+fn validate_wire_lengths(
+    header_len: usize,
+    payload_len: usize,
+    max_payload: usize,
+) -> Result<(), SignedOpWireError> {
     if header_len > MAX_SIGNED_HEADER_BYTES {
         return Err(SignedOpWireError::HeaderTooLarge {
             actual: header_len,
             max: MAX_SIGNED_HEADER_BYTES,
         });
     }
-    if payload_len > MAX_SIGNED_PAYLOAD_BYTES {
+    if payload_len > max_payload {
         return Err(SignedOpWireError::PayloadTooLarge {
             actual: payload_len,
-            max: MAX_SIGNED_PAYLOAD_BYTES,
+            max: max_payload,
         });
     }
     Ok(())

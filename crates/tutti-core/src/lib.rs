@@ -39,3 +39,10 @@ pub use ops::{
     sign_versioned_op, signing_key_from_seed, verify_signed_op_in,
 };
 pub use store::{CausalPast, DecodedOp, FoldCtx, Reach, Store, sync_root_of};
+
+/// The kernel's opaque-payload entry identity, re-exported so a downstream domain
+/// names it through `tutti_core` and never takes a direct, rev-pinned `hhhs-core`
+/// dependency purely to spell it. It is the key type of [`FoldCtx::decoded`] and
+/// the argument to [`FoldCtx::is_ancestor`]/[`FoldCtx::resolve`], so a domain
+/// `fold` cannot collect its `BTreeSet<EntryHash>` candidates without naming it.
+pub use hhhs_core::EntryHash;
