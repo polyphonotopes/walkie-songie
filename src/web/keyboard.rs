@@ -708,60 +708,97 @@ fn setup_piece_sync(state: Arc<AppState>, keyboard_el: web_sys::HtmlElement) {
     let state_clone = state.clone();
     let keyboard_el_clone = keyboard_el.clone();
 
+    // Coalesce piece-DOM updates to one animation frame. A rapid remote drag
+    // streams many piece-affecting room events; applying each synchronously
+    // re-sets `data-key`, and the all-around-keyboard MutationObserver relayout
+    // (getScreenCTM forced layout) on EVERY one is the drag-time jank seen in a
+    // trace. Instead we mark dirty and apply at most once per frame, re-reading the
+    // latest room snapshot: the final positions are identical, and the burst of
+    // relayouts collapses to <=1/frame.
+    let raf_pending = Rc::new(std::cell::Cell::new(false));
+    let raf_cb: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
+    {
+        let state = state_clone.clone();
+        let piece_elements = piece_elements_clone.clone();
+        let keyboard_el = keyboard_el_clone.clone();
+        let raf_pending = raf_pending.clone();
+        *raf_cb.borrow_mut() = Some(Closure::wrap(Box::new(move || {
+            raf_pending.set(false);
+
+            // Re-read the LATEST pieces snapshot — only the final state of a burst
+            // reaches the DOM.
+            let (pieces, pitch_count, pieces_locked) = {
+                let room_handle = state.room();
+                let room = room_handle.lock_ref();
+                let pitch_count = state.tuning.lock_ref().pitch_class_count();
+                (room.all_pieces(), pitch_count, room.pieces_locked())
+            };
+
+            if state.pieces_locked.get() != pieces_locked {
+                state.pieces_locked.set(pieces_locked);
+            }
+
+            let mut elements = piece_elements.borrow_mut();
+
+            // Build set of current piece IDs
+            let current_ids: std::collections::HashSet<String> =
+                pieces.iter().map(|p| p.id.clone()).collect();
+
+            // Remove pieces that no longer exist
+            let to_remove: Vec<String> = elements
+                .keys()
+                .filter(|id| !current_ids.contains(*id))
+                .cloned()
+                .collect();
+            for id in to_remove {
+                if let Some(el) = elements.remove(&id) {
+                    el.remove();
+                }
+            }
+
+            // Add or update pieces
+            for piece in pieces {
+                let pitch_class = piece.pitch.rem_euclid(pitch_count as i32);
+                let key_index = LEFTMOST_KEY + pitch_class;
+
+                if let Some(el) = elements.get(&piece.id) {
+                    // Piece exists - just update data-key if pitch changed
+                    let current_key = el
+                        .get_attribute("data-key")
+                        .and_then(|s| s.parse::<i32>().ok())
+                        .unwrap_or(-1);
+                    if current_key != key_index {
+                        // Ensure no data-pitch (pieces use data-key for discrete positioning)
+                        el.remove_attribute("data-pitch").ok();
+                        el.set_attribute("data-key", &key_index.to_string()).ok();
+                        el.set_attribute("data-original-pitch", &piece.pitch.to_string())
+                            .ok();
+                    }
+                } else {
+                    // New piece - create element
+                    let el = create_piece_element(&piece.id, piece.pitch, key_index, &piece.emoji);
+                    keyboard_el.append_child(&el).ok();
+                    elements.insert(piece.id.clone(), el);
+                }
+            }
+        }) as Box<dyn FnMut()>));
+    }
+
     wasm_bindgen_futures::spawn_local(async move {
-        // Process each pieces change
+        // Keep the rAF callback alive for the subscription's lifetime.
+        let raf_cb = raf_cb;
         pieces_signal
-            .for_each(move |(pieces, pitch_count, pieces_locked)| {
-                // Sync pieces_locked to AppState
-                if state_clone.pieces_locked.get() != pieces_locked {
-                    state_clone.pieces_locked.set(pieces_locked);
-                }
-
-                let mut elements = piece_elements_clone.borrow_mut();
-
-                // Build set of current piece IDs
-                let current_ids: std::collections::HashSet<String> =
-                    pieces.iter().map(|p| p.id.clone()).collect();
-
-                // Remove pieces that no longer exist
-                let to_remove: Vec<String> = elements
-                    .keys()
-                    .filter(|id| !current_ids.contains(*id))
-                    .cloned()
-                    .collect();
-                for id in to_remove {
-                    if let Some(el) = elements.remove(&id) {
-                        el.remove();
-                    }
-                }
-
-                // Add or update pieces
-                for piece in pieces {
-                    let pitch_class = piece.pitch.rem_euclid(pitch_count as i32);
-                    let key_index = LEFTMOST_KEY + pitch_class;
-
-                    if let Some(el) = elements.get(&piece.id) {
-                        // Piece exists - just update data-key if pitch changed
-                        let current_key = el
-                            .get_attribute("data-key")
-                            .and_then(|s| s.parse::<i32>().ok())
-                            .unwrap_or(-1);
-                        if current_key != key_index {
-                            // Ensure no data-pitch (pieces use data-key for discrete positioning)
-                            el.remove_attribute("data-pitch").ok();
-                            el.set_attribute("data-key", &key_index.to_string()).ok();
-                            el.set_attribute("data-original-pitch", &piece.pitch.to_string())
-                                .ok();
+            .for_each(move |_snapshot| {
+                // Mark dirty; schedule one animation-frame apply if none is pending.
+                // Multiple events within a frame collapse to a single relayout.
+                if !raf_pending.get() {
+                    raf_pending.set(true);
+                    if let Some(win) = web_sys::window() {
+                        if let Some(cb) = raf_cb.borrow().as_ref() {
+                            win.request_animation_frame(cb.as_ref().unchecked_ref()).ok();
                         }
-                    } else {
-                        // New piece - create element
-                        let el =
-                            create_piece_element(&piece.id, piece.pitch, key_index, &piece.emoji);
-                        keyboard_el_clone.append_child(&el).ok();
-                        elements.insert(piece.id.clone(), el);
                     }
                 }
-
                 // Return a ready future (for_each needs FnMut -> Future)
                 async {}
             })
