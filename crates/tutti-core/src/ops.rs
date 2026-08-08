@@ -19,11 +19,15 @@
 //! `js_sys::Date::now() as u64 * 1000`; never call p2panda's `Timestamp::now()`
 //! (it uses `SystemTime::now()`, which panics on `wasm32`).
 
+use std::collections::BTreeSet;
+
 use p2panda_core::cbor::{DecodeError, decode_cbor, encode_cbor};
 use p2panda_core::{Body, Hash, Header, Operation, OperationError, validate_operation};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use hhhs_core::EntryHash;
 
 use crate::store::FoldCtx;
 
@@ -117,6 +121,37 @@ pub trait OpLanguage: Sized + 'static {
     /// causal indexes ([`FoldCtx`]). Two peers with equal verified op-sets MUST
     /// return equal views (contract property (b)).
     fn fold(ctx: &FoldCtx<'_, Self>) -> Self::View;
+
+    /// **M3.1 compaction retention** — the domain names, at a causally-closed cut,
+    /// exactly which of the cut's ops it must keep as residue; the rest are
+    /// monotone-shadowed and may be discarded
+    /// (`docs/vision/windowed-store-design.md` §6.2 delta 2, §2.4-2.5).
+    ///
+    /// `cut` is the set of currently-retained entry hashes at a compaction point
+    /// (causally closed by strict deferral). `ctx` folds over exactly that set with
+    /// the boundary-aware ancestry oracle, so `retain` decides using the same
+    /// `is_ancestor`/`resolve`/`decoded` surface the fold uses. The return value is
+    /// the residue `R ⊆ cut`: every op NOT returned is discarded.
+    ///
+    /// **The soundness law (§2.4).** An op may be dropped iff its contribution to
+    /// *every admissible future fold* is already shadowed by retained ops — a
+    /// monotone consequence of causal facts fixed at lift (a kill by an
+    /// unconditional remove, a supersession by a retained later write), NEVER a
+    /// consequence of the continued *absence* of a future op. Retention must be
+    /// **conservative**: when in doubt, keep it (wrong-but-retained is
+    /// correct-and-bigger; wrong-and-discarded is a convergence bug). A domain that
+    /// discards an op whose liveness could still flip breaks the windowed-fold
+    /// equivalence theorem (§2.6) — which the `windowed_equiv` gate falsifies.
+    ///
+    /// **Default = retain everything** (`cut.clone()`): compaction off, the theorem
+    /// trivially true, and every non-opting language ([`crate::Store`]'s domains) is
+    /// completely unaffected. Only a language that overrides this ever discards an
+    /// op, and only [`crate::WindowedStore`] ever calls it. Default-method-only
+    /// evolution, exactly the frozen-trait freeze contract.
+    fn retain(ctx: &FoldCtx<'_, Self>, cut: &BTreeSet<EntryHash>) -> BTreeSet<EntryHash> {
+        let _ = ctx;
+        cut.clone()
+    }
 }
 
 /// A 32-byte author identity — the Ed25519 verifying-key bytes. Doubles as the

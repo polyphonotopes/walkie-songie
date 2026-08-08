@@ -27,6 +27,7 @@
 //! tokio, no iroh, no web-sys.
 
 pub mod ops;
+pub mod retain;
 pub mod store;
 pub mod windowed;
 
@@ -39,8 +40,9 @@ pub use ops::{
     SignedOp, SignedOpWireError, SigningKey, VerifiedOpG, VerifyingKey, VersionedOpG,
     sign_versioned_op, signing_key_from_seed, verify_signed_op_in,
 };
+pub use retain::causal_maxima;
 pub use store::{CausalPast, DecodedOp, FoldCtx, Reach, Store, sync_root_of};
-pub use windowed::{WindowedDag, WindowedReach, WindowedStore};
+pub use windowed::{Compaction, WindowedDag, WindowedReach, WindowedStore};
 
 /// The kernel's opaque-payload entry identity, re-exported so a downstream domain
 /// names it through `tutti_core` and never takes a direct, rev-pinned `hhhs-core`

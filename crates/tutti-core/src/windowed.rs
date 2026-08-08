@@ -1,5 +1,5 @@
-//! M3.0 — the bounded-window store, **no compaction**
-//! (`docs/vision/windowed-store-design.md` §7 "M3.0", §6.1, §3.3, §1.3).
+//! M3.0 — the bounded window — plus **M3.1 monotone-shadowing compaction**
+//! (`docs/vision/windowed-store-design.md` §7 "M3.0"/"M3.1", §6.1, §3, §2.4-2.6).
 //!
 //! Two types, mirroring the kernel's own [`MemDagStore`](hhhs_core::MemDagStore)
 //! vs [`Store<L>`](crate::Store) split (design §6.1):
@@ -13,38 +13,40 @@
 //! - [`WindowedStore<L>`] — the leaf-profile sibling of [`Store<L>`](crate::Store):
 //!   the same lift / strict-deferral / drain machinery over a [`WindowedDag`], a
 //!   cut-scoped sync surface (§1.2, §4.2), and a fenced [`WindowedStore::view`] that
-//!   folds the window through the boundary-aware [`WindowedReach`] backend (§3.5)
-//!   via the public [`FoldCtx::over`](crate::FoldCtx::over) constructor.
+//!   folds through the boundary-aware [`WindowedReach`] backend (§3.5) via the public
+//!   [`FoldCtx::over`](crate::FoldCtx::over) constructor.
 //!
-//! **What M3.0 is, precisely.** With `retain` left at its retain-everything default
-//! (§7: "nothing is ever discarded and the theorem is trivially true"), the window
-//! holds every op it has lifted. While a room's life fits the window (`N ≤ W`) this
-//! is *exactly* correct (the windowed fold is byte-identical to the full-history
-//! fold, §2.6) and *exactly* bounded (`≤ W` ops, ~64 KB @ W≤256, §5). This is what
-//! the AMY verifying leaf needs first (§7: "a jam session is a few hundred ops, the
-//! window is the world") and what makes every leaf-column *(model)* number in the
-//! RAM budget measurable by M4.
+//! **M3.0 — the bounded window** ([`WindowedStore::with_cap`]). With `retain` left at
+//! its retain-everything default, the window holds every op it lifts; while `N ≤ W`
+//! the windowed fold is byte-identical to the full-history fold (§2.6) and bounded to
+//! `≤ W` ops. The instant `N > W` the window would truncate — and because a plain
+//! reach over a truncated DAG silently computes `is_ancestor = false` across the cut
+//! (a **wrong view, not an error**, §1.3), M3.0's [`WindowedStore::view`]
+//! **hard-refuses** rather than fold it. Exact only for `N ≤ W`.
 //!
-//! **The `view()` fence (§1.3, §6.2 delta 6) — the load-bearing safety property.**
-//! A truncated DAG is a *legal* [`DagRead`] value (present-only is the kernel
-//! doctrine), so a plain [`Reach`](crate::Reach)/`ReachIndex` built over a truncated
-//! window silently computes `is_ancestor = false` for every cross-cut fact — a
-//! **wrong view, not an error**. M3.0 refuses to ship that trap: the window is
-//! window-complete *by construction* while `N ≤ W` (it holds the whole causal past,
-//! so the bitset reach is exact), and the moment truncation occurs
-//! ([`WindowedDag::is_complete`] flips to `false`) [`WindowedStore::view`] **hard-
-//! refuses** (panics) rather than fold a window it can no longer answer ancestry
-//! over. This is the design's option (a): "M3.0 is only claimed correct for `N ≤ W`."
+//! **M3.1 — monotone-shadowing compaction** ([`WindowedStore::with_window`],
+//! [`WindowedStore::compact`]). At a causally-closed cut the domain's
+//! [`OpLanguage::retain`] names the residue — the ops whose contribution to a *future*
+//! fold is not yet **monotone-shadowed** (§2.4): killed by an unconditional remove, or
+//! superseded by a retained later write; never dependent on the continued *absence* of
+//! a future op. Everything else is discarded from the fold's decoded map (the
+//! [`Checkpoint`]-tracked ancestry summary answers `is_ancestor` across the cut
+//! exactly, §3.2/§3.4), so `L::fold` over `checkpoint ⊕ window` equals the full-history
+//! fold for `N > W` (§2.6) — *iff* the domain's retention is sound, which the
+//! `windowed_equiv` gate falsifies adversarially. The [`WindowedStore::view`] fence
+//! relaxes from "complete" to [`WindowedStore::is_answerable`]: a compacted store is
+//! not complete but *is* answerable; only an M3.0 window that hard-truncated still
+//! refuses.
 //!
-//! **The honest gap to M3.1.** The instant `N > W` the window truncates and the
-//! fence trips: there is no correct fold, because a discarded op's contribution to a
-//! *future* fold (an old add a future remove kills, a killed piece a future unremove
-//! resurrects, a register write read at a narrow horizon) depends on the op still
-//! being present. Making `N > W` fold correctly is M3.1: the **monotone-shadowing
-//! retention** of §2.4-2.5 — discard an op only when every fold predicate consuming
-//! it is a monotone consequence of causal facts fixed at lift, keeping the rest as a
-//! residue of *candidates* — plus the cut masks / residue reach matrix of §3.2-3.4.
-//! M3.0 deliberately builds none of that; it builds the scaffolding it slots into.
+//! **Scope (§2.5, honestly).** M3.1 compacts the **monotone** domains — add-wins sets
+//! (survivor per-author maxima) and full-horizon causal-maxima registers (R). It does
+//! **not** compact the non-monotone piece/resurrection subgraph (`Undel` makes kills
+//! flip; §2.5-P) or a sub-horizon-read register (the R′ hazard, §2.5-R′); those are
+//! **retained wholesale** — conservative retention is always sound ("when in doubt,
+//! retain"). What M3.1 compacts is the fold's **decoded** input; the frozen ancestry
+//! summary is kept exact for every lifted op (so any shuffled reference to a discarded
+//! prev still lifts and folds with no courier), leaving its reduction to the bounded
+//! cut-mask packing + courier deep-laggard admission (§3.2-3.4, §4.5) to M3.2.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -108,39 +110,87 @@ impl BitRow {
 // §3.5 — the boundary oracle as a `CausalPast` backend.
 // ===========================================================================
 
-/// The window's causal-ancestry oracle: strict, present-only `is_ancestor` answered
-/// by one bit test over the §3.3 closure, exposed as a [`CausalPast`] backend so the
-/// *same* `L::fold` runs unchanged (design §3.5 — a third [`CausalPast`] backend
-/// beside the cheap [`Reach`](crate::Reach) and the kernel `ReachIndex`).
+/// The window's causal-ancestry oracle: strict, present-only `is_ancestor`, exposed
+/// as a [`CausalPast`] backend so the *same* `L::fold` runs unchanged (design §3.5 —
+/// a third [`CausalPast`] backend beside the cheap [`Reach`](crate::Reach) and the
+/// kernel `ReachIndex`). `resolve` inherits kernel-identical register resolution from
+/// [`CausalPast`]'s default (drop strict ancestors, max raw-bytes tiebreak) — a pure
+/// function of this `is_ancestor` (§1.1).
 ///
-/// For M3.0 (`N ≤ W`, no cut) the window holds the entire causal history, so this is
-/// the whole `is_ancestor` oracle — there is no residue and no cut mask yet (those
-/// are §3.2/§3.4, built in M3.1). `resolve` inherits kernel-identical register
-/// resolution from [`CausalPast`]'s default (drop strict ancestors, max raw-bytes
-/// tiebreak) — a pure function of this `is_ancestor` (§1.1).
+/// Two backends behind one public type:
 ///
-/// Constructed only from a *complete* window ([`WindowedDag::windowed_reach`]); a
-/// truncated window never reaches this type — [`WindowedStore::view`] fences first.
+/// - **M3.0 window bitset** ([`ReachBackend::Window`], §3.3) — one bit test over the
+///   index-compressed closure of a *complete* window. Built by
+///   [`WindowedDag::windowed_reach`]; a truncated window never reaches it (the M3.0
+///   fence refuses first).
+/// - **M3.1 projected closure** ([`ReachBackend::Closure`], §3.2/§3.4 unified) — the
+///   frozen ancestry summary a compacted [`WindowedStore`] carries across the cut:
+///   `anc[b]` is the strict causal ancestors of `b` (over full history at freeze
+///   time) intersected with the retained set, so `is_ancestor(a, b) =
+///   anc[b].contains(a)`. Exact across the cut **by construction** — frozen while
+///   full history was present, extended for window ops only through retained prevs,
+///   and pruned on discard in a way that preserves transitive paths (§2.6 corollary
+///   i). This is the residue reach matrix (§3.4) + cut masks (§3.2) in one
+///   `BTreeSet`-of-hashes shape; the 8 B/op bitset packing of §3.3-3.4 is the
+///   RAM-optimal encoding (M3.2/M4).
 pub struct WindowedReach {
-    /// entry → its dense window index. Present-only: an entry absent here is not in
-    /// the window, and every query touching it answers `false`.
-    index_of: BTreeMap<EntryHash, usize>,
-    /// `rows[i]` = the strict, present-only causal ancestor set of the window entry
-    /// with dense index `i`, as a bitset over dense indices (§3.3).
-    rows: Vec<BitRow>,
+    backend: ReachBackend,
+}
+
+enum ReachBackend {
+    /// §3.3 — the dense-index bitset closure over a complete window.
+    Window {
+        /// entry → its dense window index; an entry absent here answers `false`.
+        index_of: BTreeMap<EntryHash, usize>,
+        /// `rows[i]` = strict, present-only ancestor set of dense index `i`.
+        rows: Vec<BitRow>,
+    },
+    /// §3.2/§3.4 — the projected strict-ancestor closure over the retained set.
+    Closure {
+        anc: BTreeMap<EntryHash, BTreeSet<EntryHash>>,
+    },
+}
+
+impl WindowedReach {
+    /// The §3.2/§3.4 projected-closure backend from an owned ancestry summary — the
+    /// oracle a compacted store answers `is_ancestor` with (design §3.5). Surfaced to
+    /// callers via [`WindowedStore::windowed_reach`], so the §6.3 gate can assert
+    /// `WindowedReach::is_ancestor ≡ ReachIndex::is_ancestor` on the full store for
+    /// every retained pair.
+    fn from_closure(anc: BTreeMap<EntryHash, BTreeSet<EntryHash>>) -> Self {
+        Self {
+            backend: ReachBackend::Closure { anc },
+        }
+    }
 }
 
 impl CausalPast for WindowedReach {
-    /// `true` iff `a` is a strict transitive `prevs`-ancestor of `b`, answered by a
-    /// single bit test `rows[idx(b)][idx(a)]`. Strict by construction (a row never
-    /// carries its own bit) and present-only (an out-of-window endpoint → `false`),
-    /// so it agrees with `ReachIndex::is_ancestor` for every in-window pair — the
-    /// property the §6.3 gate asserts directly.
+    /// `true` iff `a` is a strict transitive `prevs`-ancestor of `b`. Strict by
+    /// construction (a row/closure never carries its own bit) and present-only (an
+    /// unknown endpoint → `false`), so it agrees with `ReachIndex::is_ancestor` for
+    /// every retained pair — the property the §6.3 gate asserts directly.
     fn is_ancestor(&self, a: &EntryHash, b: &EntryHash) -> bool {
-        match (self.index_of.get(a), self.index_of.get(b)) {
-            (Some(&ai), Some(&bi)) => self.rows[bi].get(ai),
-            _ => false,
+        match &self.backend {
+            ReachBackend::Window { index_of, rows } => match (index_of.get(a), index_of.get(b)) {
+                (Some(&ai), Some(&bi)) => rows[bi].get(ai),
+                _ => false,
+            },
+            ReachBackend::Closure { anc } => anc.get(b).is_some_and(|set| set.contains(a)),
         }
+    }
+}
+
+/// The internal borrowing form of the §3.2/§3.4 projected-closure oracle: it reads
+/// the store's live ancestry summary in place so `view()`/`compact()` never clone the
+/// (potentially large) closure per call. Identical `is_ancestor` to
+/// [`ReachBackend::Closure`].
+struct ClosureReach<'a> {
+    anc: &'a BTreeMap<EntryHash, BTreeSet<EntryHash>>,
+}
+
+impl CausalPast for ClosureReach<'_> {
+    fn is_ancestor(&self, a: &EntryHash, b: &EntryHash) -> bool {
+        self.anc.get(b).is_some_and(|set| set.contains(a))
     }
 }
 
@@ -337,8 +387,10 @@ impl WindowedDag {
         Some(out.into_iter().map(|(_, e)| e).collect())
     }
 
-    /// Build the §3.5 boundary oracle from the *complete* window. Panics if the
-    /// window has truncated — callers ([`WindowedStore::view`]) fence first.
+    /// Build the §3.3 boundary oracle from the *complete* window. Panics if the
+    /// window has truncated — callers ([`WindowedStore::view`]) fence first. Used only
+    /// by the M3.0 (no-compaction) path; a compacted store answers ancestry from its
+    /// own projected closure (§3.2/§3.4) instead.
     pub fn windowed_reach(&self) -> WindowedReach {
         assert!(
             self.complete,
@@ -346,8 +398,42 @@ impl WindowedDag {
              exact (windowed-store-design.md §1.3)",
         );
         WindowedReach {
-            index_of: self.index_of.clone(),
-            rows: self.rows.clone(),
+            backend: ReachBackend::Window {
+                index_of: self.index_of.clone(),
+                rows: self.rows.clone(),
+            },
+        }
+    }
+
+    /// **M3.1 compaction-mode insert** — a non-evicting append used when the store
+    /// bounds memory through [`WindowedStore::compact`] and owns the ancestry summary
+    /// itself. It records the admission epoch (for [`WindowedDag::appended_since`])
+    /// but skips the §3.3 [`BitRow`] closure entirely: in compaction mode the
+    /// [`WindowedStore`] is the authority on `is_ancestor`, via its projected closure
+    /// (§3.2/§3.4), so the window bitset would be dead weight. The cap does not evict
+    /// here — [`WindowedStore::compact`] is the only thing that removes entries.
+    pub fn insert(&mut self, entry: &Entry) {
+        let hash = entry.hash();
+        if self.entries.contains_key(&hash) {
+            return;
+        }
+        let epoch = self.next_epoch;
+        self.next_epoch += 1;
+        self.entries.insert(hash, entry.clone());
+        self.epochs.insert(hash, epoch);
+        self.admission.push_back(hash);
+    }
+
+    /// **M3.1 compaction discard** — drop a monotone-shadowed entry
+    /// ([`WindowedStore::compact`], design §2.5). The entry's admission epoch becomes
+    /// the window's lower boundary for [`WindowedDag::appended_since`] (its history is
+    /// gone), matching the `None`-past-the-cut contract (dag.rs:228-235).
+    pub fn discard(&mut self, hash: &EntryHash) {
+        if self.entries.remove(hash).is_some() {
+            if let Some(gone) = self.epochs.remove(hash) {
+                self.evicted_through_epoch = self.evicted_through_epoch.max(gone);
+            }
+            self.admission.retain(|h| h != hash);
         }
     }
 }
@@ -438,6 +524,77 @@ fn topo_of(entries: &BTreeMap<EntryHash, Entry>) -> Vec<Entry> {
 }
 
 // ===========================================================================
+// §2.2 — the checkpoint: compacted state + frozen ancestry summary.
+// ===========================================================================
+
+/// The **checkpoint** a compacted [`WindowedStore`] carries across the cut
+/// (`docs/vision/windowed-store-design.md` §2.2). Present iff the store was built for
+/// compaction ([`WindowedStore::with_window`]).
+///
+/// The checkpoint's job is to let the *unchanged* `L::fold` run over a **shrunken
+/// decoded map** (residue ∪ window — the monotone-shadowed ops discarded, §2.5) while
+/// still answering `is_ancestor`/`resolve` exactly as full history would (§3). It is
+/// **not** a folded `L::View` snapshot: the fold is an arbitrary pure function, not a
+/// monoid, so the residue-of-ops model keeps the fold code identical and puts all the
+/// intelligence into *what to retain* — where the soundness argument lives (§2.2).
+struct Checkpoint {
+    /// **The frozen ancestry summary** (§3.2/§3.4, unified). `anc[b]` = the strict
+    /// causal ancestors of `b` (over full history): the residue reach matrix (§3.4)
+    /// and the cut masks (§3.2) in one structure, so `is_ancestor(a, b) =
+    /// anc[b].contains(a)` for any pair the fold or a lift can name.
+    ///
+    /// It is always **exact**, regardless of what `decoded` has shed: each op's row is
+    /// built once at lift as `anc[f] = ⋃_{p ∈ prevs}({p} ∪ anc[p])` — a strict-once
+    /// fact (strict deferral makes an op's past final at lift, §2.4), so it never
+    /// changes afterward. That is why a compacted fold's `is_ancestor` still equals the
+    /// full store's for every retained pair — the property the §6.3 gate asserts.
+    ///
+    /// **Honesty (M3.1 → M3.2).** M3.1 keeps a row for **every** lifted op — retained
+    /// *and* discarded — because a later op may reference a discarded prev (a
+    /// laggard), and its closure must still extend through that prev's ancestors, with
+    /// no courier. So this summary is exact but **not yet bounded** (Θ(N) rows). The
+    /// leaf-bounded form — the 8 B/op bitset packing of §3.3-3.4 restricted to the
+    /// *retained* set, with courier-resolved admission for deep-laggard references
+    /// below the cut (§4.5) — is M3.2. What M3.1 *does* compact is the **`decoded`**
+    /// map: the fold's input and dominant per-op cost (§5.1), which drops to
+    /// residue ∪ window and is never iterated over a discarded op again.
+    anc: BTreeMap<EntryHash, BTreeSet<EntryHash>>,
+    /// §4.3 **pinned cut `ops_root`**: the Merkle commitment over full history at the
+    /// first compaction (computed while the leaf still held everything). The
+    /// verifiability anchor a self-compacted leaf checks discarded-op proofs against
+    /// (Mode A). `None` under `--no-default-features` (no `merkle`) or before the
+    /// first compaction.
+    #[cfg(feature = "merkle")]
+    pinned_cut_ops_root: Option<[u8; 32]>,
+    /// Total ops discarded across every compaction (diagnostics / [`Compaction`]).
+    total_discarded: usize,
+    /// Number of compaction events (diagnostics).
+    compactions: usize,
+}
+
+impl Checkpoint {
+    fn new() -> Self {
+        Self {
+            anc: BTreeMap::new(),
+            #[cfg(feature = "merkle")]
+            pinned_cut_ops_root: None,
+            total_discarded: 0,
+            compactions: 0,
+        }
+    }
+}
+
+/// The outcome of one [`WindowedStore::compact`] call (§2.5): how many monotone-
+/// shadowed ops were discarded and how many are retained (residue ∪ window) after.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Compaction {
+    /// Ops discarded by this compaction (monotone-shadowed, §2.4).
+    pub discarded: usize,
+    /// Ops the fold still iterates afterward (residue ∪ window).
+    pub retained: usize,
+}
+
+// ===========================================================================
 // §6.1 — `WindowedStore<L>`: the leaf-profile domain sibling of `Store<L>`.
 // ===========================================================================
 
@@ -451,26 +608,55 @@ fn topo_of(entries: &BTreeMap<EntryHash, Entry>) -> Vec<Entry> {
 /// convergence (§4.1). While `N ≤ W` its retained set equals a full store's, so
 /// `entry_hashes`, `sync_root`, `ops_root` and, above all, `view()` all match a
 /// [`Store<L>`](crate::Store) fed the same ops (§2.6, the §6.3 gate).
+///
+/// **Two profiles, one type:**
+///
+/// - [`with_cap`](WindowedStore::with_cap) — the **M3.0 bounded window**: no
+///   compaction, hard-evict past `W`, `view()` *refuses* once truncated (§1.3). Exact
+///   only for `N ≤ W`. Every existing M3.0 test is this profile, unchanged.
+/// - [`with_window`](WindowedStore::with_window) — the **M3.1 compacting leaf**:
+///   [`compact`](WindowedStore::compact) discards the monotone-shadowed ops at a
+///   causally-closed cut (§2.4-2.5) and folds `checkpoint ⊕ window` correctly for
+///   `N > W`. The residue (whatever the domain's [`OpLanguage::retain`] keeps) plus
+///   the window is what the fold iterates; ancestry crosses the cut via the frozen
+///   summary (§3).
 pub struct WindowedStore<L: OpLanguage> {
     /// The bounded-window causal DAG. Identity ([`EntryHash`]) is fixed here.
     dag: WindowedDag,
-    /// op id → the retained entry that lifts it.
+    /// op id → entry that lifts it. Kept for **every** lifted op (retained *and*
+    /// discarded) so a later op referencing a discarded prev still resolves it to the
+    /// same [`EntryHash`] a full peer computes — the precondition for the lifted
+    /// entry hash (and thus convergence, §4.1) to match. Bounding this to a
+    /// retained-only table + courier resolution of deep-laggard bindings is M3.2
+    /// (§4.5).
     source_to_entry: BTreeMap<OpId, EntryHash>,
-    /// retained entry → op id (inverse).
+    /// retained entry → op id (inverse). Retained-only: it backs `op_id` in the fold
+    /// and the cut-scoped identity set (`entry_hashes`/`sync_root`/`ops_root`, §4.2).
     entry_to_source: BTreeMap<EntryHash, OpId>,
-    /// retained entry → decoded op — the map the fold iterates (§2.2).
+    /// retained entry → decoded op — the map the fold iterates (§2.2). **This is the
+    /// compacted set**: monotone-shadowed ops are dropped from it at compaction, so a
+    /// discarded op never reaches the fold.
     decoded: BTreeMap<EntryHash, DecodedOp<L>>,
     /// Per-author log head, so the local author can chain new commits. (The own-author
-    /// head is checkpoint state that must survive compaction, §1.2; for M3.0 it is
-    /// just the full head map.)
+    /// head is checkpoint state that must survive compaction, §1.2.)
     heads: BTreeMap<AuthorId, LogHead>,
     /// Ops whose causal past is not all lifted yet — parked (strict deferral), drained
     /// after every successful lift.
     pending: Vec<VerifiedOpG<L>>,
+    /// M3.1: `Some` iff this store compacts (built via [`WindowedStore::with_window`]).
+    /// Holds the frozen ancestry summary + pinned roots. `None` is the M3.0
+    /// no-compaction profile (bounded window, hard fence).
+    checkpoint: Option<Checkpoint>,
+    /// M3.1: the window budget `W` that triggers auto-compaction (compaction profile
+    /// only) — the store compacts when `decoded` grows past it, so steady-state memory
+    /// stays `≈ residue + W`. Explicit [`compact`](WindowedStore::compact) is layered
+    /// on top for adversarial cut schedules.
+    window_cap: usize,
 }
 
 impl<L: OpLanguage> WindowedStore<L> {
-    /// A windowed store with cap `W` (`cap ≥ 1`).
+    /// A **M3.0 bounded window** with cap `W` (`cap ≥ 1`): no compaction, hard fence
+    /// past `W`. Exactly the pre-compaction store.
     pub fn with_cap(cap: usize) -> Self {
         Self {
             dag: WindowedDag::with_cap(cap),
@@ -479,27 +665,78 @@ impl<L: OpLanguage> WindowedStore<L> {
             decoded: BTreeMap::new(),
             heads: BTreeMap::new(),
             pending: Vec::new(),
+            checkpoint: None,
+            window_cap: cap,
         }
+    }
+
+    /// A **M3.1 compacting leaf** with window budget `W` (`W ≥ 1`): auto-compacts when
+    /// the retained set grows past `W`, and [`compact`](WindowedStore::compact) can be
+    /// called at any causally-closed point for an adversarial cut schedule. Total
+    /// retained is `residue + window`, not capped at `W` — the residue is whatever the
+    /// domain's [`OpLanguage::retain`] keeps (§2.5). Folds correctly for `N > W`.
+    pub fn with_window(window_cap: usize) -> Self {
+        assert!(window_cap >= 1, "windowed store window budget must be >= 1");
+        Self {
+            // The DAG never hard-evicts in this profile (the store bounds memory via
+            // `compact`); a large cap keeps the M3.0 `append_capped` path unused while
+            // never allocating a `W`-wide `BitRow`.
+            dag: WindowedDag::with_cap(usize::MAX),
+            source_to_entry: BTreeMap::new(),
+            entry_to_source: BTreeMap::new(),
+            decoded: BTreeMap::new(),
+            heads: BTreeMap::new(),
+            pending: Vec::new(),
+            checkpoint: Some(Checkpoint::new()),
+            window_cap,
+        }
+    }
+
+    /// Whether this store compacts (M3.1 profile, [`WindowedStore::with_window`]).
+    pub fn is_compacting(&self) -> bool {
+        self.checkpoint.is_some()
     }
 
     /// The window cap `W`.
     pub fn cap(&self) -> usize {
-        self.dag.cap()
+        self.window_cap
     }
 
-    /// Whether the window still holds its entire lifted causal history — the fence
-    /// predicate. `true` while `N ≤ W`; folding is exact iff this is `true`.
+    /// Whether the store still holds its **entire** lifted causal history in `decoded`
+    /// — i.e. nothing has been dropped, by hard eviction (M3.0) *or* compaction
+    /// (M3.1). `true` for a fresh store and while `N ≤ W` with no compaction. Distinct
+    /// from [`WindowedStore::is_answerable`], which is the fence: a compacted store is
+    /// *not* complete but *is* answerable.
     pub fn is_complete(&self) -> bool {
-        self.dag.is_complete()
+        match &self.checkpoint {
+            Some(cp) => cp.total_discarded == 0,
+            None => self.dag.is_complete(),
+        }
     }
 
-    /// Number of retained (materialized) ops (`≤ W`).
+    /// Whether [`WindowedStore::view`] can produce a **correct** fold — the relaxed
+    /// M3.1 fence (§6.2 delta 6). `true` when either the window is complete (M3.0,
+    /// `N ≤ W`) *or* every drop went through sound compaction (M3.1): a compacted
+    /// store answers `checkpoint ⊕ window` correctly for `N > W`. `false` only for a
+    /// genuinely-unanswerable state — an M3.0 window that hard-truncated past `W`
+    /// (the one thing that must still refuse, never silently mis-answer).
+    pub fn is_answerable(&self) -> bool {
+        match &self.checkpoint {
+            // M3.1: only sound (retention-checked) discards ever happen, and the
+            // frozen summary answers ancestry exactly across the cut.
+            Some(_) => true,
+            // M3.0: exact iff the window never truncated.
+            None => self.dag.is_complete(),
+        }
+    }
+
+    /// Number of retained (materialized) ops the fold iterates (residue ∪ window).
     pub fn len(&self) -> usize {
-        self.source_to_entry.len()
+        self.decoded.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.source_to_entry.is_empty()
+        self.decoded.is_empty()
     }
 
     /// The retained entry-hash identity set (cut-scoped, §4.2). While `N ≤ W` this
@@ -584,7 +821,14 @@ impl<L: OpLanguage> WindowedStore<L> {
         }
         self.advance_head(&op);
         self.pending.push(op);
-        self.drain_pending()
+        let lifted = self.drain_pending();
+        // M3.1: keep steady-state memory ≈ residue + W by compacting once the retained
+        // set outgrows the window budget. Explicit `compact()` (adversarial cuts) is
+        // layered on top; both call the same sound retention path.
+        if self.checkpoint.is_some() && self.decoded.len() > self.window_cap {
+            self.compact();
+        }
+        lifted
     }
 
     /// Advance (never regress) the author's tracked head to the greatest seq seen.
@@ -613,23 +857,51 @@ impl<L: OpLanguage> WindowedStore<L> {
     }
 
     /// Try to lift one op. Returns its entry hash iff appended; `None` (no mutation) if
-    /// its causal past is incomplete. On a successful lift that overflows the window,
-    /// evicted entries are pruned from every retained-op map in lockstep with the
-    /// [`WindowedDag`], keeping the store and its DAG's retained sets identical.
+    /// its causal past is incomplete.
+    ///
+    /// **M3.0** (no compaction): `append_capped` with hard eviction past `W`; evicted
+    /// entries are pruned from every map in lockstep with the [`WindowedDag`].
+    ///
+    /// **M3.1** (compaction): a non-evicting insert, and the frozen ancestry summary
+    /// is extended for this op — `anc[entry] = ⋃_{p ∈ prevs}({p} ∪ anc[p])`. Because
+    /// the store lifts an op only once every prev is present (strict deferral) and
+    /// every prev's closure is already known, the new row is exact (§3.2 boundary
+    /// lemma; the standard memoized-topo closure). Eviction is deferred to
+    /// [`WindowedStore::compact`].
     fn try_lift(&mut self, op: &VerifiedOpG<L>) -> Option<EntryHash> {
         let prevs = self.resolve_prevs(op)?;
-        let entry = Entry::new(frame_signed::<L>(&op.signed()), Position(prevs));
+        let entry = Entry::new(frame_signed::<L>(&op.signed()), Position(prevs.clone()));
         let entry_hash = entry.hash();
-        let evicted = self.dag.append_capped(&entry);
-
         let id = op.id();
+
+        if let Some(cp) = self.checkpoint.as_mut() {
+            // M3.1 compaction profile: non-evicting insert + closure extension.
+            self.dag.insert(&entry);
+            let mut ancestors: BTreeSet<EntryHash> = BTreeSet::new();
+            for prev in &prevs {
+                ancestors.insert(*prev);
+                if let Some(prev_anc) = cp.anc.get(prev) {
+                    ancestors.extend(prev_anc.iter().copied());
+                }
+            }
+            cp.anc.insert(entry_hash, ancestors);
+            self.source_to_entry.insert(id, entry_hash);
+            self.entry_to_source.insert(entry_hash, id);
+            self.decoded.insert(
+                entry_hash,
+                DecodedOp::new(op.author(), op.payload().clone(), op.timestamp_ms(), op.seq_num()),
+            );
+            return Some(entry_hash);
+        }
+
+        // M3.0 profile: unchanged bounded-window hard eviction.
+        let evicted = self.dag.append_capped(&entry);
         self.source_to_entry.insert(id, entry_hash);
         self.entry_to_source.insert(entry_hash, id);
         self.decoded.insert(
             entry_hash,
             DecodedOp::new(op.author(), op.payload().clone(), op.timestamp_ms(), op.seq_num()),
         );
-
         for gone in evicted {
             if let Some(gone_id) = self.entry_to_source.remove(&gone) {
                 self.source_to_entry.remove(&gone_id);
@@ -660,6 +932,104 @@ impl<L: OpLanguage> WindowedStore<L> {
             }
         }
         lifted
+    }
+
+    /// **M3.1 — compact at the current frontier** (`windowed-store-design.md`
+    /// §2.4-2.5). A no-op on the M3.0 profile (returns zero discards).
+    ///
+    /// The cut `C` is the whole currently-retained set (causally closed by strict
+    /// deferral, §2.1). The domain's [`OpLanguage::retain`] names the residue
+    /// `R ⊆ C` — the ops whose contribution to a *future* fold is not yet
+    /// monotone-shadowed (§2.4); everything else is discarded from `decoded` (the
+    /// fold never sees it again) and from the DAG. The frozen ancestry summary is
+    /// pruned in lockstep, staying exact for every retained pair (so `is_ancestor`
+    /// across the cut is unchanged), and the fold over `checkpoint ⊕ window` equals
+    /// the full-history fold (§2.6) — *iff* the domain's retention honors the
+    /// shadowing law. That "iff" is the whole adversarial gate: an unsound `retain`
+    /// makes `view() != full.view()`, which the §6.3 suite catches.
+    ///
+    /// Idempotent and composable: compacting a compacted store at a later cut folds
+    /// the same fold-equivalent object (§2.6 corollary i). Repeated calls with no new
+    /// ops discard nothing more.
+    pub fn compact(&mut self) -> Compaction {
+        if self.checkpoint.is_none() {
+            return Compaction {
+                discarded: 0,
+                retained: self.decoded.len(),
+            };
+        }
+
+        // The cut = every retained op. Ask the domain what to keep, folding through
+        // the frozen-summary oracle (borrowed, no clone) so `retain` reasons over the
+        // exact same `is_ancestor`/`resolve` the fold uses.
+        let cut: BTreeSet<EntryHash> = self.decoded.keys().copied().collect();
+        let keep = {
+            let cp = self.checkpoint.as_ref().expect("compaction profile");
+            let reach = ClosureReach { anc: &cp.anc };
+            let ctx = FoldCtx::over(&self.decoded, &self.entry_to_source, Box::new(reach));
+            L::retain(&ctx, &cut)
+        };
+
+        // Pin the cut `ops_root` at the FIRST compaction — full history is still
+        // resident here (discards happen just below), so this commits to it (§4.3).
+        #[cfg(feature = "merkle")]
+        {
+            let full_root = crate::merkle::ops_root_of(self.entry_to_source.keys());
+            let cp = self.checkpoint.as_mut().expect("compaction profile");
+            if cp.pinned_cut_ops_root.is_none() {
+                cp.pinned_cut_ops_root = Some(full_root);
+            }
+        }
+
+        // Discard C \ R from the fold's view (decoded), the cut-scoped identity map,
+        // and the DAG — the compaction proper: the fold never iterates or names a
+        // discarded op again, and the dominant per-op memory (the decoded record,
+        // §5.1) is freed. `source_to_entry` and the frozen ancestry summary (`anc`)
+        // are deliberately KEPT for every lifted op, so that a later op referencing a
+        // discarded prev still (a) resolves it to the same [`EntryHash`] a full peer
+        // computes — convergence (§4.1) — and (b) extends the closure exactly through
+        // that prev's ancestors. Bounding the summary to the retained-only cut-mask /
+        // residue-matrix form (§3.2/§3.4) with courier-resolved deep-laggard admission
+        // (§4.5) is M3.2; M3.1 keeps it exact and unbounded so any shuffled reference
+        // folds correctly with no courier.
+        let discard: BTreeSet<EntryHash> = cut.difference(&keep).copied().collect();
+        for d in &discard {
+            self.decoded.remove(d);
+            self.entry_to_source.remove(d);
+            self.dag.discard(d);
+        }
+
+        {
+            let cp = self.checkpoint.as_mut().expect("compaction profile");
+            cp.total_discarded += discard.len();
+            cp.compactions += 1;
+        }
+
+        Compaction {
+            discarded: discard.len(),
+            retained: self.decoded.len(),
+        }
+    }
+
+    /// Total ops discarded across every compaction (auto + explicit) — diagnostics.
+    /// `0` on the M3.0 profile.
+    pub fn total_discarded(&self) -> usize {
+        self.checkpoint.as_ref().map_or(0, |cp| cp.total_discarded)
+    }
+
+    /// Number of compaction events run so far (auto + explicit) — diagnostics.
+    pub fn compaction_count(&self) -> usize {
+        self.checkpoint.as_ref().map_or(0, |cp| cp.compactions)
+    }
+
+    /// The pinned cut `ops_root` (§4.3), if this store has compacted at least once
+    /// under feature `merkle`. The self-made commitment against which a Mode-A leaf
+    /// verifies proofs for discarded ops.
+    #[cfg(feature = "merkle")]
+    pub fn pinned_cut_ops_root(&self) -> Option<[u8; 32]> {
+        self.checkpoint
+            .as_ref()
+            .and_then(|cp| cp.pinned_cut_ops_root)
     }
 
     /// Author and sign a local op without mutating the projection (two-phase commit,
@@ -705,52 +1075,75 @@ impl<L: OpLanguage> WindowedStore<L> {
         self.dag.appended_since(since)
     }
 
-    /// Materialize the read model from the window — **fenced** (§1.3, §6.2 delta 6).
+    /// Materialize the read model — **fenced** (§1.3, §6.2 delta 6), now relaxed for
+    /// M3.1 compaction.
     ///
-    /// The fold runs the byte-identical `L::fold` over the retained-op map through the
-    /// window-complete [`WindowedReach`] backend, assembled via the public
+    /// The fold runs the byte-identical `L::fold` over the retained-op map
+    /// (residue ∪ window) through a [`CausalPast`] backend assembled via the public
     /// [`FoldCtx::over`](crate::FoldCtx::over) constructor — so windowed-vs-full
-    /// equivalence is *structural* (same fold, only the [`CausalPast`] backend
-    /// differs, §3.5).
+    /// equivalence is *structural* (same fold, only the ancestry backend differs,
+    /// §3.5):
     ///
-    /// # The fence
+    /// - **M3.0** (no compaction): the §3.3 window bitset ([`WindowedDag::windowed_reach`]).
+    /// - **M3.1** (compaction): the frozen projected closure (§3.2/§3.4) — exact
+    ///   across the cut, so the fold over `checkpoint ⊕ window` equals the full fold
+    ///   for `N > W` (§2.6).
     ///
-    /// It **hard-refuses (panics)** if the window has truncated
-    /// ([`WindowedStore::is_complete`] is `false`). A truncated window cannot answer
-    /// `is_ancestor` across its boundary, and a plain fold would silently mis-answer
-    /// it — a *wrong view, not an error* (§1.3). M3.0 is claimed correct only for
-    /// `N ≤ W`, and this is the guard that makes the claim safe rather than a silent
-    /// trap. Use [`WindowedStore::try_view`] for the non-panicking form, or
-    /// [`WindowedStore::is_complete`] to check first.
+    /// # The fence (relaxed, §6.2 delta 6)
+    ///
+    /// It **hard-refuses (panics)** only for a genuinely-unanswerable state
+    /// ([`WindowedStore::is_answerable`] is `false`): an M3.0 window that
+    /// hard-truncated past `W` with no compaction to account for the dropped ops.
+    /// That is the one case that must never silently mis-answer `is_ancestor` across
+    /// the cut (a *wrong view, not an error*, §1.3). A **compacted** store is not
+    /// complete but *is* answerable — its frozen summary answers ancestry exactly —
+    /// so it folds without refusing. Use [`WindowedStore::try_view`] for the
+    /// non-panicking form.
     pub fn view(&self) -> L::View {
         assert!(
-            self.dag.is_complete(),
-            "windowed view fence: the window has truncated (N > W). A fold over a \
-             truncated window would silently mis-answer is_ancestor across the cut \
-             (a wrong view, not an error — windowed-store-design.md §1.3, §6.2 delta \
-             6). M3.0 is exact only for N <= W; folding past W needs M3.1 compaction \
-             with the monotone-shadowing retention of §2.4-2.5.",
+            self.is_answerable(),
+            "windowed view fence: the window hard-truncated (N > W) with no compaction \
+             to account for the dropped ops. A fold over it would silently mis-answer \
+             is_ancestor across the cut (a wrong view, not an error — \
+             windowed-store-design.md §1.3, §6.2 delta 6). Build the store with \
+             `with_window` (M3.1 compaction) to fold past W.",
         );
-        let reach = self.dag.windowed_reach();
-        let ctx = FoldCtx::over(&self.decoded, &self.entry_to_source, Box::new(reach));
-        L::fold(&ctx)
+        match self.checkpoint.as_ref() {
+            Some(cp) => {
+                // M3.1: fold over residue ∪ window through the frozen summary.
+                let reach = ClosureReach { anc: &cp.anc };
+                let ctx = FoldCtx::over(&self.decoded, &self.entry_to_source, Box::new(reach));
+                L::fold(&ctx)
+            }
+            None => {
+                // M3.0: fold over the complete window through the §3.3 bitset.
+                let reach = self.dag.windowed_reach();
+                let ctx = FoldCtx::over(&self.decoded, &self.entry_to_source, Box::new(reach));
+                L::fold(&ctx)
+            }
+        }
     }
 
-    /// The non-panicking form of [`WindowedStore::view`]: `Some(view)` while the
-    /// window is complete (`N ≤ W`), `None` once truncated. The fence, as a value.
+    /// The non-panicking form of [`WindowedStore::view`]: `Some(view)` while
+    /// answerable (M3.0 `N ≤ W`, or any compacted M3.1 state), `None` once an M3.0
+    /// window has hard-truncated. The fence, as a value.
     pub fn try_view(&self) -> Option<L::View> {
-        if self.dag.is_complete() {
+        if self.is_answerable() {
             Some(self.view())
         } else {
             None
         }
     }
 
-    /// The §3.5 boundary oracle over the current (complete) window, exposed so the
-    /// §6.3 gate can assert `WindowedReach::is_ancestor ≡ ReachIndex::is_ancestor` for
-    /// every in-window pair. Panics if truncated.
+    /// The §3.5 boundary oracle over the current retained set, exposed so the §6.3
+    /// gate can assert `WindowedReach::is_ancestor ≡ ReachIndex::is_ancestor` on the
+    /// full store for every retained pair (M3.0: window bitset; M3.1: frozen closure).
+    /// Panics if an M3.0 window truncated.
     pub fn windowed_reach(&self) -> WindowedReach {
-        self.dag.windowed_reach()
+        match self.checkpoint.as_ref() {
+            Some(cp) => WindowedReach::from_closure(cp.anc.clone()),
+            None => self.dag.windowed_reach(),
+        }
     }
 
     /// The backing bounded-window DAG, read-only. Exposed (feature `test-support`) so
@@ -761,13 +1154,25 @@ impl<L: OpLanguage> WindowedStore<L> {
         &self.dag
     }
 
-    /// The reference projection: the identical `L::fold` driven by the kernel
-    /// `ReachIndex` over the window instead of the [`WindowedReach`] bitset — the
-    /// windowed analogue of [`Store::view_reference`](crate::Store::view_reference).
-    /// While complete this equals both [`WindowedStore::view`] and a full store's
-    /// `view()`, which is the root-of-trust cross-check the §6.3 gate makes. Fenced.
+    /// The reference projection: the identical `L::fold` driven by an independent
+    /// oracle — the windowed analogue of
+    /// [`Store::view_reference`](crate::Store::view_reference).
+    ///
+    /// **M3.0** (complete window): the kernel `ReachIndex` rebuilt over the window,
+    /// giving the root-of-trust cross-check the §6.3 gate makes against the cheap
+    /// bitset. Fenced (panics if truncated — a `ReachIndex` over a hard-truncated
+    /// window would silently mis-answer, §1.3).
+    ///
+    /// **M3.1** (compacted): a `ReachIndex` over the *truncated* DAG would be exactly
+    /// the §1.3 foot-gun, so the independent kernel oracle for a compacted store lives
+    /// on the **full** store (`full.view_reference()`), which the gate compares
+    /// against. Here this returns the frozen-summary fold ([`WindowedStore::view`]),
+    /// which the gate proves equal to that full-history oracle.
     #[cfg(any(test, feature = "test-support"))]
     pub fn view_reference(&self) -> L::View {
+        if self.checkpoint.is_some() {
+            return self.view();
+        }
         assert!(
             self.dag.is_complete(),
             "windowed view_reference fence: truncated window (windowed-store-design.md §1.3)",

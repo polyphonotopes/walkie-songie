@@ -26,8 +26,8 @@ use hhhs_core::{DagRead, GrowthEpoch};
 
 use tutti_core::{
     AuthorId, CausalPast, EntryHash, FoldCtx, LogHead, OpId, OpLanguage, SignedOp, SigningKey,
-    Store, VerifiedOpG, VersionedOpG, WindowedStore, sign_versioned_op, signing_key_from_seed,
-    verify_signed_op_in,
+    Store, VerifiedOpG, VersionedOpG, WindowedStore, causal_maxima, sign_versioned_op,
+    signing_key_from_seed, verify_signed_op_in,
 };
 
 // ===========================================================================
@@ -215,6 +215,80 @@ impl OpLanguage for WinLang {
             locked,
             objects,
         }
+    }
+
+    /// **M3.1 monotone-shadowing retention** (`windowed-store-design.md` §2.5). The
+    /// residue this domain keeps at a cut, composed from the shadowing lemmas:
+    ///
+    /// - **A (degrees, add-wins):** per key, keep the **per-author causal maxima of
+    ///   the surviving adds** (adds no remove observed); discard killed adds,
+    ///   non-maximal survivors, and **all removes**. (Lemmas A1-A3: a kill is final;
+    ///   a remove is fully consumed once its victims are dropped; a survivor `a₁ < a₂`
+    ///   of the same author is redundant — any future remove reaching `a₂` reaches
+    ///   `a₁`, and per-author maxima preserve `key_authors`.)
+    /// - **R (full-horizon `SetReg`):** per slot, keep the **causal maxima** of the
+    ///   writes; discard superseded ones (Lemma R — supersession is permanent, and
+    ///   the maxima of the retained set equal the maxima of the full set, so every
+    ///   future `resolve` picks the identical winner + tiebreak).
+    /// - **R′ (sub-horizon `SetLock`) + P/M (pieces):** **retained wholesale.** The
+    ///   lock is read sub-horizon by `locked_as_of` (§2.5-R′: maxima-only retention is
+    ///   *unsound* at a wide cut), and pieces resurrect via `Undel` (§2.5-P:
+    ///   non-monotone, honestly unbounded residue). Conservative retention is always
+    ///   sound — "when in doubt, retain" (§2.4).
+    fn retain(ctx: &FoldCtx<'_, Self>, cut: &BTreeSet<EntryHash>) -> BTreeSet<EntryHash> {
+        let mut keep: BTreeSet<EntryHash> = BTreeSet::new();
+        let mut adds: BTreeMap<u16, Vec<EntryHash>> = BTreeMap::new();
+        let mut rems: BTreeMap<u16, Vec<EntryHash>> = BTreeMap::new();
+        let mut reg_writes: BTreeMap<u8, BTreeSet<EntryHash>> = BTreeMap::new();
+
+        for entry in cut {
+            let Some(decoded) = ctx.decoded().get(entry) else {
+                continue;
+            };
+            match decoded.op() {
+                WinOp::Add { key } => adds.entry(*key).or_default().push(*entry),
+                // Removes are discarded once their kills are recorded (Lemma A2); we
+                // collect them here only to compute which adds survive.
+                WinOp::Rem { key } => rems.entry(*key).or_default().push(*entry),
+                // R — full-horizon register: compact to per-slot maxima below.
+                WinOp::SetReg { slot, .. } => {
+                    reg_writes.entry(*slot).or_default().insert(*entry);
+                }
+                // R′ sub-horizon lock + non-monotone pieces: retain wholesale.
+                WinOp::SetLock { .. }
+                | WinOp::Put { .. }
+                | WinOp::Move { .. }
+                | WinOp::Del { .. }
+                | WinOp::Undel { .. } => {
+                    keep.insert(*entry);
+                }
+            }
+        }
+
+        // R — per-slot register maxima.
+        for writes in reg_writes.values() {
+            keep.extend(causal_maxima(ctx, writes));
+        }
+
+        // A — per-key, per-author maxima of the surviving adds.
+        for (key, key_adds) in &adds {
+            let key_rems = rems.get(key).map(Vec::as_slice).unwrap_or(&[]);
+            let mut by_author: BTreeMap<AuthorId, BTreeSet<EntryHash>> = BTreeMap::new();
+            for add in key_adds {
+                let killed = key_rems.iter().any(|r| ctx.is_ancestor(add, r));
+                if !killed {
+                    by_author
+                        .entry(ctx.decoded()[add].author())
+                        .or_default()
+                        .insert(*add);
+                }
+            }
+            for author_adds in by_author.values() {
+                keep.extend(causal_maxima(ctx, author_adds));
+            }
+        }
+
+        keep
     }
 }
 
@@ -717,4 +791,377 @@ fn fence_view_panics_on_truncated_window() {
     // Precondition: actually truncated.
     assert!(!windowed.is_complete());
     let _ = windowed.view(); // MUST panic — never a silent mis-answer.
+}
+
+// ===========================================================================
+// M3.1 — the compaction gate: N ≫ W, adversarial cuts, view ≡ full ≡ kernel.
+// (`windowed-store-design.md` §2.4-2.6, §6.3.)
+//
+// The M3.1 claim in one suite: a compacting `WindowedStore` (built with
+// `with_window`, so `WinLang::retain` discards the monotone-shadowed degree adds /
+// removes and superseded registers at every cut) folds **byte-identically** to a
+// full `Store` for `N ≫ W` — under shuffled arrival, laggards, equivocation,
+// resurrection races, and adversarially-randomized compaction points on two replicas
+// with different W. The frozen ancestry summary answers `is_ancestor` across the cut
+// exactly as the kernel `ReachIndex` over full history. If compaction were unsound
+// (a non-shadowed op discarded, or the summary wrong across the cut), the per-step
+// `view() == full.view()` assertion fails — the whole point of the gate.
+// ===========================================================================
+
+#[derive(Default)]
+struct CompactStats {
+    steps: usize,
+    compactions: usize,
+    discarded: usize,
+}
+
+/// The frozen ancestry summary of a compacted store answers `is_ancestor` EXACTLY as
+/// the kernel `ReachIndex` over FULL history, for every retained pair (§3, §6.3) —
+/// the boundary-oracle cross-check, now across a real cut (residue × window, residue ×
+/// residue, window × window all folded into one closure).
+fn assert_compacted_reach_equiv(w: &WindowedStore<WinLang>, full: &Store<WinLang>, label: &str) {
+    let wreach = w.windowed_reach();
+    let kernel = ReachIndex::new(&full.dag().snapshot());
+    let retained: Vec<EntryHash> = w.entry_hashes().into_iter().collect();
+    for a in &retained {
+        for b in &retained {
+            assert_eq!(
+                CausalPast::is_ancestor(&wreach, a, b),
+                ReachIndex::is_ancestor(&kernel, a, b),
+                "{label}: frozen-summary is_ancestor != kernel ReachIndex over full history",
+            );
+        }
+    }
+}
+
+/// Ingest `ops` (shuffled by `order_seed`) into a compacting windowed replica (window
+/// `W`) and a full store IN THE SAME ORDER, calling `compact()` at seeded-random
+/// points (`comp_seed`) on top of the store's own auto-compaction. Assert after EVERY
+/// step that the compacted view equals the full view (same lifted set, since the
+/// order is shared) and the `state_root` matches; periodically root that in the kernel
+/// `ReachIndex` oracle and audit the boundary oracle.
+fn run_compacting_replica(
+    ops: &[SignedOp],
+    window: usize,
+    order_seed: u64,
+    comp_seed: u64,
+    label: &str,
+    stats: &mut CompactStats,
+) -> (WindowedStore<WinLang>, Store<WinLang>) {
+    let arrival = shuffled(ops, order_seed);
+    let mut full = Store::new();
+    let mut windowed = WindowedStore::with_window(window);
+    assert!(windowed.is_compacting(), "with_window must enable compaction");
+    let mut comp_rng = Rng::new(comp_seed);
+
+    for (i, signed) in arrival.iter().enumerate() {
+        full.ingest_verified(verified(signed));
+        windowed.ingest_verified(verified(signed));
+
+        // Adversarial explicit cut at seeded-random points (independent of the store's
+        // auto-compaction at the window budget) — this is the "different compaction
+        // points" axis (§4.1, §6.3).
+        if comp_rng.pct(18) {
+            windowed.compact();
+        }
+
+        // Same arrival order ⇒ identical lifted/pending set in both stores.
+        assert_eq!(
+            windowed.pending_len(),
+            full.pending_len(),
+            "{label} step {i}: pending diverged (lift must be identical)"
+        );
+        assert!(windowed.is_answerable(), "{label} step {i}: compacted store must be answerable");
+
+        // The core assertion: compaction never changes the view (§2.6).
+        let wv = windowed.view();
+        let fv = full.view();
+        assert_eq!(wv, fv, "{label} step {i}: compacted windowed.view() != full.view() (N>>W)");
+        assert_eq!(
+            win_state_root(&wv),
+            win_state_root(&fv),
+            "{label} step {i}: state_root diverged (§4.3 — state_root survives windowing intact)"
+        );
+
+        // Periodic root-of-trust: the full view equals the kernel ReachIndex oracle,
+        // and the frozen summary matches the kernel across the cut.
+        if i % 37 == 0 {
+            assert_eq!(fv, full.view_reference(), "{label} step {i}: full.view() != kernel ReachIndex oracle");
+            assert_compacted_reach_equiv(&windowed, &full, &format!("{label} step {i}"));
+        }
+        stats.steps += 1;
+    }
+
+    assert_eq!(windowed.pending_len(), 0, "{label}: quiescent (pending == 0)");
+    assert_eq!(full.pending_len(), 0, "{label}: full quiescent");
+    // Final full audit: view triple-equality + boundary oracle over the retained set.
+    assert_eq!(windowed.view(), full.view(), "{label}: final compacted view != full");
+    assert_eq!(full.view(), full.view_reference(), "{label}: final full view != kernel oracle");
+    assert_compacted_reach_equiv(&windowed, &full, &format!("{label} final"));
+    (windowed, full)
+}
+
+/// THE M3.1 gate: over several seeded histories with `N ≫ W`, two compacting replicas
+/// with **different W** and **different randomized compaction schedules** ingesting
+/// **different shuffles** each fold identically to a full store at every step, agree
+/// with the kernel oracle, keep `state_root` intact, and converge with each other at
+/// quiescence (§4.1). Real compaction happens: the retained fold-input is far smaller
+/// than the full history it reproduces.
+#[test]
+fn windowed_compacts_beyond_window_matches_full() {
+    let mut stats = CompactStats::default();
+    let mut largest_full = 0usize;
+    let mut smallest_final_retained = usize::MAX;
+
+    for seed in 0..5u64 {
+        let authors = 3 + (seed as usize % 3);
+        let steps = 150 + (seed as usize % 4) * 40; // N ≈ 150-290
+        let ops = build_history(seed ^ 0x3151_9A2C, authors, steps);
+        let n = ops.len();
+
+        let w_a = 12usize;
+        let w_b = 30usize;
+        assert!(n > 4 * w_b, "seed {seed}: N={n} must be >> W (w_b={w_b})");
+
+        let (wa, full_a) = run_compacting_replica(
+            &ops,
+            w_a,
+            seed ^ 0xA11CE,
+            seed ^ 0xC0FFEE,
+            &format!("seed {seed} A W={w_a}"),
+            &mut stats,
+        );
+        let (wb, _full_b) = run_compacting_replica(
+            &ops,
+            w_b,
+            seed ^ 0xB0B0,
+            seed ^ 0xF00D,
+            &format!("seed {seed} B W={w_b}"),
+            &mut stats,
+        );
+
+        // §4.1 — different W, different cut schedules, different shuffles, SAME
+        // op-set ⇒ equal views. Convergence needs no coordination of cuts.
+        assert_eq!(
+            wa.view(),
+            wb.view(),
+            "seed {seed}: different-W compacting replicas diverged (§4.1)"
+        );
+        // Compaction really shrank the fold input below the full history.
+        assert!(
+            wa.len() < full_a.len(),
+            "seed {seed}: compaction did not shrink the retained set (retained {} vs full {})",
+            wa.len(),
+            full_a.len()
+        );
+        largest_full = largest_full.max(full_a.len());
+        smallest_final_retained = smallest_final_retained.min(wa.len());
+        stats.compactions += wa.compaction_count() + wb.compaction_count();
+        stats.discarded += wa.total_discarded() + wb.total_discarded();
+    }
+
+    assert!(stats.discarded > 0, "compaction must discard monotone-shadowed ops");
+    println!(
+        "PASS windowed compaction N>>W: {} per-step (windowed.view()==full.view() + state_root) checks; \
+         {} compaction events discarded {} monotone-shadowed ops total (auto + adversarial cuts); \
+         largest full history {} ops folded identically from a residue+window as small as {}; frozen \
+         summary is_ancestor == kernel ReachIndex over full history on every retained pair; \
+         different-W/different-cut replicas converge (§4.1); state_root intact throughout (§4.3)",
+        stats.steps, stats.compactions, stats.discarded, largest_full, smallest_final_retained
+    );
+}
+
+// ===========================================================================
+// M3.1 targeted vectors the design names (§6.3 "Targeted vectors"), now with the
+// cut actually straddling the vector.
+// ===========================================================================
+
+/// **Remove straddling the cut.** An old add is retained across a compaction, killed
+/// by a later remove, then both are discarded at the next compaction — the view must
+/// stay correct ("key dead where it was the only add; alive via a concurrent
+/// survivor"), never "live forever" from a dropped add (§2.3, Lemma A1-A2).
+#[test]
+fn remove_straddling_the_cut_compacted() {
+    let mut a = Author::new(1);
+    let mut b = Author::new(2);
+    let mut pre: Vec<SignedOp> = Vec::new();
+
+    let (add, add_id) = a.sign(TS_BASE, vec![], WinOp::Add { key: 9 });
+    pre.push(add);
+    // B's concurrent add of key 9 (the remove never observes it) — the add-wins
+    // survivor that must keep key 9 live after A's add is killed and discarded.
+    let (badd, _bid) = b.sign(TS_BASE + 1, vec![], WinOp::Add { key: 9 });
+    pre.push(badd);
+    // A long span forces auto-compaction with a small window, so A's add is retained
+    // ACROSS a cut before the remove arrives.
+    for i in 0..30u64 {
+        pre.push(a.sign(TS_BASE + 10 + i, vec![], WinOp::SetReg { slot: (i % 3) as u8, val: i as u32 }).0);
+    }
+    let (rem, _r) = a.sign(TS_BASE + 100, vec![add_id], WinOp::Rem { key: 9 });
+
+    let mut full = Store::new();
+    let mut windowed = WindowedStore::with_window(6);
+    for signed in &pre {
+        full.ingest_verified(verified(signed));
+        windowed.ingest_verified(verified(signed));
+    }
+    windowed.compact();
+    assert_eq!(windowed.view(), full.view(), "pre-remove: compacted view != full");
+    assert!(windowed.view().live_keys.contains(&9), "key 9 live before the remove");
+    // A's add is still retained here (a surviving per-author maximum), so the remove
+    // that arrives next genuinely straddles the cut.
+    let add_entry = windowed.lifted_entry(OpId(add_id)).expect("add bound");
+    assert!(windowed.entry_hashes().contains(&add_entry), "A's add retained across the first cut");
+
+    full.ingest_verified(verified(&rem));
+    windowed.ingest_verified(verified(&rem));
+    let report = windowed.compact();
+    assert!(report.discarded >= 1, "the killed add + remove are discarded at the straddling cut");
+    assert!(!windowed.entry_hashes().contains(&add_entry), "the killed add is now compacted away");
+
+    assert_eq!(windowed.view(), full.view(), "post-remove: view != full (remove straddling the cut)");
+    assert_eq!(full.view(), full.view_reference(), "kernel oracle");
+    assert!(windowed.view().live_keys.contains(&9), "add-wins survivor keeps key 9 live");
+    assert_eq!(
+        windowed.view().key_authors[&9],
+        BTreeSet::from([b.author_id()]),
+        "only B survives; A's add was killed by the straddling remove"
+    );
+    println!(
+        "PASS targeted: remove straddling the cut — A's add retained across a cut then killed by a \
+         later remove (both compacted away), B's concurrent survivor keeps key 9 live; windowed == \
+         full == kernel"
+    );
+}
+
+/// **Resurrection across the cut.** Pieces are retained wholesale (§2.5-P): a put +
+/// del compacted across a wide cut still resurrect when a later undel observes the
+/// (pre-cut) del. The put/del are NEVER discarded — the "do not compact the
+/// non-monotone subgraph" scope, verified under `N ≫ W`.
+#[test]
+fn resurrection_across_the_cut_compacted() {
+    let mut a = Author::new(1);
+    let mut pre: Vec<SignedOp> = Vec::new();
+
+    let (put, put_id) = a.sign(TS_BASE, vec![], WinOp::Put { emoji: 7, pos: 60 });
+    pre.push(put);
+    let (del, del_id) = a.sign(TS_BASE + 1, vec![put_id], WinOp::Del { obj: OpId(put_id) });
+    pre.push(del);
+    for i in 0..30u64 {
+        pre.push(a.sign(TS_BASE + 10 + i, vec![], WinOp::Add { key: (i % 4) as u16 }).0);
+    }
+    let (undel, _u) = a.sign(TS_BASE + 100, vec![del_id], WinOp::Undel { del: OpId(del_id) });
+
+    let mut full = Store::new();
+    let mut windowed = WindowedStore::with_window(6);
+    for signed in &pre {
+        full.ingest_verified(verified(signed));
+        windowed.ingest_verified(verified(signed));
+    }
+    windowed.compact();
+    assert_eq!(windowed.view(), full.view(), "pre-undel: view != full");
+    assert!(!windowed.view().objects.contains_key(&OpId(put_id)), "object deleted pre-undel");
+    // The put and del are retained wholesale (pieces are never compacted).
+    let put_entry = windowed.lifted_entry(OpId(put_id)).expect("put bound");
+    let del_entry = windowed.lifted_entry(OpId(del_id)).expect("del bound");
+    assert!(windowed.entry_hashes().contains(&put_entry), "put RETAINED across the cut");
+    assert!(windowed.entry_hashes().contains(&del_entry), "del RETAINED across the cut");
+
+    full.ingest_verified(verified(&undel));
+    windowed.ingest_verified(verified(&undel));
+    windowed.compact();
+    assert_eq!(windowed.view(), full.view(), "resurrection across the cut: windowed != full");
+    assert_eq!(full.view(), full.view_reference(), "kernel oracle");
+    assert!(
+        windowed.view().objects.contains_key(&OpId(put_id)),
+        "undel resurrects the compacted-across object"
+    );
+    println!(
+        "PASS targeted: resurrection across the cut — put/del retained wholesale (never compacted), \
+         later undel resurrects; windowed == full == kernel"
+    );
+}
+
+/// **R′ narrow-horizon lock straddling the cut.** The sub-horizon lock register is
+/// retained wholesale (§2.5-R′): a move concurrent with a lock still applies, a move
+/// observing the lock is suppressed — even when the lock write straddles a
+/// compaction. The fold must not read a cut-collapsed maximum of the lock register.
+#[test]
+fn r_prime_lock_gate_across_the_cut_compacted() {
+    let mut a = Author::new(1);
+    let mut b = Author::new(2);
+    let mut pre: Vec<SignedOp> = Vec::new();
+
+    let (put, put_id) = a.sign(TS_BASE, vec![], WinOp::Put { emoji: 3, pos: 60 });
+    pre.push(put);
+    let (lock, lock_id) = a.sign(TS_BASE + 1, vec![put_id], WinOp::SetLock { locked: true });
+    pre.push(lock);
+    // Concurrent-with-lock (observes only the put) ⇒ applies.
+    let (mov_concurrent, _m1) = b.sign(TS_BASE + 2, vec![put_id], WinOp::Move { obj: OpId(put_id), pos: 64 });
+    pre.push(mov_concurrent);
+    // Observes the lock ⇒ suppressed.
+    let (mov_locked, _m2) = b.sign(TS_BASE + 3, vec![lock_id], WinOp::Move { obj: OpId(put_id), pos: 70 });
+    pre.push(mov_locked);
+    for i in 0..30u64 {
+        pre.push(a.sign(TS_BASE + 10 + i, vec![], WinOp::SetReg { slot: 0, val: i as u32 }).0);
+    }
+
+    let mut full = Store::new();
+    let mut windowed = WindowedStore::with_window(6);
+    for signed in &pre {
+        full.ingest_verified(verified(signed));
+        windowed.ingest_verified(verified(signed));
+    }
+    windowed.compact();
+
+    assert_eq!(windowed.view(), full.view(), "R′ across the cut: windowed != full");
+    assert_eq!(full.view(), full.view_reference(), "kernel oracle");
+    assert!(windowed.view().locked, "room ends up locked (full-horizon read)");
+    assert_eq!(
+        windowed.view().objects[&OpId(put_id)].1,
+        64,
+        "concurrent move applied (64); observed move suppressed (never 70) across the cut"
+    );
+    println!(
+        "PASS targeted: R′ narrow-horizon lock gate across the cut — concurrent move applies, \
+         observed move suppressed; the sub-horizon lock register is retained wholesale (never \
+         collapsed to a maximum); windowed == full == kernel"
+    );
+}
+
+/// **Conservative retention + idempotence.** Compacting never changes the view, and
+/// re-compacting a compacted store discards nothing more (§2.6 corollary i). The
+/// no-discarded-op-changes-the-fold property, made concrete.
+#[test]
+fn compact_twice_is_idempotent_and_conservative() {
+    let ops = build_history(0x1DE0_1234, 4, 130);
+    // Window > N so nothing auto-compacts: the first explicit compact does the whole
+    // job, and we can watch it discard, then watch the second do nothing.
+    let mut windowed = WindowedStore::with_window(ops.len() + 8);
+    for signed in shuffled(&ops, 0x11).iter() {
+        windowed.ingest_verified(verified(signed));
+    }
+    let full = ingest_full(&ops);
+
+    let v0 = windowed.view();
+    assert_eq!(v0, full.view(), "pre-explicit-compact view != full");
+    let first = windowed.compact();
+    let v1 = windowed.view();
+    let second = windowed.compact(); // no new ops
+    let v2 = windowed.view();
+
+    assert!(first.discarded > 0, "the first compaction must discard the monotone-shadowed ops");
+    assert_eq!(v0, v1, "compaction changed the view (conservative-retention violated)");
+    assert_eq!(v1, v2, "second compaction changed the view");
+    assert_eq!(
+        second.discarded, 0,
+        "re-compacting a compacted store with no new ops discards nothing (idempotent, §2.6 cor. i)"
+    );
+    assert_eq!(v2, full.view(), "compacted view != full view");
+    assert_eq!(full.view(), full.view_reference(), "kernel oracle");
+    println!(
+        "PASS targeted: compact-twice idempotence + conservative retention — view stable across \
+         compactions (first discarded {}, second discarded {}); view == full == kernel",
+        first.discarded, second.discarded
+    );
 }
