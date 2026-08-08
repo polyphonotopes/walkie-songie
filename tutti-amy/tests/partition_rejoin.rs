@@ -15,7 +15,6 @@
 //!      NO STUCK NOTES — every note-on matched by a note-off);
 //!   3. writes `partition-rejoin.wav` so a human can hear the union click into place.
 
-use std::collections::BTreeSet;
 
 use tutti_amy::music::{self, EDO};
 use tutti_amy::{nchans, sample_rate, write_wav, Amy};
@@ -63,7 +62,8 @@ fn partition_rejoin_drives_amy_with_no_stuck_notes() {
     // Part 2 — AUDIO: drive AMY along the REAL fold timeline.
     // ------------------------------------------------------------------
     let amy = Amy::start();
-    let report = music::drive_amy(&amy, &s.timeline, EDO, BLOCKS_PER_STEP, TEARDOWN_BLOCKS);
+    let tuning = music::room_tuning();
+    let report = music::drive_amy(&amy, &s.timeline, &tuning, BLOCKS_PER_STEP, TEARDOWN_BLOCKS);
 
     println!("=== audio (fold timeline → AMY, EDO={EDO}) ===");
     for (i, degrees) in s.timeline.iter().enumerate() {
@@ -130,11 +130,7 @@ fn partition_rejoin_drives_amy_with_no_stuck_notes() {
 
     // The removed degree (5) resolves to a specific oscillator; assert it was
     // note-ON'd once (momentary) then note-OFF'd, and is NOT sounding at the end.
-    let removed_osc = music::pitchset(&BTreeSet::from([s.removed_degree]), EDO)
-        .iter()
-        .next()
-        .unwrap()
-        .osc(music::MAX_OSCS);
+    let removed_osc = music::osc_of(s.removed_degree, music::MAX_OSCS);
     assert!(
         !report.stuck_oscs.contains(&removed_osc),
         "the retracted degree's oscillator ({removed_osc}) must be silent"

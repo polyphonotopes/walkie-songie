@@ -85,7 +85,8 @@ fn main() {
     );
 
     println!("\n  driving AMY from the converging fold (EDO={EDO}):");
-    let report = music::drive_amy(&amy, &s.timeline, EDO, 24, 40);
+    let tuning = music::room_tuning();
+    let report = music::drive_amy(&amy, &s.timeline, &tuning, 24, 40);
     for (i, degrees) in s.timeline.iter().enumerate() {
         println!(
             "    step {i}: view={:<20} rms={:.4}",
@@ -154,8 +155,8 @@ fn main() {
     // Render the two curves and show the RMS trajectory each produces.
     const HELD: usize = 70;
     const TAIL: usize = 30;
-    let (_, swell_rms) = music::render_held_with_envelope(&amy, es.pc_contested, &music::swell(), EDO, HELD, TAIL);
-    let (_, pluck_rms) = music::render_held_with_envelope(&amy, es.pc_contested, &music::pluck(), EDO, HELD, TAIL);
+    let (_, swell_rms) = music::render_held_with_envelope(&amy, es.pc_contested, &music::swell(), &tuning, HELD, TAIL);
+    let (_, pluck_rms) = music::render_held_with_envelope(&amy, es.pc_contested, &music::pluck(), &tuning, HELD, TAIL);
     let (swell_slope, pluck_slope) = (music::rms_slope(&swell_rms), music::rms_slope(&pluck_rms));
     let early = |r: &[f64]| mean(&r[2..8]);
     let late = |r: &[f64]| mean(&r[r.len() - 8..]);
@@ -177,12 +178,12 @@ fn main() {
     for _ in 0..8 {
         env_wav.extend_from_slice(&amy.render_block());
     }
-    let (loser_pcm, _) = music::render_held_with_envelope(&amy, es.pc_contested, &es.loser, EDO, HELD, TAIL);
+    let (loser_pcm, _) = music::render_held_with_envelope(&amy, es.pc_contested, &es.loser, &tuning, HELD, TAIL);
     env_wav.extend_from_slice(&loser_pcm);
     for _ in 0..16 {
         env_wav.extend_from_slice(&amy.render_block());
     }
-    let (winner_pcm, _) = music::render_held_with_envelope(&amy, es.pc_contested, &es.winner, EDO, HELD, TAIL);
+    let (winner_pcm, _) = music::render_held_with_envelope(&amy, es.pc_contested, &es.winner, &tuning, HELD, TAIL);
     env_wav.extend_from_slice(&winner_pcm);
     let env_path = concat!(env!("CARGO_MANIFEST_DIR"), "/envelope-converge.wav");
     match write_wav(env_path, &env_wav, sample_rate() as u32, nchans() as u16) {

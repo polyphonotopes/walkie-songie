@@ -25,7 +25,7 @@
 
 use std::collections::BTreeSet;
 
-use tutti_amy::music::{self, EDO, MusicView};
+use tutti_amy::music::{self, MusicView};
 use tutti_amy::{Amy, degrees_to_amy_events, envelope_to_amy, nchans, sample_rate, write_wav};
 
 const HELD_BLOCKS: usize = 70; // ~406 ms — long enough to see a 350 ms swell fully
@@ -35,7 +35,7 @@ const TAIL_BLOCKS: usize = 30; // ~174 ms release tail → silence before the ne
 /// two peers' renders are independent and any equality is a real determinism claim.
 fn render_fresh(pc: u16, env: &tutti_amy::Envelope) -> (Vec<i16>, Vec<f64>) {
     let amy = Amy::start();
-    let out = music::render_held_with_envelope(&amy, pc, env, EDO, HELD_BLOCKS, TAIL_BLOCKS);
+    let out = music::render_held_with_envelope(&amy, pc, env, &music::room_tuning(), HELD_BLOCKS, TAIL_BLOCKS);
     drop(amy);
     out
 }
@@ -44,16 +44,17 @@ fn render_fresh(pc: u16, env: &tutti_amy::Envelope) -> (Vec<i16>, Vec<f64>) {
 /// its converged envelope) + release, on a fresh engine. The determinism oracle.
 fn render_view_chord(view: &MusicView) -> Vec<i16> {
     let amy = Amy::start();
+    let tuning = music::room_tuning();
     let before = BTreeSet::new();
     let after = view.live.clone();
     let mut pcm = Vec::new();
-    for ev in degrees_to_amy_events(&before, &after, &view.envelopes, EDO, music::MAX_OSCS) {
+    for ev in degrees_to_amy_events(&before, &after, &view.envelopes, &tuning, music::MAX_OSCS) {
         amy.send(&ev);
     }
     for _ in 0..HELD_BLOCKS {
         pcm.extend_from_slice(&amy.render_block());
     }
-    for ev in degrees_to_amy_events(&after, &before, &view.envelopes, EDO, music::MAX_OSCS) {
+    for ev in degrees_to_amy_events(&after, &before, &view.envelopes, &tuning, music::MAX_OSCS) {
         amy.send(&ev);
     }
     for _ in 0..TAIL_BLOCKS {
@@ -86,12 +87,12 @@ fn envelope_convergence_drives_and_shapes_audio() {
         s.a_converged, s.b_converged,
         "peers MUST converge on the identical (live-set, envelope-registers)"
     );
-    let won = &s.a_converged.envelopes[&s.pc_contested];
+    let won = &s.a_converged.envelopes[&music::degree(s.pc_contested)];
     assert!(*won == s.env_a || *won == s.env_b, "winner is one of the two");
     assert_eq!(*won, s.winner);
     assert_ne!(s.winner, s.loser, "winner and loser must differ (a real tie)");
-    assert_eq!(s.a_converged.envelopes[&s.pc_a_only], s.env_a, "A's disjoint reg kept");
-    assert_eq!(s.a_converged.envelopes[&s.pc_b_only], s.env_b, "B's disjoint reg kept");
+    assert_eq!(s.a_converged.envelopes[&music::degree(s.pc_a_only)], s.env_a, "A's disjoint reg kept");
+    assert_eq!(s.a_converged.envelopes[&music::degree(s.pc_b_only)], s.env_b, "B's disjoint reg kept");
     assert_eq!(s.a_pending, 0, "liveness: nothing parked in A");
     assert_eq!(s.b_pending, 0, "liveness: nothing parked in B");
 
@@ -173,12 +174,12 @@ fn envelope_convergence_drives_and_shapes_audio() {
     );
     // The winner's wire == the winner-envelope's wire, and != the loser's wire.
     assert_eq!(
-        music::envelope_note_on_wire(s.pc_contested, &s.winner, EDO),
-        music::envelope_note_on_wire(s.pc_contested, won, EDO),
+        music::envelope_note_on_wire(s.pc_contested, &s.winner, &music::room_tuning()),
+        music::envelope_note_on_wire(s.pc_contested, won, &music::room_tuning()),
     );
     assert_ne!(
-        music::envelope_note_on_wire(s.pc_contested, &s.winner, EDO),
-        music::envelope_note_on_wire(s.pc_contested, &s.loser, EDO),
+        music::envelope_note_on_wire(s.pc_contested, &s.winner, &music::room_tuning()),
+        music::envelope_note_on_wire(s.pc_contested, &s.loser, &music::room_tuning()),
     );
     let winner_slope = music::rms_slope(&rms_winner);
     let winner_is_swell = s.winner == music::swell();
@@ -206,8 +207,9 @@ fn envelope_convergence_drives_and_shapes_audio() {
     let v1 = peer1.view();
     let v2 = peer2.view();
     // Byte-identical projected wire stream (pure function of the converged view).
-    let wire1 = degrees_to_amy_events(&BTreeSet::new(), &v1.live, &v1.envelopes, EDO, music::MAX_OSCS);
-    let wire2 = degrees_to_amy_events(&BTreeSet::new(), &v2.live, &v2.envelopes, EDO, music::MAX_OSCS);
+    let tuning = music::room_tuning();
+    let wire1 = degrees_to_amy_events(&BTreeSet::new(), &v1.live, &v1.envelopes, &tuning, music::MAX_OSCS);
+    let wire2 = degrees_to_amy_events(&BTreeSet::new(), &v2.live, &v2.envelopes, &tuning, music::MAX_OSCS);
     assert_eq!(wire1, wire2, "equal views must project a byte-identical wire stream");
     // Byte-identical audio (fresh engines fed the identical view).
     let pcm1 = render_view_chord(&v1);
@@ -229,12 +231,12 @@ fn envelope_convergence_drives_and_shapes_audio() {
         wav_pcm.extend_from_slice(&amy.render_block());
     }
     // The curve BEFORE convergence (the loser), then AFTER (the winner) — audibly different.
-    let (loser_pcm, _) = music::render_held_with_envelope(&amy, s.pc_contested, &s.loser, EDO, HELD_BLOCKS, TAIL_BLOCKS);
+    let (loser_pcm, _) = music::render_held_with_envelope(&amy, s.pc_contested, &s.loser, &music::room_tuning(), HELD_BLOCKS, TAIL_BLOCKS);
     wav_pcm.extend_from_slice(&loser_pcm);
     for _ in 0..16 {
         wav_pcm.extend_from_slice(&amy.render_block()); // gap
     }
-    let (winner_pcm, _) = music::render_held_with_envelope(&amy, s.pc_contested, &s.winner, EDO, HELD_BLOCKS, TAIL_BLOCKS);
+    let (winner_pcm, _) = music::render_held_with_envelope(&amy, s.pc_contested, &s.winner, &music::room_tuning(), HELD_BLOCKS, TAIL_BLOCKS);
     wav_pcm.extend_from_slice(&winner_pcm);
     drop(amy);
 

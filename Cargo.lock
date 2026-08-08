@@ -7642,6 +7642,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "tutti-midi"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.19",
+ "tutti-music",
+]
+
+[[package]]
+name = "tutti-music"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "thiserror 2.0.19",
+ "tutti-core",
+]
+
+[[package]]
+name = "tutti-osc"
+version = "0.1.0"
+dependencies = [
+ "tutti-music",
+]
+
+[[package]]
 name = "typeid"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7935,6 +7960,8 @@ dependencies = [
  "tracing-subscriber",
  "tracing-wasm",
  "tutti-core",
+ "tutti-midi",
+ "tutti-music",
  "unicode-segmentation",
  "uuid 1.19.0",
  "walkie-songie",

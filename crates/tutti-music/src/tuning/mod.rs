@@ -1,4 +1,11 @@
-//! Validated periodic tuning, keyboard mapping, and frequency quantization.
+//! Validated periodic tuning, keyboard mapping, and frequency quantization —
+//! the protocol floor of tutti-music.
+//!
+//! A tuning's identity is content: [`TuningId`] is the blake3 hash of the
+//! canonical scale + mapping bytes, so two peers holding byte-different `.scl`
+//! files with the same musical content agree on the id. Degrees are then scoped
+//! to that identity ([`TunedDegree`]), which is what lets a shared pitch-set
+//! survive a room-wide tuning change without misreading old ops.
 
 mod kbm;
 mod scl;
@@ -11,6 +18,11 @@ use thiserror::Error;
 pub use kbm::{KbmParseError, KeyboardMapping, parse_kbm};
 pub use scl::{MAX_SCALE_DEGREES, SclParseError, SclScale, parse_scl};
 
+/// The canonical-bytes domain tag [`TuningId`] hashes over. **Byte-pinned wart,
+/// kept deliberately:** the literal predates the extraction (it names walkie),
+/// and `TuningId`s derived from it are wire-visible in deployed walkie rooms —
+/// changing it would silently re-key every tuning-scoped degree. A neutral tag is
+/// a schema move to schedule with a deliberate generation bump, never a rename.
 const CANONICAL_TUNING_MAGIC: &[u8] = b"walkie-songie/tuning\0";
 const CANONICAL_TUNING_VERSION: u16 = 2;
 #[cfg(test)]
@@ -32,10 +44,11 @@ pub const TWELVE_TET_SCL: &str = r#"! walkie-songie built-in 12-TET
 1200.0
 "#;
 
-/// Legacy pitch-class carrier used by the interrupted browser/yrs UI.
+/// A raw, tuning-unscoped degree index — the loose carrier UI and compatibility
+/// code passes around before a bound is known.
 ///
-/// New durable and transport code uses [`ScaleDegree`], which cannot be
-/// constructed outside the bounds of a specific tuning.
+/// Durable and transport code uses [`ScaleDegree`], which cannot be constructed
+/// outside the bounds of a specific tuning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PitchClass(pub u16);

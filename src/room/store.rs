@@ -13,10 +13,14 @@
 //! The fold reads the decoded op-set through the public [`FoldCtx`] surface
 //! ([`FoldCtx::decoded`], [`FoldCtx::op_id`], [`FoldCtx::is_ancestor`],
 //! [`FoldCtx::resolve`]) — the domain never touches the store's private indexes.
+//! The degree and register stages are the shared `tutti_music::fold`
+//! combinators (one semantics with `MusicLang`, two wires — roadmap §A.3.1);
+//! pieces are walkie's own object fold and stay here.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use hhhs::EntryHash;
+use tutti_music::fold::{SetOp, add_wins_set, register};
 
 use crate::room::ops::{AuthorId, OpId, WalkieLang, WalkieOp};
 use crate::tuning::{TunedDegree, TunedPeriodicPitch, TuningDefinition};
@@ -52,8 +56,8 @@ pub(crate) fn walkie_fold(ctx: &FoldCtx<'_, WalkieLang>) -> RoomView {
 }
 
 impl RoomView {
-    /// Pitches: content-keyed ADD-WINS. An add is live iff no same-key remove
-    /// causally observed it (`is_ancestor(add, remove)`).
+    /// Pitches: content-keyed ADD-WINS with per-key author attribution — the
+    /// shared [`add_wins_set`] combinator, scoped to the resolved tuning.
     fn with_pitches(mut self, ctx: &FoldCtx<'_, WalkieLang>) -> Self {
         let Some(active_tuning) = self
             .tuning
@@ -62,35 +66,17 @@ impl RoomView {
         else {
             return self;
         };
-        let mut adds: BTreeMap<TunedDegree, Vec<EntryHash>> = BTreeMap::new();
-        let mut removes: BTreeMap<TunedDegree, Vec<EntryHash>> = BTreeMap::new();
-        for (entry, decoded) in ctx.decoded() {
-            match decoded.op() {
-                WalkieOp::AddDegree { pitch } if pitch.validate(&active_tuning).is_ok() => {
-                    adds.entry(*pitch).or_default().push(*entry)
-                }
-                WalkieOp::RemoveDegree { pitch } if pitch.validate(&active_tuning).is_ok() => {
-                    removes.entry(*pitch).or_default().push(*entry)
-                }
-                _ => {}
+        let degrees = add_wins_set(ctx, |decoded| match decoded.op() {
+            WalkieOp::AddDegree { pitch } if pitch.validate(&active_tuning).is_ok() => {
+                Some(SetOp::Add(*pitch))
             }
-        }
-        for (key, add_entries) in &adds {
-            let key_removes = removes.get(key).map(Vec::as_slice).unwrap_or(&[]);
-            let mut authors: BTreeSet<AuthorId> = BTreeSet::new();
-            for add in add_entries {
-                let killed = key_removes
-                    .iter()
-                    .any(|remove| ctx.is_ancestor(add, remove));
-                if !killed {
-                    authors.insert(ctx.decoded()[add].author());
-                }
+            WalkieOp::RemoveDegree { pitch } if pitch.validate(&active_tuning).is_ok() => {
+                Some(SetOp::Remove(*pitch))
             }
-            if !authors.is_empty() {
-                self.pitches.insert(*key);
-                self.pitch_authors.insert(*key, authors);
-            }
-        }
+            _ => None,
+        });
+        self.pitches = degrees.live;
+        self.pitch_authors = degrees.holders;
         self
     }
 
@@ -238,58 +224,29 @@ impl RoomView {
         self
     }
 
-    /// Tuning / config: cross-author registers resolved by causal maxima then max
-    /// raw-bytes entry hash. Each config field is resolved independently.
+    /// Tuning / config: cross-author causal-maxima registers — the shared
+    /// [`register`] combinator, one call per independently-resolved field.
     fn with_registers(mut self, ctx: &FoldCtx<'_, WalkieLang>) -> Self {
-        let mut tuning_writes: BTreeSet<EntryHash> = BTreeSet::new();
-        let mut locked_writes: BTreeSet<EntryHash> = BTreeSet::new();
-        let mut emoji_writes: BTreeSet<EntryHash> = BTreeSet::new();
-        for (entry, decoded) in ctx.decoded() {
-            match decoded.op() {
-                WalkieOp::SetTuning { .. } => {
-                    tuning_writes.insert(*entry);
-                }
-                WalkieOp::SetConfig {
-                    pieces_locked,
-                    available_emojis,
-                } => {
-                    if pieces_locked.is_some() {
-                        locked_writes.insert(*entry);
-                    }
-                    if available_emojis.is_some() {
-                        emoji_writes.insert(*entry);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        self.tuning = ctx
-            .resolve(&tuning_writes)
-            .map(|winner| match ctx.decoded()[&winner].op() {
-                WalkieOp::SetTuning { definition } => definition.clone(),
-                _ => unreachable!("tuning candidate is a SetTuning"),
-            })
-            .or_else(|| Some(TuningDefinition::twelve_tet()));
-        self.pieces_locked = ctx
-            .resolve(&locked_writes)
-            .map(|winner| match ctx.decoded()[&winner].op() {
-                WalkieOp::SetConfig {
-                    pieces_locked: Some(locked),
-                    ..
-                } => *locked,
-                _ => unreachable!("locked candidate carries pieces_locked"),
-            })
-            .unwrap_or(false);
-        self.available_emojis = ctx
-            .resolve(&emoji_writes)
-            .map(|winner| match ctx.decoded()[&winner].op() {
-                WalkieOp::SetConfig {
-                    available_emojis: Some(emojis),
-                    ..
-                } => emojis.clone(),
-                _ => unreachable!("emoji candidate carries available_emojis"),
-            });
+        self.tuning = register(ctx, |decoded| match decoded.op() {
+            WalkieOp::SetTuning { definition } => Some(definition.clone()),
+            _ => None,
+        })
+        .or_else(|| Some(TuningDefinition::twelve_tet()));
+        self.pieces_locked = register(ctx, |decoded| match decoded.op() {
+            WalkieOp::SetConfig {
+                pieces_locked: Some(locked),
+                ..
+            } => Some(*locked),
+            _ => None,
+        })
+        .unwrap_or(false);
+        self.available_emojis = register(ctx, |decoded| match decoded.op() {
+            WalkieOp::SetConfig {
+                available_emojis: Some(emojis),
+                ..
+            } => Some(emojis.clone()),
+            _ => None,
+        });
         self
     }
 }

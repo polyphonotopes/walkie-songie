@@ -1,17 +1,21 @@
-//! tutti-amy — Stage 1 of the tutti/AMY ESP32 grand challenge.
+//! tutti-amy — the AMY render leaf of the tutti stack.
 //!
 //! Two things live here:
 //!
-//! 1. A thin, safe Rust wrapper over the AMY C synthesizer (`Amy`), proving
-//!    Rust ↔ AMY works end-to-end on the desktop: start the engine, feed it
-//!    compact ASCII wire events, render audio blocks, read the sysclock.
+//! 1. A thin, safe Rust wrapper over the AMY C synthesizer (`Amy`): start the
+//!    engine, feed it compact ASCII wire events, render audio blocks, read the
+//!    sysclock.
 //!
-//! 2. The **fold → AMY edge seam** (`pitchset_to_amy_events`): a pure function
-//!    that diffs two tutti pitch-sets into AMY note-on/off wire strings. This is
-//!    exactly the shape the real fold `Revision{added, retracted}` diff will
-//!    feed later (docs/research/tutti-amy-esp32-leaf.md §3.4). Framing (a): AMY
-//!    is a render target; the shared object stays the pitch-set; AMY control
-//!    state is a *lens over the fold*.
+//! 2. The **compilers** from `tutti_music` render-surface values to AMY wire
+//!    strings: [`degrees_to_amy_events`] (state diff → note-on/off, offs before
+//!    ons) and [`envelope_to_amy`] (an [`Envelope`] facet → AMY's amplitude-EG
+//!    breakpoint fragment). AMY is a render target; the shared object stays the
+//!    pitch-set — "reconciliation upstream, events downstream"
+//!    (docs/research/tutti-amy-esp32-leaf.md §3.1).
+//!
+//! The music *protocol* — `MusicOp`/`MusicLang`, tuning identity, the
+//! [`Envelope`]/[`Interp`] facet types — lives in `tutti-music`; this crate
+//! only compiles its values for one target.
 //!
 //! AMY is a global singleton (one `amy_global`), so `Amy::start()` hands out a
 //! single guard; construct at most one at a time.
@@ -21,10 +25,15 @@ use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use serde::{Deserialize, Serialize};
+use tutti_music::render::{PitchSetDiff, fractional_midi};
+use tutti_music::tuning::{PeriodicPitch, TunedDegree, Tuning};
 
-/// The REAL music domain over tutti-core + the partition→rejoin scenario and AMY
-/// driver (docs/research/tutti-amy-esp32-leaf.md, experiment 1).
+/// The op-payload facet types, re-exported from the protocol crate so this
+/// crate's callers keep their `tutti_amy::Envelope` spellings.
+pub use tutti_music::facets::{Envelope, Interp, MAX_ENV_LEVEL, MAX_ENV_POINTS};
+
+/// The two-peer partition→rejoin scenario + AMY driver over `Store<MusicLang>`
+/// (docs/research/tutti-amy-esp32-leaf.md, experiment 1).
 pub mod music;
 
 mod ffi {
@@ -74,7 +83,7 @@ impl Amy {
     }
 
     /// Render one block: returns a fresh interleaved-stereo i16 buffer of
-    /// [`Self::block_samples`] samples (256 frames × 2 chans = 512 by default).
+    /// [`block_samples`] samples (256 frames × 2 chans = 512 by default).
     pub fn render_block(&self) -> Vec<i16> {
         let n = block_samples();
         // SAFETY: ws_amy_render_block returns AMY's output block, valid until the
@@ -169,64 +178,20 @@ pub fn write_wav(
 }
 
 // ---------------------------------------------------------------------------
-// The tutti → AMY projection (fold → AMY edge seam).
+// The tutti → AMY compilers (render surface → wire strings).
 // ---------------------------------------------------------------------------
 
-/// A tuned pitch degree — a stand-in for a tutti/walkie hot-set member.
-///
-/// A pitch is an integer `degree` (a step in an equal division of the octave)
-/// plus the `edo` (divisions per octave). This keeps `Pitch` `Ord`/`Hash` for
-/// `BTreeSet` membership while still resolving to a possibly-**fractional** MIDI
-/// note — the microtonal payoff AMY gives for free (`n` parses via `atoff`, so
-/// AMY takes float notes natively; a non-12 `.scl` renders exactly, with no MPE
-/// channel rotation or bend-range negotiation).
-///
-/// `degree 0, edo 12` is defined to be MIDI note 60 (middle C).
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
-pub struct Pitch {
-    /// Steps from the reference (may be negative).
-    pub degree: i32,
-    /// Divisions of the octave. 12 = standard semitones; 31 = 31-EDO; etc.
-    pub edo: u16,
-}
-
-/// Reference: `degree 0` maps to this MIDI note.
-const REFERENCE_MIDI_NOTE: f32 = 60.0;
-
-impl Pitch {
-    /// A standard 12-EDO pitch, `degree` semitones from middle C.
-    pub const fn semitone(degree: i32) -> Pitch {
-        Pitch { degree, edo: 12 }
-    }
-
-    /// A pitch in an arbitrary EDO.
-    pub const fn new(degree: i32, edo: u16) -> Pitch {
-        Pitch { degree, edo }
-    }
-
-    /// The (possibly fractional) MIDI note this degree resolves to.
-    pub fn midi_note(&self) -> f32 {
-        REFERENCE_MIDI_NOTE + (self.degree as f32) * 12.0 / (self.edo as f32)
-    }
-
-    /// The AMY oscillator index this pitch is assigned to.
-    ///
-    /// A *pure, stable* function of the pitch, so a note-off targets exactly the
-    /// oscillator its note-on lit — the anti-stuck-note discipline by
-    /// construction. (The real leaf will hand voice allocation to AMY's synth
-    /// layer per §3.4; addressing raw oscs here keeps the projection a pure
-    /// function with no allocation state, which is what the task asks for.)
-    ///
-    /// Distinct degrees within one EDO map to distinct oscillators until the
-    /// count wraps; a small chord never collides.
-    pub fn osc(&self, max_oscs: u16) -> u16 {
-        (self.degree.rem_euclid(max_oscs as i32)) as u16
-    }
+/// The AMY oscillator index a degree is assigned to: a *pure, stable* function
+/// of the degree, so a note-off targets exactly the oscillator its note-on lit
+/// — the anti-stuck-note discipline by construction. Distinct degrees map to
+/// distinct oscillators until the count wraps; a small chord never collides.
+fn osc_index(degree: TunedDegree, max_oscs: u16) -> u16 {
+    degree.degree.index() % max_oscs.max(1)
 }
 
 /// Format a MIDI note for the wire: integers stay integral (`60`), fractional
 /// notes get up to 3 decimals (`60.387`), matching AMY's own 3-dp convention.
-fn fmt_midi_note(note: f32) -> String {
+fn fmt_midi_note(note: f64) -> String {
     if (note.fract()).abs() < 1e-4 {
         format!("{}", note.round() as i64)
     } else {
@@ -237,98 +202,53 @@ fn fmt_midi_note(note: f32) -> String {
     }
 }
 
-/// Diff two pitch-sets into AMY wire events.
+/// Compile a degree-set transition into AMY wire events, each *added* degree's
+/// note-on carrying its converged **envelope facet** (when the room holds a
+/// register for it) as an AMY `A`/`T` amplitude-EG fragment; a degree with no
+/// facet uses AMY's default envelope. Degrees resolve to (possibly fractional)
+/// MIDI notes under `tuning` — a non-12 EDO renders exactly, with no MPE
+/// channel rotation or bend-range negotiation.
 ///
-/// * a pitch in `after` but not `before` (added)   → `vN nMIDI l1` (note-on)
-/// * a pitch in `before` but not `after` (removed)  → `vN l0`      (note-off)
-///
-/// Note-offs are emitted before note-ons so that, if two pitches happen to share
-/// an oscillator across the transition, the freed voice is reused rather than
-/// stomped. `max_oscs` bounds the oscillator address space.
-///
-/// This is the seam the real fold `Revision{added, retracted, at}` diff will
-/// feed (docs/research/tutti-amy-esp32-leaf.md §3.1, §3.4): "reconciliation
-/// upstream, events downstream."
-pub fn pitchset_to_amy_events(
-    before: &BTreeSet<Pitch>,
-    after: &BTreeSet<Pitch>,
+/// Note-offs precede note-ons ([`PitchSetDiff`]'s ordering contract), so a
+/// voice freed by the transition is reused rather than stomped.
+pub fn degrees_to_amy_events(
+    before: &BTreeSet<TunedDegree>,
+    after: &BTreeSet<TunedDegree>,
+    envelopes: &BTreeMap<TunedDegree, Envelope>,
+    tuning: &Tuning,
     max_oscs: u16,
 ) -> Vec<String> {
+    let diff = PitchSetDiff::between(before, after);
     let mut events = Vec::new();
-
-    // Removed → note-off first.
-    for p in before.difference(after) {
-        events.push(format!("v{}l0", p.osc(max_oscs)));
+    for degree in &diff.retracted {
+        events.push(format!("v{}l0", osc_index(*degree, max_oscs)));
     }
-    // Added → note-on.
-    for p in after.difference(before) {
-        events.push(format!(
-            "v{}n{}l1",
-            p.osc(max_oscs),
-            fmt_midi_note(p.midi_note())
-        ));
+    for degree in &diff.added {
+        let note = fractional_midi(tuning, PeriodicPitch::from_degree(degree.degree, 0));
+        let mut ev = format!("v{}n{}", osc_index(*degree, max_oscs), fmt_midi_note(note));
+        if let Some(env) = envelopes.get(degree) {
+            ev.push_str(&envelope_to_amy(env));
+        }
+        ev.push_str("l1");
+        events.push(ev);
     }
-
     events
 }
 
 // ---------------------------------------------------------------------------
-// Continuous facets — per-degree amplitude ENVELOPE, projected onto AMY's EG0.
+// The envelope facet → AMY EG0 compiler.
 // ---------------------------------------------------------------------------
 //
-// This is the north-star INTERPOLATION axis made concrete: tutti ships the
-// *function* — a sparse breakpoint list plus the rule to fill between the points
-// — not audio-rate samples, and AMY evaluates that function at 44.1 kHz locally
-// (docs/research/tutti-amy-esp32-leaf.md §4). AMY's own control model is already
-// "generators, not streams": each oscillator has two breakpoint envelope
-// generators (EG0/EG1), `(time_ms, value)` pairs with a per-EG interpolation
-// `eg_type` (amy.h:238-242, 330-333; docs/api.md `A`/`B`/`T`/`X`). The default
-// oscillator gates its amplitude by EG0 (`amp_coefs[COEF_EG0]=1`, amy.c:868), so
-// an EG0 breakpoint string shapes the note's loudness contour directly.
+// tutti ships the *function* — a sparse breakpoint list plus the rule to fill
+// between the points — and AMY evaluates it at 44.1 kHz locally. AMY's control
+// model is already "generators, not streams": each oscillator has two
+// breakpoint envelope generators (EG0/EG1), `(time_ms, value)` pairs with a
+// per-EG interpolation `eg_type` (amy.h:238-242; docs/api.md `A`/`T`). The
+// default oscillator gates its amplitude by EG0 (amy.c:868), so an EG0
+// breakpoint string shapes the note's loudness contour directly.
 
-/// Interpolation kind carried by a continuous envelope facet — the vision's
-/// INTERPOLATION axis (docs §8.2): a control point ships *with* the rule the
-/// renderer uses to fill between points. Bounded + serde so it is a legal op
-/// payload; maps onto AMY's `eg_type` vocabulary at the edge (docs/api.md `T`:
-/// 0 Normal/RC, 1 Linear, 2 DX7, 3 True-exponential).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
-pub enum Interp {
-    /// Straight-line between breakpoints → AMY `eg_type = 1` (ENVELOPE_LINEAR).
-    #[default]
-    Linear,
-    /// True-exponential between breakpoints → AMY `eg_type = 3`.
-    Exp,
-    /// Piecewise-constant (sample-and-hold). AMY has no native step `eg_type`, so
-    /// the projection realizes it *honestly* as a staircase over the LINEAR engine
-    /// (hold each level flat, then a short jump at each breakpoint), not by
-    /// mislabeling it as some other curve family.
-    Step,
-}
-
-/// Max breakpoints in one envelope facet. Comfortably under AMY's `MAX_BREAKPOINTS`
-/// (24, amy.h:240) even after `Interp::Step`'s staircase expansion (≤ 2N-1).
-pub const MAX_ENV_POINTS: usize = 8;
-
-/// Max linear-amplitude level a breakpoint may carry (7-bit, MIDI-ish).
-pub const MAX_ENV_LEVEL: u8 = 127;
-
-/// A continuous **envelope facet**: a sparse breakpoint list + an interpolation
-/// kind. Each `(ms, level)` is a *segment*: reach `level` (0..=127, a linear
-/// amplitude) over `ms` milliseconds from the previous point — AMY's own native
-/// breakpoint semantics (per-segment deltas, cumulated; envelope.c:81). Per AMY,
-/// the LAST point is the *release* segment: it only fires on note-off, so while a
-/// note is held the curve runs the earlier points and sustains at the
-/// second-to-last level (docs/synth.md, envelope.c:116-131).
-#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
-pub struct Envelope {
-    /// `(segment_ms, level_0_127)` breakpoints, in order. Domain bound 1..=MAX_ENV_POINTS.
-    pub points: Vec<(u16, u8)>,
-    /// How the renderer fills between breakpoints.
-    pub interp: Interp,
-}
-
-/// AMY's `eg_type` code (docs/api.md `T`) for an interpolation kind. `Step` rides
-/// the LINEAR engine (its staircase makes the curve piecewise-constant anyway).
+/// AMY's `eg_type` code (docs/api.md `T`) for an interpolation kind. `Step`
+/// rides the LINEAR engine (its staircase makes the curve piecewise-constant).
 fn eg_type_code(interp: Interp) -> u8 {
     match interp {
         Interp::Linear | Interp::Step => 1, // ENVELOPE_LINEAR
@@ -352,7 +272,8 @@ fn fmt_level(level: u8) -> String {
 
 /// `Interp::Step` expansion: over AMY's LINEAR engine, hold each level flat for its
 /// whole segment then jump to the next in `STEP_JUMP_MS`, yielding a
-/// piecewise-constant curve. The last emitted pair stays the release segment.
+/// piecewise-constant curve — realized *honestly* as a staircase, not by
+/// mislabeling the curve family. The last emitted pair stays the release segment.
 const STEP_JUMP_MS: u16 = 1;
 fn staircase(points: &[(u16, u8)]) -> Vec<(u16, u8)> {
     if points.len() <= 1 {
@@ -399,45 +320,16 @@ pub fn envelope_to_amy(env: &Envelope) -> String {
     s
 }
 
-/// Diff two degree-sets into AMY wire events, where each *added* degree's note-on
-/// carries its converged **envelope facet** (if the room holds a register for that
-/// degree) as an AMY `A`/`T` amplitude-EG fragment; a degree with no facet uses
-/// AMY's default envelope. Degrees are the room's scale steps (== `Pitch::degree`);
-/// `edo` tunes them to (possibly fractional) MIDI notes, so microtonality is
-/// preserved through the envelope-carrying note-on too.
-///
-/// Note-offs precede note-ons (voice reuse), exactly as [`pitchset_to_amy_events`].
-/// With an empty `envelopes` map this emits byte-identical events to that function.
-pub fn degrees_to_amy_events(
-    before: &BTreeSet<u16>,
-    after: &BTreeSet<u16>,
-    envelopes: &BTreeMap<u16, Envelope>,
-    edo: u16,
-    max_oscs: u16,
-) -> Vec<String> {
-    let mut events = Vec::new();
-    for &pc in before.difference(after) {
-        let p = Pitch::new(pc as i32, edo);
-        events.push(format!("v{}l0", p.osc(max_oscs)));
-    }
-    for &pc in after.difference(before) {
-        let p = Pitch::new(pc as i32, edo);
-        let mut ev = format!("v{}n{}", p.osc(max_oscs), fmt_midi_note(p.midi_note()));
-        if let Some(env) = envelopes.get(&pc) {
-            ev.push_str(&envelope_to_amy(env));
-        }
-        ev.push_str("l1");
-        events.push(ev);
-    }
-    events
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn set(pitches: &[Pitch]) -> BTreeSet<Pitch> {
-        pitches.iter().copied().collect()
+    fn degree(tuning: &Tuning, index: u16) -> TunedDegree {
+        TunedDegree::new(tuning, index).unwrap()
+    }
+
+    fn set(tuning: &Tuning, indices: &[u16]) -> BTreeSet<TunedDegree> {
+        indices.iter().map(|&i| degree(tuning, i)).collect()
     }
 
     #[test]
@@ -484,51 +376,56 @@ mod tests {
 
     #[test]
     fn degree_note_on_carries_the_facet_or_the_default() {
-        let mut envs: BTreeMap<u16, Envelope> = BTreeMap::new();
+        let tuning = Tuning::twelve_tet();
+        let mut envs: BTreeMap<TunedDegree, Envelope> = BTreeMap::new();
         envs.insert(
-            0,
+            degree(&tuning, 0),
             Envelope {
                 points: vec![(0, 127), (120, 12), (40, 0)],
                 interp: Interp::Exp,
             },
         );
         let before = BTreeSet::new();
-        let after = BTreeSet::from([0u16, 7u16]);
-        let ev = degrees_to_amy_events(&before, &after, &envs, 12, 250);
+        let after = set(&tuning, &[0, 7]);
+        let ev = degrees_to_amy_events(&before, &after, &envs, &tuning, 250);
         // Degree 0 (osc 0) carries its envelope; degree 7 (osc 7) has no facet → default.
         assert!(ev.contains(&"v0n60A0,1,120,0.0945,40,0T3l1".to_string()));
         assert!(ev.contains(&"v7n67l1".to_string()));
 
-        // With NO facets the envelope path is byte-identical to the plain projection.
-        let plain = pitchset_to_amy_events(
+        // With NO facets the note-ons are plain (byte-identical minus the fragment).
+        let plain = degrees_to_amy_events(&before, &after, &BTreeMap::new(), &tuning, 250);
+        assert_eq!(plain, vec!["v0n60l1".to_string(), "v7n67l1".to_string()]);
+    }
+
+    #[test]
+    fn fractional_midi_note_for_a_non_twelve_edo() {
+        // A quarter-tone step above middle C = 60.5, anchored by an explicit KBM.
+        let tuning = Tuning::from_scl_text(
+            "quarter",
+            "quarter tones\n2\n50.0\n1200.0\n",
+            Some("0\n0\n127\n60\n60\n261.6255653005986\n0\n"),
+        )
+        .unwrap();
+        let ev = degrees_to_amy_events(
             &BTreeSet::new(),
-            &BTreeSet::from([Pitch::semitone(0), Pitch::semitone(7)]),
+            &set(&tuning, &[1]),
+            &BTreeMap::new(),
+            &tuning,
             250,
         );
-        let via_env = degrees_to_amy_events(&before, &after, &BTreeMap::new(), 12, 250);
-        assert_eq!(via_env, plain);
-    }
-
-    #[test]
-    fn midi_note_reference_and_semitones() {
-        assert_eq!(Pitch::semitone(0).midi_note(), 60.0);
-        assert_eq!(Pitch::semitone(12).midi_note(), 72.0);
-        assert_eq!(Pitch::semitone(-12).midi_note(), 48.0);
-    }
-
-    #[test]
-    fn fractional_midi_note_for_31_edo() {
-        // One step of 31-EDO above middle C = 60 + 12/31 ≈ 60.387.
-        let p = Pitch::new(1, 31);
-        assert!((p.midi_note() - 60.3871).abs() < 1e-3);
-        assert_eq!(fmt_midi_note(p.midi_note()), "60.387");
+        assert_eq!(ev, vec!["v1n60.5l1".to_string()]);
     }
 
     #[test]
     fn empty_to_chord_is_all_note_ons() {
-        let before = set(&[]);
-        let after = set(&[Pitch::semitone(0), Pitch::semitone(4), Pitch::semitone(7)]);
-        let ev = pitchset_to_amy_events(&before, &after, 250);
+        let tuning = Tuning::twelve_tet();
+        let ev = degrees_to_amy_events(
+            &BTreeSet::new(),
+            &set(&tuning, &[0, 4, 7]),
+            &BTreeMap::new(),
+            &tuning,
+            250,
+        );
         // C major triad on distinct oscs 0, 4, 7.
         assert_eq!(ev.len(), 3);
         assert!(ev.contains(&"v0n60l1".to_string()));
@@ -538,33 +435,44 @@ mod tests {
 
     #[test]
     fn chord_to_empty_is_all_note_offs() {
-        let before = set(&[Pitch::semitone(0), Pitch::semitone(7)]);
-        let after = set(&[]);
-        let ev = pitchset_to_amy_events(&before, &after, 250);
+        let tuning = Tuning::twelve_tet();
+        let ev = degrees_to_amy_events(
+            &set(&tuning, &[0, 7]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &tuning,
+            250,
+        );
         assert_eq!(ev, vec!["v0l0".to_string(), "v7l0".to_string()]);
     }
 
     #[test]
     fn only_the_delta_is_emitted() {
         // Hold 0 and 7, add 4, drop 7.
-        let before = set(&[Pitch::semitone(0), Pitch::semitone(7)]);
-        let after = set(&[Pitch::semitone(0), Pitch::semitone(4)]);
-        let ev = pitchset_to_amy_events(&before, &after, 250);
+        let tuning = Tuning::twelve_tet();
+        let ev = degrees_to_amy_events(
+            &set(&tuning, &[0, 7]),
+            &set(&tuning, &[0, 4]),
+            &BTreeMap::new(),
+            &tuning,
+            250,
+        );
         // 0 is held (no event), 7 off, 4 on. Off precedes on.
         assert_eq!(ev, vec!["v7l0".to_string(), "v4n64l1".to_string()]);
     }
 
     #[test]
     fn note_off_targets_the_same_osc_as_note_on() {
-        // Any pitch's note-on and note-off address the same oscillator — the
-        // no-stuck-note invariant, as a pure property of Pitch::osc.
-        for degree in -40..40 {
-            let p = Pitch::semitone(degree);
-            let on = pitchset_to_amy_events(&set(&[]), &set(&[p]), 250);
-            let off = pitchset_to_amy_events(&set(&[p]), &set(&[]), 250);
-            let on_osc = on[0].split('n').next().unwrap();
-            let off_osc = off[0].trim_end_matches("l0");
-            assert_eq!(on_osc, off_osc, "on/off osc mismatch for degree {degree}");
+        // Any degree's note-on and note-off address the same oscillator — the
+        // no-stuck-note invariant, as a pure property of the osc mapping.
+        let tuning = Tuning::twelve_tet();
+        for index in 0..12 {
+            let one = set(&tuning, &[index]);
+            let on = degrees_to_amy_events(&BTreeSet::new(), &one, &BTreeMap::new(), &tuning, 250);
+            let off = degrees_to_amy_events(&one, &BTreeSet::new(), &BTreeMap::new(), &tuning, 250);
+            let on_osc = on[0].split('n').next().unwrap().to_string();
+            let off_osc = off[0].trim_end_matches("l0").to_string();
+            assert_eq!(on_osc, off_osc, "on/off osc mismatch for degree {index}");
         }
     }
 }

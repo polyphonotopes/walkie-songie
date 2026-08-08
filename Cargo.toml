@@ -104,7 +104,14 @@ plugin = ["dep:nih_plug", "dep:nih_plug_egui", "dep:crossbeam-channel", "dep:egu
 test-support = []
 
 [workspace]
-members = ["xtask", "src-tauri", "crates/tutti-core"]
+members = [
+    "xtask",
+    "src-tauri",
+    "crates/tutti-core",
+    "crates/tutti-music",
+    "crates/tutti-midi",
+    "crates/tutti-osc",
+]
 # tutti-amy links the AMY C synthesizer via a `cc` build.rs (see
 # docs/research/tutti-amy-esp32-leaf.md, Stage 1). Excluded like `relay/` so the
 # normal walkie build/CI never pulls the C toolchain.
@@ -150,6 +157,15 @@ yrs = "0.21"
 # `ops_root` Merkle layer. `src/room/` re-exports it so `WalkieLang` is the sole
 # instantiation and no external call site moves. Wasm-safe (no tokio/iroh).
 tutti-core = { path = "crates/tutti-core" }
+
+# The music protocol (tutti Phase II): tuning identity (`crate::tuning` re-exports
+# it), the MusicOp/MusicLang reference wire, the fold combinators `walkie_fold`
+# drives, and the render seam. Wasm-safe.
+tutti-music = { path = "crates/tutti-music" }
+
+# The reactive MIDI bridge: walkie's source-balanced ledger + input tracker
+# (promoted; `src/midi` re-exports them) and the reconcile-on-reconnect core.
+tutti-midi = { path = "crates/tutti-midi" }
 
 # P2P rewrite: signed operation log (p2panda-core) + HHHS causal read model.
 # p2panda-core and HHHS are wasm-safe (no tokio/iroh); the native networking

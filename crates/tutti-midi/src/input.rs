@@ -1,6 +1,13 @@
+//! Inbound MIDI: physical notes → source-balanced, tuning-scoped degree intent.
+//!
+//! Events fold into state — the tracker never mutates a view; the app commits
+//! ops (or refreshes presence leases) from the actions it returns, and the
+//! outbound side then re-projects. Local hardware input and remote peers
+//! converge through the identical path.
+
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::tuning::{TunedDegree, TunedPeriodicPitch, Tuning};
+use tutti_music::tuning::{TunedDegree, TunedPeriodicPitch, Tuning};
 
 /// Physical note identity retained from note-on until its matching note-off.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]

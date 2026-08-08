@@ -1,38 +1,24 @@
+//! The source-balanced MIDI output ledger.
+//!
+//! **Sources, not pitches, are the unit of ownership**: a source key `S` is one
+//! independent reason a note sounds (a shared degree held by one author, a
+//! moving object, a live voice, a local key press — the app chooses the type).
+//! Two sources may share an output voice without either being able to silence
+//! the other; the voice stays on until its last owner releases.
+//!
+//! Output is a deterministic sequence of MIDI 1.0 messages checkable against a
+//! fake sink — no ports, no runtime. The ledger doubles as the endpoint
+//! *shadow*: its `sources`/voice map IS what the endpoint currently sounds,
+//! which is what the reconnect bridge in [`crate::reconcile`] diffs against.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 
-use crate::{
-    room::ops::{AuthorId, OpId},
-    tuning::{TunedDegree, TunedPeriodicPitch, Tuning, TuningId},
-};
+use tutti_music::tuning::{TunedPeriodicPitch, Tuning, TuningId};
 
 pub const DEFAULT_VELOCITY: u8 = 100;
 const PITCH_BEND_CENTER: u16 = 8192;
-
-/// One independent reason a MIDI note is sounding.
-///
-/// Sources, not pitches, are the unit of ownership. Two sources may therefore
-/// share an output voice without either being able to silence the other.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum MidiSource {
-    DurableDegree {
-        author: AuthorId,
-        pitch: TunedDegree,
-    },
-    Piece {
-        id: OpId,
-    },
-    Voice {
-        author: AuthorId,
-        session: u64,
-    },
-    LocalInput {
-        port_id: String,
-        channel: u8,
-        note: u8,
-    },
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MidiVoice {
@@ -202,16 +188,16 @@ pub enum MidiRouteError {
     MicrotonalOutputDisabled,
 }
 
-/// Source-balanced MIDI output state.
+/// Source-balanced MIDI output state, generic over the app's source key `S`.
 #[derive(Debug, Clone)]
-pub struct MidiLedger {
+pub struct MidiLedger<S: Ord + Clone> {
     config: MidiOutputConfig,
     tuning_id: TuningId,
-    sources: BTreeMap<MidiSource, MidiVoice>,
+    sources: BTreeMap<S, MidiVoice>,
     voice_refcounts: BTreeMap<MidiVoice, usize>,
 }
 
-impl MidiLedger {
+impl<S: Ord + Clone> MidiLedger<S> {
     pub fn new(tuning: &Tuning, config: MidiOutputConfig) -> Result<Self, MidiRouteError> {
         config.validate()?;
         Ok(Self {
@@ -226,15 +212,27 @@ impl MidiLedger {
         self.tuning_id
     }
 
+    /// The active output config (for the bridge's panic-and-repopulate path).
+    pub(crate) fn config(&self) -> MidiOutputConfig {
+        self.config.clone()
+    }
+
+    /// Re-key an EMPTY shadow to a new tuning with no messages — only legal
+    /// after [`Self::forget`], when the endpoint is known silent.
+    pub(crate) fn align_silent(&mut self, tuning: &Tuning) {
+        debug_assert!(self.sources.is_empty() && self.voice_refcounts.is_empty());
+        self.tuning_id = tuning.id();
+    }
+
     pub fn source_count(&self) -> usize {
         self.sources.len()
     }
 
-    pub fn sources(&self) -> impl Iterator<Item = (&MidiSource, &MidiVoice)> {
+    pub fn sources(&self) -> impl Iterator<Item = (&S, &MidiVoice)> {
         self.sources.iter()
     }
 
-    pub fn voice_for_source(&self, source: &MidiSource) -> Option<MidiVoice> {
+    pub fn voice_for_source(&self, source: &S) -> Option<MidiVoice> {
         self.sources.get(source).copied()
     }
 
@@ -243,7 +241,7 @@ impl MidiLedger {
     /// the ledger untouched.
     pub fn set_source(
         &mut self,
-        source: MidiSource,
+        source: S,
         pitch: Option<TunedPeriodicPitch>,
         tuning: &Tuning,
     ) -> Result<Vec<MidiMessage>, MidiRouteError> {
@@ -294,6 +292,15 @@ impl MidiLedger {
         Ok(messages)
     }
 
+    /// Forget all tracked sources and voices WITHOUT emitting anything — for an
+    /// endpoint known to be silent already (a power-cycled synth, a fresh
+    /// peer). The messages a panic would send describe notes that endpoint
+    /// never heard; the honest reconcile from silence is note-ons only.
+    pub fn forget(&mut self) {
+        self.sources.clear();
+        self.voice_refcounts.clear();
+    }
+
     /// Release all tracked sources and reset all configured channels.
     pub fn panic(&mut self) -> Vec<MidiMessage> {
         let mut messages = Vec::new();
@@ -330,7 +337,7 @@ impl MidiLedger {
 
     fn allocate_voice(
         &self,
-        source: &MidiSource,
+        source: &S,
         pitch: TunedPeriodicPitch,
         tuning: &Tuning,
     ) -> Result<MidiVoice, MidiRouteError> {
@@ -405,12 +412,7 @@ impl MidiLedger {
         }
     }
 
-    fn acquire_voice(
-        &mut self,
-        source: MidiSource,
-        voice: MidiVoice,
-        messages: &mut Vec<MidiMessage>,
-    ) {
+    fn acquire_voice(&mut self, source: S, voice: MidiVoice, messages: &mut Vec<MidiMessage>) {
         let count = self.voice_refcounts.entry(voice).or_default();
         if *count == 0 {
             if voice.bend != PITCH_BEND_CENTER {
@@ -429,12 +431,7 @@ impl MidiLedger {
         self.sources.insert(source, voice);
     }
 
-    fn release_voice(
-        &mut self,
-        source: &MidiSource,
-        voice: MidiVoice,
-        messages: &mut Vec<MidiMessage>,
-    ) {
+    fn release_voice(&mut self, source: &S, voice: MidiVoice, messages: &mut Vec<MidiMessage>) {
         self.sources.remove(source);
         let Some(count) = self.voice_refcounts.get_mut(&voice) else {
             return;
@@ -472,17 +469,11 @@ fn bend_value(deviation_semitones: f64, range_semitones: f64) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Tuning;
+    use tutti_music::tuning::Tuning;
 
-    fn author(byte: u8) -> AuthorId {
-        AuthorId([byte; 32])
-    }
-
-    fn voice_source(byte: u8) -> MidiSource {
-        MidiSource::Voice {
-            author: author(byte),
-            session: u64::from(byte) + 1,
-        }
+    /// The ledger is generic over the source key — plain numbers suffice here.
+    fn voice_source(byte: u8) -> u8 {
+        byte
     }
 
     #[test]

@@ -22,8 +22,9 @@ path = "src/main.rs"
 # fold on the kernel ReachIndex) so convergence can be checked against the oracle.
 # NOT enabling `merkle`, matching the leaf profile (drops radix_immutable).
 tutti-core = { path = "../crates/tutti-core", features = ["test-support"] }
-# `#[derive(Serialize, Deserialize)]` on the MusicOp alphabet — CBOR-framed by
-# tutti-core exactly as the KV domain's ops are.
+# The music protocol: MusicOp/MusicLang, tuning identity, the facet types, and
+# the render seam this crate compiles to AMY wire strings.
+tutti-music = { path = "../crates/tutti-music" }
 serde = { version = "1.0", features = ["derive"] }
 
 [build-dependencies]
