@@ -33,25 +33,26 @@ use hhhs_core::register;
 use hhhs_core::{AppendOutcome, DagRead, Entry, EntryHash, MemDagStore, Position};
 
 use super::ops::{
-    AuthorId, LogHead, OpId, SignedOp, SigningKey, VerifiedOp, WalkieOp,
-    sign_op_for_topic_observing, verify_signed_op,
+    AuthorId, LogHead, OpId, OpLanguage, SignedOp, SigningKey, VerifiedOpG, VersionedOpG,
+    WalkieLang, WalkieOp, sign_versioned_op, verify_signed_op_in,
 };
 use crate::tuning::{TunedDegree, TunedPeriodicPitch, TuningDefinition};
-
-/// Framing tag prefixed to the verbatim signed bytes when they become a kernel
-/// entry payload. Bumping this changes every [`EntryHash`], so it is a schema
-/// pin: a golden-vector test asserts a concrete hash against it.
-const SIGNED_OP_FRAME_MAGIC: &[u8] = b"walkie.hhhs.signed-op/1";
 
 /// Deterministically frame a signed op into an entry payload:
 /// `MAGIC ++ len(header) ++ header ++ len(payload) ++ payload` (u64 little-endian
 /// lengths). A pure function of the signed op — never of any decoded record — so
 /// the entry hash matches byte-for-byte across peers.
-fn frame_signed(signed: &SignedOp) -> Vec<u8> {
+///
+/// The `MAGIC` is `L::ENTRY_FRAME_MAGIC` (tutti extraction Track-D step 2). For
+/// [`WalkieLang`] that is `b"walkie.hhhs.signed-op/1"`, the pre-extraction store
+/// literal, so lifted entry hashes are byte-for-byte unchanged — the golden
+/// vector pins it. Bumping the magic changes every [`EntryHash`], so it is a
+/// schema pin.
+fn frame_signed<L: OpLanguage>(signed: &SignedOp) -> Vec<u8> {
     let mut out = Vec::with_capacity(
-        SIGNED_OP_FRAME_MAGIC.len() + 16 + signed.header.len() + signed.payload.len(),
+        L::ENTRY_FRAME_MAGIC.len() + 16 + signed.header.len() + signed.payload.len(),
     );
-    out.extend_from_slice(SIGNED_OP_FRAME_MAGIC);
+    out.extend_from_slice(L::ENTRY_FRAME_MAGIC);
     out.extend_from_slice(&(signed.header.len() as u64).to_le_bytes());
     out.extend_from_slice(&signed.header);
     out.extend_from_slice(&(signed.payload.len() as u64).to_le_bytes());
@@ -62,9 +63,10 @@ fn frame_signed(signed: &SignedOp) -> Vec<u8> {
 /// Inverse of [`frame_signed`]: recover the verbatim [`SignedOp`] from a lifted
 /// entry's payload. A total inverse of the deterministic framing above, so a
 /// round-trip through the DAG payload is lossless — this is what lets the store
-/// re-emit the exact bytes an author signed for anti-entropy transfer.
-fn unframe_signed(bytes: &[u8]) -> SignedOp {
-    let mut pos = SIGNED_OP_FRAME_MAGIC.len();
+/// re-emit the exact bytes an author signed for anti-entropy transfer. Reads the
+/// same `L::ENTRY_FRAME_MAGIC` prefix `frame_signed` wrote.
+fn unframe_signed<L: OpLanguage>(bytes: &[u8]) -> SignedOp {
+    let mut pos = L::ENTRY_FRAME_MAGIC.len();
     let read_len = |bytes: &[u8], pos: usize| -> usize {
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&bytes[pos..pos + 8]);
@@ -104,11 +106,11 @@ pub fn sync_root_of<'a>(hashes: impl IntoIterator<Item = &'a EntryHash>) -> [u8;
 }
 
 /// The op contents kept alongside a lifted entry, so reads never re-verify a
-/// signature or re-decode a payload.
-#[derive(Clone, Debug)]
-struct DecodedOp {
+/// signature or re-decode a payload. Generic over the [`OpLanguage`] `L` so `op`
+/// carries the domain alphabet `L::Op` (tutti extraction Track-D step 2).
+struct DecodedOp<L: OpLanguage> {
     author: AuthorId,
-    op: WalkieOp,
+    op: L::Op,
     /// Author-stamped time (display / last-resort tiebreak only; unused by the
     /// causal view but kept per the store contract).
     #[allow(dead_code)]
@@ -120,9 +122,13 @@ struct DecodedOp {
     seq: u64,
 }
 
-/// The causal-DAG mirror of a room's signed op log plus everything reads need.
-#[derive(Default)]
-pub struct RoomStore {
+/// The causal-DAG mirror of a room's signed op log plus everything reads need,
+/// generic over the domain [`OpLanguage`] `L` (tutti extraction Track-D step 2:
+/// store + fold genericized in place; the crate move is step 3). Every field is
+/// `L`-threaded but otherwise identical to the pre-extraction store, so the
+/// lifted entry hashes and the projected view are byte-for-byte unchanged.
+/// Walkie names it through the [`RoomStore`] alias (`L = WalkieLang`).
+pub struct Store<L: OpLanguage> {
     /// The opaque-payload causal DAG. Identity ([`EntryHash`]) is fixed here.
     dag: MemDagStore,
     /// p2panda op id -> the entry that lifts it. The resolution table for prevs.
@@ -130,15 +136,35 @@ pub struct RoomStore {
     /// entry -> p2panda op id (inverse of `source_to_entry`).
     entry_to_source: BTreeMap<EntryHash, OpId>,
     /// entry -> decoded op contents (author, payload, ts, seq).
-    decoded: BTreeMap<EntryHash, DecodedOp>,
+    decoded: BTreeMap<EntryHash, DecodedOp<L>>,
     /// Per-author log head, so the local author can chain new commits.
     heads: BTreeMap<AuthorId, LogHead>,
     /// Ops whose `backlink`/`observed` are not all lifted yet — parked until
     /// their full causal past arrives (strict deferral), then drained.
-    pending: Vec<VerifiedOp>,
+    pending: Vec<VerifiedOpG<L>>,
 }
 
-impl RoomStore {
+/// Walkie-songie's room store — [`Store`] fixed at [`WalkieLang`]. Every call
+/// site outside `store.rs`/`ops.rs` keeps the pre-extraction spelling
+/// `RoomStore`, so genericizing the store moved no external code.
+pub type RoomStore = Store<WalkieLang>;
+
+/// Hand-written so `Store<L>` is `Default` without a spurious `L: Default` bound
+/// (the marker `L` never impls `Default`); every field defaults independently.
+impl<L: OpLanguage> Default for Store<L> {
+    fn default() -> Self {
+        Self {
+            dag: MemDagStore::default(),
+            source_to_entry: BTreeMap::new(),
+            entry_to_source: BTreeMap::new(),
+            decoded: BTreeMap::new(),
+            heads: BTreeMap::new(),
+            pending: Vec::new(),
+        }
+    }
+}
+
+impl<L: OpLanguage> Store<L> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -192,7 +218,7 @@ impl RoomStore {
         self.dag
             .entries_topo()
             .into_iter()
-            .map(|entry| (entry.hash(), unframe_signed(&entry.payload)))
+            .map(|entry| (entry.hash(), unframe_signed::<L>(&entry.payload)))
             .collect()
     }
 
@@ -213,41 +239,6 @@ impl RoomStore {
         sync_root_of(self.entry_to_source.keys())
     }
 
-    /// M2 — the additive `ops_root`: a canonical blake3-256 Merkle commitment to
-    /// this store's entry-hash identity set, computed over exactly the same
-    /// `entry_to_source.keys()` iterator [`Self::sync_root`] digests (so the two
-    /// can never skew). Strictly stronger than `sync_root`: root equality iff
-    /// entry-set equality, PLUS the proofs [`Self::prove_op`] emits. Beside RBSR,
-    /// never replacing it. See [`crate::room::merkle`].
-    #[cfg(feature = "merkle")]
-    pub fn ops_root(&self) -> [u8; 32] {
-        crate::room::merkle::ops_root_of(self.entry_to_source.keys())
-    }
-
-    /// An inclusion (op present) or non-inclusion (op absent) proof for `entry`
-    /// against [`Self::ops_root`]. Verify standalone — no store, no crate state —
-    /// with [`radix_immutable::verify`]: `Some(&[])` demands inclusion (the `()`
-    /// leaf value is empty bytes), `None` demands non-inclusion.
-    ///
-    /// ```ignore
-    /// let root = store.ops_root();
-    /// let proof = store.prove_op(&entry);
-    /// assert!(radix_immutable::verify(&root, entry.as_bytes(), Some(&[]), &proof));
-    /// ```
-    #[cfg(feature = "merkle")]
-    pub fn prove_op(&self, entry: &EntryHash) -> radix_immutable::Proof {
-        crate::room::merkle::prove_op(self.entry_to_source.keys(), entry)
-    }
-
-    /// M2 — the additive `state_root`: a canonical blake3-256 Merkle commitment to
-    /// the projected [`RoomView`] (a pure function of the view). Delegates to
-    /// [`RoomView::state_root`] over the current [`Self::view`]. See
-    /// [`crate::room::merkle`] for the canonical leaf grammar.
-    #[cfg(feature = "merkle")]
-    pub fn state_root(&self) -> [u8; 32] {
-        self.view().state_root()
-    }
-
     /// Signed bytes plus causal predecessors for ONE lifted entry.
     ///
     /// Exists so the sync layer can fold newly-lifted entries into its
@@ -257,7 +248,7 @@ impl RoomStore {
     pub fn repair_record(&self, hash: &EntryHash) -> Option<(SignedOp, Vec<EntryHash>)> {
         let entry = self.dag.entry(hash)?;
         Some((
-            unframe_signed(&entry.payload),
+            unframe_signed::<L>(&entry.payload),
             entry.header.prevs.0.iter().copied().collect(),
         ))
     }
@@ -272,7 +263,7 @@ impl RoomStore {
                 (
                     entry.hash(),
                     (
-                        unframe_signed(&entry.payload),
+                        unframe_signed::<L>(&entry.payload),
                         entry.header.prevs.0.iter().copied().collect(),
                     ),
                 )
@@ -297,7 +288,7 @@ impl RoomStore {
     /// op parked. Callers must not treat "accepted" as "materialized" — a parked
     /// op is not in [`Self::entry_hashes`], is not advertised to peers, and
     /// cannot be served, so counting it as ingested overstates progress.
-    pub fn ingest_verified(&mut self, op: VerifiedOp) -> Vec<EntryHash> {
+    pub fn ingest_verified(&mut self, op: VerifiedOpG<L>) -> Vec<EntryHash> {
         let id = op.id();
         if self.source_to_entry.contains_key(&id) {
             return Vec::new();
@@ -311,7 +302,7 @@ impl RoomStore {
     }
 
     /// Advance (never regress) the author's tracked head to the greatest seq seen.
-    fn advance_head(&mut self, op: &VerifiedOp) {
+    fn advance_head(&mut self, op: &VerifiedOpG<L>) {
         let advanced = op.advanced_head();
         let slot = self
             .heads
@@ -325,7 +316,7 @@ impl RoomStore {
     /// Resolve an op's `prevs` = `{ lift(backlink) } ∪ { lift(o) : o in observed }`.
     /// Returns `None` (defer) if ANY referenced op id is not yet lifted — never
     /// omit a prev, or the entry hash would depend on arrival order.
-    fn resolve_prevs(&self, op: &VerifiedOp) -> Option<BTreeSet<EntryHash>> {
+    fn resolve_prevs(&self, op: &VerifiedOpG<L>) -> Option<BTreeSet<EntryHash>> {
         let mut prevs = BTreeSet::new();
         if let Some(backlink) = op.backlink() {
             prevs.insert(*self.source_to_entry.get(&OpId(backlink))?);
@@ -339,9 +330,9 @@ impl RoomStore {
     /// Try to lift one op. Returns the lifted entry hash iff it was appended (or
     /// already present); `None` (with no mutation) if its causal past is
     /// incomplete.
-    fn try_lift(&mut self, op: &VerifiedOp) -> Option<EntryHash> {
+    fn try_lift(&mut self, op: &VerifiedOpG<L>) -> Option<EntryHash> {
         let prevs = self.resolve_prevs(op)?;
-        let entry = Entry::new(frame_signed(&op.signed()), Position(prevs));
+        let entry = Entry::new(frame_signed::<L>(&op.signed()), Position(prevs));
         let entry_hash = entry.hash();
         match self.dag.append(&entry) {
             AppendOutcome::Appended | AppendOutcome::Duplicate => {}
@@ -412,7 +403,7 @@ impl RoomStore {
         key: &SigningKey,
         topic: &str,
         ts_micros: u64,
-        op: WalkieOp,
+        op: L::Op,
     ) -> SignedOp {
         let author = AuthorId(*key.verifying_key().as_bytes());
         let head = self
@@ -421,8 +412,11 @@ impl RoomStore {
             .copied()
             .unwrap_or_else(LogHead::genesis);
         let observed = self.observed_frontier();
-        let (signed, _advanced) =
-            sign_op_for_topic_observing(key, &head, ts_micros, topic, observed, op);
+        // Byte-identical to walkie's `sign_op_for_topic_observing`: it built and
+        // signed exactly this envelope. Inlined so the store is generic over `L`.
+        let versioned =
+            VersionedOpG::<L>::current_for_topic(op, ts_micros, topic).observing(observed);
+        let (signed, _advanced) = sign_versioned_op(key, &head, versioned);
         signed
     }
 
@@ -434,55 +428,84 @@ impl RoomStore {
         key: &SigningKey,
         topic: &str,
         ts_micros: u64,
-        op: WalkieOp,
+        op: L::Op,
     ) -> SignedOp {
         let signed = self.prepare_commit(key, topic, ts_micros, op);
-        let verified = verify_signed_op(&signed).expect("a just-signed op verifies");
+        let verified = verify_signed_op_in::<L>(&signed).expect("a just-signed op verifies");
         self.ingest_verified(verified);
         signed
     }
 
-    /// Materialize the room read model from the current DAG.
+    /// Materialize the read model from the current DAG: `L::fold` over the causal
+    /// indexes packaged into a [`FoldCtx`] (tutti extraction Track-D step 2 — the
+    /// fold-over-[`OpLanguage`] seam layered on the M3 fold-over-reach). For
+    /// walkie this runs [`walkie_fold`]; other domains supply their own `fold`.
     ///
-    /// The causal semantics are exactly those the `with_*` folds document; the
-    /// only performance-relevant choice here is the ancestry backend. Where this
-    /// used to build a whole-DAG [`ReachIndex`] — materializing a per-node
-    /// ancestor `BTreeSet` (Θ(N²) time and RAM) on EVERY call — it now builds a
-    /// lazy [`Reach`] (O(N + E) `prevs` adjacency) that answers the same
-    /// `is_ancestor`/register queries by reverse walk, memoized per call. The
-    /// projected [`RoomView`] is bit-for-bit identical (a `#[cfg(test)]`
+    /// The ancestry backend is the cheap lazy [`Reach`] (O(N + E) `prevs`
+    /// adjacency, reverse-walk `is_ancestor`, memoized per call) — never the
+    /// whole-DAG [`ReachIndex`] ancestor closure. The projected view is bit-for-
+    /// bit identical to the pre-extraction projection (a `#[cfg(test)]`
     /// equivalence test pins `view()` against [`Self::view_reference`]).
-    pub fn view(&self) -> RoomView {
-        self.project(&Reach::new(&self.dag))
+    pub fn view(&self) -> L::View {
+        L::fold(&FoldCtx::new(self))
     }
 
-    /// The projection itself, generic over the ancestry backend. Both the
-    /// production [`Self::view`] (cheap [`Reach`]) and the reference
-    /// [`Self::view_reference`] (kernel [`ReachIndex`]) run this SAME code, so
-    /// the only thing that can differ between them is `is_ancestor`/`resolve`.
-    fn project<R: CausalPast>(&self, reach: &R) -> RoomView {
-        RoomView {
-            pitches: BTreeSet::new(),
-            pitch_authors: BTreeMap::new(),
-            pieces: BTreeMap::new(),
-            tuning: Some(TuningDefinition::twelve_tet()),
-            pieces_locked: false,
-            available_emojis: None,
-        }
-        .with_registers(self, reach)
-        .with_pitches(self, reach)
-        .with_pieces(self, reach)
-    }
-
-    /// The PRE-CHANGE projection: the identical fold driven by the kernel
-    /// [`ReachIndex`] and [`hhhs_core::register::resolve`]. Retained as the
-    /// reference oracle the equivalence tests assert `view()` equals for
-    /// thousands of random histories, so any drift in the cheap `Reach` backend
-    /// is caught directly against the kernel it replaced.
+    /// The PRE-CHANGE projection: the identical `L::fold`, but driven by the
+    /// kernel [`ReachIndex`] and [`hhhs_core::register::resolve`] instead of the
+    /// cheap [`Reach`]. Retained as the reference oracle the equivalence tests
+    /// assert `view()` equals for thousands of random histories, so any drift in
+    /// the cheap backend is caught directly against the kernel it replaced. Only
+    /// the [`CausalPast`] backend behind the [`FoldCtx`] differs.
     #[cfg(test)]
-    pub(crate) fn view_reference(&self) -> RoomView {
+    pub(crate) fn view_reference(&self) -> L::View {
         let snapshot = self.dag.snapshot();
-        self.project(&ReachIndex::new(&snapshot))
+        L::fold(&FoldCtx::with_reach(
+            self,
+            Box::new(ReachIndex::new(&snapshot)),
+        ))
+    }
+}
+
+/// M2 Merkle commitments (feature `merkle`), pinned to walkie's [`RoomView`].
+///
+/// `ops_root`/`prove_op` commit to the entry-hash identity set alone (already
+/// domain-agnostic), but they are kept BESIDE `state_root` — which folds walkie's
+/// view — so the whole M2 surface stays on `RoomStore` for now; hoisting them
+/// onto `Store<L>` (once `L::View: Canonical` supplies a generic `state_root`) is
+/// deferred with the rest of tutti-core to Track-D step 3. See
+/// [`crate::room::merkle`].
+#[cfg(feature = "merkle")]
+impl Store<WalkieLang> {
+    /// The additive `ops_root`: a canonical blake3-256 Merkle commitment to this
+    /// store's entry-hash identity set, computed over exactly the same
+    /// `entry_to_source.keys()` iterator [`Self::sync_root`] digests (so the two
+    /// can never skew). Strictly stronger than `sync_root`: root equality iff
+    /// entry-set equality, PLUS the proofs [`Self::prove_op`] emits. Beside RBSR,
+    /// never replacing it.
+    pub fn ops_root(&self) -> [u8; 32] {
+        crate::room::merkle::ops_root_of(self.entry_to_source.keys())
+    }
+
+    /// An inclusion (op present) or non-inclusion (op absent) proof for `entry`
+    /// against [`Self::ops_root`]. Verify standalone — no store, no crate state —
+    /// with [`radix_immutable::verify`]: `Some(&[])` demands inclusion (the `()`
+    /// leaf value is empty bytes), `None` demands non-inclusion.
+    ///
+    /// ```ignore
+    /// let root = store.ops_root();
+    /// let proof = store.prove_op(&entry);
+    /// assert!(radix_immutable::verify(&root, entry.as_bytes(), Some(&[]), &proof));
+    /// ```
+    pub fn prove_op(&self, entry: &EntryHash) -> radix_immutable::Proof {
+        crate::room::merkle::prove_op(self.entry_to_source.keys(), entry)
+    }
+
+    /// The additive `state_root`: a canonical blake3-256 Merkle commitment to the
+    /// projected [`RoomView`] (a pure function of the view). Delegates to
+    /// [`RoomView::state_root`] over the current [`Self::view`]. See
+    /// [`crate::room::merkle`] for the canonical leaf grammar.
+    pub fn state_root(&self) -> [u8; 32] {
+        self.view().state_root()
     }
 }
 
@@ -625,10 +648,86 @@ impl CausalPast for ReachIndex {
     }
 }
 
+/// The read-only causal indexes a domain [`OpLanguage::fold`] consumes (tutti
+/// extraction Track-D step 2): the decoded op set, the entry↔op-id map, and a
+/// causal-ancestry backend behind [`CausalPast`]. It packages exactly what the
+/// old `project()` handed its `with_*` builders — the decoded index plus a
+/// reach oracle — so a domain `fold` is one ordinary function over these, with
+/// no framework and no facet DSL (staging is just Rust control flow).
+///
+/// The backend is erased behind `dyn CausalPast` so the SAME `fold` runs on
+/// either ancestry backend: the cheap lazy [`Reach`] in production
+/// ([`FoldCtx::new`]) and the kernel [`ReachIndex`] in the `#[cfg(test)]`
+/// reference ([`Store::view_reference`] via [`FoldCtx::with_reach`]). The
+/// decoded/`entry_to_source` fields stay private; walkie's in-module fold reads
+/// them directly, and the generic combinator surface is [`FoldCtx::is_ancestor`]
+/// / [`FoldCtx::resolve`].
+pub struct FoldCtx<'a, L: OpLanguage> {
+    decoded: &'a BTreeMap<EntryHash, DecodedOp<L>>,
+    entry_to_source: &'a BTreeMap<EntryHash, OpId>,
+    reach: Box<dyn CausalPast + 'a>,
+}
+
+impl<'a, L: OpLanguage> FoldCtx<'a, L> {
+    /// The production fold context over `store`: the cheap lazy [`Reach`]
+    /// ancestry backend (O(N + E), memoized per call). This is what
+    /// [`Store::view`] builds.
+    pub fn new(store: &'a Store<L>) -> Self {
+        Self::with_reach(store, Box::new(Reach::new(&store.dag)))
+    }
+
+    /// A fold context over `store` with an explicit ancestry backend. Used by the
+    /// `#[cfg(test)]` reference projection to drive the SAME fold with the kernel
+    /// [`ReachIndex`] instead of the cheap [`Reach`].
+    fn with_reach(store: &'a Store<L>, reach: Box<dyn CausalPast + 'a>) -> Self {
+        Self {
+            decoded: &store.decoded,
+            entry_to_source: &store.entry_to_source,
+            reach,
+        }
+    }
+
+    /// Strict causal ancestry — the ONE reachability question the fold asks:
+    /// `true` iff `a` is strictly in the causal past of `b`. The content-keyed
+    /// add-wins and observed-remove folds are built on exactly this.
+    pub fn is_ancestor(&self, a: &EntryHash, b: &EntryHash) -> bool {
+        self.reach.is_ancestor(a, b)
+    }
+
+    /// The causal-maxima register winner over `candidates` (drop strict
+    /// ancestors, break remaining maxima by max raw-bytes [`EntryHash`]); see
+    /// [`CausalPast::resolve`]. `None` iff `candidates` is empty.
+    pub fn resolve(&self, candidates: &BTreeSet<EntryHash>) -> Option<EntryHash> {
+        self.reach.resolve(candidates)
+    }
+}
+
+/// Walkie's [`OpLanguage::fold`]: the register → add-wins → object composition
+/// that materializes a [`RoomView`] from the causal indexes in `ctx`. This is
+/// exactly the old `project()` body, re-homed beside [`RoomView`] and its
+/// `with_*` builders and reading from a [`FoldCtx`] instead of `(store, reach)`
+/// (tutti extraction Track-D step 2). The register fold runs first so the
+/// tuning-scoped set/object folds can filter by the resolved tuning (the staged
+/// fold — facets are not independent, and the API admits it). The projected view
+/// is bit-for-bit the pre-extraction one.
+pub(crate) fn walkie_fold(ctx: &FoldCtx<'_, WalkieLang>) -> RoomView {
+    RoomView {
+        pitches: BTreeSet::new(),
+        pitch_authors: BTreeMap::new(),
+        pieces: BTreeMap::new(),
+        tuning: Some(TuningDefinition::twelve_tet()),
+        pieces_locked: false,
+        available_emojis: None,
+    }
+    .with_registers(ctx)
+    .with_pitches(ctx)
+    .with_pieces(ctx)
+}
+
 impl RoomView {
     /// Pitches: content-keyed ADD-WINS. An add is live iff no same-key remove
     /// causally observed it (`is_ancestor(add, remove)`).
-    fn with_pitches<R: CausalPast>(mut self, store: &RoomStore, reach: &R) -> Self {
+    fn with_pitches(mut self, ctx: &FoldCtx<'_, WalkieLang>) -> Self {
         let Some(active_tuning) = self
             .tuning
             .as_ref()
@@ -638,7 +737,7 @@ impl RoomView {
         };
         let mut adds: BTreeMap<TunedDegree, Vec<EntryHash>> = BTreeMap::new();
         let mut removes: BTreeMap<TunedDegree, Vec<EntryHash>> = BTreeMap::new();
-        for (entry, decoded) in &store.decoded {
+        for (entry, decoded) in ctx.decoded {
             match &decoded.op {
                 WalkieOp::AddDegree { pitch } if pitch.validate(&active_tuning).is_ok() => {
                     adds.entry(*pitch).or_default().push(*entry)
@@ -655,9 +754,9 @@ impl RoomView {
             for add in add_entries {
                 let killed = key_removes
                     .iter()
-                    .any(|remove| reach.is_ancestor(add, remove));
+                    .any(|remove| ctx.is_ancestor(add, remove));
                 if !killed {
-                    authors.insert(store.decoded[add].author);
+                    authors.insert(ctx.decoded[add].author);
                 }
             }
             if !authors.is_empty() {
@@ -697,7 +796,7 @@ impl RoomView {
     ///   past; a move/remove *concurrent* with a lock (neither observed the other)
     ///   still applies — you cannot retroactively freeze an op you did not
     ///   causally precede. `PutPiece` is never suppressed.
-    fn with_pieces<R: CausalPast>(mut self, store: &RoomStore, reach: &R) -> Self {
+    fn with_pieces(mut self, ctx: &FoldCtx<'_, WalkieLang>) -> Self {
         let Some(active_tuning) = self
             .tuning
             .as_ref()
@@ -708,7 +807,7 @@ impl RoomView {
 
         // (put_entry, piece_id, owner, emoji, put_pitch)
         let mut puts: Vec<(EntryHash, OpId, AuthorId, String, TunedPeriodicPitch)> = Vec::new();
-        // (move_entry, target_piece) — pitch is read back from `store.decoded`.
+        // (move_entry, target_piece) — pitch is read back from `ctx.decoded`.
         let mut moves: Vec<(EntryHash, OpId)> = Vec::new();
         // (remove_entry, remove_op_id, target_piece)
         let mut removes: Vec<(EntryHash, OpId, OpId)> = Vec::new();
@@ -717,8 +816,8 @@ impl RoomView {
         // SetConfig writes that carry a `pieces_locked` value (the lock register).
         let mut lock_writes: BTreeSet<EntryHash> = BTreeSet::new();
 
-        for (entry, decoded) in &store.decoded {
-            let op_id = store.entry_to_source[entry];
+        for (entry, decoded) in ctx.decoded {
+            let op_id = ctx.entry_to_source[entry];
             match &decoded.op {
                 WalkieOp::PutPiece { emoji, pitch } if pitch.validate(&active_tuning).is_ok() => {
                     puts.push((*entry, op_id, decoded.author, emoji.clone(), *pitch))
@@ -745,11 +844,11 @@ impl RoomView {
             let observed: BTreeSet<EntryHash> = lock_writes
                 .iter()
                 .copied()
-                .filter(|write| reach.is_ancestor(write, op))
+                .filter(|write| ctx.is_ancestor(write, op))
                 .collect();
-            reach.resolve(&observed).is_some_and(|winner| {
+            ctx.resolve(&observed).is_some_and(|winner| {
                 matches!(
-                    &store.decoded[&winner].op,
+                    &ctx.decoded[&winner].op,
                     WalkieOp::SetConfig {
                         pieces_locked: Some(true),
                         ..
@@ -770,7 +869,7 @@ impl RoomView {
                     }
                     let overridden = unremoves.iter().any(|(un_entry, target_rem)| {
                         target_rem == rem_id
-                            && reach.is_ancestor(rem_entry, un_entry)
+                            && ctx.is_ancestor(rem_entry, un_entry)
                             && !locked_as_of(un_entry)
                     });
                     !overridden
@@ -783,7 +882,7 @@ impl RoomView {
             let survives = |add: &EntryHash| {
                 !effective_removes
                     .iter()
-                    .any(|rem| reach.is_ancestor(add, rem))
+                    .any(|rem| ctx.is_ancestor(add, rem))
             };
             let mut surviving: BTreeSet<EntryHash> = BTreeSet::new();
             if survives(put_entry) {
@@ -800,9 +899,9 @@ impl RoomView {
             }
 
             // Position = the register winner among the surviving adds' pitches.
-            let pitch = reach
+            let pitch = ctx
                 .resolve(&surviving)
-                .map(|winner| match &store.decoded[&winner].op {
+                .map(|winner| match &ctx.decoded[&winner].op {
                     WalkieOp::PutPiece { pitch, .. } | WalkieOp::MovePiece { pitch, .. } => *pitch,
                     _ => unreachable!("a surviving add is a PutPiece or MovePiece"),
                 })
@@ -823,11 +922,11 @@ impl RoomView {
 
     /// Tuning / config: cross-author registers resolved by causal maxima then
     /// max raw-bytes entry hash. Each config field is resolved independently.
-    fn with_registers<R: CausalPast>(mut self, store: &RoomStore, reach: &R) -> Self {
+    fn with_registers(mut self, ctx: &FoldCtx<'_, WalkieLang>) -> Self {
         let mut tuning_writes: BTreeSet<EntryHash> = BTreeSet::new();
         let mut locked_writes: BTreeSet<EntryHash> = BTreeSet::new();
         let mut emoji_writes: BTreeSet<EntryHash> = BTreeSet::new();
-        for (entry, decoded) in &store.decoded {
+        for (entry, decoded) in ctx.decoded {
             match &decoded.op {
                 WalkieOp::SetTuning { .. } => {
                     tuning_writes.insert(*entry);
@@ -847,16 +946,16 @@ impl RoomView {
             }
         }
 
-        self.tuning = reach
+        self.tuning = ctx
             .resolve(&tuning_writes)
-            .map(|winner| match &store.decoded[&winner].op {
+            .map(|winner| match &ctx.decoded[&winner].op {
                 WalkieOp::SetTuning { definition } => definition.clone(),
                 _ => unreachable!("tuning candidate is a SetTuning"),
             })
             .or_else(|| Some(TuningDefinition::twelve_tet()));
-        self.pieces_locked = reach
+        self.pieces_locked = ctx
             .resolve(&locked_writes)
-            .map(|winner| match &store.decoded[&winner].op {
+            .map(|winner| match &ctx.decoded[&winner].op {
                 WalkieOp::SetConfig {
                     pieces_locked: Some(locked),
                     ..
@@ -864,8 +963,8 @@ impl RoomView {
                 _ => unreachable!("locked candidate carries pieces_locked"),
             })
             .unwrap_or(false);
-        self.available_emojis = reach.resolve(&emoji_writes).map(|winner| match &store
-            .decoded[&winner]
+        self.available_emojis = ctx.resolve(&emoji_writes).map(|winner| match &ctx.decoded
+            [&winner]
             .op
         {
             WalkieOp::SetConfig {
@@ -921,7 +1020,9 @@ mod tests {
     use super::WalkieOp::*;
     use super::*;
 
-    use super::super::ops::{signing_key_from_seed, verify_signed_op_for_topic};
+    use super::super::ops::{
+        VerifiedOp, signing_key_from_seed, verify_signed_op, verify_signed_op_for_topic,
+    };
     use super::super::test_support::{
         Peer, SEED_A, SEED_B, SEED_C, TOPIC, entryhash_set, oracle, tet_definition, tet_degree,
         tet_pitch, tuning_with_step,

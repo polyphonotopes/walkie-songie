@@ -40,6 +40,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::room::store::FoldCtx;
 use crate::tuning::{MAX_SCALE_DEGREES, TunedDegree, TunedPeriodicPitch, TuningDefinition};
 
 /// Re-exported so the rest of the crate names the key types through `room::ops` and
@@ -91,10 +92,13 @@ pub const MAX_SIGNED_OP_WIRE_BYTES: usize =
 /// name is re-exported as an alias fixed at `WalkieLang`, so no call site
 /// outside this module moves.
 ///
-/// The trait carries ONLY the members the envelope needs. The read model
-/// (`type View`), the deterministic fold, and its `FoldCtx` are deliberately
-/// deferred to **step 2** (store/fold genericization) — they do not belong to
-/// the envelope and are not added here.
+/// Step 1 carried only the envelope members; **step 2** (store/fold
+/// genericization, tutti extraction Track-D) adds the read model
+/// ([`OpLanguage::View`]) and the deterministic fold ([`OpLanguage::fold`]) over
+/// the causal indexes packaged by [`FoldCtx`] (defined in [`crate::room::store`]
+/// beside [`Store`](crate::room::store::Store)). Walkie's fold is
+/// [`crate::room::store::walkie_fold`]; the view is bit-for-bit the pre-
+/// extraction projection.
 ///
 /// Every associated const is wired to walkie's CURRENT literal value, so the
 /// serialized signed bytes and the lifted entry hashes are byte-for-byte
@@ -111,11 +115,10 @@ pub trait OpLanguage: Sized + 'static {
     /// (walkie: [`OP_SCHEMA_VERSION`]).
     const SCHEMA_VERSION: u16;
     /// Framing tag prefixed to the verbatim signed bytes when they become a
-    /// kernel entry payload (walkie: `b"walkie.hhhs.signed-op/1"`). Declared
-    /// here for the step-2 store genericization; `room::store` still owns its
-    /// private copy until then, so this const is currently unread by the
-    /// envelope — but it MUST equal the store's literal for step 2 to be
-    /// wire-invisible.
+    /// kernel entry payload (walkie: `b"walkie.hhhs.signed-op/1"`). Consumed by
+    /// [`Store`](crate::room::store::Store)'s lift framing (tutti extraction
+    /// Track-D step 2), so it fully determines the lifted entry hash — the
+    /// golden entry-hash vector pins that it is byte-for-byte walkie's literal.
     const ENTRY_FRAME_MAGIC: &'static [u8];
     /// Generation marker on the length-delimited signed-op wire frame
     /// (walkie: [`SIGNED_OP_WIRE_MAGIC`]).
@@ -127,6 +130,18 @@ pub trait OpLanguage: Sized + 'static {
     /// Domain wire validation — bounds and well-formedness, run once at ingress
     /// inside [`verify_signed_op_in`].
     fn validate_wire(op: &Self::Op) -> Result<(), String>;
+
+    /// The materialized read model this language folds to (tutti extraction
+    /// Track-D step 2). The `Canonical` bound — the byte encoding `state_root`
+    /// commits to — is a later step and deliberately omitted here.
+    type View: Default + Clone + PartialEq;
+
+    /// THE deterministic fold: a pure function of the decoded op-set and its
+    /// causal indexes ([`FoldCtx`]). Two peers with equal verified op-sets MUST
+    /// return equal views (contract property (b)). Walkie composes it from
+    /// register → add-wins → object folds; see
+    /// [`crate::room::store::walkie_fold`].
+    fn fold(ctx: &FoldCtx<'_, Self>) -> Self::View;
 }
 
 /// A 32-byte author identity — the Ed25519 verifying-key bytes. Doubles as the peer's
@@ -202,6 +217,9 @@ pub struct WalkieLang;
 
 impl OpLanguage for WalkieLang {
     type Op = WalkieOp;
+    /// The room read model. Materialization is walkie-facing and lives beside
+    /// it in [`crate::room::store`]; `fold` delegates there.
+    type View = crate::room::store::RoomView;
 
     const SCHEMA_VERSION: u16 = OP_SCHEMA_VERSION;
     const ENTRY_FRAME_MAGIC: &'static [u8] = b"walkie.hhhs.signed-op/1";
@@ -255,6 +273,14 @@ impl OpLanguage for WalkieLang {
             )),
             _ => Ok(()),
         }
+    }
+
+    /// Walkie's fold: the register → add-wins → object composition that
+    /// materializes a [`RoomView`](crate::room::store::RoomView). Kept beside the
+    /// view and its `with_*` builders in [`crate::room::store`]; this is a one-
+    /// line delegation so the domain semantics stay in one place.
+    fn fold(ctx: &FoldCtx<'_, Self>) -> Self::View {
+        crate::room::store::walkie_fold(ctx)
     }
 }
 
