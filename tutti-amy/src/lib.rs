@@ -21,6 +21,10 @@ use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// The REAL music domain over tutti-core + the partition→rejoin scenario and AMY
+/// driver (docs/research/tutti-amy-esp32-leaf.md, experiment 1).
+pub mod music;
+
 mod ffi {
     use super::{c_char, c_int};
     extern "C" {
@@ -125,6 +129,41 @@ pub fn rms(block: &[i16]) -> f64 {
 /// Peak absolute sample of a block.
 pub fn peak(block: &[i16]) -> i16 {
     block.iter().map(|&s| s.saturating_abs()).max().unwrap_or(0)
+}
+
+/// Write interleaved i16 samples as a 16-bit PCM WAV (no external crate). Shared by
+/// the render-proof bin and the partition→rejoin acceptance test.
+pub fn write_wav(
+    path: &str,
+    samples: &[i16],
+    sample_rate: u32,
+    channels: u16,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let bits_per_sample: u16 = 16;
+    let byte_rate = sample_rate * channels as u32 * (bits_per_sample as u32 / 8);
+    let block_align = channels * (bits_per_sample / 8);
+    let data_bytes = (samples.len() * 2) as u32;
+
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+    f.write_all(b"RIFF")?;
+    f.write_all(&(36 + data_bytes).to_le_bytes())?;
+    f.write_all(b"WAVE")?;
+    f.write_all(b"fmt ")?;
+    f.write_all(&16u32.to_le_bytes())?; // PCM fmt chunk size
+    f.write_all(&1u16.to_le_bytes())?; // audio format = PCM
+    f.write_all(&channels.to_le_bytes())?;
+    f.write_all(&sample_rate.to_le_bytes())?;
+    f.write_all(&byte_rate.to_le_bytes())?;
+    f.write_all(&block_align.to_le_bytes())?;
+    f.write_all(&bits_per_sample.to_le_bytes())?;
+    f.write_all(b"data")?;
+    f.write_all(&data_bytes.to_le_bytes())?;
+    for &s in samples {
+        f.write_all(&s.to_le_bytes())?;
+    }
+    f.flush()
 }
 
 // ---------------------------------------------------------------------------
