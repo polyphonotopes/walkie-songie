@@ -75,7 +75,7 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
     MessageEvent, RtcConfiguration, RtcDataChannel, RtcDataChannelEvent, RtcDataChannelInit,
     RtcDataChannelState, RtcDataChannelType, RtcIceCandidateInit, RtcPeerConnection,
-    RtcPeerConnectionIceEvent, RtcSdpType, RtcSessionDescriptionInit,
+    RtcPeerConnectionIceEvent, RtcSdpType, RtcSessionDescriptionInit, RtcSignalingState,
 };
 
 /// Our custom-transport id. The bytes spell `WebRTC` (`0x57 65 62 52 54 43`); it is
@@ -722,6 +722,20 @@ async fn handle_signal(
                 tracing::warn!(target: "walkie::webrtc", "answer from {} with no link", short(&from));
                 return;
             };
+            // Only apply an answer while we are the offerer awaiting one. A
+            // duplicate or late answer (e.g. two same-identity browser tabs crossing
+            // signaling over the relay) would otherwise hit setRemoteDescription on
+            // an already-`stable` PC and throw InvalidStateError. Perfect-negotiation
+            // guard: ignore any answer outside `have-local-offer`.
+            if pc.signaling_state() != RtcSignalingState::HaveLocalOffer {
+                tracing::debug!(
+                    target: "walkie::webrtc",
+                    "ignoring answer from {} in signaling state {:?} (duplicate/late)",
+                    short(&from),
+                    pc.signaling_state()
+                );
+                return;
+            }
             let desc = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
             desc.set_sdp(&sdp);
             if let Err(error) = JsFuture::from(pc.set_remote_description(&desc)).await {

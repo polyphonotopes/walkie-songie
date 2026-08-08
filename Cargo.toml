@@ -261,7 +261,7 @@ web-sys = { version = "0.3", optional = true, features = [
     "RtcPeerConnection", "RtcPeerConnectionState", "RtcPeerConnectionIceEvent",
     "RtcDataChannel", "RtcDataChannelInit", "RtcDataChannelState", "RtcDataChannelType", "RtcDataChannelEvent",
     "RtcConfiguration", "RtcSessionDescription", "RtcSessionDescriptionInit", "RtcSdpType",
-    "RtcIceCandidate", "RtcIceCandidateInit",
+    "RtcIceCandidate", "RtcIceCandidateInit", "RtcSignalingState",
     "MidiAccess", "MidiInput", "MidiInputMap", "MidiOutput", "MidiOutputMap", "MidiMessageEvent", "MidiOptions",
     "KeyboardEvent", "FocusEvent", "PointerEvent", "DomRect",
     "MutationObserver", "MutationObserverInit", "MutationRecord",

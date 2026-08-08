@@ -106,11 +106,40 @@ fn browser_capabilities() -> Capabilities {
     }
 }
 
+/// Testing/demo affordance: `?peer=<name>` in the URL derives a distinct identity
+/// seed (blake3 of the name), so several browser contexts on one machine act as
+/// separate peers instead of sharing the persisted IndexedDB identity (which
+/// collides on a single endpoint id — same-id tabs cross signaling). `None` when
+/// the param is absent/empty.
+fn peer_override_seed() -> Option<[u8; 32]> {
+    let search = web_sys::window()?.location().search().ok()?;
+    let query = search.strip_prefix('?').unwrap_or(&search);
+    for pair in query.split('&') {
+        if let Some(value) = pair.strip_prefix("peer=") {
+            if !value.is_empty() {
+                return Some(*blake3::hash(value.as_bytes()).as_bytes());
+            }
+        }
+    }
+    None
+}
+
 /// Stand up the in-page host: load (or mint) the identity seed from IndexedDB,
 /// then register `on_event` as the UI's ordered event subscriber. The first
 /// envelope it receives is the initial (empty) snapshot.
 pub async fn init(on_event: impl Fn(AppEventEnvelope) + 'static) -> Result<(), String> {
-    let seed = super::storage::get_or_create_identity_seed().await;
+    // `?peer=<name>` gives this context a DISTINCT identity so multiple browser
+    // contexts on one machine are separate peers; otherwise the persisted IndexedDB
+    // identity collides (same endpoint id, crossed signaling). No param => persistent.
+    let seed = match peer_override_seed() {
+        Some(seed) => {
+            web_sys::console::log_1(
+                &"identity: ?peer= override (distinct per-context, not persisted)".into(),
+            );
+            seed
+        }
+        None => super::storage::get_or_create_identity_seed().await,
+    };
     let identity = WalkieIdentity::from_seed(seed);
     let host = Rc::new(BrowserHost {
         state: Rc::new(RefCell::new(HostState {
