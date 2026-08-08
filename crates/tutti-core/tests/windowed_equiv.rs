@@ -1165,3 +1165,178 @@ fn compact_twice_is_idempotent_and_conservative() {
         first.discarded, second.discarded
     );
 }
+
+// ===========================================================================
+// M3.2 — the memory-bound gate: the packed ancestry summary is O(W+|R|²), NOT O(N)/O(N²).
+// (`windowed-store-design.md` §3.2 cut masks + §3.3 in-window bitset + §3.4 residue reach
+// matrix.)
+//
+// M3.1 answered `is_ancestor` across the cut from an EXACT-but-UNBOUNDED summary: a full
+// strict-ancestor SET per lifted op — Θ(N²), the very ReachIndex cost windowing exists to
+// avoid. M3.2 replaces it with the packed bitset closure over the retained set alone. This
+// test proves the reduction is real: at a FIXED window with BOUNDED residue, the packed
+// summary's size does NOT grow with N, while the M3.1 exact-`anc` baseline it replaces
+// grows quadratically. Without this assertion there is no M3.2 deliverable.
+// ===========================================================================
+
+/// A **bounded-residue** history: only add-wins (A) and full-horizon registers (R) over a
+/// SMALL key/slot space, multi-author, with laggard horizons — and deliberately NO
+/// pieces/locks (which are retained wholesale, §2.5-P/R′, and would let the residue grow
+/// with N, §8.2). So the residue `R` (per-key-per-author surviving-add maxima + per-slot
+/// register maxima) is bounded by ≈ keys×authors + slots×authors, INDEPENDENT of N — the
+/// precondition for the packed summary to be flat in N (the M3.2 memory-bound claim). Each
+/// author's ops still chain by backlink, so laggards' stale `observed` reference early ops
+/// that get discarded, exercising the courier-deferred discarded-reach path.
+fn build_bounded_history(seed: u64, authors: usize, steps: usize) -> Vec<SignedOp> {
+    const KEYS: usize = 4;
+    const SLOTS: usize = 3;
+    let mut rng = Rng::new(seed ^ 0xB0DE_5EED);
+    let mut peers: Vec<Author> = (0..authors).map(|i| Author::new((i + 1) as u8)).collect();
+    let mut out: Vec<SignedOp> = Vec::new();
+    let mut op_hashes: Vec<[u8; 32]> = Vec::new();
+
+    for step in 0..steps {
+        let author = rng.upto(authors);
+        let ts = TS_BASE + step as u64;
+
+        let laggard = rng.pct(25);
+        let mut observed: Vec<[u8; 32]> = Vec::new();
+        if !op_hashes.is_empty() {
+            let (lo, hi) = if laggard {
+                (0, (op_hashes.len() / 3).max(1))
+            } else {
+                (op_hashes.len().saturating_sub(6), op_hashes.len())
+            };
+            for h in &op_hashes[lo..hi] {
+                if observed.len() >= 4 {
+                    break;
+                }
+                if rng.pct(45) {
+                    observed.push(*h);
+                }
+            }
+        }
+
+        let op = match rng.upto(6) {
+            0..=2 => WinOp::Add { key: rng.upto(KEYS) as u16 },
+            3 => WinOp::Rem { key: rng.upto(KEYS) as u16 },
+            _ => WinOp::SetReg { slot: rng.upto(SLOTS) as u8, val: rng.upto(1000) as u32 },
+        };
+        let (signed, id) = peers[author].sign(ts, observed, op);
+        op_hashes.push(id);
+        out.push(signed);
+    }
+    out
+}
+
+/// **THE M3.2 gate.** At a FIXED window with bounded residue, grow N 8× and assert the
+/// packed ancestry summary's size does NOT grow — O(W+|R|²), not O(N)/O(N²). Cross-check
+/// that the bounded packing is still EXACT (folds identically to the full store, and its
+/// `is_ancestor` matches the kernel `ReachIndex` over full history on every retained pair),
+/// then compare its byte size against M3.1's exact-`anc` baseline (Σ|strict ancestors| over
+/// all N ops — what the replaced `BTreeMap<EntryHash, BTreeSet<EntryHash>>` stored: Θ(N²)).
+#[test]
+fn packed_summary_is_bounded_independent_of_n() {
+    let window = 24usize;
+    // columns per N: (N, summary_entries, summary_bytes, courier_gap, m31_anc_pairs)
+    let mut table: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
+
+    for &steps in &[80usize, 160, 320, 640] {
+        let ops = build_bounded_history(0x5233_A2C0, 3, steps);
+        let n = ops.len();
+
+        // The compacting windowed leaf at a FIXED small window.
+        let mut w = WindowedStore::with_window(window);
+        for s in &ops {
+            w.ingest_verified(verified(s));
+        }
+        // Final explicit cut so the measurement is the stable §3.4 residue reach matrix
+        // (window empty): the cleanest bounded-summary snapshot.
+        w.compact();
+
+        // The full store — correctness oracle + the M3.1 Θ(N²) baseline.
+        let full = ingest_full(&ops);
+
+        // The bounded packing must still be EXACT, not merely small.
+        assert_eq!(
+            w.view(),
+            full.view(),
+            "N={n}: bounded packed summary must fold identically to the full store"
+        );
+        assert_eq!(full.view(), full.view_reference(), "N={n}: kernel oracle");
+        assert_compacted_reach_equiv(&w, &full, &format!("N={n} bounded packing"));
+        assert!(
+            w.total_discarded() > 0,
+            "N={n}: compaction must actually discard (else nothing is bounded)"
+        );
+
+        // M3.1 baseline: what the replaced exact `anc` stored = Σ over all N ops of
+        // |strict ancestors| (a full EntryHash SET per lifted op) — Θ(N²).
+        let kernel = ReachIndex::new(&full.dag().snapshot());
+        let hashes: Vec<EntryHash> = full.entry_hashes().into_iter().collect();
+        let mut m31_pairs = 0usize;
+        for b in &hashes {
+            for a in &hashes {
+                if a != b && ReachIndex::is_ancestor(&kernel, a, b) {
+                    m31_pairs += 1;
+                }
+            }
+        }
+
+        table.push((
+            n,
+            w.packed_summary_entries(),
+            w.packed_summary_bytes(),
+            w.courier_gap_entries(),
+            m31_pairs,
+        ));
+    }
+
+    let first = *table.first().unwrap();
+    let last = *table.last().unwrap();
+
+    // THE M3.2 assertion: the packed summary proper is ~FLAT in N. N grew 8× (80 → 640);
+    // at a fixed window + bounded residue the retained matrix is O((W+|R|)²), so its size
+    // must NOT track N.
+    assert!(
+        last.2 <= first.2 * 2,
+        "packed summary bytes must be ~flat in N (O(W+|R|²), NOT O(N)): {table:?}"
+    );
+    assert!(
+        last.1 <= first.1 * 2,
+        "packed summary entry-count must be ~flat in N: {table:?}"
+    );
+
+    // The M3.1 baseline it replaces DID grow super-linearly with N.
+    assert!(
+        last.4 >= first.4 * 4,
+        "the M3.1 exact-`anc` baseline (Θ(N²)) must grow with N: {table:?}"
+    );
+
+    // Concretely, at the largest N the replaced M3.1 summary dwarfs M3.2's packed one.
+    let m31_bytes_last = last.4 * std::mem::size_of::<EntryHash>();
+    assert!(
+        m31_bytes_last > last.2 * 8,
+        "M3.2 packed summary must be far smaller than M3.1's exact anc at large N: \
+         M3.1 ≈ {m31_bytes_last} B vs M3.2 {} B",
+        last.2
+    );
+
+    println!("PASS packed_summary_is_bounded — M3.2 memory bound (§3.2 cut-contact / §3.3 in-window / §3.4 residue matrix):");
+    println!(
+        "   N   | M3.2 summary rows | M3.2 summary bytes | courier gap (discarded rows, O(N)) | M3.1 anc pairs Θ(N²) | M3.1 anc bytes"
+    );
+    for (n, ent, bytes, gap, pairs) in &table {
+        println!(
+            "  {n:<5}| {ent:<17} | {bytes:<18} | {gap:<34} | {pairs:<20} | {}",
+            pairs * std::mem::size_of::<EntryHash>()
+        );
+    }
+    println!(
+        "  => M3.2 packed summary FLAT in N ({}B @ N={} -> {}B @ N={}, {} rows -> {} rows) while N grew {}x; \
+         M3.1 exact `anc` grew {}x ({} -> {} ancestor-pairs). Headline: Θ(N²) -> O(W+|R|²).",
+        first.2, first.0, last.2, last.0, first.1, last.1,
+        last.0 / first.0.max(1),
+        last.4 / first.4.max(1), first.4, last.4
+    );
+}

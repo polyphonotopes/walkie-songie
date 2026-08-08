@@ -38,15 +38,24 @@
 //! not complete but *is* answerable; only an M3.0 window that hard-truncated still
 //! refuses.
 //!
-//! **Scope (§2.5, honestly).** M3.1 compacts the **monotone** domains — add-wins sets
-//! (survivor per-author maxima) and full-horizon causal-maxima registers (R). It does
-//! **not** compact the non-monotone piece/resurrection subgraph (`Undel` makes kills
-//! flip; §2.5-P) or a sub-horizon-read register (the R′ hazard, §2.5-R′); those are
-//! **retained wholesale** — conservative retention is always sound ("when in doubt,
-//! retain"). What M3.1 compacts is the fold's **decoded** input; the frozen ancestry
-//! summary is kept exact for every lifted op (so any shuffled reference to a discarded
-//! prev still lifts and folds with no courier), leaving its reduction to the bounded
-//! cut-mask packing + courier deep-laggard admission (§3.2-3.4, §4.5) to M3.2.
+//! **Scope (§2.5, honestly).** Compaction handles the **monotone** domains — add-wins
+//! sets (survivor per-author maxima) and full-horizon causal-maxima registers (R). It
+//! does **not** compact the non-monotone piece/resurrection subgraph (`Undel` makes
+//! kills flip; §2.5-P) or a sub-horizon-read register (the R′ hazard, §2.5-R′); those
+//! are **retained wholesale** — conservative retention is always sound ("when in doubt,
+//! retain").
+//!
+//! **M3.2 — bounded ancestry packing** ([`PackedSummary`]). M3.1 answered `is_ancestor`
+//! across the cut from an exact-but-**unbounded** summary: a full strict-ancestor *set*
+//! per lifted op (Θ(N²) — the very cost windowing exists to avoid). M3.2 replaces it
+//! with the design's §3.2 cut-contact / §3.3 in-window bitset / §3.4 residue reach
+//! matrix, unified into **one dense retained-ancestor [`BitRow`] closure**: size
+//! `O((|R|+|window|)²)` bits — **independent of total history N**, so the windowed
+//! store's *memory* is now bounded to the leaf budget (§5), not just its fold input.
+//! The one residual (an honest, deferred `O(N)` — far below M3.1's Θ(N²)) is
+//! [`PackedSummary::discarded_reach`]: a bounded row per discarded op so a future
+//! laggard referencing one still folds with **no courier**; deep-laggard courier
+//! admission (§4.5) — deferred — is what would drop it.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -73,37 +82,90 @@ use crate::store::{
 /// W=256, affordable where Θ(W²) hashes was not; the ancestor closure of the whole
 /// window is one W×W bit matrix, `is_ancestor` is one bit test, and each lift is one
 /// row-OR (`row(op) = OR of row(prev) | bit(prev)`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct BitRow {
-    /// `ceil(width_bits / 64)` little-endian words. Fixed at the window cap so every
-    /// row is OR-compatible.
-    words: Box<[u64]>,
+    /// `ceil(width_bits / 64)` little-endian words. The M3.0 window path fixes the
+    /// width at the cap (`zeroed(cap)`); the M3.2 packed summary grows a row on demand
+    /// as the dense retained index grows between compactions, so `set`/`or_in` extend
+    /// the word vector rather than panic.
+    words: Vec<u64>,
 }
 
 impl BitRow {
     /// A zeroed row wide enough for `width_bits` dense indices.
     fn zeroed(width_bits: usize) -> Self {
         Self {
-            words: vec![0u64; width_bits.div_ceil(64)].into_boxed_slice(),
+            words: vec![0u64; width_bits.div_ceil(64)],
         }
     }
 
-    /// Set bit `i` (dense window index `i` is an ancestor).
+    /// Grow so bit `i` is addressable.
+    fn ensure_bit(&mut self, i: usize) {
+        let word = i / 64;
+        if word >= self.words.len() {
+            self.words.resize(word + 1, 0);
+        }
+    }
+
+    /// Set bit `i` (dense index `i` is a strict ancestor), growing on demand.
     fn set(&mut self, i: usize) {
+        self.ensure_bit(i);
         self.words[i / 64] |= 1u64 << (i % 64);
     }
 
-    /// Test bit `i`.
+    /// Test bit `i` (`false` past the row's current width).
     fn get(&self, i: usize) -> bool {
-        (self.words[i / 64] >> (i % 64)) & 1 == 1
+        let word = i / 64;
+        word < self.words.len() && (self.words[word] >> (i % 64)) & 1 == 1
     }
 
-    /// Union `other` into `self` (both rows share the cap-derived width).
+    /// Union `other` into `self`, growing `self` to cover `other`'s width.
     fn or_in(&mut self, other: &BitRow) {
+        if other.words.len() > self.words.len() {
+            self.words.resize(other.words.len(), 0);
+        }
         for (dst, src) in self.words.iter_mut().zip(other.words.iter()) {
             *dst |= *src;
         }
     }
+
+    /// Visit every set bit's dense index in ascending order.
+    fn for_each_set_bit(&self, mut f: impl FnMut(usize)) {
+        for (wi, &word) in self.words.iter().enumerate() {
+            let mut w = word;
+            while w != 0 {
+                let bit = w.trailing_zeros() as usize;
+                f(wi * 64 + bit);
+                w &= w - 1;
+            }
+        }
+    }
+
+    /// Backing-store size in bytes (the packed-summary memory-bound measurement).
+    #[cfg(any(test, feature = "test-support"))]
+    fn byte_len(&self) -> usize {
+        self.words.len() * std::mem::size_of::<u64>()
+    }
+}
+
+/// Remap `old` (a strict-ancestor bitset over the *old* dense index) onto a fresh
+/// dense index, keeping only bits whose entry survives into `new_index`. This is the
+/// index-reclaiming step that keeps the §3.4 residue matrix / §3.2 contact rows
+/// `O(|R|)`-wide after a compaction discards ops (`windowed-store-design.md`
+/// §3.2/§3.4). `old_order[i]` is the entry hash at old dense index `i`.
+fn remap_row(
+    old_order: &[EntryHash],
+    new_index: &BTreeMap<EntryHash, usize>,
+    old: &BitRow,
+    width: usize,
+) -> BitRow {
+    let mut r = BitRow::zeroed(width);
+    old.for_each_set_bit(|oi| {
+        if let Some(&ni) = new_index.get(&old_order[oi]) {
+            r.set(ni);
+        }
+    });
+    r
 }
 
 // ===========================================================================
@@ -123,16 +185,17 @@ impl BitRow {
 ///   index-compressed closure of a *complete* window. Built by
 ///   [`WindowedDag::windowed_reach`]; a truncated window never reaches it (the M3.0
 ///   fence refuses first).
-/// - **M3.1 projected closure** ([`ReachBackend::Closure`], §3.2/§3.4 unified) — the
-///   frozen ancestry summary a compacted [`WindowedStore`] carries across the cut:
-///   `anc[b]` is the strict causal ancestors of `b` (over full history at freeze
-///   time) intersected with the retained set, so `is_ancestor(a, b) =
-///   anc[b].contains(a)`. Exact across the cut **by construction** — frozen while
-///   full history was present, extended for window ops only through retained prevs,
-///   and pruned on discard in a way that preserves transitive paths (§2.6 corollary
-///   i). This is the residue reach matrix (§3.4) + cut masks (§3.2) in one
-///   `BTreeSet`-of-hashes shape; the 8 B/op bitset packing of §3.3-3.4 is the
-///   RAM-optimal encoding (M3.2/M4).
+/// - **M3.2 packed summary** ([`ReachBackend::Packed`], §3.2/§3.3/§3.4 unified) — the
+///   bounded frozen ancestry summary a compacted [`WindowedStore`] carries across the
+///   cut (see [`PackedSummary`]). Every retained op (residue *and* window) has a dense
+///   index and a strict-retained-ancestor [`BitRow`] over that index; `is_ancestor(a,
+///   b) = reach[index[b]].get(index[a])`. One dense bitset closure unifies the three
+///   query classes the design separates — window×window (§3.3), residue×residue (§3.4
+///   residue reach matrix), and residue×window (§3.2 cut-contact sets, encoded as full
+///   residue-ancestor bitsets rather than first-contacts-plus-`F_C`-masks: a valid,
+///   simpler bounded encoding of the same boundary lemma). Size is
+///   `O((W + |R|)²)` bits — **independent of total history N**, the M3.2 deliverable
+///   (M3.1 kept a full ancestor set per lifted op: Θ(N²)).
 pub struct WindowedReach {
     backend: ReachBackend,
 }
@@ -145,52 +208,62 @@ enum ReachBackend {
         /// `rows[i]` = strict, present-only ancestor set of dense index `i`.
         rows: Vec<BitRow>,
     },
-    /// §3.2/§3.4 — the projected strict-ancestor closure over the retained set.
-    Closure {
-        anc: BTreeMap<EntryHash, BTreeSet<EntryHash>>,
+    /// §3.2/§3.3/§3.4 — the packed strict-ancestor closure over the retained set.
+    Packed {
+        /// retained entry → dense retained index; an entry absent here answers `false`.
+        index: BTreeMap<EntryHash, usize>,
+        /// `reach[i]` = strict retained ancestors of retained index `i`.
+        reach: Vec<BitRow>,
     },
 }
 
 impl WindowedReach {
-    /// The §3.2/§3.4 projected-closure backend from an owned ancestry summary — the
-    /// oracle a compacted store answers `is_ancestor` with (design §3.5). Surfaced to
-    /// callers via [`WindowedStore::windowed_reach`], so the §6.3 gate can assert
-    /// `WindowedReach::is_ancestor ≡ ReachIndex::is_ancestor` on the full store for
-    /// every retained pair.
-    fn from_closure(anc: BTreeMap<EntryHash, BTreeSet<EntryHash>>) -> Self {
+    /// The §3.2/§3.3/§3.4 packed-summary backend from an owned snapshot of the
+    /// retained-op reach matrix — the oracle a compacted store answers `is_ancestor`
+    /// with (design §3.5). Surfaced to callers via [`WindowedStore::windowed_reach`],
+    /// so the §6.3 gate can assert `WindowedReach::is_ancestor ≡ ReachIndex::is_ancestor`
+    /// on the full store for every retained pair.
+    fn from_packed(index: BTreeMap<EntryHash, usize>, reach: Vec<BitRow>) -> Self {
         Self {
-            backend: ReachBackend::Closure { anc },
+            backend: ReachBackend::Packed { index, reach },
         }
     }
 }
 
 impl CausalPast for WindowedReach {
     /// `true` iff `a` is a strict transitive `prevs`-ancestor of `b`. Strict by
-    /// construction (a row/closure never carries its own bit) and present-only (an
-    /// unknown endpoint → `false`), so it agrees with `ReachIndex::is_ancestor` for
-    /// every retained pair — the property the §6.3 gate asserts directly.
+    /// construction (a row never carries its own bit) and present-only (an unknown
+    /// endpoint → `false`), so it agrees with `ReachIndex::is_ancestor` for every
+    /// retained pair — the property the §6.3 gate asserts directly.
     fn is_ancestor(&self, a: &EntryHash, b: &EntryHash) -> bool {
         match &self.backend {
             ReachBackend::Window { index_of, rows } => match (index_of.get(a), index_of.get(b)) {
                 (Some(&ai), Some(&bi)) => rows[bi].get(ai),
                 _ => false,
             },
-            ReachBackend::Closure { anc } => anc.get(b).is_some_and(|set| set.contains(a)),
+            ReachBackend::Packed { index, reach } => match (index.get(a), index.get(b)) {
+                (Some(&ai), Some(&bi)) => reach[bi].get(ai),
+                _ => false,
+            },
         }
     }
 }
 
-/// The internal borrowing form of the §3.2/§3.4 projected-closure oracle: it reads
-/// the store's live ancestry summary in place so `view()`/`compact()` never clone the
-/// (potentially large) closure per call. Identical `is_ancestor` to
-/// [`ReachBackend::Closure`].
-struct ClosureReach<'a> {
-    anc: &'a BTreeMap<EntryHash, BTreeSet<EntryHash>>,
+/// The internal borrowing form of the §3.2/§3.3/§3.4 packed-summary oracle: it reads
+/// the store's live reach matrix in place so `view()`/`compact()`/`retain()` never
+/// clone the (bounded) matrix per call. Identical `is_ancestor` to
+/// [`ReachBackend::Packed`].
+struct PackedReach<'a> {
+    index: &'a BTreeMap<EntryHash, usize>,
+    reach: &'a [BitRow],
 }
 
-impl CausalPast for ClosureReach<'_> {
+impl CausalPast for PackedReach<'_> {
     fn is_ancestor(&self, a: &EntryHash, b: &EntryHash) -> bool {
-        self.anc.get(b).is_some_and(|set| set.contains(a))
+        match (self.index.get(a), self.index.get(b)) {
+            (Some(&ai), Some(&bi)) => self.reach[bi].get(ai),
+            _ => false,
+        }
     }
 }
 
@@ -524,7 +597,142 @@ fn topo_of(entries: &BTreeMap<EntryHash, Entry>) -> Vec<Entry> {
 }
 
 // ===========================================================================
-// §2.2 — the checkpoint: compacted state + frozen ancestry summary.
+// §3.2/§3.3/§3.4 — the packed ancestry summary (the M3.2 bounded representation).
+// ===========================================================================
+
+/// The **packed ancestry summary** a compacted [`WindowedStore`] carries across the
+/// cut (`docs/vision/windowed-store-design.md` §3.2 cut masks + §3.3 in-window bitset +
+/// §3.4 residue reach matrix). This is the M3.2 replacement for M3.1's exact-but-
+/// unbounded `anc: BTreeMap<EntryHash, BTreeSet<EntryHash>>` (a full strict-ancestor
+/// **set** per lifted op → Θ(N²) space, the very cost windowing exists to avoid).
+///
+/// **The representation.** Every *retained* op — residue (below the cut) *and* window
+/// (lifted since it) — gets a dense index `0..(|R|+|window|)` and a strict-retained-
+/// ancestor [`BitRow`] over that index. `is_ancestor(a, b) = reach[index[b]].get(
+/// index[a])`. One dense bitset closure answers all three query classes the design
+/// separates:
+///
+/// - **window × window** — the §3.3 in-window bitset (`row(w) = OR row(prev) | bit`).
+/// - **residue × residue** — the §3.4 residue reach matrix.
+/// - **residue × window** — the §3.2 crossing class. The design's cut-contact set
+///   `B(w)` (first-contacts in `F_C ∪ R`) plus per-op `F_C` cut masks is here encoded
+///   more simply as `w`'s **full** residue-ancestor bitset, built at lift by the same
+///   `B(w) = ⋃ B(prev) ∪ (prevs ∩ R)` recurrence. This is a valid, bounded encoding of
+///   the boundary lemma — denser than masks (`|R|` bits vs `|F_C|` bits per window op)
+///   but exact and free of the "is the first cut-contact retained?" completeness
+///   caveat that would otherwise force courier admission (§4.5).
+///
+/// **Size.** `O((|R| + |window|)²)` bits — **independent of total history N**. With
+/// bounded residue and a fixed window budget this is flat as `N` grows (the memory-
+/// bound gate asserts exactly this), versus M3.1's Θ(N²).
+///
+/// **The honest gap (courier-deferred, §4.5).** A future *laggard* op may reference a
+/// **discarded** op directly and still lift (the store keeps every `OpId → EntryHash`
+/// binding, courier-bounding of which is the deferred §4.5 work). To keep that lift's
+/// reach exact **without** courier, [`PackedSummary::discarded_reach`] retains each
+/// discarded op's residue-ancestor bitset so a referencing op inherits it. That map is
+/// `O(N)` (one bounded row per discarded op) — smaller than M3.1's Θ(N²) but not yet
+/// flat; it is the residual the §4.5 courier admission would eliminate. The **summary
+/// proper** (`reach` over the retained set) is what the memory-bound gate measures and
+/// is provably flat in `N`.
+#[derive(Default)]
+struct PackedSummary {
+    /// retained entry → dense retained index `0..(|R|+|window|)`.
+    index: BTreeMap<EntryHash, usize>,
+    /// dense index → entry hash (drives the reclaiming remap at [`PackedSummary::rebuild`]).
+    order: Vec<EntryHash>,
+    /// `reach[index[o]]` = strict retained ancestors of `o` (bitset over the dense
+    /// index). The bounded summary proper (§3.2/§3.3/§3.4), `O((|R|+|window|)²)` bits.
+    reach: Vec<BitRow>,
+    /// Discarded op → its residue-ancestor bitset (over the *current* dense index),
+    /// so a later laggard referencing it inherits its reach exactly with no courier.
+    /// The `O(N)` courier-deferred residual (§4.5), remapped at every compaction.
+    discarded_reach: BTreeMap<EntryHash, BitRow>,
+}
+
+impl PackedSummary {
+    /// Extend the summary for a newly-lifted op `hash` (always a window op — it lifts
+    /// after the last cut) whose resolved `prevs` are all present (retained or
+    /// discarded). Builds `hash`'s strict-retained-ancestor row incrementally
+    /// (§3.2/§3.3): `reach(hash) = ⋃_{p ∈ prevs} ({index(p) if p retained} ∪ reach(p))`,
+    /// inheriting a discarded prev's residue ancestors from [`discarded_reach`]. Exact
+    /// because strict deferral fixes `hash`'s past at lift (§2.4) and every prev's row
+    /// is already built.
+    fn lift(&mut self, hash: EntryHash, prevs: &BTreeSet<EntryHash>) {
+        let new_idx = self.order.len();
+        let mut row = BitRow::default();
+        for prev in prevs {
+            if let Some(&pi) = self.index.get(prev) {
+                row.set(pi);
+                row.or_in(&self.reach[pi]);
+            } else if let Some(dr) = self.discarded_reach.get(prev) {
+                // A discarded prev contributes only its retained (residue) ancestors —
+                // the prev itself is no longer retained, so no bit for it.
+                row.or_in(dr);
+            }
+        }
+        self.index.insert(hash, new_idx);
+        self.order.push(hash);
+        self.reach.push(row);
+    }
+
+    /// Rebuild the summary over the new residue `keep` after a compaction discards
+    /// `C \ keep` (`windowed-store-design.md` §2.5). Reclaims dense indices so the
+    /// matrix stays `O(|R|²)`-wide: every kept op is re-indexed `0..|keep|` and its row
+    /// is `remap`-ed to the new index, dropping bits for discarded ops. Discarded ops
+    /// (freshly discarded here + previously discarded) keep their residue-ancestor row,
+    /// remapped, in [`discarded_reach`] for laggard support.
+    ///
+    /// Soundness of the remap: for any op `o`, `{r ∈ keep : r < o} = (old strict
+    /// retained ancestors of o) ∩ keep`, because `keep ⊆` the pre-compaction retained
+    /// set — so restricting `o`'s old row to `keep` is exactly its new retained-ancestor
+    /// set. A discarded op's ancestors are all below the (new) cut, so its remapped row
+    /// captures every residue op a future laggard could reach through it.
+    fn rebuild(&mut self, keep: &BTreeSet<EntryHash>) {
+        let new_order: Vec<EntryHash> =
+            self.order.iter().copied().filter(|h| keep.contains(h)).collect();
+        let new_index: BTreeMap<EntryHash, usize> =
+            new_order.iter().enumerate().map(|(i, h)| (*h, i)).collect();
+        let width = new_order.len();
+
+        let mut new_reach: Vec<BitRow> = Vec::with_capacity(width);
+        for h in &new_order {
+            let old_idx = self.index[h];
+            new_reach.push(remap_row(&self.order, &new_index, &self.reach[old_idx], width));
+        }
+
+        let mut new_discarded: BTreeMap<EntryHash, BitRow> = BTreeMap::new();
+        // Freshly discarded ops: their pre-compaction row, remapped to residue.
+        for (old_idx, h) in self.order.iter().enumerate() {
+            if !keep.contains(h) {
+                new_discarded.insert(*h, remap_row(&self.order, &new_index, &self.reach[old_idx], width));
+            }
+        }
+        // Previously discarded ops: remap their (already residue-only) row forward.
+        for (h, row) in &self.discarded_reach {
+            new_discarded.insert(*h, remap_row(&self.order, &new_index, row, width));
+        }
+
+        self.order = new_order;
+        self.index = new_index;
+        self.reach = new_reach;
+        self.discarded_reach = new_discarded;
+    }
+
+    /// Backing-store bytes of the **summary proper** (`reach` over the retained set +
+    /// its dense index) — the O((|R|+|window|)²) figure the memory-bound gate asserts
+    /// flat in `N`. Excludes the courier-deferred [`discarded_reach`] residual.
+    #[cfg(any(test, feature = "test-support"))]
+    fn summary_bytes(&self) -> usize {
+        let reach: usize = self.reach.iter().map(BitRow::byte_len).sum();
+        let index = self.index.len()
+            * (std::mem::size_of::<EntryHash>() + std::mem::size_of::<usize>());
+        reach + index
+    }
+}
+
+// ===========================================================================
+// §2.2 — the checkpoint: compacted state + packed ancestry summary.
 // ===========================================================================
 
 /// The **checkpoint** a compacted [`WindowedStore`] carries across the cut
@@ -533,32 +741,15 @@ fn topo_of(entries: &BTreeMap<EntryHash, Entry>) -> Vec<Entry> {
 ///
 /// The checkpoint's job is to let the *unchanged* `L::fold` run over a **shrunken
 /// decoded map** (residue ∪ window — the monotone-shadowed ops discarded, §2.5) while
-/// still answering `is_ancestor`/`resolve` exactly as full history would (§3). It is
-/// **not** a folded `L::View` snapshot: the fold is an arbitrary pure function, not a
-/// monoid, so the residue-of-ops model keeps the fold code identical and puts all the
-/// intelligence into *what to retain* — where the soundness argument lives (§2.2).
+/// still answering `is_ancestor`/`resolve` exactly as full history would (§3), in
+/// **bounded** memory (the M3.2 [`PackedSummary`]). It is **not** a folded `L::View`
+/// snapshot: the fold is an arbitrary pure function, not a monoid, so the residue-of-
+/// ops model keeps the fold code identical and puts all the intelligence into *what to
+/// retain* — where the soundness argument lives (§2.2).
 struct Checkpoint {
-    /// **The frozen ancestry summary** (§3.2/§3.4, unified). `anc[b]` = the strict
-    /// causal ancestors of `b` (over full history): the residue reach matrix (§3.4)
-    /// and the cut masks (§3.2) in one structure, so `is_ancestor(a, b) =
-    /// anc[b].contains(a)` for any pair the fold or a lift can name.
-    ///
-    /// It is always **exact**, regardless of what `decoded` has shed: each op's row is
-    /// built once at lift as `anc[f] = ⋃_{p ∈ prevs}({p} ∪ anc[p])` — a strict-once
-    /// fact (strict deferral makes an op's past final at lift, §2.4), so it never
-    /// changes afterward. That is why a compacted fold's `is_ancestor` still equals the
-    /// full store's for every retained pair — the property the §6.3 gate asserts.
-    ///
-    /// **Honesty (M3.1 → M3.2).** M3.1 keeps a row for **every** lifted op — retained
-    /// *and* discarded — because a later op may reference a discarded prev (a
-    /// laggard), and its closure must still extend through that prev's ancestors, with
-    /// no courier. So this summary is exact but **not yet bounded** (Θ(N) rows). The
-    /// leaf-bounded form — the 8 B/op bitset packing of §3.3-3.4 restricted to the
-    /// *retained* set, with courier-resolved admission for deep-laggard references
-    /// below the cut (§4.5) — is M3.2. What M3.1 *does* compact is the **`decoded`**
-    /// map: the fold's input and dominant per-op cost (§5.1), which drops to
-    /// residue ∪ window and is never iterated over a discarded op again.
-    anc: BTreeMap<EntryHash, BTreeSet<EntryHash>>,
+    /// **The packed ancestry summary** (§3.2/§3.3/§3.4) — the M3.2 bounded replacement
+    /// for M3.1's Θ(N²) `anc`. See [`PackedSummary`].
+    summary: PackedSummary,
     /// §4.3 **pinned cut `ops_root`**: the Merkle commitment over full history at the
     /// first compaction (computed while the leaf still held everything). The
     /// verifiability anchor a self-compacted leaf checks discarded-op proofs against
@@ -575,7 +766,7 @@ struct Checkpoint {
 impl Checkpoint {
     fn new() -> Self {
         Self {
-            anc: BTreeMap::new(),
+            summary: PackedSummary::default(),
             #[cfg(feature = "merkle")]
             pinned_cut_ops_root: None,
             total_discarded: 0,
@@ -862,12 +1053,13 @@ impl<L: OpLanguage> WindowedStore<L> {
     /// **M3.0** (no compaction): `append_capped` with hard eviction past `W`; evicted
     /// entries are pruned from every map in lockstep with the [`WindowedDag`].
     ///
-    /// **M3.1** (compaction): a non-evicting insert, and the frozen ancestry summary
-    /// is extended for this op — `anc[entry] = ⋃_{p ∈ prevs}({p} ∪ anc[p])`. Because
-    /// the store lifts an op only once every prev is present (strict deferral) and
-    /// every prev's closure is already known, the new row is exact (§3.2 boundary
-    /// lemma; the standard memoized-topo closure). Eviction is deferred to
-    /// [`WindowedStore::compact`].
+    /// **M3.2** (compaction): a non-evicting insert, and the **packed ancestry summary**
+    /// is extended for this op via [`PackedSummary::lift`] — one bounded strict-
+    /// retained-ancestor [`BitRow`], `reach(entry) = ⋃_{p ∈ prevs}({index(p)} ∪
+    /// reach(p))` (§3.2/§3.3). Because the store lifts an op only once every prev is
+    /// present (strict deferral) and every prev's row is already built, the new row is
+    /// exact (§3.2 boundary lemma; the standard memoized-topo closure, in bits).
+    /// Eviction is deferred to [`WindowedStore::compact`].
     fn try_lift(&mut self, op: &VerifiedOpG<L>) -> Option<EntryHash> {
         let prevs = self.resolve_prevs(op)?;
         let entry = Entry::new(frame_signed::<L>(&op.signed()), Position(prevs.clone()));
@@ -875,16 +1067,9 @@ impl<L: OpLanguage> WindowedStore<L> {
         let id = op.id();
 
         if let Some(cp) = self.checkpoint.as_mut() {
-            // M3.1 compaction profile: non-evicting insert + closure extension.
+            // M3.2 compaction profile: non-evicting insert + packed-summary extension.
             self.dag.insert(&entry);
-            let mut ancestors: BTreeSet<EntryHash> = BTreeSet::new();
-            for prev in &prevs {
-                ancestors.insert(*prev);
-                if let Some(prev_anc) = cp.anc.get(prev) {
-                    ancestors.extend(prev_anc.iter().copied());
-                }
-            }
-            cp.anc.insert(entry_hash, ancestors);
+            cp.summary.lift(entry_hash, &prevs);
             self.source_to_entry.insert(id, entry_hash);
             self.entry_to_source.insert(entry_hash, id);
             self.decoded.insert(
@@ -934,19 +1119,20 @@ impl<L: OpLanguage> WindowedStore<L> {
         lifted
     }
 
-    /// **M3.1 — compact at the current frontier** (`windowed-store-design.md`
+    /// **M3.2 — compact at the current frontier** (`windowed-store-design.md`
     /// §2.4-2.5). A no-op on the M3.0 profile (returns zero discards).
     ///
     /// The cut `C` is the whole currently-retained set (causally closed by strict
     /// deferral, §2.1). The domain's [`OpLanguage::retain`] names the residue
     /// `R ⊆ C` — the ops whose contribution to a *future* fold is not yet
     /// monotone-shadowed (§2.4); everything else is discarded from `decoded` (the
-    /// fold never sees it again) and from the DAG. The frozen ancestry summary is
-    /// pruned in lockstep, staying exact for every retained pair (so `is_ancestor`
-    /// across the cut is unchanged), and the fold over `checkpoint ⊕ window` equals
-    /// the full-history fold (§2.6) — *iff* the domain's retention honors the
-    /// shadowing law. That "iff" is the whole adversarial gate: an unsound `retain`
-    /// makes `view() != full.view()`, which the §6.3 suite catches.
+    /// fold never sees it again) and from the DAG. The **packed ancestry summary** is
+    /// rebuilt over `R` in lockstep ([`PackedSummary::rebuild`]), reclaiming dense
+    /// indices so it stays `O(|R|²)`-wide, and staying exact for every retained pair
+    /// (so `is_ancestor` across the cut is unchanged). The fold over `checkpoint ⊕
+    /// window` then equals the full-history fold (§2.6) — *iff* the domain's retention
+    /// honors the shadowing law. That "iff" is the whole adversarial gate: an unsound
+    /// `retain` makes `view() != full.view()`, which the §6.3 suite catches.
     ///
     /// Idempotent and composable: compacting a compacted store at a later cut folds
     /// the same fold-equivalent object (§2.6 corollary i). Repeated calls with no new
@@ -960,12 +1146,15 @@ impl<L: OpLanguage> WindowedStore<L> {
         }
 
         // The cut = every retained op. Ask the domain what to keep, folding through
-        // the frozen-summary oracle (borrowed, no clone) so `retain` reasons over the
+        // the packed-summary oracle (borrowed, no clone) so `retain` reasons over the
         // exact same `is_ancestor`/`resolve` the fold uses.
         let cut: BTreeSet<EntryHash> = self.decoded.keys().copied().collect();
         let keep = {
             let cp = self.checkpoint.as_ref().expect("compaction profile");
-            let reach = ClosureReach { anc: &cp.anc };
+            let reach = PackedReach {
+                index: &cp.summary.index,
+                reach: &cp.summary.reach,
+            };
             let ctx = FoldCtx::over(&self.decoded, &self.entry_to_source, Box::new(reach));
             L::retain(&ctx, &cut)
         };
@@ -981,28 +1170,32 @@ impl<L: OpLanguage> WindowedStore<L> {
             }
         }
 
-        // Discard C \ R from the fold's view (decoded), the cut-scoped identity map,
-        // and the DAG — the compaction proper: the fold never iterates or names a
-        // discarded op again, and the dominant per-op memory (the decoded record,
-        // §5.1) is freed. `source_to_entry` and the frozen ancestry summary (`anc`)
-        // are deliberately KEPT for every lifted op, so that a later op referencing a
-        // discarded prev still (a) resolves it to the same [`EntryHash`] a full peer
-        // computes — convergence (§4.1) — and (b) extends the closure exactly through
-        // that prev's ancestors. Bounding the summary to the retained-only cut-mask /
-        // residue-matrix form (§3.2/§3.4) with courier-resolved deep-laggard admission
-        // (§4.5) is M3.2; M3.1 keeps it exact and unbounded so any shuffled reference
-        // folds correctly with no courier.
         let discard: BTreeSet<EntryHash> = cut.difference(&keep).copied().collect();
+
+        // Rebuild the packed summary over the new residue `keep`: reclaim dense indices
+        // (keeping it `O(|R|²)`-wide, independent of N — the M3.2 bound) while staying
+        // exact for every retained pair. Discarded ops keep a bounded residue-ancestor
+        // row in `discarded_reach` so a later laggard referencing one still folds
+        // correctly with no courier (§4.5 residual — the O(N) part M3.2 does not yet
+        // bound; deep-laggard courier admission would eliminate it).
+        {
+            let cp = self.checkpoint.as_mut().expect("compaction profile");
+            cp.summary.rebuild(&keep);
+            cp.total_discarded += discard.len();
+            cp.compactions += 1;
+        }
+
+        // Discard C \ R from the fold's view (decoded), the cut-scoped identity map,
+        // and the DAG — the fold never iterates or names a discarded op again, and the
+        // dominant per-op memory (the decoded record, §5.1) is freed. `source_to_entry`
+        // is deliberately KEPT for every lifted op, so a later op referencing a
+        // discarded prev still resolves it to the same [`EntryHash`] a full peer
+        // computes — convergence (§4.1). Bounding that binding table (courier-resolved
+        // deep-laggard admission, §4.5) is deferred.
         for d in &discard {
             self.decoded.remove(d);
             self.entry_to_source.remove(d);
             self.dag.discard(d);
-        }
-
-        {
-            let cp = self.checkpoint.as_mut().expect("compaction profile");
-            cp.total_discarded += discard.len();
-            cp.compactions += 1;
         }
 
         Compaction {
@@ -1085,9 +1278,9 @@ impl<L: OpLanguage> WindowedStore<L> {
     /// §3.5):
     ///
     /// - **M3.0** (no compaction): the §3.3 window bitset ([`WindowedDag::windowed_reach`]).
-    /// - **M3.1** (compaction): the frozen projected closure (§3.2/§3.4) — exact
-    ///   across the cut, so the fold over `checkpoint ⊕ window` equals the full fold
-    ///   for `N > W` (§2.6).
+    /// - **M3.2** (compaction): the packed ancestry summary (§3.2/§3.3/§3.4) — exact
+    ///   across the cut in bounded memory, so the fold over `checkpoint ⊕ window`
+    ///   equals the full fold for `N > W` (§2.6).
     ///
     /// # The fence (relaxed, §6.2 delta 6)
     ///
@@ -1096,7 +1289,7 @@ impl<L: OpLanguage> WindowedStore<L> {
     /// hard-truncated past `W` with no compaction to account for the dropped ops.
     /// That is the one case that must never silently mis-answer `is_ancestor` across
     /// the cut (a *wrong view, not an error*, §1.3). A **compacted** store is not
-    /// complete but *is* answerable — its frozen summary answers ancestry exactly —
+    /// complete but *is* answerable — its packed summary answers ancestry exactly —
     /// so it folds without refusing. Use [`WindowedStore::try_view`] for the
     /// non-panicking form.
     pub fn view(&self) -> L::View {
@@ -1110,8 +1303,11 @@ impl<L: OpLanguage> WindowedStore<L> {
         );
         match self.checkpoint.as_ref() {
             Some(cp) => {
-                // M3.1: fold over residue ∪ window through the frozen summary.
-                let reach = ClosureReach { anc: &cp.anc };
+                // M3.2: fold over residue ∪ window through the packed summary.
+                let reach = PackedReach {
+                    index: &cp.summary.index,
+                    reach: &cp.summary.reach,
+                };
                 let ctx = FoldCtx::over(&self.decoded, &self.entry_to_source, Box::new(reach));
                 L::fold(&ctx)
             }
@@ -1137,13 +1333,50 @@ impl<L: OpLanguage> WindowedStore<L> {
 
     /// The §3.5 boundary oracle over the current retained set, exposed so the §6.3
     /// gate can assert `WindowedReach::is_ancestor ≡ ReachIndex::is_ancestor` on the
-    /// full store for every retained pair (M3.0: window bitset; M3.1: frozen closure).
+    /// full store for every retained pair (M3.0: window bitset; M3.2: packed summary).
     /// Panics if an M3.0 window truncated.
     pub fn windowed_reach(&self) -> WindowedReach {
         match self.checkpoint.as_ref() {
-            Some(cp) => WindowedReach::from_closure(cp.anc.clone()),
+            Some(cp) => {
+                WindowedReach::from_packed(cp.summary.index.clone(), cp.summary.reach.clone())
+            }
             None => self.dag.windowed_reach(),
         }
+    }
+
+    /// **The M3.2 memory-bound instrument (§3.2/§3.3/§3.4).** The number of retained-op
+    /// rows in the packed ancestry summary — `|R| + |window|`, the height of the
+    /// bounded reach matrix. Flat in `N` at fixed `W` + bounded residue (the memory-
+    /// bound gate asserts it). `0` on the M3.0 profile.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn packed_summary_entries(&self) -> usize {
+        self.checkpoint
+            .as_ref()
+            .map_or(0, |cp| cp.summary.reach.len())
+    }
+
+    /// **The M3.2 memory-bound instrument (§3.2/§3.3/§3.4).** Backing-store bytes of the
+    /// packed ancestry summary *proper* (the retained-op reach matrix + its dense
+    /// index) — `O((|R|+|window|)²)`, **independent of N**. This is the headline figure:
+    /// M3.1's exact `anc` was Θ(N²); this is flat. Excludes the courier-deferred
+    /// [`WindowedStore::courier_gap_entries`] residual.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn packed_summary_bytes(&self) -> usize {
+        self.checkpoint
+            .as_ref()
+            .map_or(0, |cp| cp.summary.summary_bytes())
+    }
+
+    /// **The honest residual (§4.5).** The number of discarded ops whose bounded
+    /// residue-ancestor row is retained so a future laggard referencing one still folds
+    /// with no courier. This map is `O(N)` (one bounded row per discarded op) — the part
+    /// M3.2 does **not** yet bound; deep-laggard courier admission (§4.5) would drop it.
+    /// Still far below M3.1's Θ(N²) exact `anc`. `0` on the M3.0 profile.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn courier_gap_entries(&self) -> usize {
+        self.checkpoint
+            .as_ref()
+            .map_or(0, |cp| cp.summary.discarded_reach.len())
     }
 
     /// The backing bounded-window DAG, read-only. Exposed (feature `test-support`) so
