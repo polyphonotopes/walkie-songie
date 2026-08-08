@@ -11,7 +11,7 @@
 //!                 human can hear the union click into place.
 
 use tutti_amy::music::{self, EDO};
-use tutti_amy::{block_frames, nchans, rms, sample_rate, write_wav, Amy};
+use tutti_amy::{block_frames, envelope_to_amy, nchans, rms, sample_rate, write_wav, Amy};
 
 fn mean(xs: &[f64]) -> f64 {
     if xs.is_empty() {
@@ -125,6 +125,73 @@ fn main() {
             (report.pcm.len() / nchans()) as f64 / sample_rate() as f64
         ),
         Err(err) => eprintln!("could not write WAV: {err}"),
+    }
+
+    // ------------------------------------------------------------------
+    // Checkpoint 4 — a CONTINUOUS FACET converges and shapes synthesis.
+    //   Two peers concurrently SetEnvelope on the SAME degree (a slow swell vs a
+    //   fast pluck), exchange signed ops, and converge to the causal-maxima winner.
+    //   The converged CURVE (not samples — the function) drives AMY's amplitude EG,
+    //   and the RMS trajectory reflects it: the swell rises, the pluck falls.
+    // ------------------------------------------------------------------
+    println!("\n--- Checkpoint 4: a converging envelope FACET shapes AMY synthesis ---");
+    let es = music::run_envelope_scenario();
+    println!(
+        "  peers concurrently SetEnvelope on degree {}:\n    A = {}  (swell)\n    B = {}  (pluck)",
+        es.pc_contested,
+        envelope_to_amy(&es.env_a),
+        envelope_to_amy(&es.env_b),
+    );
+    assert_eq!(es.a_converged, es.b_converged, "envelope facets must converge");
+    assert_eq!(es.a_pending, 0);
+    assert_eq!(es.b_pending, 0);
+    println!(
+        "  converged: envelope[{}] = {} (causal-maxima winner); disjoint regs 10 & 18 both kept.",
+        es.pc_contested,
+        envelope_to_amy(&es.winner),
+    );
+
+    // Render the two curves and show the RMS trajectory each produces.
+    const HELD: usize = 70;
+    const TAIL: usize = 30;
+    let (_, swell_rms) = music::render_held_with_envelope(&amy, es.pc_contested, &music::swell(), EDO, HELD, TAIL);
+    let (_, pluck_rms) = music::render_held_with_envelope(&amy, es.pc_contested, &music::pluck(), EDO, HELD, TAIL);
+    let (swell_slope, pluck_slope) = (music::rms_slope(&swell_rms), music::rms_slope(&pluck_rms));
+    let early = |r: &[f64]| mean(&r[2..8]);
+    let late = |r: &[f64]| mean(&r[r.len() - 8..]);
+    println!(
+        "    swell: rms {:.4} -> {:.4}  slope {swell_slope:+.6}/block (rises)",
+        early(&swell_rms), late(&swell_rms)
+    );
+    println!(
+        "    pluck: rms {:.4} -> {:.4}  slope {pluck_slope:+.6}/block (falls)",
+        early(&pluck_rms), late(&pluck_rms)
+    );
+    assert!(swell_slope > 0.0 && pluck_slope < 0.0, "swell rises, pluck falls");
+    assert!(pluck_slope < swell_slope, "the pluck decays faster than the swell swells");
+    println!("  PASS: the converged breakpoints actually shaped the loudness contour.");
+
+    // Write envelope-converge.wav: the loser's curve, then the converged winner's —
+    // a facet edit converging, the curve audibly changing.
+    let mut env_wav: Vec<i16> = Vec::new();
+    for _ in 0..8 {
+        env_wav.extend_from_slice(&amy.render_block());
+    }
+    let (loser_pcm, _) = music::render_held_with_envelope(&amy, es.pc_contested, &es.loser, EDO, HELD, TAIL);
+    env_wav.extend_from_slice(&loser_pcm);
+    for _ in 0..16 {
+        env_wav.extend_from_slice(&amy.render_block());
+    }
+    let (winner_pcm, _) = music::render_held_with_envelope(&amy, es.pc_contested, &es.winner, EDO, HELD, TAIL);
+    env_wav.extend_from_slice(&winner_pcm);
+    let env_path = concat!(env!("CARGO_MANIFEST_DIR"), "/envelope-converge.wav");
+    match write_wav(env_path, &env_wav, sample_rate() as u32, nchans() as u16) {
+        Ok(()) => println!(
+            "  wrote {env_path} ({} frames, {:.2} s): loser curve, then converged winner.",
+            env_wav.len() / nchans(),
+            (env_wav.len() / nchans()) as f64 / sample_rate() as f64
+        ),
+        Err(err) => eprintln!("could not write envelope WAV: {err}"),
     }
 
     println!("\nfinal sysclock = {} ms. all checkpoints passed.", amy.sysclock());

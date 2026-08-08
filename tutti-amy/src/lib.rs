@@ -16,10 +16,12 @@
 //! AMY is a global singleton (one `amy_global`), so `Amy::start()` hands out a
 //! single guard; construct at most one at a time.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use serde::{Deserialize, Serialize};
 
 /// The REAL music domain over tutti-core + the partition→rejoin scenario and AMY
 /// driver (docs/research/tutti-amy-esp32-leaf.md, experiment 1).
@@ -270,12 +272,241 @@ pub fn pitchset_to_amy_events(
     events
 }
 
+// ---------------------------------------------------------------------------
+// Continuous facets — per-degree amplitude ENVELOPE, projected onto AMY's EG0.
+// ---------------------------------------------------------------------------
+//
+// This is the north-star INTERPOLATION axis made concrete: tutti ships the
+// *function* — a sparse breakpoint list plus the rule to fill between the points
+// — not audio-rate samples, and AMY evaluates that function at 44.1 kHz locally
+// (docs/research/tutti-amy-esp32-leaf.md §4). AMY's own control model is already
+// "generators, not streams": each oscillator has two breakpoint envelope
+// generators (EG0/EG1), `(time_ms, value)` pairs with a per-EG interpolation
+// `eg_type` (amy.h:238-242, 330-333; docs/api.md `A`/`B`/`T`/`X`). The default
+// oscillator gates its amplitude by EG0 (`amp_coefs[COEF_EG0]=1`, amy.c:868), so
+// an EG0 breakpoint string shapes the note's loudness contour directly.
+
+/// Interpolation kind carried by a continuous envelope facet — the vision's
+/// INTERPOLATION axis (docs §8.2): a control point ships *with* the rule the
+/// renderer uses to fill between points. Bounded + serde so it is a legal op
+/// payload; maps onto AMY's `eg_type` vocabulary at the edge (docs/api.md `T`:
+/// 0 Normal/RC, 1 Linear, 2 DX7, 3 True-exponential).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum Interp {
+    /// Straight-line between breakpoints → AMY `eg_type = 1` (ENVELOPE_LINEAR).
+    #[default]
+    Linear,
+    /// True-exponential between breakpoints → AMY `eg_type = 3`.
+    Exp,
+    /// Piecewise-constant (sample-and-hold). AMY has no native step `eg_type`, so
+    /// the projection realizes it *honestly* as a staircase over the LINEAR engine
+    /// (hold each level flat, then a short jump at each breakpoint), not by
+    /// mislabeling it as some other curve family.
+    Step,
+}
+
+/// Max breakpoints in one envelope facet. Comfortably under AMY's `MAX_BREAKPOINTS`
+/// (24, amy.h:240) even after `Interp::Step`'s staircase expansion (≤ 2N-1).
+pub const MAX_ENV_POINTS: usize = 8;
+
+/// Max linear-amplitude level a breakpoint may carry (7-bit, MIDI-ish).
+pub const MAX_ENV_LEVEL: u8 = 127;
+
+/// A continuous **envelope facet**: a sparse breakpoint list + an interpolation
+/// kind. Each `(ms, level)` is a *segment*: reach `level` (0..=127, a linear
+/// amplitude) over `ms` milliseconds from the previous point — AMY's own native
+/// breakpoint semantics (per-segment deltas, cumulated; envelope.c:81). Per AMY,
+/// the LAST point is the *release* segment: it only fires on note-off, so while a
+/// note is held the curve runs the earlier points and sustains at the
+/// second-to-last level (docs/synth.md, envelope.c:116-131).
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub struct Envelope {
+    /// `(segment_ms, level_0_127)` breakpoints, in order. Domain bound 1..=MAX_ENV_POINTS.
+    pub points: Vec<(u16, u8)>,
+    /// How the renderer fills between breakpoints.
+    pub interp: Interp,
+}
+
+/// AMY's `eg_type` code (docs/api.md `T`) for an interpolation kind. `Step` rides
+/// the LINEAR engine (its staircase makes the curve piecewise-constant anyway).
+fn eg_type_code(interp: Interp) -> u8 {
+    match interp {
+        Interp::Linear | Interp::Step => 1, // ENVELOPE_LINEAR
+        Interp::Exp => 3,                   // ENVELOPE_TRUE_EXPONENTIAL
+    }
+}
+
+/// One breakpoint level (0..=127) as AMY's linear-amplitude float (0..1), formatted
+/// like AMY's own patch strings: fixed 4-dp then trimmed, so it is compact AND a
+/// deterministic pure function of the level (determinism gate).
+fn fmt_level(level: u8) -> String {
+    let v = (level.min(MAX_ENV_LEVEL) as f32) / (MAX_ENV_LEVEL as f32);
+    let s = format!("{:.4}", v);
+    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// `Interp::Step` expansion: over AMY's LINEAR engine, hold each level flat for its
+/// whole segment then jump to the next in `STEP_JUMP_MS`, yielding a
+/// piecewise-constant curve. The last emitted pair stays the release segment.
+const STEP_JUMP_MS: u16 = 1;
+fn staircase(points: &[(u16, u8)]) -> Vec<(u16, u8)> {
+    if points.len() <= 1 {
+        return points.to_vec();
+    }
+    let mut out = Vec::with_capacity(points.len() * 2 - 1);
+    out.push(points[0]); // reach level0 over its ms (usually 0 = instant)
+    for w in points.windows(2) {
+        let (_prev_ms, prev_level) = w[0];
+        let (seg_ms, level) = w[1];
+        let hold = seg_ms.saturating_sub(STEP_JUMP_MS);
+        out.push((hold, prev_level)); // hold flat at the previous level
+        out.push((STEP_JUMP_MS, level)); // then jump to the new level
+    }
+    out
+}
+
+/// Project an [`Envelope`] facet into AMY's amplitude-EG wire fragment: the `A`
+/// breakpoint-set string (docs/api.md `A` → `eg0_times`/`eg0_values`; comma-
+/// separated `time_ms,value` pairs, last pair = release) plus the `T` eg_type
+/// code (docs/api.md `T` → `eg_type[0]`). AMY's tokenizer copies the `A` argument
+/// over the charset `" 0123456789-,."` and stops at the next letter (parse.c:188),
+/// so appending `T…` (and later `l1`) to the same message is unambiguous.
+///
+/// Example — `Envelope{ points:[(0,127),(120,12),(40,0)], interp: Exp }`
+/// projects to `"A0,1,120,0.0945,40,0T3"`: jump to full, true-exp decay to ~0.09
+/// over 120 ms, then a 40 ms release to silence on note-off.
+pub fn envelope_to_amy(env: &Envelope) -> String {
+    let pairs: Vec<(u16, u8)> = match env.interp {
+        Interp::Step => staircase(&env.points),
+        _ => env.points.clone(),
+    };
+    let mut s = String::from("A");
+    for (i, (ms, level)) in pairs.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&ms.to_string());
+        s.push(',');
+        s.push_str(&fmt_level(*level));
+    }
+    s.push('T');
+    s.push_str(&eg_type_code(env.interp).to_string());
+    s
+}
+
+/// Diff two degree-sets into AMY wire events, where each *added* degree's note-on
+/// carries its converged **envelope facet** (if the room holds a register for that
+/// degree) as an AMY `A`/`T` amplitude-EG fragment; a degree with no facet uses
+/// AMY's default envelope. Degrees are the room's scale steps (== `Pitch::degree`);
+/// `edo` tunes them to (possibly fractional) MIDI notes, so microtonality is
+/// preserved through the envelope-carrying note-on too.
+///
+/// Note-offs precede note-ons (voice reuse), exactly as [`pitchset_to_amy_events`].
+/// With an empty `envelopes` map this emits byte-identical events to that function.
+pub fn degrees_to_amy_events(
+    before: &BTreeSet<u16>,
+    after: &BTreeSet<u16>,
+    envelopes: &BTreeMap<u16, Envelope>,
+    edo: u16,
+    max_oscs: u16,
+) -> Vec<String> {
+    let mut events = Vec::new();
+    for &pc in before.difference(after) {
+        let p = Pitch::new(pc as i32, edo);
+        events.push(format!("v{}l0", p.osc(max_oscs)));
+    }
+    for &pc in after.difference(before) {
+        let p = Pitch::new(pc as i32, edo);
+        let mut ev = format!("v{}n{}", p.osc(max_oscs), fmt_midi_note(p.midi_note()));
+        if let Some(env) = envelopes.get(&pc) {
+            ev.push_str(&envelope_to_amy(env));
+        }
+        ev.push_str("l1");
+        events.push(ev);
+    }
+    events
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn set(pitches: &[Pitch]) -> BTreeSet<Pitch> {
         pitches.iter().copied().collect()
+    }
+
+    #[test]
+    fn envelope_to_amy_linear_and_exp_grammar() {
+        // Linear pluck-ish: instant to full, ramp to half over 200 ms, release.
+        let lin = Envelope {
+            points: vec![(0, 127), (200, 64), (100, 0)],
+            interp: Interp::Linear,
+        };
+        // 127/127=1, 64/127=0.5039..→"0.5039", 0→"0". Last pair is release.
+        assert_eq!(envelope_to_amy(&lin), "A0,1,200,0.5039,100,0T1");
+
+        // True-exp decay (the docstring's example), eg_type 3.
+        let exp = Envelope {
+            points: vec![(0, 127), (120, 12), (40, 0)],
+            interp: Interp::Exp,
+        };
+        assert_eq!(envelope_to_amy(&exp), "A0,1,120,0.0945,40,0T3");
+    }
+
+    #[test]
+    fn envelope_to_amy_step_is_a_staircase_on_linear() {
+        // Step over 3 points expands to hold-then-jump on the LINEAR engine (T1).
+        let step = Envelope {
+            points: vec![(0, 0), (200, 64), (100, 127)],
+            interp: Interp::Step,
+        };
+        // points[0]=(0,0); window0 -> (200-1, 0),(1, 0.5039); window1 -> (100-1, 0.5039),(1,1)
+        assert_eq!(
+            envelope_to_amy(&step),
+            "A0,0,199,0,1,0.5039,99,0.5039,1,1T1"
+        );
+    }
+
+    #[test]
+    fn envelope_projection_is_a_deterministic_pure_function() {
+        // Equal envelopes ⇒ byte-identical strings, every time (determinism gate).
+        let e = Envelope {
+            points: vec![(0, 8), (350, 127), (60, 0)],
+            interp: Interp::Linear,
+        };
+        assert_eq!(envelope_to_amy(&e), envelope_to_amy(&e.clone()));
+    }
+
+    #[test]
+    fn degree_note_on_carries_the_facet_or_the_default() {
+        let mut envs: BTreeMap<u16, Envelope> = BTreeMap::new();
+        envs.insert(
+            0,
+            Envelope {
+                points: vec![(0, 127), (120, 12), (40, 0)],
+                interp: Interp::Exp,
+            },
+        );
+        let before = BTreeSet::new();
+        let after = BTreeSet::from([0u16, 7u16]);
+        let ev = degrees_to_amy_events(&before, &after, &envs, 12, 250);
+        // Degree 0 (osc 0) carries its envelope; degree 7 (osc 7) has no facet → default.
+        assert!(ev.contains(&"v0n60A0,1,120,0.0945,40,0T3l1".to_string()));
+        assert!(ev.contains(&"v7n67l1".to_string()));
+
+        // With NO facets the envelope path is byte-identical to the plain projection.
+        let plain = pitchset_to_amy_events(
+            &BTreeSet::new(),
+            &BTreeSet::from([Pitch::semitone(0), Pitch::semitone(7)]),
+            250,
+        );
+        let via_env = degrees_to_amy_events(&before, &after, &BTreeMap::new(), 12, 250);
+        assert_eq!(via_env, plain);
     }
 
     #[test]
