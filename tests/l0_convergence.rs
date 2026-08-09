@@ -31,7 +31,10 @@ fn w16_wire_bytes_cross_store_identity() {
     net.inject("A", &signed0);
     net.inject("B", &signed0);
 
-    const GOLDEN: &str = "9e217937915d7f0969a214c904ab6adb00da97c873d89407d82b7e5bf0bf3568";
+    // v3 FIXTURE — the schema-3 single-lane wire's pinned entry hash, retained
+    // while that wire remains deployed (the v4 lanes pin their own vectors in
+    // `room::v4` and `tests/music_lane_interop.rs`).
+    const GOLDEN_V3: &str = "9e217937915d7f0969a214c904ab6adb00da97c873d89407d82b7e5bf0bf3568";
     for name in ["A", "B"] {
         let hashes: Vec<String> = net
             .store(name)
@@ -41,7 +44,7 @@ fn w16_wire_bytes_cross_store_identity() {
             .collect();
         assert_eq!(
             hashes,
-            vec![GOLDEN.to_string()],
+            vec![GOLDEN_V3.to_string()],
             "{name} lifts the golden entry hash"
         );
     }

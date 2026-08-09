@@ -19,6 +19,10 @@ pub mod store;
 pub mod streams;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+/// Room v4: the two-lane room (music lane + walkie extension lane) a bare
+/// tutti-music peer can join. The deployed wire is still the v3 single-lane
+/// `RoomStore` until the v4 net-layer generation lands.
+pub mod v4;
 pub mod yrs_state;
 
 // `view.rs` (per-author-union hand fold) and `mirror.rs` (opaque-entry HHHS mirror)

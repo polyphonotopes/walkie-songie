@@ -80,26 +80,9 @@ impl RoomView {
         self
     }
 
-    /// Pieces: SHARED, resolved as a pure function of the op-set — any author's
-    /// `Move`/`Remove`/`UnremovePiece` counts. `owner` is attribution only (the
-    /// `PutPiece` author), never a gate; `pieces_locked` is the consent gate.
-    ///
-    /// * **Lifecycle — observed-remove + add-wins, mirroring degrees.** The
-    ///   `PutPiece` and every valid `MovePiece` of the piece are *adds*. A
-    ///   `RemovePiece` `R` **kills** exactly the adds in its causal past
-    ///   (`is_ancestor(add, R)`) — so a remove concurrent with an add cannot kill
-    ///   it (add-wins), and a move/put causally *after* a remove resurrects the
-    ///   piece. An `UnremovePiece` `U` **overrides** the remove it observed
-    ///   (`U.remove == R` and `is_ancestor(R, U)`). The piece is alive iff at
-    ///   least one add survives every effective remove.
-    /// * **Position — a register across ALL authors.** Concurrent moves are
-    ///   resolved by [`FoldCtx::resolve`] over the *surviving* adds: causal
-    ///   precedence where comparable, then the max raw-bytes [`EntryHash`]
-    ///   tiebreak. No wall-clock, no seqs.
-    /// * **`pieces_locked` — the consent gate, applied per op by causal past.** A
-    ///   `Move`/`Remove`/`UnremovePiece` is suppressed iff the lock register
-    ///   resolved over that op's causal ancestors reads `true`. A move/remove
-    ///   *concurrent* with a lock still applies. `PutPiece` is never suppressed.
+    /// Pieces: the shared [`fold_pieces`] fold, with the v3 single-lane
+    /// classification — every piece op is scoped to the resolved tuning at
+    /// classification time (an other-tuning put/move is not an assertion at all).
     fn with_pieces(mut self, ctx: &FoldCtx<'_, WalkieLang>) -> Self {
         let Some(active_tuning) = self
             .tuning
@@ -108,119 +91,27 @@ impl RoomView {
         else {
             return self;
         };
-
-        // (put_entry, piece_id, owner, emoji, put_pitch)
-        let mut puts: Vec<(EntryHash, OpId, AuthorId, String, TunedPeriodicPitch)> = Vec::new();
-        // (move_entry, target_piece) — pitch is read back from `ctx.decoded()`.
-        let mut moves: Vec<(EntryHash, OpId)> = Vec::new();
-        // (remove_entry, remove_op_id, target_piece)
-        let mut removes: Vec<(EntryHash, OpId, OpId)> = Vec::new();
-        // (unremove_entry, target_remove_op_id)
-        let mut unremoves: Vec<(EntryHash, OpId)> = Vec::new();
-        // SetConfig writes that carry a `pieces_locked` value (the lock register).
-        let mut lock_writes: BTreeSet<EntryHash> = BTreeSet::new();
-
-        for (entry, decoded) in ctx.decoded() {
-            let op_id = ctx.op_id(entry);
-            match decoded.op() {
-                WalkieOp::PutPiece { emoji, pitch } if pitch.validate(&active_tuning).is_ok() => {
-                    puts.push((*entry, op_id, decoded.author(), emoji.clone(), *pitch))
-                }
-                WalkieOp::MovePiece { piece, pitch } if pitch.validate(&active_tuning).is_ok() => {
-                    moves.push((*entry, *piece))
-                }
-                WalkieOp::RemovePiece { piece } => removes.push((*entry, op_id, *piece)),
-                WalkieOp::UnremovePiece { remove } => unremoves.push((*entry, *remove)),
-                WalkieOp::SetConfig {
-                    pieces_locked: Some(_),
-                    ..
-                } => {
-                    lock_writes.insert(*entry);
-                }
-                _ => {}
-            }
-        }
-
-        // Whether the pieces-lock register, resolved over ONLY the causal ancestors
-        // of `op`, reads `true`. A move/remove/unremove is suppressed exactly when
-        // this holds — i.e. an active lock sits in its causal past.
-        let locked_as_of = |op: &EntryHash| -> bool {
-            let observed: BTreeSet<EntryHash> = lock_writes
-                .iter()
-                .copied()
-                .filter(|write| ctx.is_ancestor(write, op))
-                .collect();
-            ctx.resolve(&observed).is_some_and(|winner| {
-                matches!(
-                    ctx.decoded()[&winner].op(),
-                    WalkieOp::SetConfig {
-                        pieces_locked: Some(true),
-                        ..
-                    }
-                )
-            })
-        };
-
-        for (put_entry, piece_id, owner, emoji, put_pitch) in &puts {
-            // Effective removes of this piece: not lock-suppressed, and not
-            // overridden by an unremove that observed them (and is itself unlocked).
-            let effective_removes: Vec<EntryHash> = removes
-                .iter()
-                .filter(|(_, _, target)| target == piece_id)
-                .filter(|(rem_entry, rem_id, _)| {
-                    if locked_as_of(rem_entry) {
-                        return false;
-                    }
-                    let overridden = unremoves.iter().any(|(un_entry, target_rem)| {
-                        target_rem == rem_id
-                            && ctx.is_ancestor(rem_entry, un_entry)
-                            && !locked_as_of(un_entry)
-                    });
-                    !overridden
-                })
-                .map(|(rem_entry, _, _)| *rem_entry)
-                .collect();
-
-            // Adds = the put + every non-suppressed move of this piece; an add
-            // survives iff no effective remove causally observed it (add-wins).
-            let survives = |add: &EntryHash| {
-                !effective_removes
-                    .iter()
-                    .any(|rem| ctx.is_ancestor(add, rem))
-            };
-            let mut surviving: BTreeSet<EntryHash> = BTreeSet::new();
-            if survives(put_entry) {
-                surviving.insert(*put_entry);
-            }
-            for (move_entry, _) in moves.iter().filter(|(_, target)| target == piece_id) {
-                if !locked_as_of(move_entry) && survives(move_entry) {
-                    surviving.insert(*move_entry);
-                }
-            }
-            if surviving.is_empty() {
-                // Every assertion of this piece was observed-removed: it is gone.
-                continue;
-            }
-
-            // Position = the register winner among the surviving adds' pitches.
-            let pitch = ctx
-                .resolve(&surviving)
-                .map(|winner| match ctx.decoded()[&winner].op() {
-                    WalkieOp::PutPiece { pitch, .. } | WalkieOp::MovePiece { pitch, .. } => *pitch,
-                    _ => unreachable!("a surviving add is a PutPiece or MovePiece"),
-                })
-                .unwrap_or(*put_pitch);
-
-            self.pieces.insert(
-                *piece_id,
-                Piece {
-                    id: *piece_id,
-                    owner: *owner,
+        self.pieces = fold_pieces(ctx, |decoded| match decoded.op() {
+            WalkieOp::PutPiece { emoji, pitch } if pitch.validate(&active_tuning).is_ok() => {
+                Some(PieceEvent::Put {
                     emoji: emoji.clone(),
-                    pitch,
-                },
-            );
-        }
+                    pitch: *pitch,
+                })
+            }
+            WalkieOp::MovePiece { piece, pitch } if pitch.validate(&active_tuning).is_ok() => {
+                Some(PieceEvent::Move {
+                    piece: *piece,
+                    pitch: *pitch,
+                })
+            }
+            WalkieOp::RemovePiece { piece } => Some(PieceEvent::Remove { piece: *piece }),
+            WalkieOp::UnremovePiece { remove } => Some(PieceEvent::Unremove { remove: *remove }),
+            WalkieOp::SetConfig {
+                pieces_locked: Some(locked),
+                ..
+            } => Some(PieceEvent::Lock { locked: *locked }),
+            _ => None,
+        });
         self
     }
 
@@ -249,6 +140,166 @@ impl RoomView {
         });
         self
     }
+}
+
+/// One piece-relevant reading of a decoded op — the alphabet-neutral input to
+/// [`fold_pieces`]. Two wires classify into it: the deployed single-lane v3
+/// [`WalkieOp`] (tuning-scoped at classification) and the v4 extension lane's
+/// [`ExtensionOp`](crate::room::v4::ExtensionOp) (unscoped — the v4 room scopes
+/// pieces to the music lane's tuning at composition instead).
+pub(crate) enum PieceEvent {
+    /// Create a piece. Its identity is the classifying op's [`OpId`], and this is
+    /// its first position assertion.
+    Put {
+        emoji: String,
+        pitch: TunedPeriodicPitch,
+    },
+    /// Assert a new position for the piece created by `piece`.
+    Move {
+        piece: OpId,
+        pitch: TunedPeriodicPitch,
+    },
+    /// Observed-remove the piece created by `piece`.
+    Remove { piece: OpId },
+    /// Override the remove op `remove` (a remove-of-remove); resurrects the piece.
+    Unremove { remove: OpId },
+    /// A write to the pieces-lock register (the consent gate).
+    Lock { locked: bool },
+}
+
+/// The shared pieces fold: SHARED pieces resolved as a pure function of the
+/// op-set — any author's move/remove/unremove counts. `owner` is attribution only
+/// (the put author), never a gate; the lock register is the consent gate.
+///
+/// * **Lifecycle — observed-remove + add-wins, mirroring degrees.** The put and
+///   every classified move of a piece are *adds*. A remove `R` **kills** exactly
+///   the adds in its causal past (`is_ancestor(add, R)`) — so a remove concurrent
+///   with an add cannot kill it (add-wins), and a move/put causally *after* a
+///   remove resurrects the piece. An unremove `U` **overrides** the remove it
+///   observed (`U.remove == R` and `is_ancestor(R, U)`). The piece is alive iff
+///   at least one add survives every effective remove.
+/// * **Position — a register across ALL authors.** Concurrent moves are resolved
+///   by [`FoldCtx::resolve`] over the *surviving* adds: causal precedence where
+///   comparable, then the max raw-bytes [`EntryHash`] tiebreak. No wall-clock,
+///   no seqs.
+/// * **The lock — the consent gate, applied per op by causal past.** A move/
+///   remove/unremove is suppressed iff the lock register resolved over that op's
+///   causal ancestors reads `true`. An op *concurrent* with a lock still applies.
+///   A put is never suppressed.
+///
+/// `classify` names which ops participate and with what reading; an op it maps to
+/// `None` does not exist for this fold. Generic over the [`OpLanguage`] so the v3
+/// wire and the v4 extension lane run the byte-identical semantics.
+pub(crate) fn fold_pieces<L: tutti_core::OpLanguage>(
+    ctx: &FoldCtx<'_, L>,
+    classify: impl Fn(&DecodedOp<L>) -> Option<PieceEvent>,
+) -> BTreeMap<OpId, Piece> {
+    // (put_entry, piece_id, owner, emoji, put_pitch)
+    let mut puts: Vec<(EntryHash, OpId, AuthorId, String, TunedPeriodicPitch)> = Vec::new();
+    // (move_entry, target_piece)
+    let mut moves: Vec<(EntryHash, OpId)> = Vec::new();
+    // (remove_entry, remove_op_id, target_piece)
+    let mut removes: Vec<(EntryHash, OpId, OpId)> = Vec::new();
+    // (unremove_entry, target_remove_op_id)
+    let mut unremoves: Vec<(EntryHash, OpId)> = Vec::new();
+    // The position each put/move asserts, read back for the register winner.
+    let mut asserted_pitch: BTreeMap<EntryHash, TunedPeriodicPitch> = BTreeMap::new();
+    // The lock-register writes and the value each carries.
+    let mut lock_writes: BTreeMap<EntryHash, bool> = BTreeMap::new();
+
+    for (entry, decoded) in ctx.decoded() {
+        match classify(decoded) {
+            Some(PieceEvent::Put { emoji, pitch }) => {
+                asserted_pitch.insert(*entry, pitch);
+                puts.push((*entry, ctx.op_id(entry), decoded.author(), emoji, pitch));
+            }
+            Some(PieceEvent::Move { piece, pitch }) => {
+                asserted_pitch.insert(*entry, pitch);
+                moves.push((*entry, piece));
+            }
+            Some(PieceEvent::Remove { piece }) => {
+                removes.push((*entry, ctx.op_id(entry), piece));
+            }
+            Some(PieceEvent::Unremove { remove }) => unremoves.push((*entry, remove)),
+            Some(PieceEvent::Lock { locked }) => {
+                lock_writes.insert(*entry, locked);
+            }
+            None => {}
+        }
+    }
+
+    // Whether the lock register, resolved over ONLY the causal ancestors of `op`,
+    // reads `true`. A move/remove/unremove is suppressed exactly when this holds —
+    // i.e. an active lock sits in its causal past.
+    let locked_as_of = |op: &EntryHash| -> bool {
+        let observed: BTreeSet<EntryHash> = lock_writes
+            .keys()
+            .copied()
+            .filter(|write| ctx.is_ancestor(write, op))
+            .collect();
+        ctx.resolve(&observed)
+            .is_some_and(|winner| lock_writes[&winner])
+    };
+
+    let mut pieces = BTreeMap::new();
+    for (put_entry, piece_id, owner, emoji, put_pitch) in &puts {
+        // Effective removes of this piece: not lock-suppressed, and not
+        // overridden by an unremove that observed them (and is itself unlocked).
+        let effective_removes: Vec<EntryHash> = removes
+            .iter()
+            .filter(|(_, _, target)| target == piece_id)
+            .filter(|(rem_entry, rem_id, _)| {
+                if locked_as_of(rem_entry) {
+                    return false;
+                }
+                let overridden = unremoves.iter().any(|(un_entry, target_rem)| {
+                    target_rem == rem_id
+                        && ctx.is_ancestor(rem_entry, un_entry)
+                        && !locked_as_of(un_entry)
+                });
+                !overridden
+            })
+            .map(|(rem_entry, _, _)| *rem_entry)
+            .collect();
+
+        // Adds = the put + every non-suppressed move of this piece; an add
+        // survives iff no effective remove causally observed it (add-wins).
+        let survives = |add: &EntryHash| {
+            !effective_removes
+                .iter()
+                .any(|rem| ctx.is_ancestor(add, rem))
+        };
+        let mut surviving: BTreeSet<EntryHash> = BTreeSet::new();
+        if survives(put_entry) {
+            surviving.insert(*put_entry);
+        }
+        for (move_entry, _) in moves.iter().filter(|(_, target)| target == piece_id) {
+            if !locked_as_of(move_entry) && survives(move_entry) {
+                surviving.insert(*move_entry);
+            }
+        }
+        if surviving.is_empty() {
+            // Every assertion of this piece was observed-removed: it is gone.
+            continue;
+        }
+
+        // Position = the register winner among the surviving adds' pitches.
+        let pitch = ctx
+            .resolve(&surviving)
+            .map(|winner| asserted_pitch[&winner])
+            .unwrap_or(*put_pitch);
+
+        pieces.insert(
+            *piece_id,
+            Piece {
+                id: *piece_id,
+                owner: *owner,
+                emoji: emoji.clone(),
+                pitch,
+            },
+        );
+    }
+    pieces
 }
 
 /// A live emoji piece.
@@ -1121,10 +1172,14 @@ mod tests {
 
     // ---------------------------------------------------------------------
     // Golden vector: pins the framing/lift so a format change is caught.
+    //
+    // v3 FIXTURE — the schema-3 single-lane wire, retained verbatim while that
+    // wire remains deployed. The v4 two-lane goldens live in `room::v4`; a v3
+    // value must never be "updated" to a v4 one (hard cut, not a migration).
     // ---------------------------------------------------------------------
 
     #[test]
-    fn golden_vector_entry_hash_and_pitches() {
+    fn golden_v3_entry_hash_and_pitches() {
         let key = signing_key_from_seed(&SEED_A);
         let mut store = RoomStore::new();
         let signed0 = store.commit(
@@ -1221,9 +1276,12 @@ mod tests {
     /// Golden vector: a fixed op-set pins concrete `ops_root` and `state_root`,
     /// and both are history-independent — the SAME roots regardless of ingest
     /// order (the whole point of a canonical Merkle commitment).
+    ///
+    /// v3 FIXTURE — pins the schema-3 single-lane wire (see the entry-hash
+    /// golden above). The v4 lanes pin their own roots in `room::v4`.
     #[cfg(feature = "merkle")]
     #[test]
-    fn merkle_golden_roots_and_history_independence() {
+    fn merkle_golden_v3_roots_and_history_independence() {
         let base = rich_history();
         let n = base.len();
 
@@ -1237,12 +1295,16 @@ mod tests {
         let state_root = baseline.state_root();
 
         // Pinned golden vectors (blake3-256, radix_immutable merkle v1 format).
-        const GOLDEN_OPS_ROOT: &str =
+        const GOLDEN_V3_OPS_ROOT: &str =
             "0c06563b3c948882383459c249421e0f5b809af3d843d3f7f362fe527ea3ca01";
-        const GOLDEN_STATE_ROOT: &str =
+        const GOLDEN_V3_STATE_ROOT: &str =
             "d4d3e5b6c1e3d407d0cc744101d2f0d06deb9a671ee4b7e3aac3ba6d8d2454b4";
-        assert_eq!(hex32(&ops_root), GOLDEN_OPS_ROOT, "ops_root golden vector");
-        assert_eq!(hex32(&state_root), GOLDEN_STATE_ROOT, "state_root golden vector");
+        assert_eq!(hex32(&ops_root), GOLDEN_V3_OPS_ROOT, "v3 ops_root fixture");
+        assert_eq!(
+            hex32(&state_root),
+            GOLDEN_V3_STATE_ROOT,
+            "v3 state_root fixture"
+        );
 
         // History-independence: every ingest order yields the identical roots.
         for order in [reversed, interleave] {

@@ -184,6 +184,10 @@ walkie-songie = { path = ".", default-features = false, features = ["test-suppor
 # `reach_equiv` equivalence tests. As a dev-dependency it is unified into the
 # `cargo test` build only, so a plain `cargo build` keeps tutti-core lean.
 tutti-core = { git = "https://github.com/polyphonotopes/tutti.git", rev = "b3c2982d7819c7acce01e412a3bed6e0e198a85e", features = ["test-support"] }
+# Named directly by `tests/music_lane_interop.rs`, whose bare-peer half must be
+# spelled purely in tutti crates (an ESP32 knows nothing of walkie). Same pin as
+# the regular dependency, so the types unify.
+tutti-music = { git = "https://github.com/polyphonotopes/tutti.git", rev = "b3c2982d7819c7acce01e412a3bed6e0e198a85e" }
 hhhs-sync = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "5802a25bf783324de321a918e93de88e3934124e" }
 # Benchmark suite (M0). criterion: native micro-benchmarks; dhat: heap profiling
 # for the reach/view RAM harness; postcard: the real RBSR wire codec, for
