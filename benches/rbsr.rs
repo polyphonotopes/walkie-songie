@@ -1,6 +1,6 @@
 //! Bench 3 — reconciliation bytes + roundtrips (H4).
 //!
-//! Proves sync is bandwidth-∝-disagreement. The pure hhhs-core primitives
+//! Proves sync is bandwidth-∝-disagreement. The pure hhhs-sync primitives
 //! (`fingerprint`/`split`/`respond`) are timed with criterion; a full driven
 //! loopback session is REPORTED (wire bytes + roundtrips + peak outstanding vs.
 //! divergence S), cross-checked against hhhs's own peak-outstanding figures.
@@ -13,7 +13,7 @@ mod support;
 use std::collections::{BTreeMap, BTreeSet};
 
 use criterion::{BenchmarkId, Criterion, black_box};
-use hhhs_core::reconciliation::{Config, KeyRange, Message, opening, respond};
+use hhhs_sync::reconciliation::{Config, KeyRange, Message, opening, respond};
 
 use walkie_songie::room::ops::{OpId, VerifiedOp, WalkieOp};
 use walkie_songie::room::store::RoomStore;

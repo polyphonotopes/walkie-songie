@@ -2,7 +2,7 @@
 //! (`docs/research/performance-benchmark-suite.md` §8).
 //!
 //! Everything here is built from walkie-songie's PUBLIC op/store surface plus
-//! hhhs-core's kernel types — no `#[cfg(test)]` internals — so the benches
+//! hhhs's kernel types — no `#[cfg(test)]` internals — so the benches
 //! exercise exactly the embeddable core the device would run (fold + ops + RBSR,
 //! no iroh/tokio/wasm). Fixtures are seeded and deterministic.
 
@@ -10,8 +10,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hhhs_core::reconciliation::Index;
-use hhhs_core::{Digest, Entry, EntryHash, MemDagStore, Position, SortKey};
+use hhhs::{Digest, Entry, EntryHash, MemDagStore, Position, SortKey};
+use hhhs_sync::reconciliation::Index;
 
 use walkie_songie::room::ops::{
     LogHead, OpId, SignedOp, SigningKey, VerifiedOp, VersionedOp, WalkieOp,

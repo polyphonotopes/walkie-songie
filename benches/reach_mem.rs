@@ -28,7 +28,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 
 mod support;
 
-use hhhs_core::cover::ReachIndex;
+use hhhs::cover::ReachIndex;
 
 const NS: [usize; 3] = [10, 100, 1_000];
 const FORK_HEADS: usize = 4;

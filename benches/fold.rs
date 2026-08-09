@@ -14,7 +14,7 @@
 mod support;
 
 use criterion::{BenchmarkId, Criterion, black_box};
-use hhhs_core::cover::ReachIndex;
+use hhhs::cover::ReachIndex;
 
 /// N sweep for the full fold + reach. 10k is deliberately omitted: a linear log
 /// at N=10k materializes ~50M ancestor hashes (~1.6 GB), which the budget
