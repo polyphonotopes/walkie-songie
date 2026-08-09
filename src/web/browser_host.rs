@@ -1418,6 +1418,9 @@ impl LaneStoreAccess<WalkieLang> for BrowserSyncStore {
         Ok(SyncApply {
             admitted,
             lifted: lifted.len(),
+            // The browser runs a full (non-windowed) store, so it never defers
+            // ops for courier admission.
+            courier: Vec::new(),
         })
     }
 }
