@@ -178,10 +178,20 @@ pub(crate) enum PieceEvent {
 ///   remove resurrects the piece. An unremove `U` **overrides** the remove it
 ///   observed (`U.remove == R` and `is_ancestor(R, U)`). The piece is alive iff
 ///   at least one add survives every effective remove.
-/// * **Position — a register across ALL authors.** Concurrent moves are resolved
-///   by [`FoldCtx::resolve`] over the *surviving* adds: causal precedence where
-///   comparable, then the max raw-bytes [`EntryHash`] tiebreak. No wall-clock,
-///   no seqs.
+/// * **Position — a register across ALL authors, scoped per `(piece, TuningId)`.**
+///   Concurrent moves are resolved by [`FoldCtx::resolve`] over the *surviving*
+///   adds: causal precedence where comparable, then the max raw-bytes
+///   [`EntryHash`] tiebreak. No wall-clock, no seqs. A move whose asserted
+///   pitch belongs to a DIFFERENT tuning than the piece's put is a non-event
+///   for that piece (neither an add nor a register candidate): tunings hold
+///   independent registers, and only the put's tuning register is ever
+///   observable (composition shows a piece only under the tuning its put
+///   asserts). Without this scoping, an unrelated tuning's register winner
+///   could hide a piece that holds a perfectly valid assertion under the
+///   active tuning — the v4 regression this guards against. Under the v3
+///   wire the scoping is vacuous: classification already restricts puts and
+///   moves to the active tuning, so all of a piece's adds share one
+///   `TuningId`.
 /// * **The lock — the consent gate, applied per op by causal past.** A move/
 ///   remove/unremove is suppressed iff the lock register resolved over that op's
 ///   causal ancestors reads `true`. An op *concurrent* with a lock still applies.
@@ -262,8 +272,12 @@ pub(crate) fn fold_pieces<L: tutti_core::OpLanguage>(
             .map(|(rem_entry, _, _)| *rem_entry)
             .collect();
 
-        // Adds = the put + every non-suppressed move of this piece; an add
-        // survives iff no effective remove causally observed it (add-wins).
+        // Adds = the put + every non-suppressed move of this piece IN THE PUT'S
+        // TUNING; an add survives iff no effective remove causally observed it
+        // (add-wins). An other-tuning move is a non-event here — its register
+        // lives under its own `TuningId` and is never the one composition
+        // reads, so folding it in could only displace (and thereby hide) the
+        // put-tuning winner.
         let survives = |add: &EntryHash| {
             !effective_removes
                 .iter()
@@ -274,6 +288,9 @@ pub(crate) fn fold_pieces<L: tutti_core::OpLanguage>(
             surviving.insert(*put_entry);
         }
         for (move_entry, _) in moves.iter().filter(|(_, target)| target == piece_id) {
+            if asserted_pitch[move_entry].tuning_id != put_pitch.tuning_id {
+                continue;
+            }
             if !locked_as_of(move_entry) && survives(move_entry) {
                 surviving.insert(*move_entry);
             }

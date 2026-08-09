@@ -7,7 +7,31 @@
 //! changed one signed byte, one framing byte, or one predecessor, the pinned
 //! hashes here would move and the vector would fail. The bare-peer half is
 //! deliberately spelled ONLY in `tutti_core` + `tutti_music` — no walkie type
-//! appears until the bytes cross to the room.
+//! appears until the bytes cross to the room. Even the room topic is derived
+//! INDEPENDENTLY here (`blake3::derive_key` over the pinned context), never by
+//! calling walkie's derivation.
+//!
+//! **The signed-topic contract is production's, not a test convenience.**
+//! Production never signs the human room name: it signs the DERIVED topic's
+//! lowercase-hex string — `RoomTopic::from_room_name(name).to_string()` in
+//! `src/net/iroh_common.rs`, i.e. `hex(blake3::derive_key("walkie-songie room
+//! topic v1", name))` — and enforces it at ingress
+//! (`verify_signed_op_for_topic` on v3, `verify_music_op`'s expected-topic
+//! argument on the v4 lanes). An implementation that signed the human name
+//! would pass a weaker vector and then fail every production peer's topic
+//! gate; [`SIGNED_TOPIC`] pins the exact string so that mistake is caught
+//! here.
+//!
+//! Beyond the hashes, the vector pins the exact WIRE BYTES: the CBOR payload,
+//! the signed header, and the full `to_wire_bytes_in::<MusicLang>` frame.
+//! The frame pin is load-bearing on its own — lifting hashes over
+//! `ENTRY_FRAME_MAGIC` framing, so a `MusicLang::WIRE_MAGIC` change would
+//! move NEITHER pinned hash; only the frame constant catches it.
+//!
+//! These fixtures are self-generated-then-frozen: they catch any future drift
+//! in walkie or tutti, but they are not yet an independently produced
+//! artifact. A truly independent fixture — bytes captured from a real
+//! second-implementation peer (the ESP32 firmware) — is a future step.
 //!
 //! The v3 fixtures (`9e2179…3568` and friends) pin the OLD single-lane wire in
 //! `src/room/store.rs` and `tests/l0_convergence.rs`; the vectors here are NEW
@@ -28,24 +52,123 @@ use walkie_songie::room::v4::{ExtensionOp, Room, verify_extension_op, verify_mus
 const SEED_ESP32: [u8; 32] = [7u8; 32];
 const SEED_WALKIE: [u8; 32] = [1u8; 32];
 const TS: u64 = 1_700_000_000_000_000; // µs
-const TOPIC: &str = "sunny-garden-melody";
 
-/// v4 FIXTURE — the pinned identity of the vector op below. Ed25519 is
+/// The human room name. Never signed — only the derivation input.
+const ROOM_NAME: &str = "sunny-garden-melody";
+/// The production topic-derivation context (`ROOM_TOPIC_CONTEXT` in
+/// `src/net/iroh_common.rs`). Byte-pinned: changing it severs every deployed
+/// room.
+const ROOM_TOPIC_CONTEXT: &str = "walkie-songie room topic v1";
+
+/// v4 FIXTURE — the exact string every op in this room signs and every
+/// conforming peer enforces at ingress: the derived topic's lowercase hex.
+const SIGNED_TOPIC: &str = "072aaa8bdb9bea93fe8b3af1a3214533027e9973fb007440b55606e2fe452a7a";
+
+/// v4 FIXTURES — the pinned identity of the vector op below. Ed25519 is
 /// deterministic, so a fixed seed + fixed bytes pin these forever; they move
 /// only if the MusicLang wire itself changes (which is tutti-music's schema
-/// bump to make, never walkie's).
-const VECTOR_OP_ID: &str = "63922bf7f6bcd80097fa065ca922da27741f4c87d0a6bc9717ec3b16187de762";
-const VECTOR_ENTRY: &str = "f51c8931dd5cb8cff58fb2a17e21429802ef53ac8c7ae7fe4ca30fd3f4ba6887";
+/// bump to make, never walkie's) or the signed-topic contract changes.
+const VECTOR_OP_ID: &str = "fc5ae35d9a75ecc81c6244250b1225d73711a7a4fb640ec29f633e8b488460c6";
+const VECTOR_ENTRY: &str = "59fd1ad628d0f279b579a4e7c06db23f9d950cd9918e9f77bb4494be2c4871ac";
+
+/// v4 FIXTURES — the vector op's exact bytes, hex-encoded: the CBOR payload
+/// (the signed `VersionedOpG` body), the signed p2panda header, and the full
+/// `MusicLang` wire frame (`WIRE_MAGIC` + length-delimited header/payload).
+const VECTOR_PAYLOAD: &str = "a46776657273696f6e036974735f6d6963726f731b00060a24181e400065746f706963784030373261616138626462396265613933666538623361663161333231343533333032376539393733666230303734343062353536303665326665343532613761626f70a169416464446567726565a166646567726565a26974756e696e675f696498201823185b18a2183c1846188b182d18fb187518fe189818f3021839060118490b1862184718ea18d518221832188a18b2186818a1183d181918b9188b6664656772656504";
+const VECTOR_HEADER: &str = "86015820ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c5840b0e4c740ce9ddb60a38740c999dbeb5a32ca2e38612937514ab5f67f38fa21e80cad5a2937276b224d8b9e20f0828a8b9983506f576e2988bb2dcffe60aa1d0118cc5820b2e5eed0a07e93db73f9761f93ff93f0270c021a09826305daf2c514fae282f600";
+const VECTOR_WIRE_FRAME: &str = "74757474692e6d757369632e776972652f32008b000000cc00000086015820ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c5840b0e4c740ce9ddb60a38740c999dbeb5a32ca2e38612937514ab5f67f38fa21e80cad5a2937276b224d8b9e20f0828a8b9983506f576e2988bb2dcffe60aa1d0118cc5820b2e5eed0a07e93db73f9761f93ff93f0270c021a09826305daf2c514fae282f600a46776657273696f6e036974735f6d6963726f731b00060a24181e400065746f706963784030373261616138626462396265613933666538623361663161333231343533333032376539393733666230303734343062353536303665326665343532613761626f70a169416464446567726565a166646567726565a26974756e696e675f696498201823185b18a2183c1846188b182d18fb187518fe189818f3021839060118490b1862184718ea18d518221832188a18b2186818a1183d181918b9188b6664656772656504";
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The production topic derivation, recomputed independently of walkie: an
+/// ESP32 that knows only the context string and the room name derives the
+/// identical signed topic.
+fn production_topic() -> String {
+    hex(&blake3::derive_key(
+        ROOM_TOPIC_CONTEXT,
+        ROOM_NAME.as_bytes(),
+    ))
+}
 
 /// Author the fixed vector op the way a bare tutti-music peer does: genesis
-/// head, empty causal horizon, the canonical envelope, MusicLang's schema.
+/// head, empty causal horizon, the canonical envelope, MusicLang's schema,
+/// the PRODUCTION signed topic.
 fn bare_peer_vector_op() -> SignedOp {
     let key = signing_key_from_seed(&SEED_ESP32);
     let degree = TunedDegree::new(&Tuning::twelve_tet(), 4).expect("valid degree");
-    let versioned =
-        VersionedOpG::<MusicLang>::current_for_topic(MusicOp::AddDegree { degree }, TS, TOPIC);
+    let versioned = VersionedOpG::<MusicLang>::current_for_topic(
+        MusicOp::AddDegree { degree },
+        TS,
+        SIGNED_TOPIC,
+    );
     let (signed, _head) = sign_versioned_op(&key, &LogHead::genesis(), versioned);
     signed
+}
+
+/// The byte-level pins: signed topic, payload, header, wire frame, and the
+/// genesis predecessor set. Everything an independent implementation must
+/// reproduce EXACTLY, checked byte-for-byte.
+#[test]
+fn vector_wire_bytes_and_signed_topic_are_pinned() {
+    // The derivation itself is part of the contract.
+    assert_eq!(
+        production_topic(),
+        SIGNED_TOPIC,
+        "the signed topic is the derived topic's lowercase hex"
+    );
+
+    let signed = bare_peer_vector_op();
+    assert_eq!(hex(&signed.payload), VECTOR_PAYLOAD, "pinned CBOR payload");
+    assert_eq!(hex(&signed.header), VECTOR_HEADER, "pinned signed header");
+
+    // The DOMAIN frame — what actually crosses a v4 music-lane wire. Pinned
+    // separately from the hashes because lifting frames with
+    // `ENTRY_FRAME_MAGIC`, so a `WIRE_MAGIC` change moves only this constant.
+    let frame = signed
+        .to_wire_bytes_in::<MusicLang>()
+        .expect("vector op frames");
+    assert_eq!(
+        hex(&frame),
+        VECTOR_WIRE_FRAME,
+        "pinned MusicLang wire frame"
+    );
+    assert_eq!(
+        SignedOp::from_wire_bytes_in::<MusicLang>(&frame).expect("frame deframes"),
+        signed,
+        "the frame round-trips to the identical signed bytes"
+    );
+
+    // Walkie's ingress enforces the production topic...
+    let verified = verify_music_op(&signed, SIGNED_TOPIC).expect("vector verifies");
+    assert_eq!(verified.topic(), Some(SIGNED_TOPIC));
+    // ...and refuses the human room name — the trap a weaker vector would
+    // have blessed: an implementation signing the name verifies fine WITHOUT
+    // a topic gate and then fails every production peer.
+    assert!(
+        matches!(
+            verify_music_op(&signed, ROOM_NAME),
+            Err(tutti_core::OpVerifyError::TopicMismatch { .. })
+        ),
+        "the human room name is not the signed topic"
+    );
+
+    // The pinned predecessor set: a genesis op — no backlink, empty horizon.
+    assert!(verified.observed().is_empty(), "empty causal horizon");
+    assert_eq!(verified.backlink(), None, "no backlink");
+    assert_eq!(verified.seq_num(), 0, "first op of its log");
+}
+
+/// Walkie's own derivation must agree with the independent recomputation the
+/// bare peer runs (compiled only when the net layer is present).
+#[cfg(feature = "native-net")]
+#[test]
+fn walkie_room_topic_matches_the_pinned_derivation() {
+    use walkie_songie::net::iroh_common::RoomTopic;
+    let topic = RoomTopic::from_room_name(ROOM_NAME);
+    assert_eq!(topic.to_hex(), SIGNED_TOPIC, "RoomTopic::to_hex");
+    assert_eq!(topic.to_string(), SIGNED_TOPIC, "the exact signed string");
 }
 
 /// The vector itself: bare peer -> both stores -> identical identity.
@@ -53,7 +176,9 @@ fn bare_peer_vector_op() -> SignedOp {
 fn music_op_lifts_identically_through_bare_store_and_walkie_lane() {
     let signed = bare_peer_vector_op();
 
-    // The signed identity is pinned before any store sees the bytes.
+    // The signed identity is pinned before any store sees the bytes. (The
+    // language check alone fixes the identity; a conforming peer ALSO gates
+    // on the room topic, as walkie does below.)
     let verified = verify_signed_op_in::<MusicLang>(&signed).expect("bare music op verifies");
     assert_eq!(
         verified.id().to_hex(),
@@ -71,9 +196,11 @@ fn music_op_lifts_identically_through_bare_store_and_walkie_lane() {
         "pinned MusicLang entry hash"
     );
 
-    // Walkie's music lane, fed the SAME bytes through walkie's own ingress.
+    // Walkie's music lane, fed the SAME bytes through walkie's own ingress —
+    // which enforces the production topic the op signed.
     let mut room = Room::new();
-    let lifted = room.ingest_music(verify_music_op(&signed).expect("walkie verifies it too"));
+    let lifted =
+        room.ingest_music(verify_music_op(&signed, SIGNED_TOPIC).expect("walkie verifies it too"));
     assert_eq!(lifted.len(), 1, "walkie lifts the op immediately");
     let lane_entry = room
         .music()
@@ -102,13 +229,14 @@ fn walkie_and_bare_peer_share_one_music_history() {
     let esp_key = signing_key_from_seed(&SEED_ESP32);
     let degree0 = TunedDegree::new(&Tuning::twelve_tet(), 0).unwrap();
     let degree4 = TunedDegree::new(&Tuning::twelve_tet(), 4).unwrap();
+    let topic = production_topic();
 
     // Walkie's room, with extension traffic that must NEVER leak into the
     // music lane's causal horizon.
     let mut room = Room::new();
     room.commit_extension(
         &walkie_key,
-        TOPIC,
+        &topic,
         TS,
         ExtensionOp::SetConfig {
             pieces_locked: Some(true),
@@ -117,13 +245,13 @@ fn walkie_and_bare_peer_share_one_music_history() {
     );
     let w0 = room.commit_music(
         &walkie_key,
-        TOPIC,
+        &topic,
         TS + 1,
         MusicOp::AddDegree { degree: degree0 },
     );
     let w1 = room.commit_music(
         &walkie_key,
-        TOPIC,
+        &topic,
         TS + 2,
         MusicOp::AddDegree { degree: degree4 },
     );
@@ -135,6 +263,12 @@ fn walkie_and_bare_peer_share_one_music_history() {
     for signed in [&w0, &w1] {
         let verified = verify_signed_op_in::<MusicLang>(signed)
             .expect("a walkie music op is a valid bare music op");
+        assert_eq!(
+            verified.topic(),
+            Some(topic.as_str()),
+            "walkie signs the derived topic, so the bare peer's own topic \
+             gate would admit it"
+        );
         bare.ingest_verified(verified);
     }
     assert_eq!(bare.pending_len(), 0, "nothing parks: no undecodable prevs");
@@ -148,11 +282,12 @@ fn walkie_and_bare_peer_share_one_music_history() {
     // through the shared lane. `bare.commit` stamps the bare store's frontier.
     let esp_reply = bare.commit(
         &esp_key,
-        TOPIC,
+        &topic,
         TS + 3,
         MusicOp::RemoveDegree { degree: degree0 },
     );
-    let verified_reply = verify_music_op(&esp_reply).expect("walkie verifies the ESP32 reply");
+    let verified_reply =
+        verify_music_op(&esp_reply, &topic).expect("walkie verifies the ESP32 reply");
     assert!(
         !verified_reply.observed().is_empty(),
         "the reply's horizon references walkie's music ops"
@@ -186,7 +321,7 @@ fn music_lane_enforces_the_64k_cap() {
     };
     assert!(
         matches!(
-            verify_music_op(&oversized),
+            verify_music_op(&oversized, SIGNED_TOPIC),
             Err(OpVerifyError::PayloadTooLarge { actual, max })
                 if actual == cap + 1 && max == cap
         ),
@@ -220,14 +355,14 @@ fn v3_walkie_op_cannot_enter_the_music_lane() {
     );
     assert!(
         matches!(
-            verify_music_op(&v3_signed),
+            verify_music_op(&v3_signed, SIGNED_TOPIC),
             Err(OpVerifyError::PayloadDecode(_))
         ),
         "a v3 walkie payload is not a MusicOp"
     );
     // The music lane's OWN ops verify as extension ops even less: framing and
     // schema both differ (see room::v4's unit tests for the schema gate).
-    assert!(verify_extension_op(&v3_signed).is_err());
+    assert!(verify_extension_op(&v3_signed, SIGNED_TOPIC).is_err());
 }
 
 /// The lifted entry identity is order-independent across peers: the ESP32 op
@@ -244,7 +379,7 @@ fn music_lane_identity_is_order_independent() {
     let mut authoring = Room::new();
     let w_signed = authoring.commit_music(
         &walkie_key,
-        TOPIC,
+        SIGNED_TOPIC,
         TS + 1,
         MusicOp::AddDegree {
             degree: TunedDegree::new(&Tuning::twelve_tet(), 0).unwrap(),
@@ -252,12 +387,12 @@ fn music_lane_identity_is_order_independent() {
     );
 
     let mut forward = Room::new();
-    forward.ingest_music(verify_music_op(&esp_signed).unwrap());
-    forward.ingest_music(verify_music_op(&w_signed).unwrap());
+    forward.ingest_music(verify_music_op(&esp_signed, SIGNED_TOPIC).unwrap());
+    forward.ingest_music(verify_music_op(&w_signed, SIGNED_TOPIC).unwrap());
 
     let mut reverse = Room::new();
-    reverse.ingest_music(verify_music_op(&w_signed).unwrap());
-    reverse.ingest_music(verify_music_op(&esp_signed).unwrap());
+    reverse.ingest_music(verify_music_op(&w_signed, SIGNED_TOPIC).unwrap());
+    reverse.ingest_music(verify_music_op(&esp_signed, SIGNED_TOPIC).unwrap());
 
     assert_eq!(
         forward.music().entry_hashes(),
@@ -265,7 +400,7 @@ fn music_lane_identity_is_order_independent() {
     );
     assert_eq!(forward.view(), reverse.view());
 
-    let vector_id = verify_music_op(&esp_signed).unwrap().id();
+    let vector_id = verify_music_op(&esp_signed, SIGNED_TOPIC).unwrap().id();
     assert_eq!(vector_id.to_hex(), VECTOR_OP_ID);
     assert_eq!(
         forward.music().lifted_entry(vector_id).unwrap().to_hex(),

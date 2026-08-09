@@ -25,14 +25,32 @@
 //! there is no combined frontier to leak an undecodable predecessor into a
 //! music-only peer's causal past.
 //!
+//! **Scope of that invariant, stated honestly:** it binds every op AUTHORED
+//! through a lane's store — [`Room::commit_music`]/[`Room::commit_extension`]
+//! stamp only their own lane's frontier, and walkie exposes no other v4
+//! authoring path, so walkie can never accidentally construct a cross-lane
+//! reference (the per-lane stores ARE the lane-typed authoring heads). It is
+//! NOT an ingress invariant over arbitrary valid signers: causal refs are
+//! untyped 32-byte hashes, so a Byzantine (or merely broken) author can sign a
+//! music op `.observing` an extension entry hash — indistinguishable at
+//! verification time from an op citing a music entry we have not yet received.
+//! Such an op fails closed: strict deferral parks it forever (the dangling ref
+//! never resolves inside the music lane), it never lifts, and it never touches
+//! the fold — pinned by `cross_lane_ref_parks_forever_and_fails_closed` below.
+//! Dangling refs from arbitrary signers are unavoidable in any content-hash
+//! DAG; parking is the designed containment.
+//!
 //! [`Room::view`] composes both lanes into the familiar [`RoomView`]. Because
 //! the extension lane cannot causally observe the music lane's tuning register,
-//! tuning-scoping of pieces is a composition-time projection: a piece whose
-//! resolved position belongs to another tuning is hidden (never reinterpreted)
-//! and resurrects when the room switches back. The music lane's per-degree
-//! envelopes are folded in [`MusicView`] but deliberately NOT part of
-//! [`RoomView`] — adding them to committed state is an explicit `state_root`
-//! schema change, deferred.
+//! tuning-scoping of pieces is a composition-time projection: each piece's
+//! position register is resolved per `(piece, TuningId)` — an other-tuning
+//! move can never displace the put-tuning winner (see
+//! [`fold_pieces`](crate::room::store)) — and a piece whose put asserts
+//! another tuning is hidden (never reinterpreted), resurrecting when the room
+//! switches back. This keeps the v3 piece semantics observably unchanged. The
+//! music lane's per-degree envelopes are folded in [`MusicView`] but
+//! deliberately NOT part of [`RoomView`] — adding them to committed state is
+//! an explicit `state_root` schema change, deferred.
 //!
 //! **Received bytes are sacred:** both lanes store and re-emit the exact bytes
 //! an author signed ([`Store`] lifts verbatim frames); nothing here re-signs,
@@ -105,10 +123,13 @@ pub enum ExtensionOp {
 
 /// The extension lane's read model: pieces plus the config registers.
 ///
-/// `pieces` is deliberately UNSCOPED by tuning — this lane cannot causally
-/// observe the music lane's tuning register, so scoping happens once, at
-/// composition ([`Room::view`]). Nothing outside this module consumes the raw
-/// extension view; the room hands out [`RoomView`].
+/// `pieces` is deliberately UNSCOPED by the ACTIVE tuning — this lane cannot
+/// causally observe the music lane's tuning register, so active-tuning scoping
+/// happens once, at composition ([`Room::view`]). Each piece's position
+/// register IS scoped to the tuning its put asserts (the pitch carries its
+/// [`TuningId`](crate::tuning::TuningId); see `fold_pieces`), so a resolved
+/// position always shares its put's tuning. Nothing outside this module
+/// consumes the raw extension view; the room hands out [`RoomView`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ExtensionView {
     /// Live pieces keyed by their `PutPiece` op id, across all tunings.
@@ -221,15 +242,52 @@ pub type VerifiedMusicOp = VerifiedOpG<MusicLang>;
 /// A verified extension-lane op.
 pub type VerifiedExtensionOp = VerifiedOpG<ExtensionLang>;
 
-/// Verify a music-lane [`SignedOp`] — [`MusicLang`]'s verification, byte-for-byte
-/// what a bare tutti-music peer runs (schema gate, 64 KiB cap, music wire rules).
-pub fn verify_music_op(signed: &SignedOp) -> Result<VerifiedMusicOp, OpVerifyError> {
-    verify_signed_op_in::<MusicLang>(signed)
+/// Require the verified op to be bound to `expected_topic` — the same room-topic
+/// gate v3 ingress applies (`verify_signed_op_for_topic`). Runs AFTER language
+/// verification so schema/decode failures surface first.
+fn require_topic<L: OpLanguage>(
+    verified: VerifiedOpG<L>,
+    expected_topic: &str,
+) -> Result<VerifiedOpG<L>, OpVerifyError> {
+    match verified.topic() {
+        None => Err(OpVerifyError::MissingTopic),
+        Some(actual) if actual != expected_topic => Err(OpVerifyError::TopicMismatch {
+            expected: expected_topic.to_string(),
+            actual: actual.to_string(),
+        }),
+        Some(_) => Ok(verified),
+    }
 }
 
-/// Verify an extension-lane [`SignedOp`] against [`ExtensionLang`].
-pub fn verify_extension_op(signed: &SignedOp) -> Result<VerifiedExtensionOp, OpVerifyError> {
-    verify_signed_op_in::<ExtensionLang>(signed)
+/// Verify a music-lane [`SignedOp`] — [`MusicLang`]'s verification, byte-for-byte
+/// what a bare tutti-music peer runs (schema gate, 64 KiB cap, music wire rules) —
+/// and require the op to be bound to `expected_topic`.
+///
+/// The topic is part of the room contract, not a walkie extra: production signs
+/// the DERIVED topic's hex string (`RoomTopic::from_room_name(name).to_string()`
+/// in `net::iroh_common` — `blake3::derive_key("walkie-songie room topic v1",
+/// name)`), never the human room name, and every conforming peer — walkie or a
+/// bare ESP32 — enforces that exact string at ingress just as v3's
+/// `verify_signed_op_for_topic` does. `tests/music_lane_interop.rs` pins the
+/// derivation and the signed value.
+pub fn verify_music_op(
+    signed: &SignedOp,
+    expected_topic: &str,
+) -> Result<VerifiedMusicOp, OpVerifyError> {
+    require_topic(verify_signed_op_in::<MusicLang>(signed)?, expected_topic)
+}
+
+/// Verify an extension-lane [`SignedOp`] against [`ExtensionLang`] and require it
+/// to be bound to `expected_topic` (the same derived-topic contract as
+/// [`verify_music_op`]; lane-separate topics are net-layer generation work).
+pub fn verify_extension_op(
+    signed: &SignedOp,
+    expected_topic: &str,
+) -> Result<VerifiedExtensionOp, OpVerifyError> {
+    require_topic(
+        verify_signed_op_in::<ExtensionLang>(signed)?,
+        expected_topic,
+    )
 }
 
 /// A v4 room: the music lane and the extension lane, composed on read.
@@ -307,10 +365,12 @@ impl Room {
     /// the extension lane's pieces and config, scoped to one tuning.
     ///
     /// Pieces are filtered here — not in the extension fold — because tuning is
-    /// music-lane state the extension lane cannot causally observe. A piece
-    /// whose resolved position belongs to another tuning is hidden as-is (its
-    /// ops are preserved, never reinterpreted through a bare degree index) and
-    /// reappears when the room switches back.
+    /// music-lane state the extension lane cannot causally observe. A piece's
+    /// resolved position always belongs to its put's tuning (the fold's
+    /// per-`(piece, TuningId)` register scoping guarantees it), so the filter
+    /// reduces to "is this piece's tuning the active one": an other-tuning
+    /// piece is hidden as-is (its ops are preserved, never reinterpreted
+    /// through a bare degree index) and reappears when the room switches back.
     pub fn view(&self) -> RoomView {
         let music = self.music.view();
         let extension = self.extension.view();
@@ -375,7 +435,7 @@ mod tests {
                 pitch: tet_pitch(60),
             },
         );
-        let verified = verify_extension_op(&signed).expect("a just-committed op verifies");
+        let verified = verify_extension_op(&signed, TOPIC).expect("a just-committed op verifies");
         assert_eq!(
             verified.id().to_hex(),
             "7f9c48b66e443436fbfd91cc0ca83f7000e25a86d31e6c228a30adb58bbdf001",
@@ -422,7 +482,7 @@ mod tests {
                 pitch: tet_pitch(60),
             },
         );
-        let piece = verify_extension_op(&put).unwrap().id();
+        let piece = verify_extension_op(&put, TOPIC).unwrap().id();
         room.commit_extension(
             &key_a,
             TOPIC,
@@ -467,7 +527,7 @@ mod tests {
                 degree: tet_degree(0),
             },
         );
-        let first = verify_music_op(&first).unwrap();
+        let first = verify_music_op(&first, TOPIC).unwrap();
         assert!(
             first.observed().is_empty(),
             "extension ops are invisible to the music frontier"
@@ -481,7 +541,7 @@ mod tests {
                 degree: tet_degree(4),
             },
         );
-        let second = verify_music_op(&second).unwrap();
+        let second = verify_music_op(&second, TOPIC).unwrap();
         assert_eq!(
             second.observed(),
             &[first.hash()],
@@ -498,7 +558,7 @@ mod tests {
                 available_emojis: None,
             },
         );
-        let ext = verify_extension_op(&ext).unwrap();
+        let ext = verify_extension_op(&ext, TOPIC).unwrap();
         for observed in ext.observed() {
             assert!(
                 room.extension().lifted_entry(OpId(*observed)).is_some(),
@@ -521,7 +581,7 @@ mod tests {
                 pitch: tet_pitch(60),
             },
         );
-        let piece = verify_extension_op(&put).unwrap().id();
+        let piece = verify_extension_op(&put, TOPIC).unwrap().id();
         room.commit_extension(
             &key_a,
             TOPIC,
@@ -564,7 +624,7 @@ mod tests {
                 pitch: tet_pitch(60),
             },
         );
-        let piece = verify_extension_op(&put).unwrap().id();
+        let piece = verify_extension_op(&put, TOPIC).unwrap().id();
         assert!(room.view().pieces.contains_key(&piece));
 
         // Switch the room (music lane) to another tuning: the 12-TET piece is
@@ -703,7 +763,7 @@ mod tests {
                 pitch: tet_pitch(60),
             },
         );
-        let piece = verify_extension_op(&put).unwrap().id();
+        let piece = verify_extension_op(&put, TOPIC).unwrap().id();
         room.commit_extension(
             &key_a,
             TOPIC,
@@ -838,7 +898,7 @@ mod tests {
         );
         assert!(
             matches!(
-                verify_extension_op(&v3_signed),
+                verify_extension_op(&v3_signed, TOPIC),
                 Err(OpVerifyError::UnsupportedVersion(3))
             ),
             "a v3 op must fail the extension lane's schema gate"
@@ -923,6 +983,394 @@ mod tests {
         assert_eq!(
             view.pitch_authors[&tet_degree(4)],
             BTreeSet::from([AuthorId(*key.verifying_key().as_bytes())]),
+        );
+    }
+
+    /// The extension-piece content of a view, keyed off op identity: v3 and v4
+    /// spell the same history through different wires, so a piece's `OpId`
+    /// legitimately differs — equivalence is over what the pieces ARE.
+    fn piece_contents(
+        view: &RoomView,
+    ) -> Vec<(String, crate::room::ops::AuthorId, TunedPeriodicPitch)> {
+        view.pieces
+            .values()
+            .map(|piece| (piece.emoji.clone(), piece.owner, piece.pitch))
+            .collect()
+    }
+
+    fn assert_views_equivalent(v4_view: &RoomView, v3_view: &RoomView, when: &str) {
+        assert_eq!(
+            piece_contents(v4_view),
+            piece_contents(v3_view),
+            "{when}: v4 pieces must match v3's"
+        );
+        assert_eq!(v4_view.pitches, v3_view.pitches, "{when}: pitches");
+        assert_eq!(v4_view.tuning, v3_view.tuning, "{when}: tuning");
+        assert_eq!(v4_view.pieces_locked, v3_view.pieces_locked, "{when}: lock");
+        assert_eq!(
+            v4_view.available_emojis, v3_view.available_emojis,
+            "{when}: palette"
+        );
+    }
+
+    /// H1 REGRESSION GATE — the object must not disappear. Active tuning
+    /// 12-TET; the piece holds a valid 12-TET move (M_A) and a LATER
+    /// other-tuning move (M_B) that causally dominates it, so a GLOBAL
+    /// position register would deterministically pick M_B — whose pitch then
+    /// fails the active-tuning filter, hiding the whole piece (the pre-fix v4
+    /// behavior). Per-`(piece, TuningId)` scoping makes M_B a non-event for
+    /// the put-tuning register: the piece stays at M_A, exactly as v3 (whose
+    /// classification never admits M_B). Checked as a full v3-vs-v4
+    /// equivalence, through a tuning switch and back.
+    #[test]
+    fn other_tuning_move_never_hides_the_piece_v3_v4_equivalence() {
+        use crate::room::ops::{WalkieOp, verify_signed_op};
+        use crate::room::store::RoomStore;
+
+        let key_a = signing_key_from_seed(&SEED_A);
+        let key_b = signing_key_from_seed(&SEED_B);
+        let other_tuning = tuning_with_step(700);
+        let other_pitch =
+            TunedPeriodicPitch::new(&other_tuning.validate("other tuning").unwrap(), 1, 0).unwrap();
+
+        // v4: put -> M_A -> M_B on the extension lane; each commit observes the
+        // lane frontier, so M_B causally dominates M_A.
+        let mut room = Room::new();
+        let put = room.commit_extension(
+            &key_a,
+            TOPIC,
+            TS,
+            ExtensionOp::PutPiece {
+                emoji: "🌵".into(),
+                pitch: tet_pitch(60),
+            },
+        );
+        let piece = verify_extension_op(&put, TOPIC).unwrap().id();
+        room.commit_extension(
+            &key_b,
+            TOPIC,
+            TS + 1,
+            ExtensionOp::MovePiece {
+                piece,
+                pitch: tet_pitch(64),
+            },
+        );
+        room.commit_extension(
+            &key_b,
+            TOPIC,
+            TS + 2,
+            ExtensionOp::MovePiece {
+                piece,
+                pitch: other_pitch,
+            },
+        );
+
+        // v3: the identical history through the single-lane wire.
+        let mut v3 = RoomStore::new();
+        let v3_put = v3.commit(
+            &key_a,
+            TOPIC,
+            TS,
+            WalkieOp::PutPiece {
+                emoji: "🌵".into(),
+                pitch: tet_pitch(60),
+            },
+        );
+        let v3_piece = verify_signed_op(&v3_put).unwrap().id();
+        v3.commit(
+            &key_b,
+            TOPIC,
+            TS + 1,
+            WalkieOp::MovePiece {
+                piece: v3_piece,
+                pitch: tet_pitch(64),
+            },
+        );
+        v3.commit(
+            &key_b,
+            TOPIC,
+            TS + 2,
+            WalkieOp::MovePiece {
+                piece: v3_piece,
+                pitch: other_pitch,
+            },
+        );
+
+        let v4_view = room.view();
+        assert_eq!(
+            v4_view.pieces[&piece].pitch,
+            tet_pitch(64),
+            "the piece must NOT vanish: the other-tuning register winner is \
+             irrelevant to the active tuning's assertion"
+        );
+        assert_views_equivalent(&v4_view, &v3.view(), "under 12-TET");
+
+        // Switch the active tuning to M_B's: the piece (created under 12-TET)
+        // is hidden on BOTH wires — an other-tuning move never conjures it.
+        room.commit_music(
+            &key_a,
+            TOPIC,
+            TS + 3,
+            MusicOp::SetTuning {
+                definition: other_tuning.clone(),
+            },
+        );
+        v3.commit(
+            &key_a,
+            TOPIC,
+            TS + 3,
+            WalkieOp::SetTuning {
+                definition: other_tuning.clone(),
+            },
+        );
+        assert!(
+            room.view().pieces.is_empty(),
+            "hidden under the other tuning"
+        );
+        assert_views_equivalent(&room.view(), &v3.view(), "under the other tuning");
+
+        // Switch back: it resurrects at M_A's position on both wires.
+        room.commit_music(
+            &key_a,
+            TOPIC,
+            TS + 4,
+            MusicOp::SetTuning {
+                definition: TuningDefinition::twelve_tet(),
+            },
+        );
+        v3.commit(
+            &key_a,
+            TOPIC,
+            TS + 4,
+            WalkieOp::SetTuning {
+                definition: TuningDefinition::twelve_tet(),
+            },
+        );
+        assert_eq!(room.view().pieces[&piece].pitch, tet_pitch(64));
+        assert_views_equivalent(&room.view(), &v3.view(), "after switching back");
+    }
+
+    /// H1, the review's exact fixture: M_A (active tuning) and M_B (other
+    /// tuning) are CONCURRENT — neither observed the other — so pre-fix the
+    /// global register winner was an entry-hash coin toss that could hide the
+    /// piece. Per-tuning scoping makes the outcome tiebreak-independent: M_B
+    /// is a non-event, M_A dominates the put, and v4 matches v3 exactly.
+    #[test]
+    fn concurrent_moves_across_tunings_v3_v4_equivalence() {
+        use crate::room::test_support::Peer;
+        use tutti_core::{LogHead, VersionedOpG, sign_versioned_op};
+
+        let key_a = signing_key_from_seed(&SEED_A);
+        let key_b = signing_key_from_seed(&SEED_B);
+        let other_pitch = TunedPeriodicPitch::new(
+            &tuning_with_step(700).validate("other tuning").unwrap(),
+            1,
+            0,
+        )
+        .unwrap();
+
+        // Hand-sign the v4 extension ops so the two moves are truly concurrent.
+        let sign_ext = |key: &SigningKey,
+                        head: &LogHead,
+                        ts: u64,
+                        observed: Vec<[u8; 32]>,
+                        op: ExtensionOp| {
+            sign_versioned_op(
+                key,
+                head,
+                VersionedOpG::<ExtensionLang>::current_for_topic(op, ts, TOPIC).observing(observed),
+            )
+        };
+        let (put, head_a) = sign_ext(
+            &key_a,
+            &LogHead::genesis(),
+            TS,
+            vec![],
+            ExtensionOp::PutPiece {
+                emoji: "🌵".into(),
+                pitch: tet_pitch(60),
+            },
+        );
+        let put_verified = verify_extension_op(&put, TOPIC).unwrap();
+        let piece = put_verified.id();
+        let put_hash = put_verified.hash();
+        let (m_a, _) = sign_ext(
+            &key_a,
+            &head_a,
+            TS + 1,
+            vec![put_hash],
+            ExtensionOp::MovePiece {
+                piece,
+                pitch: tet_pitch(64),
+            },
+        );
+        // B observed only the put -> M_B is concurrent with M_A.
+        let (m_b, _) = sign_ext(
+            &key_b,
+            &LogHead::genesis(),
+            TS + 2,
+            vec![put_hash],
+            ExtensionOp::MovePiece {
+                piece,
+                pitch: other_pitch,
+            },
+        );
+
+        let mut room = Room::new();
+        for signed in [&put, &m_a, &m_b] {
+            room.ingest_extension(verify_extension_op(signed, TOPIC).unwrap());
+        }
+
+        // v3: the same causal shape through the single-lane wire.
+        let mut peer_a = Peer::new(&SEED_A);
+        let mut peer_b = Peer::new(&SEED_B);
+        use crate::room::ops::WalkieOp;
+        use crate::room::store::RoomStore;
+        let v3_put = peer_a.sign(
+            TS,
+            vec![],
+            WalkieOp::PutPiece {
+                emoji: "🌵".into(),
+                pitch: tet_pitch(60),
+            },
+        );
+        let v3_piece = v3_put.id();
+        let v3_m_a = peer_a.sign(
+            TS + 1,
+            vec![v3_put.hash()],
+            WalkieOp::MovePiece {
+                piece: v3_piece,
+                pitch: tet_pitch(64),
+            },
+        );
+        let v3_m_b = peer_b.sign(
+            TS + 2,
+            vec![v3_put.hash()],
+            WalkieOp::MovePiece {
+                piece: v3_piece,
+                pitch: other_pitch,
+            },
+        );
+        let mut v3 = RoomStore::new();
+        for op in [v3_put, v3_m_a, v3_m_b] {
+            v3.ingest_verified(op);
+        }
+
+        let v4_view = room.view();
+        assert_eq!(
+            v4_view.pieces[&piece].pitch,
+            tet_pitch(64),
+            "M_A dominates the put within the put's tuning; concurrent M_B \
+             cannot displace (or hide) it"
+        );
+        assert_views_equivalent(&v4_view, &v3.view(), "concurrent cross-tuning moves");
+    }
+
+    /// Ingress requires the room's topic on BOTH lanes — v3's
+    /// `verify_signed_op_for_topic` gate carried into v4. In production the
+    /// expected string is the DERIVED topic's hex (see `verify_music_op` docs
+    /// and `tests/music_lane_interop.rs`, which pins the derivation); this
+    /// test pins the mechanism: wrong topic and missing topic both refuse.
+    #[test]
+    fn lane_verification_enforces_the_room_topic() {
+        use tutti_core::{LogHead, VersionedOpG, sign_versioned_op};
+
+        let key = signing_key_from_seed(&SEED_A);
+        let mut room = Room::new();
+        let music = room.commit_music(
+            &key,
+            TOPIC,
+            TS,
+            MusicOp::AddDegree {
+                degree: tet_degree(0),
+            },
+        );
+        let ext = room.commit_extension(
+            &key,
+            TOPIC,
+            TS + 1,
+            ExtensionOp::SetConfig {
+                pieces_locked: Some(true),
+                available_emojis: None,
+            },
+        );
+
+        assert!(verify_music_op(&music, TOPIC).is_ok());
+        assert!(verify_extension_op(&ext, TOPIC).is_ok());
+        assert!(matches!(
+            verify_music_op(&music, "another-room-topic"),
+            Err(OpVerifyError::TopicMismatch { .. })
+        ));
+        assert!(matches!(
+            verify_extension_op(&ext, "another-room-topic"),
+            Err(OpVerifyError::TopicMismatch { .. })
+        ));
+
+        // A topicless op refuses room ingress outright.
+        let (topicless, _) = sign_versioned_op(
+            &key,
+            &LogHead::genesis(),
+            VersionedOpG::<MusicLang>::current(
+                MusicOp::AddDegree {
+                    degree: tet_degree(0),
+                },
+                TS,
+            ),
+        );
+        assert!(matches!(
+            verify_music_op(&topicless, TOPIC),
+            Err(OpVerifyError::MissingTopic)
+        ));
+    }
+
+    /// The parking containment for a NON-conforming author (module docs: the
+    /// separate-frontier invariant binds Store-based authors, not arbitrary
+    /// signers). A validly signed music op whose horizon cites an EXTENSION
+    /// entry hash verifies — causal refs are untyped, so no ingress check can
+    /// tell it from an op citing a music entry not yet received — but strict
+    /// deferral parks it forever: it never lifts and the fold never sees it.
+    /// Fails closed, not open.
+    #[test]
+    fn cross_lane_ref_parks_forever_and_fails_closed() {
+        use tutti_core::{LogHead, VersionedOpG, sign_versioned_op};
+
+        let key_a = signing_key_from_seed(&SEED_A);
+        let key_b = signing_key_from_seed(&SEED_B);
+        let mut room = Room::new();
+        let ext = room.commit_extension(
+            &key_a,
+            TOPIC,
+            TS,
+            ExtensionOp::PutPiece {
+                emoji: "🌵".into(),
+                pitch: tet_pitch(60),
+            },
+        );
+        let ext_entry = room
+            .extension()
+            .lifted_entry(verify_extension_op(&ext, TOPIC).unwrap().id())
+            .expect("extension op is lifted");
+        let before = room.view();
+
+        let versioned = VersionedOpG::<MusicLang>::current_for_topic(
+            MusicOp::AddDegree {
+                degree: tet_degree(4),
+            },
+            TS + 1,
+            TOPIC,
+        )
+        .observing([*ext_entry.as_bytes()]);
+        let (signed, _) = sign_versioned_op(&key_b, &LogHead::genesis(), versioned);
+
+        let verified = verify_music_op(&signed, TOPIC)
+            .expect("verification cannot type-check an untyped causal ref");
+        let lifted = room.ingest_music(verified);
+        assert!(lifted.is_empty(), "the op never lifts");
+        assert_eq!(room.music().pending_len(), 1, "parked, permanently");
+        assert_eq!(
+            room.view(),
+            before,
+            "the fold never sees the parked op — fails closed"
         );
     }
 
