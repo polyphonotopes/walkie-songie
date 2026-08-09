@@ -9,6 +9,7 @@
 //! room-scoped mDNS, relay policy, and observable path state live in [`native`]
 //! behind `native-net`.
 
+pub mod courier;
 pub mod identity;
 pub mod loopback;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-net"))]
@@ -89,11 +90,19 @@ pub use webrtc_transport::{
 };
 
 pub use sync::{
-    DEFAULT_RECV_TIMEOUT, EXTENSION_RBSR_ALPN, EXTENSION_STRATEGY_NAME, ExtensionLane,
-    LANE_STRATEGY_VERSION, LaneSpec, LaneStoreAccess, LaneSyncSource, MAX_SYNC_FRAME_BYTES,
-    MUSIC_RBSR_ALPN, MUSIC_STRATEGY_NAME, MusicLane, RBSR_ALPN, RoomSyncSource, SyncApply,
-    SyncError, SyncLimits, SyncOutcome, SyncTimer, WalkieLane, drive_initiator, drive_responder,
-    ingest_pairs,
+    DEFAULT_RECV_TIMEOUT, EXTENSION_COURIER_ALPN, EXTENSION_RBSR_ALPN, EXTENSION_STRATEGY_NAME,
+    ExtensionLane, LANE_STRATEGY_VERSION, LaneIngest, LaneSpec, LaneStoreAccess, LaneSyncSource,
+    MAX_SYNC_FRAME_BYTES, MUSIC_COURIER_ALPN, MUSIC_RBSR_ALPN, MUSIC_STRATEGY_NAME, MusicLane,
+    RBSR_ALPN, RoomSyncSource, SyncApply, SyncError, SyncLimits, SyncOutcome, SyncTimer,
+    WALKIE_COURIER_ALPN, WalkieLane, drive_initiator, drive_responder, ingest_pairs,
+};
+
+pub use courier::{
+    CourierFrame, CourierRefusal, CourierRequest, CourierResponder, CourierResponse,
+    CourierWireAnswer, MAX_COURIER_CONTEXT_ENTRIES, MAX_COURIER_FRAME_BYTES,
+    MAX_COURIER_LATER_BATCHES, MAX_COURIER_SIBLINGS, TrackedDiscardHistory,
+    apply_courier_response, courier_request_for, exchange_courier, lift_deferred_over_stream,
+    serve_courier_once,
 };
 
 // ---------------------------------------------------------------------------

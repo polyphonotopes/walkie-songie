@@ -58,7 +58,8 @@ use hhhs_sync::{
     },
 };
 use tutti_core::{
-    OpLanguage, SignedOp, SignedOpWireError, Store, sync_root_of, verify_signed_op_in,
+    DeferredLift, OpId, OpLanguage, SignedOp, SignedOpWireError, Store, VerifiedOpG,
+    WindowIngest, WindowedStore, sync_root_of, verify_signed_op_in,
 };
 
 use super::{SyncStream, TransportError};
@@ -86,7 +87,9 @@ pub const RBSR_ALPN: &[u8] = b"walkie/rbsr/2";
 // The music lane's network identity lives in tutti-music itself, so an
 // independently built bare peer (an ESP32 running only tutti crates) speaks
 // the exact same anti-entropy contract as walkie without depending on it.
-pub use tutti_music::{LANE_STRATEGY_VERSION, MUSIC_RBSR_ALPN, MUSIC_STRATEGY_NAME};
+pub use tutti_music::{
+    LANE_STRATEGY_VERSION, MUSIC_COURIER_ALPN, MUSIC_RBSR_ALPN, MUSIC_STRATEGY_NAME,
+};
 
 /// The walkie extension lane's repair ALPN (generation 3, in lockstep with
 /// [`LANE_STRATEGY_VERSION`]). Extension state is walkie-only, so unlike the
@@ -94,6 +97,12 @@ pub use tutti_music::{LANE_STRATEGY_VERSION, MUSIC_RBSR_ALPN, MUSIC_STRATEGY_NAM
 pub const EXTENSION_RBSR_ALPN: &[u8] = b"walkie/extension/rbsr/3";
 /// RBSR strategy name for the extension lane.
 pub const EXTENSION_STRATEGY_NAME: &str = "walkie-extension-entryhash";
+/// The extension lane's deep-laggard courier ALPN (see
+/// [`LaneSpec::COURIER_ALPN`]).
+pub const EXTENSION_COURIER_ALPN: &[u8] = b"walkie/extension/courier/1";
+/// The v3 single-lane wire's courier ALPN, kept beside [`RBSR_ALPN`] until the
+/// app hard-cuts onto the two-lane room and [`WalkieLane`] is deleted.
+pub const WALKIE_COURIER_ALPN: &[u8] = b"walkie/courier/1";
 
 /// One anti-entropy lane: an [`OpLanguage`] plus its network identity.
 ///
@@ -107,6 +116,15 @@ pub trait LaneSpec: 'static {
     type Lang: OpLanguage;
     /// The lane's repair ALPN. Registering it IS declaring the capability.
     const ALPN: &'static [u8];
+    /// The lane's deep-laggard courier ALPN (M3.2 §4.5): one
+    /// [`CourierRequest`](super::courier::CourierRequest) /
+    /// [`CourierResponse`](super::courier::CourierResponse) exchange per stream,
+    /// through which a windowed leaf that deferred a laggard (its predecessor's
+    /// reach row evicted) obtains a real `DiscardProof` + ancestor mask from a
+    /// fuller peer. Never multiplexed into the RBSR ALPN: the RBSR pump decodes
+    /// every inbound frame as a `SyncMessage`, so a foreign frame there would be
+    /// a wire/state-machine change and a generation bump.
+    const COURIER_ALPN: &'static [u8];
     /// The lane's RBSR strategy name, paired with [`LANE_STRATEGY_VERSION`].
     const STRATEGY_NAME: &'static str;
 
@@ -123,6 +141,7 @@ pub enum MusicLane {}
 impl LaneSpec for MusicLane {
     type Lang = MusicLang;
     const ALPN: &'static [u8] = MUSIC_RBSR_ALPN;
+    const COURIER_ALPN: &'static [u8] = MUSIC_COURIER_ALPN;
     const STRATEGY_NAME: &'static str = MUSIC_STRATEGY_NAME;
 }
 
@@ -133,6 +152,7 @@ pub enum ExtensionLane {}
 impl LaneSpec for ExtensionLane {
     type Lang = ExtensionLang;
     const ALPN: &'static [u8] = EXTENSION_RBSR_ALPN;
+    const COURIER_ALPN: &'static [u8] = EXTENSION_COURIER_ALPN;
     const STRATEGY_NAME: &'static str = EXTENSION_STRATEGY_NAME;
 }
 
@@ -145,6 +165,7 @@ pub enum WalkieLane {}
 impl LaneSpec for WalkieLane {
     type Lang = WalkieLang;
     const ALPN: &'static [u8] = RBSR_ALPN;
+    const COURIER_ALPN: &'static [u8] = WALKIE_COURIER_ALPN;
     const STRATEGY_NAME: &'static str = SYNC_STRATEGY_NAME;
 
     fn strategy() -> StrategyId {
@@ -470,6 +491,10 @@ pub struct SyncApply {
     /// Ops newly LIFTED — parked ops are not counted, since they are neither
     /// advertised nor servable. Outcome bookkeeping only.
     pub lifted: usize,
+    /// Ops a windowed leaf deferred for courier admission (M3.2 §4.5) — parked
+    /// AND admitted (under the wire hash), awaiting a courier round trip on the
+    /// lane's [`LaneSpec::COURIER_ALPN`]. Always empty for a full [`Store`].
+    pub courier: Vec<DeferredLift>,
 }
 
 impl<L: OpLanguage> LaneStoreAccess<L> for Store<L> {
@@ -488,6 +513,7 @@ impl<L: OpLanguage> LaneStoreAccess<L> for Store<L> {
         Ok(SyncApply {
             admitted: report.admitted,
             lifted: report.lifted.len(),
+            courier: report.courier,
         })
     }
 }
@@ -500,6 +526,52 @@ pub struct IngestReport {
     /// Entries newly LIFTED, for folding into the snapshot via
     /// [`RoomSyncSource::absorb`].
     pub lifted: Vec<EntryHash>,
+    /// Courier-deferred ops (windowed leaves only) — see [`SyncApply::courier`].
+    pub courier: Vec<DeferredLift>,
+}
+
+/// The one store surface the lane-generic repair ingress ([`ingest_pairs`])
+/// needs, implemented by BOTH store profiles: the full [`Store`] (which never
+/// courier-defers) and the windowed leaf [`WindowedStore`] (which surfaces
+/// [`DeferredLift`]s for deep laggards instead of materializing them wrongly).
+pub trait LaneIngest<L: OpLanguage> {
+    /// The retained entry lifting op `id`, if materialized.
+    fn lifted_entry(&self, id: OpId) -> Option<EntryHash>;
+    /// Whether `id` is already lifted or parked.
+    fn knows_op(&self, id: OpId) -> bool;
+    /// Ingest through the store's production ingress.
+    fn ingest_lane(&mut self, op: VerifiedOpG<L>) -> WindowIngest;
+}
+
+impl<L: OpLanguage> LaneIngest<L> for Store<L> {
+    fn lifted_entry(&self, id: OpId) -> Option<EntryHash> {
+        Store::lifted_entry(self, id)
+    }
+
+    fn knows_op(&self, id: OpId) -> bool {
+        Store::knows_op(self, id)
+    }
+
+    fn ingest_lane(&mut self, op: VerifiedOpG<L>) -> WindowIngest {
+        WindowIngest {
+            lifted: self.ingest_verified(op),
+            courier: Vec::new(),
+        }
+    }
+}
+
+impl<L: OpLanguage> LaneIngest<L> for WindowedStore<L> {
+    fn lifted_entry(&self, id: OpId) -> Option<EntryHash> {
+        WindowedStore::lifted_entry(self, id)
+    }
+
+    fn knows_op(&self, id: OpId) -> bool {
+        WindowedStore::knows_op(self, id)
+    }
+
+    fn ingest_lane(&mut self, op: VerifiedOpG<L>) -> WindowIngest {
+        self.ingest_verified(op)
+    }
 }
 
 /// Ingest peer-supplied entries through the production ingress only.
@@ -512,8 +584,8 @@ pub struct IngestReport {
 /// from the wire, so a peer cannot inject an unverified entry. Frames that fail
 /// to decode or verify are dropped: a hostile peer wastes its own bandwidth,
 /// and the kernel counts the un-admitted hash as refused (re-fetchable).
-pub fn ingest_pairs<L: OpLanguage>(
-    store: &mut Store<L>,
+pub fn ingest_pairs<L: OpLanguage, K: LaneIngest<L>>(
+    store: &mut K,
     topic: &str,
     pairs: &[(EntryHash, Vec<u8>)],
 ) -> IngestReport {
@@ -541,17 +613,21 @@ pub fn ingest_pairs<L: OpLanguage>(
             report.admitted.push(*wire_hash);
             continue;
         }
-        let newly = store.ingest_verified(verified);
-        if newly.is_empty() {
+        let ingest = store.ingest_lane(verified);
+        if ingest.lifted.is_empty() {
             // Parked just now — kept, so it must be admitted or the kernel
-            // re-fetches bytes already in hand until "no progress" aborts.
+            // re-fetches bytes already in hand until "no progress" aborts. A
+            // courier-deferred op is exactly this case: its verified bytes are
+            // parked, so re-fetching them would only spin the fruitless-fetch
+            // budget; the courier round trip resolves it out of band.
             report.admitted.push(*wire_hash);
         } else {
             // Lifted, possibly unblocking earlier parked deliveries; admit the
             // store-derived hashes (all of them are kept AND indexed).
-            report.admitted.extend(newly.iter().copied());
-            report.lifted.extend(newly);
+            report.admitted.extend(ingest.lifted.iter().copied());
+            report.lifted.extend(ingest.lifted);
         }
+        report.courier.extend(ingest.courier);
     }
     report
 }
@@ -587,11 +663,15 @@ impl From<SessionError> for SyncError {
 }
 
 /// What one completed session did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SyncOutcome {
     /// Ops newly LIFTED through the production ingress. Parked ops are excluded:
     /// they are not yet part of the identity set peers reconcile over.
     pub ingested: usize,
+    /// Ops a windowed leaf deferred for courier admission during this session
+    /// (M3.2 §4.5), deduplicated per apply. The session itself completes normally
+    /// — the caller follows up on the lane's [`LaneSpec::COURIER_ALPN`].
+    pub courier: Vec<DeferredLift>,
     pub frames_sent: usize,
     pub frames_received: usize,
     /// The `Done` cross-check disagreed: both halves went idle while their entry
@@ -862,6 +942,7 @@ where
             } else {
                 let applied = store.apply(topic, &output.ingest, source).await?;
                 outcome.ingested += applied.lifted;
+                outcome.courier.extend(applied.courier);
                 applied.admitted
             };
             let more = session.resume_admitted(source.index(), &admitted, Some(source.root()))?;

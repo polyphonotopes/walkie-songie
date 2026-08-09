@@ -317,3 +317,21 @@ opt-level = 3
 [profile.release.package.blake3]
 opt-level = 3
 
+
+# TEMP: local dev for m32-courier; convert to git pins on release.
+# Overrides EVERY dependency on these git URLs (walkie's own pins above AND the
+# transitive pins inside tutti-core/tutti-music/bare-music-peer) with the local
+# working copies, so walkie builds against the uncommitted m32-courier branches.
+# The hhhs-rs checkout is exactly the pushed rev fb8b0b3 (clean tree); converting
+# means repinning walkie's hhhs deps 5802a25 -> fb8b0b3 and the tutti deps to the
+# pushed m32-courier rev, then deleting this whole block.
+[patch."https://github.com/polyphonotopes/tutti.git"]
+tutti-core = { path = "../tutti/tutti-core" }
+tutti-music = { path = "../tutti/tutti-music" }
+tutti-midi = { path = "../tutti/tutti-midi" }
+
+[patch."https://gitlab.com/micahscopes/hhhs-rs.git"]
+hhhs = { path = "../fe-stuff/hhhs-rs/hhhs" }
+hhhs-dag = { path = "../fe-stuff/hhhs-rs/hhhs-dag" }
+hhhs-sync = { path = "../fe-stuff/hhhs-rs/hhhs-sync" }
+hhhs-reactive = { path = "../fe-stuff/hhhs-rs/hhhs-reactive" }

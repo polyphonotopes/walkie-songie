@@ -2830,7 +2830,6 @@ dependencies = [
 [[package]]
 name = "hhhs"
 version = "0.2.0"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?rev=5802a25bf783324de321a918e93de88e3934124e#5802a25bf783324de321a918e93de88e3934124e"
 dependencies = [
  "hhhs-dag",
 ]
@@ -2838,7 +2837,6 @@ dependencies = [
 [[package]]
 name = "hhhs-dag"
 version = "0.2.0"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?rev=5802a25bf783324de321a918e93de88e3934124e#5802a25bf783324de321a918e93de88e3934124e"
 dependencies = [
  "blake3",
  "serde",
@@ -2847,7 +2845,6 @@ dependencies = [
 [[package]]
 name = "hhhs-reactive"
 version = "0.2.0"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?rev=5802a25bf783324de321a918e93de88e3934124e#5802a25bf783324de321a918e93de88e3934124e"
 dependencies = [
  "futures",
  "futures-signals",
@@ -2857,7 +2854,6 @@ dependencies = [
 [[package]]
 name = "hhhs-sync"
 version = "0.2.0"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?rev=5802a25bf783324de321a918e93de88e3934124e#5802a25bf783324de321a918e93de88e3934124e"
 dependencies = [
  "hhhs-dag",
  "postcard",
@@ -7641,7 +7637,6 @@ dependencies = [
 [[package]]
 name = "tutti-core"
 version = "0.1.0"
-source = "git+https://github.com/polyphonotopes/tutti.git?rev=430a0bd1632713b0b2fad753faeb929781255db2#430a0bd1632713b0b2fad753faeb929781255db2"
 dependencies = [
  "blake3",
  "getrandom 0.2.16",
@@ -7656,7 +7651,6 @@ dependencies = [
 [[package]]
 name = "tutti-midi"
 version = "0.1.0"
-source = "git+https://github.com/polyphonotopes/tutti.git?rev=430a0bd1632713b0b2fad753faeb929781255db2#430a0bd1632713b0b2fad753faeb929781255db2"
 dependencies = [
  "thiserror 2.0.19",
  "tutti-music",
@@ -7665,7 +7659,6 @@ dependencies = [
 [[package]]
 name = "tutti-music"
 version = "0.1.0"
-source = "git+https://github.com/polyphonotopes/tutti.git?rev=430a0bd1632713b0b2fad753faeb929781255db2#430a0bd1632713b0b2fad753faeb929781255db2"
 dependencies = [
  "blake3",
  "serde",
