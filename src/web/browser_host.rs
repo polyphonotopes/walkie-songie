@@ -41,12 +41,13 @@ use crate::{
     is_valid_room_name,
     net::{
         BrowserIncomingRepair, BrowserNetHandle, BrowserRoomInbound, BrowserRoomNetwork,
-        BrowserTimer, IrohSyncStream, NativeNetworkEvent, NativeRoomNetworkConfig,
-        NativeRoomTicket, RelayPolicy, RoomSyncSource, RoomTopic, SyncApply, SyncLimits,
-        SyncOutcome, SyncStoreAccess, WalkieIdentity, drive_initiator, drive_responder,
+        BrowserTimer, IrohSyncStream, LaneStoreAccess, NativeNetworkEvent,
+        NativeRoomNetworkConfig, NativeRoomTicket, RelayPolicy, RoomSyncSource, RoomTopic,
+        SyncApply, SyncError, SyncLimits, SyncOutcome, WalkieIdentity, WalkieLane,
+        drive_initiator, drive_responder,
     },
     room::{
-        ops::{AuthorId, OpId, SignedOp, SigningKey, WalkieOp, verify_signed_op_for_topic},
+        ops::{AuthorId, OpId, SignedOp, SigningKey, WalkieLang, WalkieOp, verify_signed_op_for_topic},
         presence::{PresenceBody, SignedPresence},
         store::{RoomStore, RoomView},
     },
@@ -1344,7 +1345,7 @@ fn spawn_repair(
     });
 }
 
-/// [`SyncStoreAccess`] over the in-memory browser store.
+/// [`LaneStoreAccess`] over the in-memory browser store's v3 single lane.
 ///
 /// Borrows per call and NEVER across an await: the same store serves gossip
 /// ingest and local commits on this thread, and a `RefCell` borrow held across
@@ -1356,9 +1357,9 @@ struct BrowserSyncStore {
     host: Rc<BrowserHost>,
 }
 
-impl SyncStoreAccess for BrowserSyncStore {
-    async fn capture(&mut self, salt: [u8; 16]) -> RoomSyncSource {
-        RoomSyncSource::capture(&self.store.borrow(), salt)
+impl LaneStoreAccess<WalkieLang> for BrowserSyncStore {
+    async fn capture(&mut self, salt: [u8; 16]) -> Result<RoomSyncSource, SyncError> {
+        Ok(RoomSyncSource::capture(&self.store.borrow(), salt)?)
     }
 
     async fn apply(
@@ -1366,7 +1367,7 @@ impl SyncStoreAccess for BrowserSyncStore {
         topic: &str,
         pairs: &[(EntryHash, Vec<u8>)],
         source: &mut RoomSyncSource,
-    ) -> SyncApply {
+    ) -> Result<SyncApply, SyncError> {
         let (admitted, lifted, view, journal_dirty) = {
             let mut store = self.store.borrow_mut();
             let mut journal = self.journal.borrow_mut();
@@ -1403,7 +1404,7 @@ impl SyncStoreAccess for BrowserSyncStore {
                     lifted.extend(newly);
                 }
             }
-            source.absorb(&store, &lifted);
+            source.absorb(&store, &lifted)?;
             let view = store.view();
             (admitted, lifted, view, journal_dirty)
         };
@@ -1414,10 +1415,10 @@ impl SyncStoreAccess for BrowserSyncStore {
         if !lifted.is_empty() {
             self.host.apply_room_view(view);
         }
-        SyncApply {
+        Ok(SyncApply {
             admitted,
             lifted: lifted.len(),
-        }
+        })
     }
 }
 
@@ -1438,9 +1439,11 @@ async fn run_repair_session(
     };
     let limits = SyncLimits::default();
     let outcome: SyncOutcome = if initiator {
-        drive_initiator(stream, &BrowserTimer, &mut access, &topic, limits).await
+        drive_initiator::<WalkieLane, _, _, _>(stream, &BrowserTimer, &mut access, &topic, limits)
+            .await
     } else {
-        drive_responder(stream, &BrowserTimer, &mut access, &topic, limits).await
+        drive_responder::<WalkieLane, _, _, _>(stream, &BrowserTimer, &mut access, &topic, limits)
+            .await
     }
     .map_err(|error| error.to_string())?;
 

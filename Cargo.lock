@@ -404,6 +404,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bare-music-peer"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "hhhs-sync",
+ "tutti-core",
+ "tutti-music",
+]
+
+[[package]]
 name = "base16ct"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7631,7 +7641,7 @@ dependencies = [
 [[package]]
 name = "tutti-core"
 version = "0.1.0"
-source = "git+https://github.com/polyphonotopes/tutti.git?rev=b3c2982d7819c7acce01e412a3bed6e0e198a85e#b3c2982d7819c7acce01e412a3bed6e0e198a85e"
+source = "git+https://github.com/polyphonotopes/tutti.git?rev=430a0bd1632713b0b2fad753faeb929781255db2#430a0bd1632713b0b2fad753faeb929781255db2"
 dependencies = [
  "blake3",
  "getrandom 0.2.16",
@@ -7646,7 +7656,7 @@ dependencies = [
 [[package]]
 name = "tutti-midi"
 version = "0.1.0"
-source = "git+https://github.com/polyphonotopes/tutti.git?rev=b3c2982d7819c7acce01e412a3bed6e0e198a85e#b3c2982d7819c7acce01e412a3bed6e0e198a85e"
+source = "git+https://github.com/polyphonotopes/tutti.git?rev=430a0bd1632713b0b2fad753faeb929781255db2#430a0bd1632713b0b2fad753faeb929781255db2"
 dependencies = [
  "thiserror 2.0.19",
  "tutti-music",
@@ -7655,7 +7665,7 @@ dependencies = [
 [[package]]
 name = "tutti-music"
 version = "0.1.0"
-source = "git+https://github.com/polyphonotopes/tutti.git?rev=b3c2982d7819c7acce01e412a3bed6e0e198a85e#b3c2982d7819c7acce01e412a3bed6e0e198a85e"
+source = "git+https://github.com/polyphonotopes/tutti.git?rev=430a0bd1632713b0b2fad753faeb929781255db2#430a0bd1632713b0b2fad753faeb929781255db2"
 dependencies = [
  "blake3",
  "serde",
@@ -7915,6 +7925,7 @@ dependencies = [
  "anyhow",
  "async-broadcast",
  "async-channel",
+ "bare-music-peer",
  "blake3",
  "console_error_panic_hook",
  "criterion",

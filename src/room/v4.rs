@@ -244,8 +244,10 @@ pub type VerifiedExtensionOp = VerifiedOpG<ExtensionLang>;
 
 /// Require the verified op to be bound to `expected_topic` — the same room-topic
 /// gate v3 ingress applies (`verify_signed_op_for_topic`). Runs AFTER language
-/// verification so schema/decode failures surface first.
-fn require_topic<L: OpLanguage>(
+/// verification so schema/decode failures surface first. `pub(crate)` so the
+/// lane-generic repair ingress (`net::sync::ingest_pairs`) applies the one gate
+/// every lane's ingress shares.
+pub(crate) fn require_topic<L: OpLanguage>(
     verified: VerifiedOpG<L>,
     expected_topic: &str,
 ) -> Result<VerifiedOpG<L>, OpVerifyError> {

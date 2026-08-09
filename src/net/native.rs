@@ -25,10 +25,10 @@ use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use super::iroh_common::{
-    EVENT_QUEUE_DEPTH, MAX_GOSSIP_MESSAGE_BYTES, NativeNetError, NativeNetworkEvent,
-    NativeRoomNetworkConfig, NativeRoomTicket, PeerTransportPath, RBSR_ALPN,
-    REPAIR_ACCEPT_TIMEOUT, REPAIR_QUEUE_DEPTH, RoomTopic, classify_peer_path, peer_of,
-    room_mdns_service_name,
+    EVENT_QUEUE_DEPTH, EXTENSION_RBSR_ALPN, MAX_GOSSIP_MESSAGE_BYTES, MUSIC_RBSR_ALPN,
+    NativeNetError, NativeNetworkEvent, NativeRoomNetworkConfig, NativeRoomTicket,
+    PeerTransportPath, RBSR_ALPN, REPAIR_ACCEPT_TIMEOUT, REPAIR_QUEUE_DEPTH, RoomTopic,
+    classify_peer_path, peer_of, room_mdns_service_name,
 };
 use super::repair::IrohSyncStream;
 use super::{PeerId, Transport, TransportError, TransportEvent, TransportMode};
@@ -64,6 +64,10 @@ pub enum RoomInbound {
 #[derive(Debug)]
 pub struct IncomingRepair {
     pub endpoint_id: EndpointId,
+    /// The ALPN the connection was accepted under — the lane tag. The ALPN is
+    /// the ONLY place the lane is named (no lane byte rides inside an RBSR
+    /// frame), so the responder dispatches on this to pick the lane driver.
+    pub alpn: &'static [u8],
     pub connection: Connection,
     pub stream: IrohSyncStream,
 }
@@ -84,9 +88,19 @@ impl NativeRoomNetwork {
 
         // N0 supplies the native IP and relay transports. Address lookup is
         // deliberately rebuilt from memory + room-scoped mDNS below.
+        // The registered ALPN set is this peer's live lane-capability
+        // declaration: walkie speaks the deployed v3 single lane plus BOTH v4
+        // lanes (music + extension); a bare tutti-music peer registers the
+        // music ALPN alone. An unsupported lane fails at QUIC negotiation,
+        // before any RBSR byte.
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(secret_key)
-            .alpns(vec![GOSSIP_ALPN.to_vec(), RBSR_ALPN.to_vec()])
+            .alpns(vec![
+                GOSSIP_ALPN.to_vec(),
+                RBSR_ALPN.to_vec(),
+                MUSIC_RBSR_ALPN.to_vec(),
+                EXTENSION_RBSR_ALPN.to_vec(),
+            ])
             .relay_mode(relay_mode)
             .clear_address_lookup()
             .address_lookup(memory.clone())
@@ -114,12 +128,30 @@ impl NativeRoomNetwork {
         let gossip = Gossip::builder()
             .max_message_size(MAX_GOSSIP_MESSAGE_BYTES)
             .spawn(endpoint.clone());
+        // One accept handler per repair lane, each stamping the queued
+        // connection with the ALPN it arrived under. All three feed the same
+        // bounded repair queue; the room loop dispatches per lane.
         let router = Router::builder(endpoint.clone())
             .accept(GOSSIP_ALPN, gossip.clone())
             .accept(
                 RBSR_ALPN,
                 RepairProtocol {
+                    repairs: repairs_tx.clone(),
+                    alpn: RBSR_ALPN,
+                },
+            )
+            .accept(
+                MUSIC_RBSR_ALPN,
+                RepairProtocol {
+                    repairs: repairs_tx.clone(),
+                    alpn: MUSIC_RBSR_ALPN,
+                },
+            )
+            .accept(
+                EXTENSION_RBSR_ALPN,
+                RepairProtocol {
                     repairs: repairs_tx,
+                    alpn: EXTENSION_RBSR_ALPN,
                 },
             )
             .spawn();
@@ -372,6 +404,8 @@ impl NativeRoomNetwork {
 #[derive(Debug, Clone)]
 struct RepairProtocol {
     repairs: mpsc::Sender<IncomingRepair>,
+    /// The lane ALPN this handler is registered under.
+    alpn: &'static [u8],
 }
 
 impl ProtocolHandler for RepairProtocol {
@@ -400,6 +434,7 @@ impl ProtocolHandler for RepairProtocol {
         // `shutdown`'s note.
         match self.repairs.try_send(IncomingRepair {
             endpoint_id,
+            alpn: self.alpn,
             connection,
             stream,
         }) {

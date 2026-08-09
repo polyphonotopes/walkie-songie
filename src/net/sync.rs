@@ -7,6 +7,17 @@
 //! Nothing here names a backend, so the same driver serves iroh, a loopback
 //! pair, and any browser-bridged carrier.
 //!
+//! # Lanes
+//!
+//! One RBSR session serves exactly ONE causal lane: a [`LaneSpec`] names the
+//! lane's [`OpLanguage`], its ALPN, and its `StrategyId`, and the drivers are
+//! generic over it. The lane tag never rides inside an RBSR frame — the
+//! authenticated ALPN *is* the lane, so a peer that cannot speak a lane is
+//! refused at QUIC negotiation, before any signed-op byte. [`MusicLane`] is
+//! the tutti-music lane a bare (walkie-free) peer joins; [`ExtensionLane`] is
+//! walkie's own pieces/config lane; [`WalkieLane`] is the deployed v3
+//! single-lane wire, kept until the app hard-cuts onto the two-lane room.
+//!
 //! # The consistency invariant
 //!
 //! The kernel requires that the [`EntrySource`] answering `Fetch`es and the
@@ -14,7 +25,7 @@
 //! the index advertises hashes the source cannot serve; `Fetch`es come back
 //! partially answered, `outstanding_fetches` still decrements, both sides reach
 //! `Done`, and the session reports success **while the peers have not
-//! converged**. [`RoomSyncSource`] makes that failure unrepresentable: it owns
+//! converged**. [`LaneSyncSource`] makes that failure unrepresentable: it owns
 //! both, and builds the index from the very map that backs `have()`.
 //!
 //! # Liveness
@@ -33,6 +44,7 @@
 //!   anti-entropy re-syncs", never an error.
 
 use core::future::Future;
+use core::marker::PhantomData;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
@@ -45,23 +57,100 @@ use hhhs_sync::{
         EntrySource, SessionBudget, SessionError, SessionStatus, SyncMessage, SyncSession,
     },
 };
-
-use super::{SyncStream, TransportError};
-use crate::room::{
-    ops::{MAX_SIGNED_OP_WIRE_BYTES, MAX_SIGNED_PAYLOAD_BYTES, SignedOp, verify_signed_op_for_topic},
-    store::{RoomStore, sync_root_of},
+use tutti_core::{
+    OpLanguage, SignedOp, SignedOpWireError, Store, sync_root_of, verify_signed_op_in,
 };
 
-/// Protocol generation. A change here is an ALPN/mode change, never a silent
-/// reshape — peers compare this for equality and `Abort` on mismatch.
+use super::{SyncStream, TransportError};
+use crate::room::ops::{MAX_SIGNED_OP_WIRE_BYTES, MAX_SIGNED_PAYLOAD_BYTES, WalkieLang};
+use crate::room::v4::{ExtensionLang, MusicLang, require_topic};
+
+/// The v3 single-lane protocol generation. A change here is an ALPN/mode
+/// change, never a silent reshape — peers compare this for equality and
+/// `Abort` on mismatch.
 ///
 /// Version 2 is the hardened kernel's wire generation: `Recon(Message)` became
 /// `Question { id, msg }` with a mandatory per-question `Ack(id)`, and
 /// `Entries(Vec<..>)` became the chunkable `Entries { pairs, more }`. The ALPN
-/// (`net::native::RBSR_ALPN`) bumps in lockstep so old and new peers never
-/// attempt to interop.
+/// ([`RBSR_ALPN`]) bumps in lockstep so old and new peers never attempt to
+/// interop. [`WalkieLane`] carries these until the app hard-cuts onto the
+/// two-lane room; the v4 lanes ride [`LANE_STRATEGY_VERSION`] instead.
 pub const SYNC_STRATEGY_NAME: &str = "walkie-entryhash";
 pub const SYNC_STRATEGY_VERSION: u32 = 2;
+
+/// v3 single-lane HHHS H6 repair ALPN (see [`SYNC_STRATEGY_VERSION`] for why
+/// generation 2). Re-exported by `net::iroh_common` for the endpoints; defined
+/// here so [`WalkieLane`] names it without a feature gate.
+pub const RBSR_ALPN: &[u8] = b"walkie/rbsr/2";
+
+// The music lane's network identity lives in tutti-music itself, so an
+// independently built bare peer (an ESP32 running only tutti crates) speaks
+// the exact same anti-entropy contract as walkie without depending on it.
+pub use tutti_music::{LANE_STRATEGY_VERSION, MUSIC_RBSR_ALPN, MUSIC_STRATEGY_NAME};
+
+/// The walkie extension lane's repair ALPN (generation 3, in lockstep with
+/// [`LANE_STRATEGY_VERSION`]). Extension state is walkie-only, so unlike the
+/// music identities this one lives here, not in a tutti crate.
+pub const EXTENSION_RBSR_ALPN: &[u8] = b"walkie/extension/rbsr/3";
+/// RBSR strategy name for the extension lane.
+pub const EXTENSION_STRATEGY_NAME: &str = "walkie-extension-entryhash";
+
+/// One anti-entropy lane: an [`OpLanguage`] plus its network identity.
+///
+/// The ALPN is the ONLY lane tag on the wire. No lane byte rides inside an
+/// RBSR frame: the QUIC-authenticated ALPN scopes the whole connection, so a
+/// peer that does not register a lane's ALPN is refused before any RBSR or
+/// signed-op byte, and a demux bug cannot leak one lane's entries into
+/// another's session.
+pub trait LaneSpec: 'static {
+    /// The lane's op language: wire magic, schema gate, payload cap, fold.
+    type Lang: OpLanguage;
+    /// The lane's repair ALPN. Registering it IS declaring the capability.
+    const ALPN: &'static [u8];
+    /// The lane's RBSR strategy name, paired with [`LANE_STRATEGY_VERSION`].
+    const STRATEGY_NAME: &'static str;
+
+    /// The `Hello` strategy peers compare for equality (mismatch => `Abort`).
+    fn strategy() -> StrategyId {
+        StrategyId::new(Self::STRATEGY_NAME, LANE_STRATEGY_VERSION)
+    }
+}
+
+/// The tutti-music lane — exactly what a bare tutti-music peer speaks. Every
+/// identity here is tutti-music's own export; using them IS the interop.
+pub enum MusicLane {}
+
+impl LaneSpec for MusicLane {
+    type Lang = MusicLang;
+    const ALPN: &'static [u8] = MUSIC_RBSR_ALPN;
+    const STRATEGY_NAME: &'static str = MUSIC_STRATEGY_NAME;
+}
+
+/// Walkie's extension lane: emoji pieces and room config. Only walkie peers
+/// register its ALPN.
+pub enum ExtensionLane {}
+
+impl LaneSpec for ExtensionLane {
+    type Lang = ExtensionLang;
+    const ALPN: &'static [u8] = EXTENSION_RBSR_ALPN;
+    const STRATEGY_NAME: &'static str = EXTENSION_STRATEGY_NAME;
+}
+
+/// The deployed v3 single-lane wire ([`WalkieLang`]), spelled as a lane so the
+/// one generic driver serves it too. Keeps the generation-2 strategy id — the
+/// deployed ALPN/strategy must not move until the app hard-cuts the room onto
+/// the two-lane stores, at which point this lane is deleted outright.
+pub enum WalkieLane {}
+
+impl LaneSpec for WalkieLane {
+    type Lang = WalkieLang;
+    const ALPN: &'static [u8] = RBSR_ALPN;
+    const STRATEGY_NAME: &'static str = SYNC_STRATEGY_NAME;
+
+    fn strategy() -> StrategyId {
+        StrategyId::new(SYNC_STRATEGY_NAME, SYNC_STRATEGY_VERSION)
+    }
+}
 
 /// Hard cap on one encoded `SyncMessage`.
 ///
@@ -88,10 +177,6 @@ const _: () = assert!(
 /// A session with no deadline anywhere is a task that a silent peer parks
 /// forever.
 pub const DEFAULT_RECV_TIMEOUT: Duration = Duration::from_secs(20);
-
-pub fn sync_strategy() -> StrategyId {
-    StrategyId::new(SYNC_STRATEGY_NAME, SYNC_STRATEGY_VERSION)
-}
 
 /// A runtime's sleep.
 ///
@@ -151,48 +236,55 @@ impl Default for SyncLimits {
 }
 
 /// A consistent (`EntrySource`, `Index`, root) triple captured at one store
-/// horizon.
+/// horizon of ONE lane.
+///
+/// Language-scoped by construction: it captures a `Store<L>` alone, its wire
+/// bytes are exactly `to_wire_bytes_in::<L>()` output (framed with
+/// `L::WIRE_MAGIC`), its index holds only that store's entry hashes, and the
+/// closure traversal reads only that store's predecessors — so a session built
+/// on it can never advertise, serve, or emit another lane's entry.
 ///
 /// Replaces the previous `RoomRepairSnapshot` + separate `build_repair_index`,
 /// whose split let a caller pair a fresh index with a stale snapshot.
-pub struct RoomSyncSource {
+pub struct LaneSyncSource<L: OpLanguage> {
     /// entry hash -> (verbatim signed-op wire bytes, causal predecessors)
     records: BTreeMap<EntryHash, (Vec<u8>, Vec<EntryHash>)>,
     index: Index,
     /// Convergence digest over `records`' key set, for the `Done` cross-check.
     root: [u8; 32],
+    _lang: PhantomData<L>,
 }
 
-impl RoomSyncSource {
+/// The v3 single-lane spelling, kept for the deployed call sites until the app
+/// hard-cut deletes [`WalkieLane`].
+pub type RoomSyncSource = LaneSyncSource<WalkieLang>;
+
+impl<L: OpLanguage> LaneSyncSource<L> {
     /// Capture the store's current horizon. The index and root are derived from
     /// exactly the records that back `have()`, so the three cannot disagree.
-    pub fn capture(store: &RoomStore, salt: [u8; 16]) -> Self {
-        let records: BTreeMap<EntryHash, (Vec<u8>, Vec<EntryHash>)> = store
-            .repair_records()
-            .into_iter()
-            .filter_map(|(hash, (signed, predecessors))| match signed.to_wire_bytes() {
-                Ok(bytes) => Some((hash, (bytes, predecessors))),
-                // A lifted entry that cannot be re-serialized would be advertised
-                // by neither index nor root, so both peers would "agree" while
-                // one silently holds an entry the other can never obtain.
-                // `verify_signed_op` enforces the same limits at ingress, so this
-                // is a store-invariant violation, not a peer's doing.
-                Err(error) => {
-                    debug_assert!(false, "lifted entry {} is unserializable: {error}", hash.to_hex());
-                    None
-                }
-            })
-            .collect();
+    ///
+    /// A lifted entry that cannot be re-serialized is a loud error: advertised
+    /// by neither index nor root, both peers would "agree" while one silently
+    /// holds an entry the other can never obtain. `verify_signed_op_in`
+    /// enforces the same limits at ingress, so this is a store-invariant
+    /// violation, never a peer's doing.
+    pub fn capture(store: &Store<L>, salt: [u8; 16]) -> Result<Self, SignedOpWireError> {
+        let mut records: BTreeMap<EntryHash, (Vec<u8>, Vec<EntryHash>)> = BTreeMap::new();
+        for (hash, (signed, predecessors)) in store.repair_records() {
+            let bytes = signed.to_wire_bytes_in::<L>()?;
+            records.insert(hash, (bytes, predecessors));
+        }
         let mut index = Index::new(salt);
         for hash in records.keys() {
             index.insert(SortKey(hash.as_bytes().to_vec()), *hash);
         }
         let root = sync_root_of(records.keys());
-        Self {
+        Ok(Self {
             records,
             index,
             root,
-        }
+            _lang: PhantomData,
+        })
     }
 
     /// Fold entries the store has just lifted into this snapshot.
@@ -201,7 +293,7 @@ impl RoomSyncSource {
     /// re-serialization plus full index rebuild — which the driver used to run
     /// once per `Entries` frame. Index, records and root move together, so the
     /// consistency invariant holds through the update as well as at capture.
-    pub fn absorb(&mut self, store: &RoomStore, lifted: &[EntryHash]) {
+    pub fn absorb(&mut self, store: &Store<L>, lifted: &[EntryHash]) -> Result<(), SignedOpWireError> {
         let mut changed = false;
         for hash in lifted {
             if self.records.contains_key(hash) {
@@ -211,10 +303,7 @@ impl RoomSyncSource {
                 debug_assert!(false, "store reported lifting {} but has no record", hash.to_hex());
                 continue;
             };
-            let Ok(bytes) = signed.to_wire_bytes() else {
-                debug_assert!(false, "lifted entry {} is unserializable", hash.to_hex());
-                continue;
-            };
+            let bytes = signed.to_wire_bytes_in::<L>()?;
             self.index.insert(SortKey(hash.as_bytes().to_vec()), *hash);
             self.records.insert(*hash, (bytes, predecessors));
             changed = true;
@@ -222,6 +311,7 @@ impl RoomSyncSource {
         if changed {
             self.root = sync_root_of(self.records.keys());
         }
+        Ok(())
     }
 
     /// A clone of the index for `SyncSession::{initiate, accept, resume}`.
@@ -243,7 +333,7 @@ impl RoomSyncSource {
     }
 }
 
-impl EntrySource for RoomSyncSource {
+impl<L: OpLanguage> EntrySource for LaneSyncSource<L> {
     fn have(&self, hash: &EntryHash) -> bool {
         self.records.contains_key(hash)
     }
@@ -324,17 +414,21 @@ impl EntrySource for RoomSyncSource {
 }
 
 /// The store side of one session, borrowed only for the duration of a single
-/// call.
+/// call. Language-scoped: an implementation serves exactly one lane's
+/// `Store<L>`, so a session can never be handed another lane's records.
 ///
 /// The driver must never hold the store across a network round trip: a durable
-/// runtime keeps its `RoomStore` behind a lock that the room loop also needs, so
-/// a `&mut RoomStore` held for a whole session freezes gossip ingest, local
+/// runtime keeps its store behind a lock that the room loop also needs, so a
+/// `&mut Store<L>` held for a whole session freezes gossip ingest, local
 /// commits and the UI for as long as the peer takes to answer. Implementations
-/// re-acquire per call; `RoomStore` itself implements it directly for tests and
+/// re-acquire per call; `Store<L>` itself implements it directly for tests and
 /// single-threaded runtimes.
-pub trait SyncStoreAccess {
+pub trait LaneStoreAccess<L: OpLanguage> {
     /// Capture a consistent horizon.
-    fn capture(&mut self, salt: [u8; 16]) -> impl Future<Output = RoomSyncSource>;
+    fn capture(
+        &mut self,
+        salt: [u8; 16],
+    ) -> impl Future<Output = Result<LaneSyncSource<L>, SyncError>>;
 
     /// Ingest peer entries through the production ingress and fold everything
     /// newly lifted into `source`, so the answer set and the advertised set move
@@ -344,8 +438,8 @@ pub trait SyncStoreAccess {
         &mut self,
         topic: &str,
         pairs: &[(EntryHash, Vec<u8>)],
-        source: &mut RoomSyncSource,
-    ) -> impl Future<Output = SyncApply>;
+        source: &mut LaneSyncSource<L>,
+    ) -> impl Future<Output = Result<SyncApply, SyncError>>;
 }
 
 /// The app's verdict on one delivered `Entries` frame, in the exact shape
@@ -378,23 +472,23 @@ pub struct SyncApply {
     pub lifted: usize,
 }
 
-impl SyncStoreAccess for RoomStore {
-    async fn capture(&mut self, salt: [u8; 16]) -> RoomSyncSource {
-        RoomSyncSource::capture(self, salt)
+impl<L: OpLanguage> LaneStoreAccess<L> for Store<L> {
+    async fn capture(&mut self, salt: [u8; 16]) -> Result<LaneSyncSource<L>, SyncError> {
+        Ok(LaneSyncSource::capture(self, salt)?)
     }
 
     async fn apply(
         &mut self,
         topic: &str,
         pairs: &[(EntryHash, Vec<u8>)],
-        source: &mut RoomSyncSource,
-    ) -> SyncApply {
+        source: &mut LaneSyncSource<L>,
+    ) -> Result<SyncApply, SyncError> {
         let report = ingest_pairs(self, topic, pairs);
-        source.absorb(self, &report.lifted);
-        SyncApply {
+        source.absorb(self, &report.lifted)?;
+        Ok(SyncApply {
             admitted: report.admitted,
             lifted: report.lifted.len(),
-        }
+        })
     }
 }
 
@@ -410,21 +504,28 @@ pub struct IngestReport {
 
 /// Ingest peer-supplied entries through the production ingress only.
 ///
-/// The entry is re-derived from the verified op by [`RoomStore`], never trusted
+/// Language-scoped end to end: the frame must deframe under `L::WIRE_MAGIC`
+/// (another lane's frame fails with `WrongDomain`), the op must pass `L`'s
+/// verification (schema gate, payload cap, wire rules), and it must be bound
+/// to this room's topic — the same gate every lane's gossip ingress applies.
+/// The entry is re-derived from the verified op by [`Store`], never trusted
 /// from the wire, so a peer cannot inject an unverified entry. Frames that fail
 /// to decode or verify are dropped: a hostile peer wastes its own bandwidth,
 /// and the kernel counts the un-admitted hash as refused (re-fetchable).
-pub fn ingest_pairs(
-    store: &mut RoomStore,
+pub fn ingest_pairs<L: OpLanguage>(
+    store: &mut Store<L>,
     topic: &str,
     pairs: &[(EntryHash, Vec<u8>)],
 ) -> IngestReport {
     let mut report = IngestReport::default();
     for (wire_hash, bytes) in pairs {
-        let Ok(signed) = SignedOp::from_wire_bytes(bytes) else {
+        let Ok(signed) = SignedOp::from_wire_bytes_in::<L>(bytes) else {
             continue;
         };
-        let Ok(verified) = verify_signed_op_for_topic(&signed, topic) else {
+        let Ok(verified) = verify_signed_op_in::<L>(&signed) else {
+            continue;
+        };
+        let Ok(verified) = require_topic(verified, topic) else {
             continue;
         };
         let id = verified.id();
@@ -459,6 +560,12 @@ pub fn ingest_pairs(
 pub enum SyncError {
     #[error("sync transport failed: {0}")]
     Transport(#[from] TransportError),
+    /// A lifted entry refused to re-serialize under its own lane's wire rules —
+    /// a store-invariant violation (ingress enforces the same limits), so the
+    /// session fails loudly instead of letting both peers "agree" while one
+    /// holds an entry the other can never obtain.
+    #[error("lane snapshot could not serialize a lifted entry: {0}")]
+    Snapshot(#[from] SignedOpWireError),
     #[error("sync session failed: {0}")]
     Session(String),
     #[error("sync frame could not be decoded: {0}")]
@@ -497,11 +604,13 @@ pub struct SyncOutcome {
     pub incomplete: bool,
 }
 
-/// Dial side: open with `Hello`, then pump to completion.
+/// Dial side: open with `Hello`, then pump to completion. Generic over the
+/// [`LaneSpec`]: one session serves exactly one lane, named at the call site
+/// (`drive_initiator::<MusicLane, _, _, _>(..)`).
 ///
 /// Takes the stream by value so it can be closed on every exit — success,
 /// refusal, transport error, timeout.
-pub async fn drive_initiator<S, T, K>(
+pub async fn drive_initiator<P, S, T, K>(
     mut stream: S,
     timer: &T,
     store: &mut K,
@@ -509,16 +618,17 @@ pub async fn drive_initiator<S, T, K>(
     limits: SyncLimits,
 ) -> Result<SyncOutcome, SyncError>
 where
+    P: LaneSpec,
     S: SyncStream,
     T: SyncTimer,
-    K: SyncStoreAccess,
+    K: LaneStoreAccess<P::Lang>,
 {
-    let result = initiate(&mut stream, timer, store, topic, limits).await;
+    let result = initiate::<P, _, _, _>(&mut stream, timer, store, topic, limits).await;
     stream.close().await;
     result
 }
 
-async fn initiate<S, T, K>(
+async fn initiate<P, S, T, K>(
     stream: &mut S,
     timer: &T,
     store: &mut K,
@@ -526,9 +636,10 @@ async fn initiate<S, T, K>(
     limits: SyncLimits,
 ) -> Result<SyncOutcome, SyncError>
 where
+    P: LaneSpec,
     S: SyncStream,
     T: SyncTimer,
-    K: SyncStoreAccess,
+    K: LaneStoreAccess<P::Lang>,
 {
     let mut outcome = SyncOutcome::default();
     // Fresh per session, never caller-supplied. The salt keys the range
@@ -537,9 +648,9 @@ where
     // reach `Done` silently unconverged — permanently, since the same collision
     // works in every later session too.
     let salt: [u8; 16] = rand::random();
-    let mut source = store.capture(salt).await;
+    let mut source = store.capture(salt).await?;
     let (session, opening) =
-        SyncSession::initiate(sync_strategy(), source.index(), Config::default(), salt);
+        SyncSession::initiate(P::strategy(), source.index(), Config::default(), salt);
     let mut session = session.with_budget(limits.budget);
     // The INITIAL root only; after any ingest it rides `resume_admitted`.
     session.set_root(Some(source.root()));
@@ -559,8 +670,9 @@ where
 }
 
 /// Accept side: adopt the initiator's salt (the kernel's "initiator's salt wins"
-/// rule), then pump to completion.
-pub async fn drive_responder<S, T, K>(
+/// rule), then pump to completion. Generic over the [`LaneSpec`] like
+/// [`drive_initiator`]; the caller picks the lane the accepted ALPN named.
+pub async fn drive_responder<P, S, T, K>(
     mut stream: S,
     timer: &T,
     store: &mut K,
@@ -568,16 +680,17 @@ pub async fn drive_responder<S, T, K>(
     limits: SyncLimits,
 ) -> Result<SyncOutcome, SyncError>
 where
+    P: LaneSpec,
     S: SyncStream,
     T: SyncTimer,
-    K: SyncStoreAccess,
+    K: LaneStoreAccess<P::Lang>,
 {
-    let result = respond_to_dial(&mut stream, timer, store, topic, limits).await;
+    let result = respond_to_dial::<P, _, _, _>(&mut stream, timer, store, topic, limits).await;
     stream.close().await;
     result
 }
 
-async fn respond_to_dial<S, T, K>(
+async fn respond_to_dial<P, S, T, K>(
     stream: &mut S,
     timer: &T,
     store: &mut K,
@@ -585,9 +698,10 @@ async fn respond_to_dial<S, T, K>(
     limits: SyncLimits,
 ) -> Result<SyncOutcome, SyncError>
 where
+    P: LaneSpec,
     S: SyncStream,
     T: SyncTimer,
-    K: SyncStoreAccess,
+    K: LaneStoreAccess<P::Lang>,
 {
     let mut outcome = SyncOutcome::default();
     let Some(first) = recv_frame(stream, timer, &limits).await? else {
@@ -606,8 +720,8 @@ where
     };
     // The index MUST be built under the initiator's salt.
     let salt = hello.session_salt;
-    let mut source = store.capture(salt).await;
-    let mut session = match accept_session(&hello, &source, limits) {
+    let mut source = store.capture(salt).await?;
+    let mut session = match accept_session::<P>(&hello, &source, limits) {
         Ok(session) => session,
         Err(reason) => {
             refuse(stream, &reason, &limits, &mut outcome).await;
@@ -630,12 +744,12 @@ where
     Ok(outcome)
 }
 
-fn accept_session(
+fn accept_session<P: LaneSpec>(
     hello: &SessionHello,
-    source: &RoomSyncSource,
+    source: &LaneSyncSource<P::Lang>,
     limits: SyncLimits,
 ) -> Result<SyncSession, String> {
-    SyncSession::accept(hello, sync_strategy(), source.index(), Config::default())
+    SyncSession::accept(hello, P::strategy(), source.index(), Config::default())
         .map(|session| session.with_budget(limits.budget))
 }
 
@@ -670,20 +784,21 @@ fn frame_kind(message: &SyncMessage) -> &'static str {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn pump<S, T, K>(
+async fn pump<L, S, T, K>(
     stream: &mut S,
     timer: &T,
     session: &mut SyncSession,
-    source: &mut RoomSyncSource,
+    source: &mut LaneSyncSource<L>,
     store: &mut K,
     topic: &str,
     limits: SyncLimits,
     outcome: &mut SyncOutcome,
 ) -> Result<(), SyncError>
 where
+    L: OpLanguage,
     S: SyncStream,
     T: SyncTimer,
-    K: SyncStoreAccess,
+    K: LaneStoreAccess<L>,
 {
     // The kernel's `max_rounds` bounds frames it processes; this bounds frames we
     // exchange, so a driver bug that keeps both halves talking without converging
@@ -745,7 +860,7 @@ where
             let admitted = if output.ingest.is_empty() {
                 Vec::new()
             } else {
-                let applied = store.apply(topic, &output.ingest, source).await;
+                let applied = store.apply(topic, &output.ingest, source).await?;
                 outcome.ingested += applied.lifted;
                 applied.admitted
             };
@@ -804,6 +919,7 @@ mod tests {
     use crate::net::loopback::loopback_pair;
     use crate::net::{Transport, TransportEvent};
     use crate::room::ops::{MAX_EMOJI_PALETTE_BYTES, WalkieOp, signing_key_from_seed};
+    use crate::room::store::RoomStore;
     use crate::tuning::{TunedDegree, Tuning, TuningDefinition};
     use hhhs_sync::Digest;
     use hhhs_sync::reconciliation::{KeyRange, Message};
@@ -874,8 +990,10 @@ mod tests {
                 }
             };
 
-            let initiator = drive_initiator(initiator_stream, &NoTimeout, left, TOPIC, limits);
-            let responder = drive_responder(responder_stream, &NoTimeout, right, TOPIC, limits);
+            let initiator =
+                drive_initiator::<WalkieLane, _, _, _>(initiator_stream, &NoTimeout, left, TOPIC, limits);
+            let responder =
+                drive_responder::<WalkieLane, _, _, _>(responder_stream, &NoTimeout, right, TOPIC, limits);
             futures::future::join(initiator, responder).await
         })
     }
@@ -1146,7 +1264,7 @@ mod tests {
             SyncMessage::Ack(1),
             SyncMessage::Done { root: None },
         ]);
-        let outcome = futures::executor::block_on(drive_initiator(
+        let outcome = futures::executor::block_on(drive_initiator::<WalkieLane, _, _, _>(
             &mut peer,
             &NoTimeout,
             &mut store,
@@ -1176,7 +1294,7 @@ mod tests {
 
         // No frames at all: the driver blocks on the first read.
         let mut peer = ScriptedPeer::silent(Vec::new());
-        let error = futures::executor::block_on(drive_initiator(
+        let error = futures::executor::block_on(drive_initiator::<WalkieLane, _, _, _>(
             &mut peer,
             &Expired,
             &mut store,
@@ -1202,7 +1320,7 @@ mod tests {
             SyncMessage::Ack(0),
             SyncMessage::Done { root: None },
         ]);
-        let outcome = futures::executor::block_on(drive_initiator(
+        let outcome = futures::executor::block_on(drive_initiator::<WalkieLane, _, _, _>(
             &mut peer,
             &Expired,
             &mut store,
@@ -1219,7 +1337,7 @@ mod tests {
     fn a_non_hello_opener_is_refused_with_an_abort() {
         let mut store = RoomStore::new();
         let mut peer = ScriptedPeer::hanging_up(vec![SyncMessage::Fetch(vec![bogus_hash(1)])]);
-        let error = futures::executor::block_on(drive_responder(
+        let error = futures::executor::block_on(drive_responder::<WalkieLane, _, _, _>(
             &mut peer,
             &NoTimeout,
             &mut store,
@@ -1243,7 +1361,7 @@ mod tests {
             strategy: StrategyId::new("some-other-protocol", 7),
             session_salt: [3; 16],
         })]);
-        let error = futures::executor::block_on(drive_responder(
+        let error = futures::executor::block_on(drive_responder::<WalkieLane, _, _, _>(
             &mut peer,
             &NoTimeout,
             &mut store,
@@ -1276,7 +1394,7 @@ mod tests {
                 root: Some(store.sync_root()),
             },
         ]);
-        let matched = futures::executor::block_on(drive_initiator(
+        let matched = futures::executor::block_on(drive_initiator::<WalkieLane, _, _, _>(
             &mut agreeing,
             &NoTimeout,
             &mut store,
@@ -1291,7 +1409,7 @@ mod tests {
             SyncMessage::Ack(0),
             SyncMessage::Done { root: Some([9; 32]) },
         ]);
-        let mismatched = futures::executor::block_on(drive_initiator(
+        let mismatched = futures::executor::block_on(drive_initiator::<WalkieLane, _, _, _>(
             &mut lying,
             &NoTimeout,
             &mut store,
@@ -1314,7 +1432,7 @@ mod tests {
     fn the_snapshot_root_matches_the_store_root() {
         let mut store = RoomStore::new();
         add_degrees(&mut store, &[13; 32], &[0, 4, 7], 1);
-        let source = RoomSyncSource::capture(&store, [0; 16]);
+        let source = RoomSyncSource::capture(&store, [0; 16]).unwrap();
         assert_eq!(
             source.root(),
             store.sync_root(),
@@ -1336,7 +1454,7 @@ mod tests {
             report.admitted, report.lifted,
             "one clean lifted delivery: admitted is exactly the lifted hash"
         );
-        source.absorb(&store, &report.lifted);
+        source.absorb(&store, &report.lifted).unwrap();
         assert_eq!(source.root(), store.sync_root());
         assert_eq!(source.len(), store.entry_hashes().len());
     }
@@ -1398,7 +1516,7 @@ mod tests {
     fn every_session_draws_a_fresh_salt() {
         fn salt_of_first_hello(store: &mut RoomStore) -> [u8; 16] {
             let mut peer = ScriptedPeer::hanging_up(Vec::new());
-            let _ = futures::executor::block_on(drive_initiator(
+            let _ = futures::executor::block_on(drive_initiator::<WalkieLane, _, _, _>(
                 &mut peer,
                 &NoTimeout,
                 store,
@@ -1439,7 +1557,7 @@ mod tests {
     fn closure_is_whole_ancestors_first_and_deduplicated() {
         let mut store = RoomStore::new();
         add_degrees(&mut store, &[6; 32], &[0, 1, 2], 1);
-        let source = RoomSyncSource::capture(&store, [0; 16]);
+        let source = RoomSyncSource::capture(&store, [0; 16]).unwrap();
 
         // The frontier entry's closure is the whole three-op chain: the source
         // returns everything and lets the kernel chunk it to frames.
@@ -1512,7 +1630,7 @@ mod tests {
         let mut store = RoomStore::new();
         add_chain(&mut store, &[16; 32], 40);
         let requested: Vec<EntryHash> = store.entry_hashes().into_iter().collect();
-        let source = RoomSyncSource::capture(&store, [0; 16]);
+        let source = RoomSyncSource::capture(&store, [0; 16]).unwrap();
 
         let (delivered, total_pairs) = answer_session(&source, &requested);
         assert_eq!(delivered.len(), 40, "the union is the whole DAG");
@@ -1531,7 +1649,7 @@ mod tests {
         let mut store = RoomStore::new();
         add_chain(&mut store, &[17; 32], 24);
         let requested: Vec<EntryHash> = store.entry_hashes().into_iter().collect();
-        let source = RoomSyncSource::capture(&store, [0; 16]);
+        let source = RoomSyncSource::capture(&store, [0; 16]).unwrap();
 
         let mut included = BTreeSet::new();
         for hash in &requested {
@@ -1554,7 +1672,7 @@ mod tests {
         let mut store = RoomStore::new();
         add_chain(&mut store, &[22; 32], 16);
         let requested: Vec<EntryHash> = store.entry_hashes().into_iter().collect();
-        let source = RoomSyncSource::capture(&store, [0; 16]);
+        let source = RoomSyncSource::capture(&store, [0; 16]).unwrap();
 
         let mut joiner = RoomStore::new();
         let mut included = BTreeSet::new();
@@ -1650,5 +1768,85 @@ mod tests {
         let mut joiner = RoomStore::new();
         run_ok(&mut established, &mut joiner, SyncLimits::default());
         assert_converged(&established, &joiner);
+    }
+
+    // ---------------------------------------------------------------------
+    // Lane scoping
+    // ---------------------------------------------------------------------
+
+    /// The music-isolation proof at the unit it lives at: each lane's source
+    /// captures only its own store, indexes only that store's entry hashes,
+    /// frames every record with its own wire magic, and the repair ingress
+    /// fails closed on a foreign lane's frame.
+    #[test]
+    fn lane_sources_are_language_scoped() {
+        use crate::room::test_support::{SEED_A, tet_degree, tet_pitch};
+        use crate::room::v4::{ExtensionOp, Room};
+        use tutti_music::MusicOp;
+
+        let key = signing_key_from_seed(&SEED_A);
+        let mut room = Room::new();
+        room.commit_music(
+            &key,
+            TOPIC,
+            1,
+            MusicOp::AddDegree {
+                degree: tet_degree(0),
+            },
+        );
+        room.commit_music(
+            &key,
+            TOPIC,
+            2,
+            MusicOp::AddDegree {
+                degree: tet_degree(4),
+            },
+        );
+        room.commit_extension(
+            &key,
+            TOPIC,
+            3,
+            ExtensionOp::PutPiece {
+                emoji: "🌵".into(),
+                pitch: tet_pitch(60),
+            },
+        );
+
+        let music = LaneSyncSource::<MusicLang>::capture(room.music(), [0; 16]).unwrap();
+        let extension =
+            LaneSyncSource::<ExtensionLang>::capture(room.extension(), [0; 16]).unwrap();
+
+        assert_eq!(music.len(), 2);
+        assert_eq!(extension.len(), 1);
+        let music_hashes: BTreeSet<EntryHash> = music.records.keys().copied().collect();
+        assert_eq!(music_hashes, room.music().entry_hashes());
+        for (bytes, _) in music.records.values() {
+            assert!(bytes.starts_with(MusicLang::WIRE_MAGIC));
+            SignedOp::from_wire_bytes_in::<MusicLang>(bytes).expect("music frame deframes");
+            assert!(
+                SignedOp::from_wire_bytes_in::<ExtensionLang>(bytes).is_err(),
+                "a music frame must refuse to deframe as extension"
+            );
+        }
+        for (bytes, _) in extension.records.values() {
+            assert!(bytes.starts_with(ExtensionLang::WIRE_MAGIC));
+            assert!(
+                SignedOp::from_wire_bytes_in::<MusicLang>(bytes).is_err(),
+                "an extension frame must refuse to deframe as music"
+            );
+        }
+
+        // Cross-lane ingest fails closed: a whole music delivery bounces off
+        // the extension lane's ingress without admitting or lifting a thing.
+        let music_pairs: Vec<(EntryHash, Vec<u8>)> = music
+            .records
+            .iter()
+            .map(|(hash, (bytes, _))| (*hash, bytes.clone()))
+            .collect();
+        let mut foreign = Store::<ExtensionLang>::new();
+        let report = ingest_pairs(&mut foreign, TOPIC, &music_pairs);
+        assert!(report.admitted.is_empty(), "nothing admits cross-lane");
+        assert!(report.lifted.is_empty(), "nothing lifts cross-lane");
+        assert!(foreign.is_empty());
     }
 }

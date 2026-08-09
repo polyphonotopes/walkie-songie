@@ -43,13 +43,23 @@ const _: () = assert!(
 /// give up on it. Without this a peer that dials and then says nothing pins a
 /// handler task (and a queue slot) forever.
 pub(crate) const REPAIR_ACCEPT_TIMEOUT: Duration = Duration::from_secs(20);
-/// HHHS H6 range-reconciliation protocol generation.
+/// The repair ALPNs, re-exported from the lane layer so both iroh transports
+/// name them from the one shared place.
 ///
-/// Generation 2 is the hardened kernel's breaking wire reshape
-/// (`Question`/`Ack`, chunkable `Entries { pairs, more }`; see
-/// `sync::SYNC_STRATEGY_VERSION`). Old and new peers must never attempt to
-/// interop, so the ALPN — the earliest negotiation point — carries the bump.
-pub const RBSR_ALPN: &[u8] = b"walkie/rbsr/2";
+/// * [`RBSR_ALPN`] — the deployed v3 single-lane generation ([`super::sync::WalkieLane`]).
+///   Generation 2 is the hardened kernel's breaking wire reshape
+///   (`Question`/`Ack`, chunkable `Entries { pairs, more }`; see
+///   `sync::SYNC_STRATEGY_VERSION`). Old and new peers must never attempt to
+///   interop, so the ALPN — the earliest negotiation point — carries the bump.
+/// * [`MUSIC_RBSR_ALPN`] — the tutti-music lane (generation 3), defined by
+///   tutti-music itself so a bare peer speaks it without walkie.
+/// * [`EXTENSION_RBSR_ALPN`] — walkie's extension lane (generation 3).
+///
+/// The registered ALPN set IS a peer's live lane-capability declaration: an
+/// unsupported lane fails at QUIC negotiation, before any RBSR byte. Lane
+/// capability deliberately does NOT ride [`NativeRoomTicket`], which stays at
+/// version 1.
+pub use super::sync::{EXTENSION_RBSR_ALPN, MUSIC_RBSR_ALPN, RBSR_ALPN};
 /// Production home relay. A trailing dot avoids relative DNS interpretation.
 pub const PRODUCTION_RELAY_URL: &str = "https://relay.wondering.xyz/";
 /// Topic-rendezvous signaling server (y-webrtc `funnyzak/y-webrtc-signaling`,

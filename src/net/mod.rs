@@ -89,8 +89,11 @@ pub use webrtc_transport::{
 };
 
 pub use sync::{
-    DEFAULT_RECV_TIMEOUT, MAX_SYNC_FRAME_BYTES, RoomSyncSource, SyncApply, SyncError, SyncLimits,
-    SyncOutcome, SyncStoreAccess, SyncTimer, drive_initiator, drive_responder, sync_strategy,
+    DEFAULT_RECV_TIMEOUT, EXTENSION_RBSR_ALPN, EXTENSION_STRATEGY_NAME, ExtensionLane,
+    LANE_STRATEGY_VERSION, LaneSpec, LaneStoreAccess, LaneSyncSource, MAX_SYNC_FRAME_BYTES,
+    MUSIC_RBSR_ALPN, MUSIC_STRATEGY_NAME, MusicLane, RBSR_ALPN, RoomSyncSource, SyncApply,
+    SyncError, SyncLimits, SyncOutcome, SyncTimer, WalkieLane, drive_initiator, drive_responder,
+    ingest_pairs,
 };
 
 // ---------------------------------------------------------------------------

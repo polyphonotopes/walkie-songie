@@ -1,0 +1,18 @@
+[package]
+name = "bare-music-peer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+publish = false
+
+# THE point of this crate is its dependency list: a peer that joins a room's
+# MUSIC lane speaks tutti-core (the signed-op substrate), tutti-music (the
+# music protocol + its lane network identities), and hhhs-sync (the real RBSR
+# session kernel) — and NOTHING of walkie-songie. If a walkie type were ever
+# needed here, the music lane would not be joinable by an independent device
+# (an ESP32), and the two-lane design would be broken.
+[dependencies]
+tutti-core = { git = "https://github.com/polyphonotopes/tutti.git", rev = "430a0bd1632713b0b2fad753faeb929781255db2" }
+tutti-music = { git = "https://github.com/polyphonotopes/tutti.git", rev = "430a0bd1632713b0b2fad753faeb929781255db2" }
+hhhs-sync = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "5802a25bf783324de321a918e93de88e3934124e", features = ["wire"] }
+futures = "0.3"

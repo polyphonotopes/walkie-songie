@@ -20,14 +20,15 @@ use walkie_songie::{
         MidiSource, NativeMidiService, PhysicalMidiKey,
     },
     net::{
-        FileSeedStore, IrohSyncStream, NativeNetworkEvent, NativeRoomNetwork,
-        NativeRoomNetworkConfig, NativeRoomTicket, PeerTransportPath, RelayPolicy, RoomInbound,
-        RoomSyncSource, RoomTopic, SyncApply, SyncLimits, SyncOutcome, SyncStoreAccess, TokioTimer,
-        WalkieIdentity, drive_initiator, drive_responder, spawn_rendezvous,
+        FileSeedStore, IrohSyncStream, LaneStoreAccess, NativeNetworkEvent, NativeRoomNetwork,
+        NativeRoomNetworkConfig, NativeRoomTicket, PeerTransportPath, RBSR_ALPN, RelayPolicy,
+        RoomInbound, RoomSyncSource, RoomTopic, SyncApply, SyncError, SyncLimits, SyncOutcome,
+        TokioTimer, WalkieIdentity, WalkieLane, drive_initiator, drive_responder,
+        spawn_rendezvous,
     },
     room::{
         journal::FileOpJournal,
-        ops::{AuthorId, SignedOp, SigningKey, WalkieOp, verify_signed_op_for_topic},
+        ops::{AuthorId, SignedOp, SigningKey, WalkieLang, WalkieOp, verify_signed_op_for_topic},
         presence::{PresenceBody, SignedPresence},
         store::{RoomStore, RoomView},
     },
@@ -544,6 +545,25 @@ impl AppRuntime {
                         };
                         let event = match inbound {
                             RoomInbound::Repair(repair) => {
+                                // The accepted ALPN is the lane tag. The app's
+                                // durable room still runs the deployed v3
+                                // single lane; the v4 lane responders (music +
+                                // extension stores) land with the room's
+                                // hard-cut onto `room::v4`, so until then a v4
+                                // lane dial is declined here rather than driven
+                                // against the wrong store.
+                                if repair.alpn != RBSR_ALPN {
+                                    runtime.emit_diagnostic(
+                                        "repair_lane_unavailable",
+                                        &format!(
+                                            "peer {} opened a v4 lane repair ({}); the durable room still serves the v3 lane only",
+                                            repair.endpoint_id,
+                                            String::from_utf8_lossy(repair.alpn),
+                                        ),
+                                    );
+                                    repair.connection.close(4u32.into(), b"lane not yet served");
+                                    continue;
+                                }
                                 spawn_repair(
                                     runtime.clone(),
                                     durable.clone(),
@@ -1455,7 +1475,7 @@ async fn dial_repair(
     Ok((connection.clone(), stream.owning(connection)))
 }
 
-/// [`SyncStoreAccess`] over the durable room.
+/// [`LaneStoreAccess`] over the durable room's v3 single lane.
 ///
 /// Locks per call and NEVER across a network round trip. The store sits behind
 /// the same mutex the room loop needs for gossip ingest, local commits and view
@@ -1470,10 +1490,10 @@ struct DurableSyncStore {
     runtime: AppRuntime,
 }
 
-impl SyncStoreAccess for DurableSyncStore {
-    async fn capture(&mut self, salt: [u8; 16]) -> RoomSyncSource {
+impl LaneStoreAccess<WalkieLang> for DurableSyncStore {
+    async fn capture(&mut self, salt: [u8; 16]) -> Result<RoomSyncSource, SyncError> {
         let durable = self.durable.lock().await;
-        RoomSyncSource::capture(&durable.store, salt)
+        Ok(RoomSyncSource::capture(&durable.store, salt)?)
     }
 
     async fn apply(
@@ -1481,7 +1501,7 @@ impl SyncStoreAccess for DurableSyncStore {
         topic: &str,
         pairs: &[(EntryHash, Vec<u8>)],
         source: &mut RoomSyncSource,
-    ) -> SyncApply {
+    ) -> Result<SyncApply, SyncError> {
         let mut journal_failure = None;
         let (admitted, lifted, view) = {
             let mut durable = self.durable.lock().await;
@@ -1526,7 +1546,7 @@ impl SyncStoreAccess for DurableSyncStore {
                     lifted.extend(newly);
                 }
             }
-            source.absorb(&durable.store, &lifted);
+            source.absorb(&durable.store, &lifted)?;
             let view = durable.store.view();
             (admitted, lifted, view)
         };
@@ -1536,10 +1556,10 @@ impl SyncStoreAccess for DurableSyncStore {
         if !lifted.is_empty() {
             self.runtime.apply_room_view(view);
         }
-        SyncApply {
+        Ok(SyncApply {
             admitted,
             lifted: lifted.len(),
-        }
+        })
     }
 }
 
@@ -1561,9 +1581,11 @@ async fn run_repair_session(
     };
     let limits = SyncLimits::default();
     let outcome: SyncOutcome = if initiator {
-        drive_initiator(stream, &TokioTimer, &mut store, &signed_topic, limits).await
+        drive_initiator::<WalkieLane, _, _, _>(stream, &TokioTimer, &mut store, &signed_topic, limits)
+            .await
     } else {
-        drive_responder(stream, &TokioTimer, &mut store, &signed_topic, limits).await
+        drive_responder::<WalkieLane, _, _, _>(stream, &TokioTimer, &mut store, &signed_topic, limits)
+            .await
     }
     .map_err(|error| error.to_string())?;
 

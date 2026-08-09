@@ -107,6 +107,7 @@ test-support = []
 members = [
     "xtask",
     "src-tauri",
+    "tests/bare-music-peer",
 ]
 # tutti now lives at github.com/polyphonotopes/tutti and is consumed via git pin.
 exclude = ["relay"]
@@ -148,16 +149,16 @@ yrs = "0.21"
 # machinery, the `Store<L>`/`FoldCtx`/`OpLanguage` fold seam, and the generic
 # `ops_root` Merkle layer. `src/room/` re-exports it so `WalkieLang` is the sole
 # instantiation and no external call site moves. Wasm-safe (no tokio/iroh).
-tutti-core = { git = "https://github.com/polyphonotopes/tutti.git", rev = "b3c2982d7819c7acce01e412a3bed6e0e198a85e" }
+tutti-core = { git = "https://github.com/polyphonotopes/tutti.git", rev = "430a0bd1632713b0b2fad753faeb929781255db2" }
 
 # The music protocol (tutti Phase II): tuning identity (`crate::tuning` re-exports
 # it), the MusicOp/MusicLang reference wire, the fold combinators `walkie_fold`
 # drives, and the render seam. Wasm-safe.
-tutti-music = { git = "https://github.com/polyphonotopes/tutti.git", rev = "b3c2982d7819c7acce01e412a3bed6e0e198a85e" }
+tutti-music = { git = "https://github.com/polyphonotopes/tutti.git", rev = "430a0bd1632713b0b2fad753faeb929781255db2" }
 
 # The reactive MIDI bridge: walkie's source-balanced ledger + input tracker
 # (promoted; `src/midi` re-exports them) and the reconcile-on-reconnect core.
-tutti-midi = { git = "https://github.com/polyphonotopes/tutti.git", rev = "b3c2982d7819c7acce01e412a3bed6e0e198a85e" }
+tutti-midi = { git = "https://github.com/polyphonotopes/tutti.git", rev = "430a0bd1632713b0b2fad753faeb929781255db2" }
 
 # P2P rewrite: signed operation log (p2panda-core) + HHHS causal read model.
 # p2panda-core and HHHS are wasm-safe (no tokio/iroh); the native networking
@@ -183,12 +184,16 @@ walkie-songie = { path = ".", default-features = false, features = ["test-suppor
 # `Store::dag`, the kernel-`ReachIndex` `CausalPast` backend) for the in-crate
 # `reach_equiv` equivalence tests. As a dev-dependency it is unified into the
 # `cargo test` build only, so a plain `cargo build` keeps tutti-core lean.
-tutti-core = { git = "https://github.com/polyphonotopes/tutti.git", rev = "b3c2982d7819c7acce01e412a3bed6e0e198a85e", features = ["test-support"] }
+tutti-core = { git = "https://github.com/polyphonotopes/tutti.git", rev = "430a0bd1632713b0b2fad753faeb929781255db2", features = ["test-support"] }
 # Named directly by `tests/music_lane_interop.rs`, whose bare-peer half must be
 # spelled purely in tutti crates (an ESP32 knows nothing of walkie). Same pin as
 # the regular dependency, so the types unify.
-tutti-music = { git = "https://github.com/polyphonotopes/tutti.git", rev = "b3c2982d7819c7acce01e412a3bed6e0e198a85e" }
+tutti-music = { git = "https://github.com/polyphonotopes/tutti.git", rev = "430a0bd1632713b0b2fad753faeb929781255db2" }
 hhhs-sync = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "5802a25bf783324de321a918e93de88e3934124e" }
+# The walkie-free music peer for the lane-isolation gate
+# (`tests/native_music_lane_e2e.rs`). Its OWN manifest must never name
+# walkie-songie — that absence is what the gate proves.
+bare-music-peer = { path = "tests/bare-music-peer" }
 # Benchmark suite (M0). criterion: native micro-benchmarks; dhat: heap profiling
 # for the reach/view RAM harness; postcard: the real RBSR wire codec, for
 # byte-accurate reconciliation-size reporting.
