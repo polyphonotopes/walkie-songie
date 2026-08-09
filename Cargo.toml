@@ -149,24 +149,24 @@ yrs = "0.21"
 # machinery, the `Store<L>`/`FoldCtx`/`OpLanguage` fold seam, and the generic
 # `ops_root` Merkle layer. `src/room/` re-exports it so `WalkieLang` is the sole
 # instantiation and no external call site moves. Wasm-safe (no tokio/iroh).
-tutti-core = { git = "https://github.com/polyphonotopes/tutti.git", rev = "430a0bd1632713b0b2fad753faeb929781255db2" }
+tutti-core = { git = "https://github.com/polyphonotopes/tutti.git", rev = "3d6af5939cc463d6d9d357f60eea5e079362a591" }
 
 # The music protocol (tutti Phase II): tuning identity (`crate::tuning` re-exports
 # it), the MusicOp/MusicLang reference wire, the fold combinators `walkie_fold`
 # drives, and the render seam. Wasm-safe.
-tutti-music = { git = "https://github.com/polyphonotopes/tutti.git", rev = "430a0bd1632713b0b2fad753faeb929781255db2" }
+tutti-music = { git = "https://github.com/polyphonotopes/tutti.git", rev = "3d6af5939cc463d6d9d357f60eea5e079362a591" }
 
 # The reactive MIDI bridge: walkie's source-balanced ledger + input tracker
 # (promoted; `src/midi` re-exports them) and the reconcile-on-reconnect core.
-tutti-midi = { git = "https://github.com/polyphonotopes/tutti.git", rev = "430a0bd1632713b0b2fad753faeb929781255db2" }
+tutti-midi = { git = "https://github.com/polyphonotopes/tutti.git", rev = "3d6af5939cc463d6d9d357f60eea5e079362a591" }
 
 # P2P rewrite: signed operation log (p2panda-core) + HHHS causal read model.
 # p2panda-core and HHHS are wasm-safe (no tokio/iroh); the native networking
 # stack (p2panda-net) and browser iroh transport are added target-gated below.
 p2panda-core = "0.7"
-hhhs = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "5802a25bf783324de321a918e93de88e3934124e" }
-hhhs-sync = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "5802a25bf783324de321a918e93de88e3934124e", features = ["wire"] }
-hhhs-reactive = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "5802a25bf783324de321a918e93de88e3934124e" }
+hhhs = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "fb8b0b37ebcdc7d541c6eb71827e04f351164263" }
+hhhs-sync = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "fb8b0b37ebcdc7d541c6eb71827e04f351164263", features = ["wire"] }
+hhhs-reactive = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "fb8b0b37ebcdc7d541c6eb71827e04f351164263" }
 # futures-signals drives the HHHS reactive read model (room::mirror) on ALL targets
 # (native plugin + wasm UI); dominator (wasm-only, below) consumes the same signals.
 futures-signals = "0.3"
@@ -184,12 +184,12 @@ walkie-songie = { path = ".", default-features = false, features = ["test-suppor
 # `Store::dag`, the kernel-`ReachIndex` `CausalPast` backend) for the in-crate
 # `reach_equiv` equivalence tests. As a dev-dependency it is unified into the
 # `cargo test` build only, so a plain `cargo build` keeps tutti-core lean.
-tutti-core = { git = "https://github.com/polyphonotopes/tutti.git", rev = "430a0bd1632713b0b2fad753faeb929781255db2", features = ["test-support"] }
+tutti-core = { git = "https://github.com/polyphonotopes/tutti.git", rev = "3d6af5939cc463d6d9d357f60eea5e079362a591", features = ["test-support"] }
 # Named directly by `tests/music_lane_interop.rs`, whose bare-peer half must be
 # spelled purely in tutti crates (an ESP32 knows nothing of walkie). Same pin as
 # the regular dependency, so the types unify.
-tutti-music = { git = "https://github.com/polyphonotopes/tutti.git", rev = "430a0bd1632713b0b2fad753faeb929781255db2" }
-hhhs-sync = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "5802a25bf783324de321a918e93de88e3934124e" }
+tutti-music = { git = "https://github.com/polyphonotopes/tutti.git", rev = "3d6af5939cc463d6d9d357f60eea5e079362a591" }
+hhhs-sync = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "fb8b0b37ebcdc7d541c6eb71827e04f351164263" }
 # The walkie-free music peer for the lane-isolation gate
 # (`tests/native_music_lane_e2e.rs`). Its OWN manifest must never name
 # walkie-songie — that absence is what the gate proves.
@@ -316,22 +316,3 @@ opt-level = 3
 opt-level = 3
 [profile.release.package.blake3]
 opt-level = 3
-
-
-# TEMP: local dev for m32-courier; convert to git pins on release.
-# Overrides EVERY dependency on these git URLs (walkie's own pins above AND the
-# transitive pins inside tutti-core/tutti-music/bare-music-peer) with the local
-# working copies, so walkie builds against the uncommitted m32-courier branches.
-# The hhhs-rs checkout is exactly the pushed rev fb8b0b3 (clean tree); converting
-# means repinning walkie's hhhs deps 5802a25 -> fb8b0b3 and the tutti deps to the
-# pushed m32-courier rev, then deleting this whole block.
-[patch."https://github.com/polyphonotopes/tutti.git"]
-tutti-core = { path = "../tutti/tutti-core" }
-tutti-music = { path = "../tutti/tutti-music" }
-tutti-midi = { path = "../tutti/tutti-midi" }
-
-[patch."https://gitlab.com/micahscopes/hhhs-rs.git"]
-hhhs = { path = "../fe-stuff/hhhs-rs/hhhs" }
-hhhs-dag = { path = "../fe-stuff/hhhs-rs/hhhs-dag" }
-hhhs-sync = { path = "../fe-stuff/hhhs-rs/hhhs-sync" }
-hhhs-reactive = { path = "../fe-stuff/hhhs-rs/hhhs-reactive" }
