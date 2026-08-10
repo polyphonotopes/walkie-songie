@@ -53,8 +53,8 @@ web-ui = [
     "browser-net",
 ]
 # Browser (wasm) iroh transport: relay-only Endpoint + iroh-gossip + Router.
-# The browser host intentionally remains on room v3 while native is room v4;
-# its live two-lane transport and IndexedDB cutover are a separate milestone.
+# The browser host speaks the same room-v4 two-lane protocol as native, with a
+# lane-tagged IndexedDB journal and the exact v4 repair/courier ALPN surface.
 # Enabled by `web-ui` so the plain-browser build (no Tauri) stands up a
 # peer-to-peer room. The iroh crates are declared under the wasm target table
 # below; native uses `native-net`.

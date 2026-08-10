@@ -15,8 +15,8 @@
 //! authenticated ALPN *is* the lane, so a peer that cannot speak a lane is
 //! refused at QUIC negotiation, before any signed-op byte. [`MusicLane`] is
 //! the tutti-music lane a bare (walkie-free) peer joins; [`ExtensionLane`] is
-//! walkie's own pieces/config lane. [`WalkieLane`] remains only for the browser
-//! host and legacy compatibility tests while their separate cutover is pending.
+//! walkie's own pieces/config lane. [`WalkieLane`] remains only as a legacy
+//! test fixture; no live runtime registers or drives its protocol.
 //!
 //! # The consistency invariant
 //!
@@ -74,8 +74,8 @@ use crate::room::v4::{ExtensionLang, MusicLang, RoomLane, require_topic};
 /// `Question { id, msg }` with a mandatory per-question `Ack(id)`, and
 /// `Entries(Vec<..>)` became the chunkable `Entries { pairs, more }`. The ALPN
 /// ([`RBSR_ALPN`]) bumps in lockstep so old and new peers never attempt to
-/// interop. [`WalkieLane`] carries these for the remaining browser-v3 path;
-/// the v4 lanes ride [`LANE_STRATEGY_VERSION`] instead.
+/// interop. [`WalkieLane`] carries these only in legacy tests; the live v4
+/// lanes ride [`LANE_STRATEGY_VERSION`] instead.
 pub const SYNC_STRATEGY_NAME: &str = "walkie-entryhash";
 pub const SYNC_STRATEGY_VERSION: u32 = 2;
 
@@ -100,8 +100,8 @@ pub const EXTENSION_STRATEGY_NAME: &str = "walkie-extension-entryhash";
 /// The extension lane's deep-laggard courier ALPN (see
 /// [`LaneSpec::COURIER_ALPN`]).
 pub const EXTENSION_COURIER_ALPN: &[u8] = b"walkie/extension/courier/1";
-/// The v3 single-lane wire's courier ALPN, retained for the browser-v3 path and
-/// legacy compatibility tests until [`WalkieLane`] can be deleted.
+/// The v3 single-lane wire's courier ALPN, retained only for legacy tests until
+/// [`WalkieLane`] can be deleted.
 pub const WALKIE_COURIER_ALPN: &[u8] = b"walkie/courier/1";
 
 /// One anti-entropy lane: an [`OpLanguage`] plus its network identity.
@@ -316,7 +316,7 @@ pub struct LaneSyncSource<L: OpLanguage> {
 }
 
 /// The v3 single-lane spelling, kept for the browser-v3 call sites and legacy
-/// compatibility tests until that cutover deletes [`WalkieLane`].
+/// compatibility tests until those fixtures delete [`WalkieLane`].
 pub type RoomSyncSource = LaneSyncSource<WalkieLang>;
 
 impl<L: OpLanguage> LaneSyncSource<L> {

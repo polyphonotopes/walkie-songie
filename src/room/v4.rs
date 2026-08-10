@@ -56,9 +56,8 @@
 //! an author signed ([`Store`] lifts verbatim frames); nothing here re-signs,
 //! re-wraps, or reserializes a verified op.
 //!
-//! The native app and endpoint use the v4 identity suite, lane journals, and
-//! separate repair/courier ALPNs. The browser host deliberately retains the
-//! v3 single-lane path until its own live-runtime and IndexedDB cutover.
+//! Both native and browser hosts use the v4 identity suite, lane journals, and
+//! separate repair/courier ALPNs. No live runtime falls back to the v3 room.
 
 use std::collections::BTreeMap;
 

@@ -2,24 +2,23 @@
 //!
 //! A plain browser tab has no Tauri runtime, so this module plays the role
 //! `src-tauri`'s `AppRuntime` plays on desktop: it owns the `WalkieIdentity`,
-//! the signed `RoomStore`, and the live `BrowserRoomNetwork`, accepts the same
+//! the two-lane v4 `Room`, and the live `BrowserRoomNetwork`, accepts the same
 //! [`ClientCommand`]s, and emits the same ordered [`AppEventEnvelope`]s. The
 //! UI cannot tell the difference — `app.rs` routes through one dispatch/apply
 //! seam either way.
 //!
 //! Differences from the desktop runtime, all deliberate:
-//! * a signed-op journal in IndexedDB, keyed by the room topic hex, rather than
-//!   the desktop file journal (`src/room/journal.rs`): the store is seeded from
-//!   it on start and it grows on every admitted op, so a lone tab keeps its
-//!   history across a reload. It is additive to gossip + anti-entropy — peers
-//!   still converge exactly as before;
+//! * a lane-tagged v4 journal in IndexedDB, keyed by the room topic hex, rather
+//!   than the desktop file journal: the room is strictly recovered from it on
+//!   start and each transaction commits before new state becomes visible;
 //! * no native MIDI — the browser keeps Web MIDI, so MIDI commands are
 //!   acknowledged and ignored;
 //! * relay-only reachability (see [`crate::net::browser`]).
 
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
+    marker::PhantomData,
     rc::Rc,
     time::Duration,
 };
@@ -27,6 +26,7 @@ use std::{
 use futures::{
     SinkExt, StreamExt,
     channel::{mpsc, oneshot},
+    lock::Mutex,
 };
 use hhhs::EntryHash;
 use wasm_bindgen_futures::spawn_local;
@@ -41,22 +41,29 @@ use crate::{
     is_valid_room_name,
     net::{
         BrowserIncomingRepair, BrowserNetHandle, BrowserRoomInbound, BrowserRoomNetwork,
-        BrowserTimer, IrohSyncStream, LaneStoreAccess, NativeNetworkEvent,
-        NativeRoomNetworkConfig, NativeRoomTicket, RelayPolicy, RoomSyncSource, RoomTopic,
-        SyncApply, SyncError, SyncLimits, SyncOutcome, WalkieIdentity, WalkieLane,
-        drive_initiator, drive_responder,
+        BrowserTimer, CourierFrame, CourierResponder, ExtensionLane, IncomingOp, IrohSyncStream,
+        LaneIngest, LaneProtocol, LaneSpec, LaneStoreAccess, LaneSyncSource, MusicLane,
+        NativeNetworkEvent, NativeRoomNetworkConfig, NativeRoomTicketV4, PeerId, RelayPolicy,
+        RoomTopic, SyncApply, SyncError, SyncLimits, SyncOutcome, SyncStream,
+        TrackedDiscardHistory, WalkieIdentity, drive_initiator, drive_responder, ingest_pairs,
+        spawn_rendezvous_v4,
     },
     room::{
-        ops::{AuthorId, OpId, SignedOp, SigningKey, WalkieLang, WalkieOp, verify_signed_op_for_topic},
-        presence::{PresenceBody, SignedPresence},
-        store::{RoomStore, RoomView},
+        lane_journal::RoomJournalV4,
+        ops::{AuthorId, OpId, OpLanguage, SignedOp, SigningKey, VerifiedOpG, WindowIngest},
+        presence::{PresenceBody, SignedPresenceV4},
+        store::{RoomView, Store},
+        v4::{
+            ExtensionLang, ExtensionOp, LaneSet, LocalRoomOp, LocalRoomPrepared, MusicLang,
+            MusicOp, Room, RoomLane, verify_extension_op, verify_music_op,
+        },
     },
     tuning::{TunedDegree, TunedPeriodicPitch, TuningDefinition},
 };
 
 enum RoomControl {
     Commit {
-        op: WalkieOp,
+        op: LocalRoomOp,
         response: oneshot::Sender<Result<CommandAck, AppError>>,
     },
     Presence {
@@ -66,6 +73,15 @@ enum RoomControl {
     },
     Shutdown,
 }
+
+struct DurableRoom {
+    topic_hex: String,
+    room: Room,
+    journal: RoomJournalV4,
+    courier: BTreeMap<(PeerId, RoomLane), TrackedDiscardHistory>,
+}
+
+type SharedDurableRoom = Rc<Mutex<DurableRoom>>;
 
 struct ActiveRoom {
     control: mpsc::Sender<RoomControl>,
@@ -103,7 +119,7 @@ fn browser_capabilities() -> Capabilities {
         mdns: false,
         relay: true,
         native_midi: false,
-        durable_storage: false,
+        durable_storage: true,
     }
 }
 
@@ -233,38 +249,42 @@ impl BrowserHost {
                     AppError::new(AppErrorCode::InvalidTuning, "invalid tuning definition")
                         .with_detail(error.to_string())
                 })?;
-                self.submit_durable(WalkieOp::SetTuning { definition })
+                self.submit_durable(MusicOp::SetTuning { definition }.into())
                     .await
             }
             ClientCommand::AddDegree { pitch } => {
                 self.validate_degree(pitch)?;
-                self.submit_durable(WalkieOp::AddDegree { pitch }).await
+                self.submit_durable(MusicOp::AddDegree { degree: pitch }.into())
+                    .await
             }
             ClientCommand::RemoveDegree { pitch } => {
                 self.validate_degree(pitch)?;
-                self.submit_durable(WalkieOp::RemoveDegree { pitch }).await
+                self.submit_durable(MusicOp::RemoveDegree { degree: pitch }.into())
+                    .await
             }
             ClientCommand::PutPiece { emoji, pitch } => {
                 self.validate_periodic_pitch(pitch)?;
-                self.submit_durable(WalkieOp::PutPiece { emoji, pitch })
+                self.submit_durable(ExtensionOp::PutPiece { emoji, pitch }.into())
                     .await
             }
             ClientCommand::MovePiece { piece, pitch } => {
                 self.validate_periodic_pitch(pitch)?;
-                self.submit_durable(WalkieOp::MovePiece { piece, pitch })
+                self.submit_durable(ExtensionOp::MovePiece { piece, pitch }.into())
                     .await
             }
             ClientCommand::RemovePiece { piece } => {
-                self.submit_durable(WalkieOp::RemovePiece { piece }).await
+                self.submit_durable(ExtensionOp::RemovePiece { piece }.into())
+                    .await
             }
             ClientCommand::SetRoomConfig {
                 pieces_locked,
                 available_emojis,
             } => {
-                self.submit_durable(WalkieOp::SetConfig {
+                self.submit_durable(ExtensionOp::SetConfig {
                     pieces_locked,
                     available_emojis,
-                })
+                }
+                .into())
                 .await
             }
             ClientCommand::SetVoicePreview { session, pitch } => {
@@ -297,7 +317,7 @@ impl BrowserHost {
             ));
         }
         let config = NativeRoomNetworkConfig {
-            topic: RoomTopic::from_room_name(&room_name),
+            topic: RoomTopic::from_room_name_v4(&room_name),
             relay: RelayPolicy::Production,
             bootstrap: None,
             bootstrap_lanes: None,
@@ -306,7 +326,7 @@ impl BrowserHost {
     }
 
     async fn join_ticket(self: &Rc<Self>, encoded: String) -> Result<CommandAck, AppError> {
-        let ticket = encoded.parse::<NativeRoomTicket>().map_err(|error| {
+        let ticket = encoded.parse::<NativeRoomTicketV4>().map_err(|error| {
             AppError::new(AppErrorCode::InvalidTicket, "invalid room ticket")
                 .with_detail(error.to_string())
         })?;
@@ -314,7 +334,7 @@ impl BrowserHost {
             topic: ticket.topic(),
             relay: RelayPolicy::Production,
             bootstrap: Some(ticket.endpoint_addr().clone()),
-            bootstrap_lanes: None,
+            bootstrap_lanes: Some(ticket.lanes()),
         };
         self.start_room(None, config).await
     }
@@ -332,15 +352,33 @@ impl BrowserHost {
         let topic_hex = config.topic.to_hex();
         let presence_topic = *config.topic.as_bytes();
         let bootstrap = config.bootstrap.as_ref().map(|address| address.id);
+        let bootstrap_lanes = config.bootstrap_lanes;
 
-        // Signed-op journal: rather than converge from empty, seed the store
-        // from this room's IndexedDB journal so a solo reload keeps its history
-        // with no peer present, then grow the journal on every admitted op.
-        // Additive to gossip + anti-entropy; a read/write failure just falls
-        // back to the old empty-then-converge behavior.
-        let store = Rc::new(RefCell::new(RoomStore::new()));
-        let journal = Rc::new(RefCell::new(RoomJournal::new(topic_hex.clone())));
-        rehydrate_from_journal(&store, &journal, &topic_hex, &topic_string, self).await;
+        // Room-v4 recovery is strict: the disjoint, lane-tagged IndexedDB blob
+        // must decode and every complete record must verify in its declared
+        // lane. Storage errors and causal holes refuse room entry instead of
+        // silently presenting an empty room over durable history.
+        let recovered = super::storage::get_op_journal_v4(&topic_hex)
+            .await
+            .map_err(persistence_error)?;
+        let room = Room::recover(&topic_string, &recovered).map_err(|error| {
+            persistence_error(format!("stored operation failed recovery: {error}"))
+        })?;
+        let pending = room.music().pending_len() + room.extension().pending_len();
+        if pending != 0 {
+            return Err(persistence_error(format!(
+                "{pending} stored operations are missing causal predecessors"
+            )));
+        }
+        let recovered_view = room.view();
+        let mut journal = RoomJournalV4::from_records(recovered).map_err(persistence_error)?;
+        seed_journal_known(&mut journal, &topic_string).map_err(persistence_error)?;
+        let durable = Rc::new(Mutex::new(DurableRoom {
+            topic_hex,
+            room,
+            journal,
+            courier: BTreeMap::new(),
+        }));
 
         let mut network = BrowserRoomNetwork::bind(self.identity.iroh_secret(), config)
             .await
@@ -364,9 +402,12 @@ impl BrowserHost {
         let alive = Rc::new(Cell::new(true));
         let peers: Rc<RefCell<BTreeMap<iroh::EndpointId, (DiscoverySource, PeerPath)>>> =
             Rc::new(RefCell::new(BTreeMap::new()));
+        let peer_lanes: Rc<RefCell<BTreeMap<iroh::EndpointId, LaneSet>>> =
+            Rc::new(RefCell::new(BTreeMap::new()));
         // author -> (session, sequence, issued_at_ms, local_expires_at_ms)
         let presence_order: Rc<RefCell<BTreeMap<AuthorId, (u64, u64, u64, u64)>>> =
             Rc::new(RefCell::new(BTreeMap::new()));
+        let sync_progress = Rc::new(Mutex::new(PeerSyncProgress::default()));
 
         if let Some(endpoint_id) = bootstrap {
             peers
@@ -378,6 +419,9 @@ impl BrowserHost {
                 PeerPath::Connecting,
                 false,
             );
+            if let Some(lanes) = bootstrap_lanes {
+                peer_lanes.borrow_mut().insert(endpoint_id, lanes);
+            }
         }
 
         // ---- topic rendezvous: auto-peer everyone in this room by code ----
@@ -387,11 +431,14 @@ impl BrowserHost {
         // join_peers, and iroh resolves the relay address from the hello.
         let rendezvous = if bootstrap.is_none() {
             let peers_for_rdv = peers.clone();
+            let lanes_for_rdv = peer_lanes.clone();
             let host_for_rdv = self.clone();
-            Some(crate::net::spawn_rendezvous(
+            Some(spawn_rendezvous_v4(
                 handle.rendezvous_peering(),
                 handle.topic(),
-                move |endpoint_id| {
+                LaneSet::WALKIE,
+                move |endpoint_id, lanes| {
+                    lanes_for_rdv.borrow_mut().insert(endpoint_id, lanes);
                     let inserted = {
                         let mut peers = peers_for_rdv.borrow_mut();
                         if peers.contains_key(&endpoint_id) {
@@ -423,13 +470,12 @@ impl BrowserHost {
         // ---- control task: local commits and presence --------------------
         {
             let host = self.clone();
-            let store = store.clone();
+            let durable = durable.clone();
             let handle = handle.clone();
             let topic = topic_string.clone();
             let alive = alive.clone();
             let presence_order = presence_order.clone();
             let signing_key = signing_key.clone();
-            let journal = journal.clone();
             let mut shutdown_tx = Some(shutdown_tx);
             spawn_local(async move {
                 let mut local_presence_session = 0_u64;
@@ -438,13 +484,12 @@ impl BrowserHost {
                     match control_rx.next().await {
                         Some(RoomControl::Commit { op, response }) => {
                             let result = commit_room_op(
-                                &store,
+                                &durable,
                                 &signing_key,
                                 &topic,
                                 op,
                                 &handle,
                                 &host,
-                                &journal,
                             )
                             .await;
                             let _ = response.send(
@@ -464,9 +509,9 @@ impl BrowserHost {
                                 local_presence_sequence = 0;
                             }
                             let now = unix_time_millis();
-                            match SignedPresence::sign(
+                            match SignedPresenceV4::sign(
                                 &signing_key,
-                                PresenceBody::new(
+                                PresenceBody::new_v4(
                                     presence_topic,
                                     session,
                                     local_presence_sequence,
@@ -523,12 +568,13 @@ impl BrowserHost {
         // ---- inbound task: gossip, repair queue, membership --------------
         {
             let host = self.clone();
-            let store = store.clone();
+            let durable = durable.clone();
             let handle = handle.clone();
             let topic = topic_string.clone();
             let peers = peers.clone();
+            let peer_lanes = peer_lanes.clone();
+            let sync_progress = sync_progress.clone();
             let presence_order = presence_order.clone();
-            let journal = journal.clone();
             let mut shutdown_rx = shutdown_rx;
             let rendezvous_guard = rendezvous;
             spawn_local(async move {
@@ -575,14 +621,50 @@ impl BrowserHost {
                     };
                     let event = match inbound {
                         BrowserRoomInbound::Repair(repair) => {
-                            spawn_repair(
-                                host.clone(),
-                                store.clone(),
-                                journal.clone(),
-                                topic.clone(),
-                                repair,
-                                false,
-                            );
+                            let expected = peer_lanes
+                                .borrow()
+                                .get(&repair.endpoint_id)
+                                .copied()
+                                .unwrap_or(LaneSet::WALKIE);
+                            match LaneProtocol::from_alpn(repair.alpn) {
+                                Some(LaneProtocol::Repair(RoomLane::Music)) => {
+                                    spawn_repair::<MusicLane>(
+                                        host.clone(),
+                                        durable.clone(),
+                                        sync_progress.clone(),
+                                        expected,
+                                        topic.clone(),
+                                        repair,
+                                    );
+                                }
+                                Some(LaneProtocol::Repair(RoomLane::Extension)) => {
+                                    spawn_repair::<ExtensionLane>(
+                                        host.clone(),
+                                        durable.clone(),
+                                        sync_progress.clone(),
+                                        expected,
+                                        topic.clone(),
+                                        repair,
+                                    );
+                                }
+                                Some(LaneProtocol::Courier(RoomLane::Music)) => {
+                                    spawn_courier::<MusicLane>(
+                                        host.clone(),
+                                        durable.clone(),
+                                        repair,
+                                    );
+                                }
+                                Some(LaneProtocol::Courier(RoomLane::Extension)) => {
+                                    spawn_courier::<ExtensionLane>(
+                                        host.clone(),
+                                        durable.clone(),
+                                        repair,
+                                    );
+                                }
+                                None => repair
+                                    .connection
+                                    .close(4u32.into(), b"unsupported lane protocol"),
+                            }
                             continue;
                         }
                         BrowserRoomInbound::Event(event) => event,
@@ -603,22 +685,20 @@ impl BrowserHost {
                             // Same deterministic tie-break as desktop: the
                             // smaller endpoint id dials the repair session.
                             if own_endpoint.as_bytes() < endpoint_id.as_bytes() {
-                                match dial_repair(&handle, endpoint_id).await {
-                                    Ok(repair) => spawn_repair(
-                                        host.clone(),
-                                        store.clone(),
-                                        journal.clone(),
-                                        topic.clone(),
-                                        repair,
-                                        true,
-                                    ),
-                                    Err(error) => {
-                                        host.emit_diagnostic("repair_connect", &error)
-                                    }
-                                }
+                                let advertised = peer_lanes.borrow().get(&endpoint_id).copied();
+                                spawn_repair_round(
+                                    host.clone(),
+                                    durable.clone(),
+                                    sync_progress.clone(),
+                                    advertised,
+                                    topic.clone(),
+                                    endpoint_id,
+                                    handle.clone(),
+                                );
                             }
                         }
                         NativeNetworkEvent::NeighborDown { endpoint_id } => {
+                            sync_progress.lock().await.clear(endpoint_id);
                             let known = {
                                 let mut peers = peers.borrow_mut();
                                 match peers.get_mut(&endpoint_id) {
@@ -642,30 +722,33 @@ impl BrowserHost {
                             delivered_from,
                             bytes,
                         } => {
-                            if let Ok(signed) = SignedOp::from_wire_bytes(&bytes) {
-                                match verify_signed_op_for_topic(&signed, &topic) {
-                                    Ok(verified) => {
-                                        if verified.author().0 != *delivered_from.as_bytes() {
-                                            host.emit_diagnostic(
-                                                "gossip_forwarded",
-                                                "received a valid operation through a forwarding neighbor",
-                                            );
-                                        }
-                                        let id = verified.id();
-                                        let view = {
-                                            let mut store = store.borrow_mut();
-                                            store.ingest_verified(verified);
-                                            store.view()
-                                        };
-                                        // Admitted (verified + kept): journal the
-                                        // verbatim bytes so a solo reload keeps it.
-                                        journal_admit(&journal, id, bytes);
-                                        host.apply_room_view(view);
-                                    }
-                                    Err(error) => host
-                                        .emit_diagnostic("gossip_rejected", &error.to_string()),
+                            if bytes.starts_with(MusicLang::WIRE_MAGIC) {
+                                let mut access = BrowserLaneAccess::<MusicLane>::new(
+                                    durable.clone(),
+                                    host.clone(),
+                                );
+                                if let Err(error) = access.apply_gossip(&topic, &bytes).await {
+                                    host.emit_diagnostic(
+                                        "gossip_rejected",
+                                        &format!(
+                                            "music frame from {delivered_from} was refused: {error}"
+                                        ),
+                                    );
                                 }
-                            } else if let Ok(signed) = SignedPresence::from_wire_bytes(&bytes) {
+                            } else if bytes.starts_with(ExtensionLang::WIRE_MAGIC) {
+                                let mut access = BrowserLaneAccess::<ExtensionLane>::new(
+                                    durable.clone(),
+                                    host.clone(),
+                                );
+                                if let Err(error) = access.apply_gossip(&topic, &bytes).await {
+                                    host.emit_diagnostic(
+                                        "gossip_rejected",
+                                        &format!(
+                                            "extension frame from {delivered_from} was refused: {error}"
+                                        ),
+                                    );
+                                }
+                            } else if let Ok(signed) = SignedPresenceV4::from_wire_bytes(&bytes) {
                                 match signed.verify(presence_topic) {
                                     Ok(verified) => {
                                         let body = verified.body;
@@ -809,8 +892,7 @@ impl BrowserHost {
             room_topic: Some(topic_string),
             ticket: Some(ticket_string),
         });
-        let initial_view = store.borrow().view();
-        self.apply_room_view(initial_view);
+        self.apply_room_view(recovered_view);
         Ok(CommandAck {
             accepted_sequence: self.sequence(),
         })
@@ -850,7 +932,7 @@ impl BrowserHost {
         }
     }
 
-    async fn submit_durable(&self, op: WalkieOp) -> Result<CommandAck, AppError> {
+    async fn submit_durable(&self, op: LocalRoomOp) -> Result<CommandAck, AppError> {
         let control = self
             .state
             .borrow()
@@ -1183,322 +1265,520 @@ impl BrowserHost {
     }
 }
 
-/// A room's local signed-op journal: the in-memory mirror of what is persisted
-/// to IndexedDB under the room topic hex. Additive and behavior-preserving — it
-/// seeds the store on start and grows on every admitted op so a lone reloader
-/// keeps their history; it never touches op semantics, gossip, or RBSR.
-///
-/// Deduped by op id, so re-noting a known op (duplicate gossip, a repair that
-/// re-delivers what we already hold) is a no-op. Its lifetime is the room's:
-/// each room owns one keyed to its own topic, so switching rooms cannot
-/// cross-contaminate.
-struct RoomJournal {
-    /// The room topic hex — the IndexedDB key this journal persists under.
-    topic_hex: String,
-    /// Op ids already recorded, for idempotent notes.
-    known: BTreeSet<OpId>,
-    /// Verbatim signed-op wire bytes, in admit order — exactly what each author
-    /// produced, so a rehydrated op is byte-identical for anti-entropy.
-    records: Vec<Vec<u8>>,
-}
-
-impl RoomJournal {
-    fn new(topic_hex: String) -> Self {
-        Self {
-            topic_hex,
-            known: BTreeSet::new(),
-            records: Vec::new(),
-        }
-    }
-
-    /// Record an admitted op's verbatim bytes. Idempotent by op id: returns
-    /// `true` iff the op was newly added (so the caller should persist), `false`
-    /// if it was already journaled.
-    fn note(&mut self, id: OpId, wire_bytes: Vec<u8>) -> bool {
-        if !self.known.insert(id) {
-            return false;
-        }
-        self.records.push(wire_bytes);
-        true
-    }
-}
-
-/// Persist the journal's current records to IndexedDB off the hot path. A write
-/// failure is logged and swallowed — the journal is a best-effort local cache
-/// backstopped by anti-entropy, so it must never block or fail room activity.
-fn persist_journal(journal: &Rc<RefCell<RoomJournal>>) {
-    let (topic_hex, records) = {
-        let journal = journal.borrow();
-        (journal.topic_hex.clone(), journal.records.clone())
-    };
-    spawn_local(async move {
-        if let Err(error) = super::storage::set_op_journal(&topic_hex, &records).await {
-            web_sys::console::warn_1(
-                &format!("op journal write failed (history may not survive reload): {error}")
-                    .into(),
-            );
-        }
-    });
-}
-
-/// Note one admitted op and persist iff it was new. Used by the single-op admit
-/// paths (local commit, one gossip frame).
-fn journal_admit(journal: &Rc<RefCell<RoomJournal>>, id: OpId, wire_bytes: Vec<u8>) {
-    if journal.borrow_mut().note(id, wire_bytes) {
-        persist_journal(journal);
-    }
-}
-
-/// Seed the store (and the in-memory journal mirror) from the IndexedDB journal
-/// before the network comes up, so the projection paints restored state with no
-/// peer present. Malformed or unverifiable records are skipped; the store dedups
-/// and strict-defers, so replay is idempotent and order-independent.
-async fn rehydrate_from_journal(
-    store: &Rc<RefCell<RoomStore>>,
-    journal: &Rc<RefCell<RoomJournal>>,
-    topic_hex: &str,
-    verify_topic: &str,
-    host: &BrowserHost,
-) {
-    let records = super::storage::get_op_journal(topic_hex).await;
-    if records.is_empty() {
-        return;
-    }
-    let mut restored = 0usize;
-    let mut skipped = 0usize;
-    {
-        let mut store = store.borrow_mut();
-        let mut journal = journal.borrow_mut();
-        for bytes in records {
-            let Ok(signed) = SignedOp::from_wire_bytes(&bytes) else {
-                skipped += 1;
-                continue;
-            };
-            let Ok(verified) = verify_signed_op_for_topic(&signed, verify_topic) else {
-                skipped += 1;
-                continue;
-            };
-            let id = verified.id();
-            store.ingest_verified(verified);
-            journal.note(id, bytes);
-            restored += 1;
-        }
-    }
-    host.emit_diagnostic(
-        "journal_restored",
-        &format!("restored {restored} operation(s) from the local journal ({skipped} skipped)"),
-    );
-    // If any records were dropped, rewrite the compacted journal so the on-disk
-    // blob stays clean; harmless if everything was valid (identical bytes).
-    if skipped > 0 {
-        persist_journal(journal);
-    }
-}
-
-/// Dial a peer and open the one bi-stream a repair session runs over.
-async fn dial_repair(
-    handle: &BrowserNetHandle,
-    endpoint_id: iroh::EndpointId,
-) -> Result<BrowserIncomingRepair, String> {
-    let connection = handle
-        .begin_repair(endpoint_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    let stream = IrohSyncStream::open(&connection)
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(BrowserIncomingRepair {
-        endpoint_id,
-        alpn: crate::net::RBSR_ALPN,
-        connection,
-        stream,
-    })
-}
-
-fn spawn_repair(
-    host: Rc<BrowserHost>,
-    store: Rc<RefCell<RoomStore>>,
-    journal: Rc<RefCell<RoomJournal>>,
-    topic: String,
-    repair: BrowserIncomingRepair,
-    initiator: bool,
-) {
-    spawn_local(async move {
-        let endpoint_id = repair.endpoint_id;
-        let telemetry_connection = repair.connection.clone();
-        let stream = repair.stream.owning(repair.connection);
-        match run_repair_session(stream, initiator, store, journal, topic, host.clone()).await {
-            Ok(ingested) => {
-                if let Some(rtt) = telemetry_connection.rtt(iroh::endpoint::PathId::ZERO) {
-                    host.update_peer_rtt(endpoint_id, rtt);
-                }
-                host.mark_peer_synchronized(endpoint_id);
-                host.emit_diagnostic(
-                    "repair_complete",
-                    &format!(
-                        "HHHS H6 repair with {endpoint_id} completed; ingested {ingested} operations"
-                    ),
-                );
+fn seed_journal_known(journal: &mut RoomJournalV4, topic: &str) -> Result<(), String> {
+    let records = journal.records().to_vec();
+    for record in records {
+        let id = match record.lane {
+            RoomLane::Music => {
+                let signed = SignedOp::from_wire_bytes_in::<MusicLang>(&record.wire)
+                    .map_err(|error| error.to_string())?;
+                verify_music_op(&signed, topic)
+                    .map_err(|error| error.to_string())?
+                    .id()
             }
-            Err(error) => host.emit_diagnostic(
-                "repair_failed",
-                &format!("HHHS H6 repair with {endpoint_id} failed: {error}"),
-            ),
+            RoomLane::Extension => {
+                let signed = SignedOp::from_wire_bytes_in::<ExtensionLang>(&record.wire)
+                    .map_err(|error| error.to_string())?;
+                verify_extension_op(&signed, topic)
+                    .map_err(|error| error.to_string())?
+                    .id()
+            }
+        };
+        journal.mark_known(record.lane, id);
+    }
+    Ok(())
+}
+
+trait BrowserLane: LaneSpec {
+    const LANE: RoomLane;
+
+    fn store(room: &Room) -> &Store<Self::Lang>;
+    fn ingest(room: &mut Room, op: VerifiedOpG<Self::Lang>) -> WindowIngest;
+}
+
+impl BrowserLane for MusicLane {
+    const LANE: RoomLane = RoomLane::Music;
+
+    fn store(room: &Room) -> &Store<MusicLang> {
+        room.music()
+    }
+
+    fn ingest(room: &mut Room, op: VerifiedOpG<MusicLang>) -> WindowIngest {
+        WindowIngest {
+            lifted: room.ingest_music(op),
+            courier: Vec::new(),
         }
-    });
+    }
 }
 
-/// [`LaneStoreAccess`] over the in-memory browser store's v3 single lane.
-///
-/// Borrows per call and NEVER across an await: the same store serves gossip
-/// ingest and local commits on this thread, and a `RefCell` borrow held across
-/// a network round trip is a guaranteed panic the first time gossip races a
-/// session.
-struct BrowserSyncStore {
-    store: Rc<RefCell<RoomStore>>,
-    journal: Rc<RefCell<RoomJournal>>,
+impl BrowserLane for ExtensionLane {
+    const LANE: RoomLane = RoomLane::Extension;
+
+    fn store(room: &Room) -> &Store<ExtensionLang> {
+        room.extension()
+    }
+
+    fn ingest(room: &mut Room, op: VerifiedOpG<ExtensionLang>) -> WindowIngest {
+        WindowIngest {
+            lifted: room.ingest_extension(op),
+            courier: Vec::new(),
+        }
+    }
+}
+
+/// A private staging sink. It mutates only a room reconstructed from the last
+/// durable journal; the shared room is replaced only after IndexedDB commits.
+struct BrowserLaneSink<'a, P: BrowserLane> {
+    room: &'a mut Room,
+    journal: &'a mut RoomJournalV4,
+    lane: PhantomData<P>,
+}
+
+impl<P: BrowserLane> LaneIngest<P::Lang> for BrowserLaneSink<'_, P> {
+    fn lifted_entry(&self, id: OpId) -> Option<EntryHash> {
+        P::store(self.room).lifted_entry(id)
+    }
+
+    fn knows_op(&self, id: OpId) -> bool {
+        P::store(self.room).knows_op(id)
+    }
+
+    fn ingest_lane(
+        &mut self,
+        wire: &[u8],
+        op: VerifiedOpG<P::Lang>,
+    ) -> Result<WindowIngest, SyncError> {
+        self.journal
+            .admit(P::LANE, op.id(), wire)
+            .map_err(|error| SyncError::Persistence(error.to_string()))?;
+        Ok(P::ingest(self.room, op))
+    }
+}
+
+struct BrowserLaneAccess<P: BrowserLane> {
+    durable: SharedDurableRoom,
     host: Rc<BrowserHost>,
+    lane: PhantomData<P>,
 }
 
-impl LaneStoreAccess<WalkieLang> for BrowserSyncStore {
-    async fn capture(&mut self, salt: [u8; 16]) -> Result<RoomSyncSource, SyncError> {
-        Ok(RoomSyncSource::capture(&self.store.borrow(), salt)?)
+impl<P: BrowserLane> BrowserLaneAccess<P> {
+    fn new(durable: SharedDurableRoom, host: Rc<BrowserHost>) -> Self {
+        Self {
+            durable,
+            host,
+            lane: PhantomData,
+        }
+    }
+
+    async fn apply_gossip(&mut self, topic: &str, wire: &[u8]) -> Result<usize, SyncError> {
+        let (report, view) = {
+            let mut durable = self.durable.lock().await;
+            let mut staged_room = Room::recover(topic, durable.journal.records())
+                .map_err(|error| SyncError::Persistence(error.to_string()))?;
+            let mut staged_journal = durable.journal.clone();
+            let before = staged_journal.len();
+            let report = {
+                let mut sink = BrowserLaneSink::<P> {
+                    room: &mut staged_room,
+                    journal: &mut staged_journal,
+                    lane: PhantomData,
+                };
+                ingest_pairs::<P::Lang, _>(
+                    &mut sink,
+                    topic,
+                    [IncomingOp {
+                        claimed_entry: None,
+                        wire,
+                    }],
+                )?
+            };
+            if staged_journal.len() != before {
+                super::storage::set_op_journal_v4(
+                    &durable.topic_hex,
+                    staged_journal.records(),
+                )
+                .await
+                .map_err(SyncError::Persistence)?;
+            }
+            let view = staged_room.view();
+            durable.room = staged_room;
+            durable.journal = staged_journal;
+            (report, view)
+        };
+        if !report.lifted.is_empty() {
+            self.host.apply_room_view(view);
+        }
+        Ok(report.lifted.len())
+    }
+}
+
+impl<P: BrowserLane> LaneStoreAccess<P::Lang> for BrowserLaneAccess<P> {
+    async fn capture(&mut self, salt: [u8; 16]) -> Result<LaneSyncSource<P::Lang>, SyncError> {
+        let durable = self.durable.lock().await;
+        Ok(LaneSyncSource::capture(P::store(&durable.room), salt)?)
     }
 
     async fn apply(
         &mut self,
         topic: &str,
         pairs: &[(EntryHash, Vec<u8>)],
-        source: &mut RoomSyncSource,
+        source: &mut LaneSyncSource<P::Lang>,
     ) -> Result<SyncApply, SyncError> {
-        let (admitted, lifted, view, journal_dirty) = {
-            let mut store = self.store.borrow_mut();
-            let mut journal = self.journal.borrow_mut();
-            // The session's admitted set: every hash verified and KEPT (lifted
-            // or parked). Undecodable or unverifiable pairs are left out, which
-            // is what makes them eligible to be asked for again. Every admitted
-            // op is also noted in the journal (idempotent by op id) so a solo
-            // reload keeps repair-delivered history.
-            let mut admitted = Vec::new();
-            let mut lifted = Vec::new();
-            let mut journal_dirty = false;
-            for (wire_hash, bytes) in pairs {
-                let Ok(signed) = SignedOp::from_wire_bytes(bytes) else {
-                    continue;
+        let (report, view) = {
+            let mut durable = self.durable.lock().await;
+            let mut staged_room = Room::recover(topic, durable.journal.records())
+                .map_err(|error| SyncError::Persistence(error.to_string()))?;
+            let mut staged_journal = durable.journal.clone();
+            let before = staged_journal.len();
+            let report = {
+                let mut sink = BrowserLaneSink::<P> {
+                    room: &mut staged_room,
+                    journal: &mut staged_journal,
+                    lane: PhantomData,
                 };
-                let Ok(verified) = verify_signed_op_for_topic(&signed, topic) else {
-                    continue;
-                };
-                let id = verified.id();
-                journal_dirty |= journal.note(id, bytes.clone());
-                if let Some(entry) = store.lifted_entry(id) {
-                    admitted.push(entry);
-                    continue;
-                }
-                if store.knows_op(id) {
-                    admitted.push(*wire_hash);
-                    continue;
-                }
-                let newly = store.ingest_verified(verified);
-                if newly.is_empty() {
-                    admitted.push(*wire_hash);
-                } else {
-                    admitted.extend(newly.iter().copied());
-                    lifted.extend(newly);
-                }
+                ingest_pairs::<P::Lang, _>(
+                    &mut sink,
+                    topic,
+                    pairs.iter().map(IncomingOp::from),
+                )?
+            };
+            if staged_journal.len() != before {
+                super::storage::set_op_journal_v4(
+                    &durable.topic_hex,
+                    staged_journal.records(),
+                )
+                .await
+                .map_err(SyncError::Persistence)?;
             }
-            source.absorb(&store, &lifted)?;
-            let view = store.view();
-            (admitted, lifted, view, journal_dirty)
+            source.absorb(P::store(&staged_room), &report.lifted)?;
+            let view = staged_room.view();
+            durable.room = staged_room;
+            durable.journal = staged_journal;
+            (report, view)
         };
-        // One IndexedDB write per session, not per op.
-        if journal_dirty {
-            persist_journal(&self.journal);
-        }
-        if !lifted.is_empty() {
+        if !report.lifted.is_empty() {
             self.host.apply_room_view(view);
         }
         Ok(SyncApply {
-            admitted,
-            lifted: lifted.len(),
-            // The browser runs a full (non-windowed) store, so it never defers
-            // ops for courier admission.
-            courier: Vec::new(),
+            admitted: report.admitted,
+            lifted: report.lifted.len(),
+            courier: report.courier,
         })
     }
 }
 
-/// Drive one HHHS H6 anti-entropy session over an established stream. The
-/// session logic is `net::sync`, shared with desktop and the loopback tests.
-async fn run_repair_session(
-    stream: IrohSyncStream,
-    initiator: bool,
-    store: Rc<RefCell<RoomStore>>,
-    journal: Rc<RefCell<RoomJournal>>,
+#[derive(Default)]
+struct PeerSyncProgress {
+    completed: BTreeMap<iroh::EndpointId, u8>,
+}
+
+impl PeerSyncProgress {
+    fn record(&mut self, peer: iroh::EndpointId, lane: RoomLane, expected: LaneSet) -> bool {
+        let completed = self.completed.entry(peer).or_default();
+        *completed |= lane.tag();
+        *completed & expected.bits() == expected.bits()
+    }
+
+    fn clear(&mut self, peer: iroh::EndpointId) {
+        self.completed.remove(&peer);
+    }
+}
+
+type SharedSyncProgress = Rc<Mutex<PeerSyncProgress>>;
+
+async fn finish_repair<P: BrowserLane>(
+    result: Result<SyncOutcome, String>,
+    host: &Rc<BrowserHost>,
+    progress: &SharedSyncProgress,
+    expected: LaneSet,
+    endpoint_id: iroh::EndpointId,
+    telemetry: &iroh::endpoint::Connection,
+) {
+    match result {
+        Ok(outcome) if !outcome.root_mismatch && !outcome.incomplete => {
+            if let Some(rtt) = telemetry.rtt(iroh::endpoint::PathId::ZERO) {
+                host.update_peer_rtt(endpoint_id, rtt);
+            }
+            if progress.lock().await.record(endpoint_id, P::LANE, expected) {
+                host.mark_peer_synchronized(endpoint_id);
+            }
+            host.emit_diagnostic(
+                "repair_complete",
+                &format!(
+                    "{} repair with {endpoint_id} completed; ingested {} operations",
+                    String::from_utf8_lossy(P::ALPN),
+                    outcome.ingested,
+                ),
+            );
+        }
+        Ok(outcome) => host.emit_diagnostic(
+            "repair_incomplete",
+            &format!(
+                "{} repair with {endpoint_id} ended without convergence (root_mismatch={}, incomplete={})",
+                String::from_utf8_lossy(P::ALPN),
+                outcome.root_mismatch,
+                outcome.incomplete,
+            ),
+        ),
+        Err(error) => host.emit_diagnostic(
+            "repair_failed",
+            &format!(
+                "{} repair with {endpoint_id} failed: {error}",
+                String::from_utf8_lossy(P::ALPN)
+            ),
+        ),
+    }
+}
+
+fn spawn_repair<P: BrowserLane>(
+    host: Rc<BrowserHost>,
+    durable: SharedDurableRoom,
+    progress: SharedSyncProgress,
+    expected: LaneSet,
+    topic: String,
+    repair: BrowserIncomingRepair,
+) {
+    spawn_local(async move {
+        let endpoint_id = repair.endpoint_id;
+        let telemetry = repair.connection.clone();
+        let result = run_repair_session::<P>(
+            repair.stream.owning(repair.connection),
+            false,
+            durable,
+            topic,
+            host.clone(),
+        )
+        .await;
+        finish_repair::<P>(result, &host, &progress, expected, endpoint_id, &telemetry).await;
+    });
+}
+
+fn spawn_repair_round(
+    host: Rc<BrowserHost>,
+    durable: SharedDurableRoom,
+    progress: SharedSyncProgress,
+    advertised: Option<LaneSet>,
+    topic: String,
+    endpoint_id: iroh::EndpointId,
+    handle: BrowserNetHandle,
+) {
+    spawn_local(async move {
+        let attempted = advertised.unwrap_or(LaneSet::WALKIE);
+        let music = {
+            let host = host.clone();
+            let durable = durable.clone();
+            let topic = topic.clone();
+            let handle = handle.clone();
+            async move {
+                if attempted.contains(RoomLane::Music) {
+                    dial_and_run::<MusicLane>(&handle, endpoint_id, durable, topic, host).await
+                } else {
+                    None
+                }
+            }
+        };
+        let extension = {
+            let host = host.clone();
+            async move {
+                if attempted.contains(RoomLane::Extension) {
+                    dial_and_run::<ExtensionLane>(&handle, endpoint_id, durable, topic, host).await
+                } else {
+                    None
+                }
+            }
+        };
+        let (music, extension) = futures::join!(music, extension);
+        let negotiated_bits = u8::from(music.is_some()) * RoomLane::Music.tag()
+            | u8::from(extension.is_some()) * RoomLane::Extension.tag();
+        let Some(expected) = advertised.or_else(|| LaneSet::from_bits(negotiated_bits)) else {
+            return;
+        };
+        if let Some((telemetry, result)) = music {
+            finish_repair::<MusicLane>(
+                result,
+                &host,
+                &progress,
+                expected,
+                endpoint_id,
+                &telemetry,
+            )
+            .await;
+        }
+        if let Some((telemetry, result)) = extension {
+            finish_repair::<ExtensionLane>(
+                result,
+                &host,
+                &progress,
+                expected,
+                endpoint_id,
+                &telemetry,
+            )
+            .await;
+        }
+    });
+}
+
+async fn dial_and_run<P: BrowserLane>(
+    handle: &BrowserNetHandle,
+    endpoint_id: iroh::EndpointId,
+    durable: SharedDurableRoom,
     topic: String,
     host: Rc<BrowserHost>,
-) -> Result<usize, String> {
-    let mut access = BrowserSyncStore {
-        store,
-        journal,
-        host: host.clone(),
+) -> Option<(iroh::endpoint::Connection, Result<SyncOutcome, String>)> {
+    let connection = match handle
+        .begin_lane(endpoint_id, LaneProtocol::Repair(P::LANE))
+        .await
+    {
+        Ok(connection) => connection,
+        Err(error) => {
+            host.emit_diagnostic(
+                "repair_connect",
+                &format!(
+                    "{} repair connection to {endpoint_id} failed: {error}",
+                    String::from_utf8_lossy(P::ALPN)
+                ),
+            );
+            return None;
+        }
     };
-    let limits = SyncLimits::default();
-    let outcome: SyncOutcome = if initiator {
-        drive_initiator::<WalkieLane, _, _, _>(stream, &BrowserTimer, &mut access, &topic, limits)
-            .await
-    } else {
-        drive_responder::<WalkieLane, _, _, _>(stream, &BrowserTimer, &mut access, &topic, limits)
-            .await
-    }
-    .map_err(|error| error.to_string())?;
+    let stream = match IrohSyncStream::open(&connection).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            host.emit_diagnostic("repair_connect", &error.to_string());
+            return None;
+        }
+    };
+    let telemetry = connection.clone();
+    let result = run_repair_session::<P>(
+        stream.owning(connection),
+        true,
+        durable,
+        topic,
+        host,
+    )
+    .await;
+    Some((telemetry, result))
+}
 
-    if outcome.root_mismatch {
-        host.emit_diagnostic(
-            "repair_root_mismatch",
-            "HHHS repair peers reported different roots; periodic repair will retry",
-        );
+async fn run_repair_session<P: BrowserLane>(
+    stream: IrohSyncStream,
+    initiator: bool,
+    durable: SharedDurableRoom,
+    topic: String,
+    host: Rc<BrowserHost>,
+) -> Result<SyncOutcome, String> {
+    let mut access = BrowserLaneAccess::<P>::new(durable, host);
+    let limits = SyncLimits::default();
+    if initiator {
+        drive_initiator::<P, _, _, _>(stream, &BrowserTimer, &mut access, &topic, limits).await
+    } else {
+        drive_responder::<P, _, _, _>(stream, &BrowserTimer, &mut access, &topic, limits).await
     }
-    if outcome.incomplete {
-        host.emit_diagnostic(
-            "repair_incomplete",
-            "HHHS repair ended before both halves finished; periodic repair will retry",
-        );
+    .map_err(|error| error.to_string())
+}
+
+fn spawn_courier<P: BrowserLane>(
+    host: Rc<BrowserHost>,
+    durable: SharedDurableRoom,
+    repair: BrowserIncomingRepair,
+) {
+    spawn_local(async move {
+        let endpoint_id = repair.endpoint_id;
+        let mut stream = repair.stream.owning(repair.connection);
+        let result: Result<(), String> = async {
+            let Some(frame) = stream.recv_frame().await.map_err(|error| error.to_string())? else {
+                return Ok(());
+            };
+            let request = match CourierFrame::decode(&frame).map_err(|error| error.to_string())? {
+                CourierFrame::Request(request) => request,
+                CourierFrame::Response(_) => return Err("courier opener was a response".into()),
+            };
+            let response = {
+                let durable = durable.lock().await;
+                let empty = TrackedDiscardHistory::new();
+                let peer = PeerId(*endpoint_id.as_bytes());
+                let history = durable.courier.get(&(peer, P::LANE)).unwrap_or(&empty);
+                CourierResponder {
+                    history,
+                    full: P::store(&durable.room),
+                }
+                .answer(&request)
+            };
+            let bytes = CourierFrame::Response(response)
+                .encode()
+                .map_err(|error| error.to_string())?;
+            stream
+                .send_frame(&bytes)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        }
+        .await;
+        stream.close().await;
+        if let Err(error) = result {
+            host.emit_diagnostic(
+                "courier_failed",
+                &format!(
+                    "{} courier with {endpoint_id} failed: {error}",
+                    String::from_utf8_lossy(P::COURIER_ALPN)
+                ),
+            );
+        }
+    });
+}
+
+fn prepared_id(prepared: &LocalRoomPrepared, topic: &str) -> Result<OpId, AppError> {
+    match prepared {
+        LocalRoomPrepared::Music(signed) => verify_music_op(signed, topic)
+            .map(|verified| verified.id())
+            .map_err(persistence_error),
+        LocalRoomPrepared::Extension(signed) => verify_extension_op(signed, topic)
+            .map(|verified| verified.id())
+            .map_err(persistence_error),
     }
-    Ok(outcome.ingested)
 }
 
 async fn commit_room_op(
-    store: &Rc<RefCell<RoomStore>>,
+    durable: &SharedDurableRoom,
     signing_key: &SigningKey,
     topic: &str,
-    op: WalkieOp,
+    op: LocalRoomOp,
     handle: &BrowserNetHandle,
     host: &Rc<BrowserHost>,
-    journal: &Rc<RefCell<RoomJournal>>,
 ) -> Result<u64, AppError> {
-    let (signed, view) = {
-        let mut store = store.borrow_mut();
-        let signed = store.commit(signing_key, topic, unix_time_micros(), op);
-        (signed, store.view())
+    let (wire, view) = {
+        let mut durable = durable.lock().await;
+        let prepared = durable
+            .room
+            .prepare(signing_key, topic, unix_time_micros(), op);
+        let wire = prepared.to_wire_bytes().map_err(persistence_error)?;
+        let id = prepared_id(&prepared, topic)?;
+        let mut staged_journal = durable.journal.clone();
+        staged_journal
+            .admit(prepared.lane(), id, &wire)
+            .map_err(persistence_error)?;
+        super::storage::set_op_journal_v4(&durable.topic_hex, staged_journal.records())
+            .await
+            .map_err(persistence_error)?;
+        durable
+            .room
+            .ingest_prepared(topic, &prepared)
+            .expect("a just-signed, topic-scoped lane operation verifies");
+        durable.journal = staged_journal;
+        (wire, durable.room.view())
     };
-    match signed.to_wire_bytes() {
-        Ok(bytes) => {
-            // Admitted (a just-committed op is always kept): journal the verbatim
-            // bytes before broadcast so history survives a solo reload.
-            if let Ok(verified) = verify_signed_op_for_topic(&signed, topic) {
-                journal_admit(journal, verified.id(), bytes.clone());
-            }
-            if let Err(error) = handle.broadcast(bytes).await {
-                host.emit_diagnostic(
-                    "gossip_broadcast",
-                    &format!("operation committed locally but broadcast failed: {error}"),
-                );
-            }
-        }
-        Err(error) => host.emit_diagnostic("operation_frame", &error.to_string()),
+    if let Err(error) = handle.broadcast(wire).await {
+        host.emit_diagnostic(
+            "gossip_broadcast",
+            &format!("operation committed locally but broadcast failed: {error}"),
+        );
     }
     Ok(host.apply_room_view(view))
+}
+
+fn persistence_error(error: impl std::fmt::Display) -> AppError {
+    AppError::new(AppErrorCode::Persistence, "durable room storage failed")
+        .with_detail(error.to_string())
 }
 
 fn unix_time_micros() -> u64 {

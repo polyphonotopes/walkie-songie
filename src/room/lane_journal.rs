@@ -190,7 +190,7 @@ pub fn decode_idb_op_journal_v4(bytes: &[u8]) -> Result<Vec<LaneRecord>, LaneJou
 /// The browser room journal, v4 shape: lane-tagged records plus the
 /// `(lane, OpId)` dedup set that keeps one admitted op from being journaled
 /// twice.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct RoomJournalV4 {
     known: BTreeSet<(RoomLane, OpId)>,
     records: Vec<LaneRecord>,
