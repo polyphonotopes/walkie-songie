@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     marker::PhantomData,
     path::PathBuf,
     sync::{Arc, Mutex, MutexGuard},
@@ -339,6 +339,16 @@ impl AppRuntime {
             presence_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut midi_refresh = tokio::time::interval(Duration::from_secs(2));
             midi_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Gossip is intentionally lossy. Give every room a stable, slightly
+            // jittered anti-entropy cadence so a missed operation converges even
+            // when membership never changes and no Lagged event is surfaced.
+            let repair_period =
+                Duration::from_secs(25 + u64::from(network.endpoint_id().as_bytes()[0] % 11));
+            let mut repair_refresh = tokio::time::interval_at(
+                tokio::time::Instant::now() + repair_period,
+                repair_period,
+            );
+            repair_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     control = control_rx.recv() => {
@@ -522,6 +532,26 @@ impl AppRuntime {
                                     *source,
                                     path,
                                     false,
+                                );
+                            }
+                        }
+                    }
+                    _ = repair_refresh.tick() => {
+                        for endpoint_id in peers
+                            .iter()
+                            .filter(|(_, (_, path))| *path != PeerPath::Disconnected)
+                            .map(|(endpoint_id, _)| *endpoint_id)
+                            .collect::<Vec<_>>()
+                        {
+                            if network.endpoint_id().as_bytes() < endpoint_id.as_bytes() {
+                                spawn_repair_round(
+                                    runtime.clone(),
+                                    durable.clone(),
+                                    sync_progress.clone(),
+                                    peer_lanes.get(&endpoint_id).copied(),
+                                    signed_topic.clone(),
+                                    endpoint_id,
+                                    network_handle.clone(),
                                 );
                             }
                         }
@@ -785,10 +815,30 @@ impl AppRuntime {
                                     );
                                 }
                             }
-                            NativeNetworkEvent::Lagged => runtime.emit_diagnostic(
-                                "gossip_lagged",
-                                "the gossip event consumer lagged; anti-entropy repair is required",
-                            ),
+                            NativeNetworkEvent::Lagged => {
+                                runtime.emit_diagnostic(
+                                    "gossip_lagged",
+                                    "the gossip event consumer lagged; scheduling anti-entropy repair",
+                                );
+                                for endpoint_id in peers
+                                    .iter()
+                                    .filter(|(_, (_, path))| *path != PeerPath::Disconnected)
+                                    .map(|(endpoint_id, _)| *endpoint_id)
+                                    .collect::<Vec<_>>()
+                                {
+                                    if network.endpoint_id().as_bytes() < endpoint_id.as_bytes() {
+                                        spawn_repair_round(
+                                            runtime.clone(),
+                                            durable.clone(),
+                                            sync_progress.clone(),
+                                            peer_lanes.get(&endpoint_id).copied(),
+                                            signed_topic.clone(),
+                                            endpoint_id,
+                                            network_handle.clone(),
+                                        );
+                                    }
+                                }
+                            }
                             NativeNetworkEvent::Closed => break,
                             NativeNetworkEvent::Diagnostic(message) => runtime.emit_diagnostic(
                                 "native_network",
@@ -1614,6 +1664,7 @@ impl<P: AppLane> LaneStoreAccess<P::Lang> for DurableLaneAccess<P> {
 #[derive(Default)]
 struct PeerSyncProgress {
     completed: BTreeMap<iroh::EndpointId, u8>,
+    outbound_in_flight: BTreeSet<iroh::EndpointId>,
 }
 
 impl PeerSyncProgress {
@@ -1625,6 +1676,14 @@ impl PeerSyncProgress {
 
     fn clear(&mut self, peer: iroh::EndpointId) {
         self.completed.remove(&peer);
+    }
+
+    fn begin_outbound(&mut self, peer: iroh::EndpointId) -> bool {
+        self.outbound_in_flight.insert(peer)
+    }
+
+    fn finish_outbound(&mut self, peer: iroh::EndpointId) {
+        self.outbound_in_flight.remove(&peer);
     }
 }
 
@@ -1708,6 +1767,9 @@ fn spawn_repair_round(
     network: NativeRoomNetworkHandle,
 ) {
     tauri::async_runtime::spawn(async move {
+        if !progress.lock().await.begin_outbound(endpoint_id) {
+            return;
+        }
         let attempted = advertised.unwrap_or(LaneSet::WALKIE);
         let music_network = network.clone();
         let music_durable = durable.clone();
@@ -1746,31 +1808,31 @@ fn spawn_repair_round(
         let (music, extension) = tokio::join!(music, extension);
         let negotiated_bits = u8::from(music.is_some()) * RoomLane::Music.tag()
             | u8::from(extension.is_some()) * RoomLane::Extension.tag();
-        let Some(expected) = advertised.or_else(|| LaneSet::from_bits(negotiated_bits)) else {
-            return;
-        };
-        if let Some((telemetry, result)) = music {
-            finish_repair::<MusicLane>(
-                result,
-                &runtime,
-                &progress,
-                expected,
-                endpoint_id,
-                &telemetry,
-            )
-            .await;
+        if let Some(expected) = advertised.or_else(|| LaneSet::from_bits(negotiated_bits)) {
+            if let Some((telemetry, result)) = music {
+                finish_repair::<MusicLane>(
+                    result,
+                    &runtime,
+                    &progress,
+                    expected,
+                    endpoint_id,
+                    &telemetry,
+                )
+                .await;
+            }
+            if let Some((telemetry, result)) = extension {
+                finish_repair::<ExtensionLane>(
+                    result,
+                    &runtime,
+                    &progress,
+                    expected,
+                    endpoint_id,
+                    &telemetry,
+                )
+                .await;
+            }
         }
-        if let Some((telemetry, result)) = extension {
-            finish_repair::<ExtensionLane>(
-                result,
-                &runtime,
-                &progress,
-                expected,
-                endpoint_id,
-                &telemetry,
-            )
-            .await;
-        }
+        progress.lock().await.finish_outbound(endpoint_id);
     });
 }
 

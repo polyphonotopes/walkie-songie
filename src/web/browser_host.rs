@@ -17,7 +17,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     marker::PhantomData,
     rc::Rc,
     time::Duration,
@@ -390,6 +390,7 @@ impl BrowserHost {
                 .with_detail(error.to_string())
             })?;
         let handle = network.handle();
+        let own_endpoint = handle.endpoint_id();
         // Wait up to ~5s (iroh's NET_REPORT_TIMEOUT guidance) for the home relay
         // handshake so the emitted ticket carries a real relay address. On wasm
         // the endpoint address is relay-only and empty until then; a 750ms wait
@@ -591,7 +592,6 @@ impl BrowserHost {
                     Inbound(Option<BrowserRoomInbound>),
                 }
 
-                let own_endpoint = handle.endpoint_id();
                 loop {
                     // Resolve the select FIRST, then act: the shutdown arm
                     // consumes `network`, which it may not do while the other
@@ -793,10 +793,33 @@ impl BrowserHost {
                                 );
                             }
                         }
-                        NativeNetworkEvent::Lagged => host.emit_diagnostic(
-                            "gossip_lagged",
-                            "the gossip event consumer lagged; anti-entropy repair is required",
-                        ),
+                        NativeNetworkEvent::Lagged => {
+                            host.emit_diagnostic(
+                                "gossip_lagged",
+                                "the gossip event consumer lagged; scheduling anti-entropy repair",
+                            );
+                            let endpoint_ids = peers
+                                .borrow()
+                                .iter()
+                                .filter(|(_, (_, path))| *path != PeerPath::Disconnected)
+                                .map(|(endpoint_id, _)| *endpoint_id)
+                                .collect::<Vec<_>>();
+                            for endpoint_id in endpoint_ids {
+                                if own_endpoint.as_bytes() < endpoint_id.as_bytes() {
+                                    let advertised =
+                                        peer_lanes.borrow().get(&endpoint_id).copied();
+                                    spawn_repair_round(
+                                        host.clone(),
+                                        durable.clone(),
+                                        sync_progress.clone(),
+                                        advertised,
+                                        topic.clone(),
+                                        endpoint_id,
+                                        handle.clone(),
+                                    );
+                                }
+                            }
+                        }
                         NativeNetworkEvent::Closed => break,
                         NativeNetworkEvent::Diagnostic(message) => {
                             host.emit_diagnostic("browser_network", &message)
@@ -834,6 +857,51 @@ impl BrowserHost {
                         };
                         if let Some(source) = changed {
                             host.update_peer(endpoint_id, source, path, false);
+                        }
+                    }
+                }
+            });
+        }
+
+        // ---- periodic anti-entropy task ----------------------------------
+        // Gossip can lose an individual operation without emitting Lagged.
+        // Re-run both advertised lanes on a stable per-endpoint jitter, while
+        // PeerSyncProgress prevents overlapping rounds to the same peer.
+        {
+            let host = self.clone();
+            let durable = durable.clone();
+            let handle = handle.clone();
+            let topic = topic_string.clone();
+            let peers = peers.clone();
+            let peer_lanes = peer_lanes.clone();
+            let sync_progress = sync_progress.clone();
+            let alive = alive.clone();
+            let repair_period =
+                Duration::from_secs(25 + u64::from(own_endpoint.as_bytes()[0] % 11));
+            spawn_local(async move {
+                while alive.get() {
+                    n0_future::time::sleep(repair_period).await;
+                    if !alive.get() {
+                        break;
+                    }
+                    let endpoint_ids = peers
+                        .borrow()
+                        .iter()
+                        .filter(|(_, (_, path))| *path != PeerPath::Disconnected)
+                        .map(|(endpoint_id, _)| *endpoint_id)
+                        .collect::<Vec<_>>();
+                    for endpoint_id in endpoint_ids {
+                        if own_endpoint.as_bytes() < endpoint_id.as_bytes() {
+                            let advertised = peer_lanes.borrow().get(&endpoint_id).copied();
+                            spawn_repair_round(
+                                host.clone(),
+                                durable.clone(),
+                                sync_progress.clone(),
+                                advertised,
+                                topic.clone(),
+                                endpoint_id,
+                                handle.clone(),
+                            );
                         }
                     }
                 }
@@ -1470,6 +1538,7 @@ impl<P: BrowserLane> LaneStoreAccess<P::Lang> for BrowserLaneAccess<P> {
 #[derive(Default)]
 struct PeerSyncProgress {
     completed: BTreeMap<iroh::EndpointId, u8>,
+    outbound_in_flight: BTreeSet<iroh::EndpointId>,
 }
 
 impl PeerSyncProgress {
@@ -1481,6 +1550,14 @@ impl PeerSyncProgress {
 
     fn clear(&mut self, peer: iroh::EndpointId) {
         self.completed.remove(&peer);
+    }
+
+    fn begin_outbound(&mut self, peer: iroh::EndpointId) -> bool {
+        self.outbound_in_flight.insert(peer)
+    }
+
+    fn finish_outbound(&mut self, peer: iroh::EndpointId) {
+        self.outbound_in_flight.remove(&peer);
     }
 }
 
@@ -1563,6 +1640,9 @@ fn spawn_repair_round(
     handle: BrowserNetHandle,
 ) {
     spawn_local(async move {
+        if !progress.lock().await.begin_outbound(endpoint_id) {
+            return;
+        }
         let attempted = advertised.unwrap_or(LaneSet::WALKIE);
         let music = {
             let host = host.clone();
@@ -1590,31 +1670,31 @@ fn spawn_repair_round(
         let (music, extension) = futures::join!(music, extension);
         let negotiated_bits = u8::from(music.is_some()) * RoomLane::Music.tag()
             | u8::from(extension.is_some()) * RoomLane::Extension.tag();
-        let Some(expected) = advertised.or_else(|| LaneSet::from_bits(negotiated_bits)) else {
-            return;
-        };
-        if let Some((telemetry, result)) = music {
-            finish_repair::<MusicLane>(
-                result,
-                &host,
-                &progress,
-                expected,
-                endpoint_id,
-                &telemetry,
-            )
-            .await;
+        if let Some(expected) = advertised.or_else(|| LaneSet::from_bits(negotiated_bits)) {
+            if let Some((telemetry, result)) = music {
+                finish_repair::<MusicLane>(
+                    result,
+                    &host,
+                    &progress,
+                    expected,
+                    endpoint_id,
+                    &telemetry,
+                )
+                .await;
+            }
+            if let Some((telemetry, result)) = extension {
+                finish_repair::<ExtensionLane>(
+                    result,
+                    &host,
+                    &progress,
+                    expected,
+                    endpoint_id,
+                    &telemetry,
+                )
+                .await;
+            }
         }
-        if let Some((telemetry, result)) = extension {
-            finish_repair::<ExtensionLane>(
-                result,
-                &host,
-                &progress,
-                expected,
-                endpoint_id,
-                &telemetry,
-            )
-            .await;
-        }
+        progress.lock().await.finish_outbound(endpoint_id);
     });
 }
 
