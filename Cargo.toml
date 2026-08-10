@@ -12,6 +12,11 @@ name = "walkie-songie-plugin"
 path = "src/plugin_main.rs"
 required-features = ["plugin"]
 
+[[bin]]
+name = "room-v4-native-probe"
+path = "tests/support/room_v4_native_probe.rs"
+required-features = ["native-net"]
+
 # Performance benchmark suite (docs/research/performance-benchmark-suite.md).
 # All native, feature-free, exercising the embeddable core (fold + ops + RBSR).
 [[bench]]

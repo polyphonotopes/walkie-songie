@@ -7,15 +7,14 @@
 //! [`crate::net::sync`] — they are transport-neutral, and keeping them there is
 //! what stops a caller from pairing a fresh index with a stale snapshot.
 
-#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use thiserror::Error;
 
+use super::sync::MAX_SYNC_FRAME_BYTES;
 #[cfg(not(target_arch = "wasm32"))]
 use super::sync::SyncTimer;
-use super::sync::MAX_SYNC_FRAME_BYTES;
 use super::{SyncStream, TransportError};
 
 /// The native runtime's clock for [`SyncTimer`].
@@ -38,6 +37,11 @@ impl SyncTimer for TokioTimer {
 /// session budget uses, so the framing cap and the session cap cannot drift into
 /// a state where a legal message is unsendable.
 pub const MAX_REPAIR_FRAME_BYTES: usize = MAX_SYNC_FRAME_BYTES;
+
+/// Upper bound for waiting until the peer acknowledges every byte queued before
+/// our stream FIN. `finish()` alone only schedules the FIN; dropping the owning
+/// [`Connection`] immediately afterwards can discard the terminal sync frame.
+const FIN_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Error)]
 pub enum RepairError {
@@ -115,7 +119,15 @@ impl SyncStream for IrohSyncStream {
     }
 
     async fn close(mut self) {
+        let stopped = self.send.stopped();
         let _ = self.send.finish();
+        // Keep the owning connection alive until the peer has acknowledged all
+        // buffered stream bytes. The timeout preserves the driver's guarantee
+        // that closing after a failed/silent session cannot park forever.
+        #[cfg(target_arch = "wasm32")]
+        let _ = n0_future::time::timeout(FIN_ACK_TIMEOUT, stopped).await;
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = tokio::time::timeout(FIN_ACK_TIMEOUT, stopped).await;
     }
 }
 

@@ -236,8 +236,6 @@ async fn run_two_lane_round(
     );
     let music_connection = music_connection.expect("music ALPN negotiates");
     let extension_connection = extension_connection.expect("extension ALPN negotiates");
-    let music_keepalive = music_connection.clone();
-    let extension_keepalive = extension_connection.clone();
     let (music_stream, extension_stream) = tokio::join!(
         IrohSyncStream::open(&music_connection),
         IrohSyncStream::open(&extension_connection),
@@ -294,9 +292,7 @@ async fn run_two_lane_round(
     assert_eq!(incoming.len(), 2, "exactly two concurrent lane connections");
     let mut incoming_music = None;
     let mut incoming_extension = None;
-    let mut acceptor_keepalives = Vec::with_capacity(2);
     for repair in incoming {
-        acceptor_keepalives.push(repair.connection.clone());
         match LaneProtocol::from_alpn(repair.alpn) {
             Some(LaneProtocol::Repair(RoomLane::Music)) => {
                 incoming_music = Some(repair.stream.owning(repair.connection));
@@ -344,9 +340,6 @@ async fn run_two_lane_round(
         let outcome = outcome.expect("lane repair completes");
         assert!(!outcome.root_mismatch && !outcome.incomplete);
     }
-    drop(music_keepalive);
-    drop(extension_keepalive);
-    drop(acceptor_keepalives);
 }
 
 async fn run_music_round(
@@ -364,7 +357,6 @@ async fn run_music_round(
         )
         .await
         .expect("music repair reconnects");
-    let keepalive = connection.clone();
     let stream = IrohSyncStream::open(&connection)
         .await
         .expect("music reconnect stream")
@@ -392,7 +384,6 @@ async fn run_music_round(
         LaneProtocol::from_alpn(incoming.alpn),
         Some(LaneProtocol::Repair(RoomLane::Music))
     );
-    let acceptor_keepalive = incoming.connection.clone();
     let responder_stream = incoming.stream.owning(incoming.connection);
     let mut acceptor_access = Access::<MusicLane>::new(acceptor_room);
     let responder = drive_responder::<MusicLane, _, _, _>(
@@ -413,8 +404,6 @@ async fn run_music_round(
         initiator.is_ok() && responder.is_ok(),
         "initiator={initiator:?}, responder={responder:?}"
     );
-    drop(keepalive);
-    drop(acceptor_keepalive);
 }
 
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
