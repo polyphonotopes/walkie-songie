@@ -65,13 +65,31 @@ authenticated ALPN; no lane tag is added to an RBSR frame. Walkie advertises
 both lane bits (`0x03`); a bare music peer advertises only music (`0x01`). Fresh
 lane stores mean fresh author heads: no v4 op ever backlinks to a v3 entry.
 
-The browser host temporarily retains the v3 runtime until its live transport and
-IndexedDB cutover. That is a separate implementation boundary, not v3/v4 room
-interop.
+Both native and browser hosts now use this v4 generation exclusively. The old
+single-lane types and golden vectors remain only as refusal, equivalence, and
+kernel fixtures; no live endpoint registers their ALPNs, opens their journals,
+or derives their topic, ticket, rendezvous, mDNS, or presence identities.
 
 Mixed v3/v4 in one room fails loudly and permanently (mutual verifier rejects,
 RBSR roots never converge, parked ops). At most, ship an offline "open projected
 v3 state as a new v4 room" importer — a reset, not interop.
+
+## Release evidence (2026-08-10)
+
+The hard cut is exercised at the real runtime seams, not only in model tests:
+
+- `cargo test --workspace` covers the Room v4 core, native live endpoint,
+  dropped-gossip repair, v3 ALPN refusal, lane isolation, convergence, journal
+  reopen, and bare `tutti-music` interoperability.
+- `tests/browser_room_v4_live_e2e.mjs` attaches to a production Trunk artifact,
+  creates disposable Chromium contexts, and proves browser/browser reload and
+  complete-record corruption refusal plus browser/native two-lane convergence
+  after deliberately dropping gossip. The release run observed 13 exact music
+  frames, 10 exact extension frames, and zero cross-lane violations.
+- Desktop `cargo check`, wasm `cargo check`, `trunk build --release`, and
+  `cargo fmt --all -- --check` all pass. A source audit of the native and browser
+  hosts finds no v3 ticket, topic, rendezvous, journal, repair, or courier call
+  site.
 
 ## Golden re-baseline
 

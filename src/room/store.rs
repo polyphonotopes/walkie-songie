@@ -143,8 +143,8 @@ impl RoomView {
 }
 
 /// One piece-relevant reading of a decoded op — the alphabet-neutral input to
-/// [`fold_pieces`]. Two wires classify into it: the deployed single-lane v3
-/// [`WalkieOp`] (tuning-scoped at classification) and the v4 extension lane's
+/// [`fold_pieces`]. Two wires classify into it: the retired single-lane v3
+/// [`WalkieOp`] fixtures (tuning-scoped at classification) and the v4 extension lane's
 /// [`ExtensionOp`](crate::room::v4::ExtensionOp) (unscoped — the v4 room scopes
 /// pieces to the music lane's tuning at composition instead).
 pub(crate) enum PieceEvent {
@@ -1186,8 +1186,8 @@ mod tests {
     // ---------------------------------------------------------------------
     // Golden vector: pins the framing/lift so a format change is caught.
     //
-    // v3 FIXTURE — the schema-3 single-lane wire, retained verbatim while that
-    // wire remains deployed. The v4 two-lane goldens live in `room::v4`; a v3
+    // v3 FIXTURE — the schema-3 single-lane wire, retained verbatim for golden
+    // and refusal coverage. The v4 two-lane goldens live in `room::v4`; a v3
     // value must never be "updated" to a v4 one (hard cut, not a migration).
     // ---------------------------------------------------------------------
 

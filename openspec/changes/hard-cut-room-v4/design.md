@@ -55,3 +55,21 @@ matrix live in `docs/vision/wire-embedding-design.md`.
 
 There is no rollback path inside a room. Reverting the application returns to a
 separate v3 generation and cannot open v4 artifacts.
+
+## Validation Evidence (2026-08-10)
+
+- `nix develop -c cargo test --workspace` passes the core/native suite,
+  including live two-lane repair, v3 refusal, dropped-gossip recovery, journal
+  reopen, convergence, lane isolation, and bare `tutti-music` interoperability.
+- The release artifact from `nix develop -c trunk build --release` passes
+  `tests/browser_room_v4_live_e2e.mjs` against Chromium and the native probe:
+  browser/browser reload and complete-record corruption refusal pass;
+  browser/native converges after dropped gossip with 13 music frames, 10
+  extension frames, and zero cross-lane violations.
+- Desktop and wasm `cargo check` plus `cargo fmt --all -- --check` pass.
+- A host source audit finds no v3 ticket, topic, rendezvous, journal, repair, or
+  courier call in `src-tauri/src/lib.rs`, `src/web/browser_host.rs`,
+  `src/web/storage.rs`, `src/net/browser.rs`, or `src/net/native.rs`. Retained v3
+  symbols are restricted to refusal, golden, equivalence, and kernel fixtures.
+- The `openspec` CLI is unavailable in this environment; the change documents
+  were checked manually against `openspec/AGENTS.md`.

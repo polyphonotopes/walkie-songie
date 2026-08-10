@@ -3,10 +3,10 @@
 //! Everything here is target-independent given an iroh dependency: room topics,
 //! tickets, relay policy, wire limits, and path classification. The native
 //! endpoint machinery (mDNS, tokio loops) stays in [`super::native`]; the
-//! browser endpoint machinery (relay-only, `n0-future` runtime) lives in
-//! [`super::browser`]. Both speak the exact same ALPNs, ticket format, and
-//! gossip topic derivation — a browser peer and a desktop peer in the same room
-//! interoperate byte-for-byte.
+//! browser endpoint machinery (relay fallback, WebRTC custom direct transport,
+//! `n0-future` runtime) lives in [`super::browser`]. Both speak the exact same
+//! ALPNs, ticket format, and gossip topic derivation — a browser peer and a
+//! desktop peer in the same room interoperate byte-for-byte.
 
 use std::{fmt, str::FromStr, time::Duration};
 
@@ -67,11 +67,9 @@ pub(crate) const REPAIR_ACCEPT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Repair ALPNs re-exported from the lane layer so every transport names them
 /// from one shared place.
 ///
-/// * [`RBSR_ALPN`] — the deployed v3 single-lane generation ([`super::sync::WalkieLane`]).
-///   Generation 2 is the hardened kernel's breaking wire reshape
-///   (`Question`/`Ack`, chunkable `Entries { pairs, more }`; see
-///   `sync::SYNC_STRATEGY_VERSION`). Old and new peers must never attempt to
-///   interop, so the ALPN — the earliest negotiation point — carries the bump.
+/// * [`RBSR_ALPN`] — the retired v3 single-lane generation
+///   ([`super::sync::WalkieLane`]), retained only for refusal and legacy-kernel
+///   fixtures. It is never included in [`ROOM_V4_ALPNS`].
 /// * [`MUSIC_RBSR_ALPN`] — the tutti-music lane (generation 3), defined by
 ///   tutti-music itself so a bare peer speaks it without walkie.
 /// * [`EXTENSION_RBSR_ALPN`] — walkie's extension lane (generation 3).
@@ -116,7 +114,8 @@ pub(crate) const EVENT_QUEUE_DEPTH: usize = 64;
 pub struct RoomTopic([u8; 32]);
 
 impl RoomTopic {
-    /// Derive the room topic without exposing the human-readable room name.
+    /// Derive the retired v1 room topic for golden and refusal fixtures.
+    /// Live runtimes use [`Self::from_room_name_v4`].
     pub fn from_room_name(room_name: &str) -> Self {
         Self(blake3::derive_key(ROOM_TOPIC_CONTEXT, room_name.as_bytes()))
     }
@@ -149,7 +148,7 @@ impl fmt::Display for RoomTopic {
     }
 }
 
-/// Room-isolated DNS-SD label. Only a truncated topic hash is advertised.
+/// Retired v1 DNS-SD label, retained for fixture and refusal coverage.
 pub fn room_mdns_service_name(topic: RoomTopic) -> String {
     format!("walkie-{}-v1", encode_hex(&topic.as_bytes()[..10]))
 }
@@ -337,7 +336,8 @@ pub enum NativeNetworkEvent {
     Diagnostic(String),
 }
 
-/// Versioned, room-scoped bootstrap ticket.
+/// Retired v3 room bootstrap ticket, retained for fixture and refusal coverage.
+/// Live runtimes use [`NativeRoomTicketV4`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeRoomTicket {
     topic: RoomTopic,

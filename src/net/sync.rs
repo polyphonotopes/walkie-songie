@@ -99,8 +99,8 @@ pub const EXTENSION_STRATEGY_NAME: &str = "walkie-extension-entryhash";
 /// The extension lane's deep-laggard courier ALPN (see
 /// [`LaneSpec::COURIER_ALPN`]).
 pub const EXTENSION_COURIER_ALPN: &[u8] = b"walkie/extension/courier/1";
-/// The v3 single-lane wire's courier ALPN, retained only for legacy tests until
-/// [`WalkieLane`] can be deleted.
+/// The v3 single-lane wire's courier ALPN, retained only for legacy kernel and
+/// refusal fixtures. No live endpoint registers it.
 pub const WALKIE_COURIER_ALPN: &[u8] = b"walkie/courier/1";
 
 /// One anti-entropy lane: an [`OpLanguage`] plus its network identity.
@@ -194,10 +194,9 @@ impl LaneSpec for ExtensionLane {
     const STRATEGY_NAME: &'static str = EXTENSION_STRATEGY_NAME;
 }
 
-/// The deployed v3 single-lane wire ([`WalkieLang`]), spelled as a lane so the
-/// one generic driver serves it too. Keeps the generation-2 strategy id — the
-/// deployed ALPN/strategy must not move while browser-v3 compatibility remains;
-/// this lane is deleted outright when that path is cut over.
+/// The retired v3 single-lane wire ([`WalkieLang`]), spelled as a lane so legacy
+/// kernel and golden tests can exercise the generic driver. Its identity stays
+/// pinned for refusal coverage; no live endpoint registers or drives it.
 pub enum WalkieLane {}
 
 impl LaneSpec for WalkieLane {
@@ -314,8 +313,8 @@ pub struct LaneSyncSource<L: OpLanguage> {
     _lang: PhantomData<L>,
 }
 
-/// The v3 single-lane spelling, kept for the browser-v3 call sites and legacy
-/// compatibility tests until those fixtures delete [`WalkieLane`].
+/// The v3 single-lane spelling, retained only by legacy kernel and golden tests.
+/// No live native or browser runtime captures this source.
 pub type RoomSyncSource = LaneSyncSource<WalkieLang>;
 
 impl<L: OpLanguage> LaneSyncSource<L> {

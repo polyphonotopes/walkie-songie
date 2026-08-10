@@ -11,26 +11,26 @@
 
 ## 2. Browser runtime hard cut
 
-- [ ] 2.1 Recover `Room` from the v4 IndexedDB journal and fail corruption
+- [x] 2.1 Recover `Room` from the v4 IndexedDB journal and fail corruption
   loudly without reading the v3 key.
-- [ ] 2.2 Map browser commands to `LocalRoomOp`, persist-before-ingest, compose
+- [x] 2.2 Map browser commands to `LocalRoomOp`, persist-before-ingest, compose
   `RoomView`, and broadcast exact lane bytes.
-- [ ] 2.3 Route browser gossip to music, extension, or v4 presence and use the
+- [x] 2.3 Route browser gossip to music, extension, or v4 presence and use the
   common durable lane admission seam.
-- [ ] 2.4 Register exactly the five v4 endpoint ALPNs and use v4 tickets,
+- [x] 2.4 Register exactly the five v4 endpoint ALPNs and use v4 tickets,
   rendezvous hellos, and topic identity.
-- [ ] 2.5 Drive both advertised/negotiated repair lanes concurrently on
+- [x] 2.5 Drive both advertised/negotiated repair lanes concurrently on
   separate connections and dispatch lane-specific courier connections.
-- [ ] 2.6 Delete every live browser-v3 room path and compatibility fallback.
+- [x] 2.6 Delete every live browser-v3 room path and compatibility fallback.
 
 ## 3. Automated release evidence
 
-- [ ] 3.1 Prove browser reload and complete-record corruption refusal using the
+- [x] 3.1 Prove browser reload and complete-record corruption refusal using the
   real storage adapter.
-- [ ] 3.2 Prove browser/browser and browser/native two-lane convergence,
+- [x] 3.2 Prove browser/browser and browser/native two-lane convergence,
   dropped-gossip recovery, and zero cross-lane bytes.
-- [ ] 3.3 Prove a bare `tutti-music` peer joins only the shared music lane.
-- [ ] 3.4 Run native, desktop, wasm, production Trunk, formatting, and source
+- [x] 3.3 Prove a bare `tutti-music` peer joins only the shared music lane.
+- [x] 3.4 Run native, desktop, wasm, production Trunk, formatting, and source
   audits with no live v3 paths.
-- [ ] 3.5 Update the protocol design and task evidence, then commit each
+- [x] 3.5 Update the protocol design and task evidence, then commit each
   validated milestone without pushing or merging.

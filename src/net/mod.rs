@@ -38,7 +38,8 @@ pub mod repair;
 ))]
 pub mod rendezvous;
 
-// The relay-only browser iroh transport (Topology A in a plain browser tab).
+// Browser iroh transport: relay discovery/fallback plus a WebRTC custom direct
+// carrier when rendezvous establishes one.
 #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
 pub mod browser;
 

@@ -26,8 +26,8 @@ pub mod streams;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 /// Room v4: the two-lane room (music lane + walkie extension lane) a bare
-/// tutti-music peer can join. Native rooms use this generation; the browser
-/// host retains the v3 single-lane path until its separate transport cutover.
+/// tutti-music peer can join. Both native and browser hosts use this generation;
+/// the v3 store remains only for golden, refusal, and semantic-equivalence tests.
 pub mod v4;
 pub mod yrs_state;
 

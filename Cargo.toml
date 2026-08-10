@@ -57,7 +57,8 @@ web-ui = [
     "dep:dominator",
     "browser-net",
 ]
-# Browser (wasm) iroh transport: relay-only Endpoint + iroh-gossip + Router.
+# Browser (wasm) iroh transport: relay fallback + WebRTC custom direct carrier,
+# iroh-gossip, and Router.
 # The browser host speaks the same room-v4 two-lane protocol as native, with a
 # lane-tagged IndexedDB journal and the exact v4 repair/courier ALPN surface.
 # Enabled by `web-ui` so the plain-browser build (no Tauri) stands up a
@@ -243,7 +244,7 @@ tokio = { version = "1.32", default-features = false, features = ["time", "sync"
 wasm-bindgen = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 
-# Browser iroh transport (relay-only). `default-features = false` drops the
+# Browser iroh transport. `default-features = false` drops the
 # native IP/portmapper/quinn stack; `tls-ring` supplies the QUIC crypto provider
 # (ring compiles to wasm32 with clang as CC_wasm32_unknown_unknown). iroh 1.0.3
 # gates its non-wasm deps out for `target_family = "wasm"`, so this links on

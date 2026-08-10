@@ -1,4 +1,4 @@
-//! Browser Iroh room transport (wasm32, relay-only).
+//! Browser Iroh room transport (wasm32, relay fallback + WebRTC direct).
 //!
 //! The exact protocol surface of [`super::native`] — the same ALPNs, gossip
 //! topic derivation, ticket format, and HHHS repair protocol — compiled to
@@ -6,9 +6,10 @@
 //!
 //! * No mDNS: browsers have no UDP. Peers meet through the relay via ticket
 //!   bootstrap (`MemoryLookup`) or gossip.
-//! * Relay-only: iroh's wasm build compiles the IP transport out and tunnels
-//!   QUIC over the relay's WebSocket, so [`PeerTransportPath`] can honestly
-//!   report only `Relayed` (or `Connecting`/`Disconnected`).
+//! * No native IP carrier: iroh's wasm build tunnels QUIC over the relay's
+//!   WebSocket, while [`super::webrtc_transport`] supplies an optional custom
+//!   direct carrier. The current [`PeerTransportPath`] classifier reports the
+//!   built-in path as `Relayed` (or `Connecting`/`Disconnected`).
 //! * `n0-future` supplies spawn/sleep/timeout where native uses tokio, and the
 //!   queues are `futures` channels — everything here is single-threaded and
 //!   `!Send` by construction.
@@ -222,8 +223,9 @@ impl BrowserRoomNetwork {
             // server sends `Access-Control-Allow-Origin: *`). Without a resolver,
             // a known node id whose address isn't already cached is undialable
             // -> gossip's "No addressing information available". Default
-            // `AddrFilter::relay_only()` is exactly what a relay-only browser
-            // wants; do not widen it.
+            // `AddrFilter::relay_only()` is exactly what the built-in browser
+            // carrier wants; WebRTC direct addresses arrive separately through
+            // the custom transport, so do not widen this filter.
             .address_lookup(PkarrPublisher::n0_dns())
             .address_lookup(PkarrResolver::n0_dns())
             .bind()

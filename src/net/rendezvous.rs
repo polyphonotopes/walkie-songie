@@ -6,14 +6,14 @@
 //! over the y-webrtc signaling server at [`SIGNALING_SERVER_URL`], implementing
 //! `docs/research/peer-discovery-design.md` §3 Option 1.
 //!
-//! Both tabs (or a browser and a desktop) that enter the same room derive the
+//! Both tabs (or a browser and a desktop) that enter the same v4 room derive the
 //! same [`RoomTopic`], subscribe to the same opaque channel
-//! `walkie-rdv-v1-<topic-hex>` (never the human room name — same privacy stance
-//! as [`room_mdns_service_name`](super::iroh_common::room_mdns_service_name)),
-//! and publish a hello carrying their endpoint id + home relay url. On hearing a
-//! peer's hello we seed iroh's [`MemoryLookup`] with `{id → relay}`, ask gossip
-//! to [`join_peers`](GossipSender::join_peers), and reply with our own hello so
-//! late joiners learn us with zero server-side state.
+//! `walkie-rdv-v4-<topic-hex>` (never the human room name), and publish a
+//! [`HelloV4`] carrying their endpoint id, lane capabilities, and home relay
+//! URL. On hearing a peer's hello we seed iroh's [`MemoryLookup`] with
+//! `{id → relay}`, ask gossip to [`join_peers`](GossipSender::join_peers), and
+//! reply with our own hello so late joiners learn us with zero server-side
+//! state. The v1 channel and hello remain only for legacy fixtures.
 //!
 //! The wasm backend is a raw [`web_sys::WebSocket`]; the native backend is
 //! `tokio-tungstenite`. Both sit behind [`SignalStream`] so the session loop
@@ -681,9 +681,8 @@ impl Drop for RendezvousHandle {
     }
 }
 
-/// Start the topic rendezvous. `on_discovered` fires once per genuinely new peer
-/// (use it to seed the host's peer map with [`DiscoverySource::AddressLookup`]
-/// and [`PeerPath::Connecting`]).
+/// Start the retired v1 rendezvous for legacy fixtures. Live runtimes call
+/// [`spawn_rendezvous_v4`]. `on_discovered` fires once per genuinely new peer.
 ///
 /// [`DiscoverySource::AddressLookup`]: crate::client::DiscoverySource::AddressLookup
 /// [`PeerPath::Connecting`]: crate::client::PeerPath::Connecting
@@ -727,7 +726,8 @@ pub fn spawn_rendezvous_v4(
     }
 }
 
-/// Start the topic rendezvous (wasm; the loop and JS handles are `!Send`).
+/// Start the retired v1 rendezvous for wasm legacy fixtures. Live runtimes call
+/// [`spawn_rendezvous_v4`]; the loop and JS handles are `!Send`.
 #[cfg(target_arch = "wasm32")]
 pub fn spawn_rendezvous(
     peering: RendezvousPeering,
