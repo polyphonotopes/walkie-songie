@@ -1,8 +1,8 @@
 # Room v4: letting a bare tutti-music peer join a walkie room
 
-Design notes for the WalkieOp ⊇ MusicOp goal, after a codex (gpt-5.6-sol) review.
-The short version: the naive `WalkieOp::Music(MusicOp)` variant does **not** get us
-what we want, and the real thing is a room protocol generation, not a schema bump.
+Design notes for the WalkieOp ⊇ MusicOp goal. The short version: the naive
+`WalkieOp::Music(MusicOp)` variant does **not** get us what we want, and the real
+thing is a room protocol generation, not a schema bump.
 
 ## Why the naive embedding fails
 
@@ -41,15 +41,33 @@ build and is no longer "an ESP32 running today's MusicLang."
 
 ## Migration: hard cut, new protocol generation
 
-~0 rooms are deployed, so no live translating shim. Treat v4 as a whole protocol
-suite, not just `OP_SCHEMA_VERSION = 4`:
+~0 rooms are deployed, so there is no live translating shim. v4 is a complete,
+mutually incompatible protocol suite, not an `OP_SCHEMA_VERSION` bump:
 
-- repair ALPN `walkie/rbsr/2` → `/3` (`src/net/iroh_common.rs:46`) + strategy gen.
-- version the gossip topic derivation, or v3/v4 peers share a topic
-  (`iroh_common.rs:22,75`).
-- new room-ticket format carrying the protocol generation (`iroh_common.rs:24,308`).
-- journal magic `/3` → `/4` (`src/room/journal.rs:13`).
-- fresh author heads; never backlink v4 → v3.
+| Surface | Room v4 identity |
+|---|---|
+| Shared room topic | `blake3::derive_key("walkie-songie room topic v4", ascii_lowercase(room_name))` |
+| Endpoint ALPNs | gossip, music repair, extension repair, music courier, extension courier |
+| Music repair | `tutti/music/rbsr/3` |
+| Extension repair | `walkie/extension/rbsr/3` |
+| Music courier | `tutti/music/courier/1` |
+| Extension courier | `walkie/extension/courier/1` |
+| Ticket | kind `walkieroom4`; format 2, generation 4, lane bits, topic, endpoint |
+| Rendezvous | v4 channel and `HelloV4` with required lane bits |
+| mDNS | room-scoped service name ending in `-v4` |
+| Native journal | `walkie-songie/op-journal/4\n`; every record carries its lane byte |
+| IndexedDB journal | `walkie-songie/idb-op-journal/4\0`; every record carries its lane byte |
+| Presence | signed presence generation 4 on the shared v4 topic |
+
+The native endpoint registers exactly the five v4 ALPNs above and refuses the
+v3 repair ALPN. Each repair or courier connection is scoped to one lane by its
+authenticated ALPN; no lane tag is added to an RBSR frame. Walkie advertises
+both lane bits (`0x03`); a bare music peer advertises only music (`0x01`). Fresh
+lane stores mean fresh author heads: no v4 op ever backlinks to a v3 entry.
+
+The browser host temporarily retains the v3 runtime until its live transport and
+IndexedDB cutover. That is a separate implementation boundary, not v3/v4 room
+interop.
 
 Mixed v3/v4 in one room fails loudly and permanently (mutual verifier rejects,
 RBSR roots never converge, parked ops). At most, ship an offline "open projected

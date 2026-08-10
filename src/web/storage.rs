@@ -430,3 +430,34 @@ pub async fn get_op_journal(topic_hex: &str) -> Vec<Vec<u8>> {
 pub async fn set_op_journal(topic_hex: &str, records: &[Vec<u8>]) -> Result<(), String> {
     set_bytes(&op_journal_key(topic_hex), &encode_op_journal(records)).await
 }
+
+/// Load room-v4 lane-tagged records from the disjoint v4 key. Invalid or
+/// foreign-generation blobs fail loudly; silently replacing durable history
+/// with an empty room would hide corruption. There is no v3 fallback.
+#[cfg(feature = "browser-net")]
+pub async fn get_op_journal_v4(
+    topic_hex: &str,
+) -> Result<Vec<crate::room::v4::LaneRecord>, String> {
+    use crate::room::lane_journal::{decode_idb_op_journal_v4, idb_op_journal_key_v4};
+
+    match get_bytes(&idb_op_journal_key_v4(topic_hex)).await {
+        Some(blob) => decode_idb_op_journal_v4(&blob).map_err(|error| error.to_string()),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Persist the room-v4 marker plus lane-tagged verbatim wire records under
+/// `opjournal:v4:{topic}`.
+#[cfg(feature = "browser-net")]
+pub async fn set_op_journal_v4(
+    topic_hex: &str,
+    records: &[crate::room::v4::LaneRecord],
+) -> Result<(), String> {
+    use crate::room::lane_journal::{encode_idb_op_journal_v4, idb_op_journal_key_v4};
+
+    set_bytes(
+        &idb_op_journal_key_v4(topic_hex),
+        &encode_idb_op_journal_v4(records).map_err(|error| error.to_string())?,
+    )
+    .await
+}

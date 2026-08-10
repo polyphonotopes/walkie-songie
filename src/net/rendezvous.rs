@@ -30,6 +30,7 @@ use iroh_gossip::api::GossipSender;
 use serde::{Deserialize, Serialize};
 
 use super::iroh_common::{RoomTopic, SIGNALING_SERVER_URL};
+use crate::room::v4::LaneSet;
 
 /// Channel-name prefix. Bumped only on a wire-incompatible protocol change.
 const RENDEZVOUS_CHANNEL_PREFIX: &str = "walkie-rdv-v1-";
@@ -37,6 +38,8 @@ const RENDEZVOUS_CHANNEL_PREFIX: &str = "walkie-rdv-v1-";
 const HELLO_KIND: &str = "walkie-hello";
 /// Hello payload version.
 const HELLO_VERSION: u32 = 1;
+const RENDEZVOUS_CHANNEL_PREFIX_V4: &str = "walkie-rdv-v4-";
+pub const HELLO_VERSION_V4: u32 = 4;
 /// Discriminator for a WebRTC signaling envelope (SDP offer/answer + ICE) riding
 /// the same channel as hellos. Non-`walkie-rtc` publishers are ignored; a peer that
 /// does not understand it never sees one (it is addressed by endpoint id).
@@ -63,6 +66,11 @@ const MAX_RENDEZVOUS_PEERS: usize = 64;
 /// never the human room name.
 fn rendezvous_channel(topic: RoomTopic) -> String {
     format!("{RENDEZVOUS_CHANNEL_PREFIX}{}", topic.to_hex())
+}
+
+/// The disjoint room-v4 rendezvous channel.
+pub fn rendezvous_channel_v4(topic: RoomTopic) -> String {
+    format!("{RENDEZVOUS_CHANNEL_PREFIX_V4}{}", topic.to_hex())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -153,6 +161,55 @@ struct Hello {
     rtc: Option<bool>,
 }
 
+/// A room-v4 discovery hello. `lanes` is intentionally required in JSON;
+/// validation additionally rejects zero and unknown capability bits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HelloV4 {
+    pub kind: String,
+    pub v: u32,
+    pub lanes: u8,
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtc: Option<bool>,
+}
+
+impl HelloV4 {
+    pub fn new(lanes: LaneSet, id: String, relay: Option<String>, rtc: Option<bool>) -> Self {
+        Self {
+            kind: HELLO_KIND.to_owned(),
+            v: HELLO_VERSION_V4,
+            lanes: lanes.bits(),
+            id,
+            relay,
+            rtc,
+        }
+    }
+
+    pub fn validate(&self) -> Option<LaneSet> {
+        if self.kind != HELLO_KIND || self.v != HELLO_VERSION_V4 {
+            return None;
+        }
+        LaneSet::from_bits(self.lanes)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RendezvousGeneration {
+    V1,
+    V4 { local_lanes: LaneSet },
+}
+
+impl RendezvousGeneration {
+    fn channel(self, topic: RoomTopic) -> String {
+        match self {
+            Self::V1 => rendezvous_channel(topic),
+            Self::V4 { .. } => rendezvous_channel_v4(topic),
+        }
+    }
+}
+
 /// A WebRTC signaling envelope (browser only). Addressed peer-to-peer over the
 /// fan-out channel: everyone receives it, only `to` acts on it. Discriminated from
 /// [`Hello`] by `kind == "walkie-rtc"`.
@@ -222,6 +279,7 @@ async fn send_hello<S: SignalStream>(
     channel: &str,
     peering: &RendezvousPeering,
     our_id: EndpointId,
+    generation: RendezvousGeneration,
 ) -> Result<bool, RendezvousError> {
     // On wasm the endpoint address is relay-only; `relay_urls` filters native's
     // direct addrs out too, so a hello always advertises the relay alone.
@@ -232,16 +290,25 @@ async fn send_hello<S: SignalStream>(
     let rtc = peering.webrtc.is_some().then_some(true);
     #[cfg(not(all(target_arch = "wasm32", feature = "browser-net")))]
     let rtc = None;
-    let hello = Hello {
-        kind: HELLO_KIND.to_owned(),
-        v: HELLO_VERSION,
-        id: our_id.to_string(),
-        relay: relay.as_ref().map(|url| url.as_str().to_owned()),
-        rtc,
+    let relay_string = relay.as_ref().map(|url| url.as_str().to_owned());
+    let data = match generation {
+        RendezvousGeneration::V1 => serde_json::to_value(Hello {
+            kind: HELLO_KIND.to_owned(),
+            v: HELLO_VERSION,
+            id: our_id.to_string(),
+            relay: relay_string,
+            rtc,
+        })?,
+        RendezvousGeneration::V4 { local_lanes } => serde_json::to_value(HelloV4::new(
+            local_lanes,
+            our_id.to_string(),
+            relay_string,
+            rtc,
+        ))?,
     };
     let message = ClientMessage::Publish {
         topic: channel.to_owned(),
-        data: serde_json::to_value(&hello)?,
+        data,
     };
     socket.send(serde_json::to_string(&message)?).await?;
     Ok(relay.is_some())
@@ -268,7 +335,8 @@ async fn run_rendezvous<S: SignalStream>(
     socket: &mut S,
     channel: &str,
     peering: &RendezvousPeering,
-    on_discovered: &impl Fn(EndpointId),
+    generation: RendezvousGeneration,
+    on_discovered: &impl Fn(EndpointId, Option<LaneSet>),
     joined: &mut HashSet<EndpointId>,
 ) -> Result<(), RendezvousError> {
     let our_id = peering.endpoint.id();
@@ -286,7 +354,7 @@ async fn run_rendezvous<S: SignalStream>(
         topics: vec![channel.to_owned()],
     };
     socket.send(serde_json::to_string(&subscribe)?).await?;
-    let mut have_relay = send_hello(socket, channel, peering, our_id).await?;
+    let mut have_relay = send_hello(socket, channel, peering, our_id, generation).await?;
 
     loop {
         let interval = if have_relay {
@@ -331,7 +399,7 @@ async fn run_rendezvous<S: SignalStream>(
         match turn {
             Turn::Closed => return Ok(()),
             Turn::ReHello => {
-                have_relay = send_hello(socket, channel, peering, our_id).await?;
+                have_relay = send_hello(socket, channel, peering, our_id, generation).await?;
             }
             #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
             Turn::SignalOut(signal) => {
@@ -370,20 +438,35 @@ async fn run_rendezvous<S: SignalStream>(
                             route_rtc_envelope(peering, our_id, data);
                             continue;
                         }
-                        let Ok(hello) = serde_json::from_value::<Hello>(data) else {
-                            continue;
+                        let (id_text, relay_text, rtc, lanes) = match generation {
+                            RendezvousGeneration::V1 => {
+                                let Ok(hello) = serde_json::from_value::<Hello>(data) else {
+                                    continue;
+                                };
+                                if hello.kind != HELLO_KIND || hello.v != HELLO_VERSION {
+                                    continue;
+                                }
+                                (hello.id, hello.relay, hello.rtc, None)
+                            }
+                            RendezvousGeneration::V4 { .. } => {
+                                let Ok(hello) = serde_json::from_value::<HelloV4>(data) else {
+                                    continue;
+                                };
+                                let Some(lanes) = hello.validate() else {
+                                    continue;
+                                };
+                                (hello.id, hello.relay, hello.rtc, Some(lanes))
+                            }
                         };
-                        if hello.kind != HELLO_KIND || hello.v != HELLO_VERSION {
-                            continue;
-                        }
-                        let Ok(id) = hello.id.parse::<EndpointId>() else {
+                        #[cfg(not(all(target_arch = "wasm32", feature = "browser-net")))]
+                        let _ = rtc;
+                        let Ok(id) = id_text.parse::<EndpointId>() else {
                             continue;
                         };
                         if id == our_id {
                             continue; // our own hello, fanned back to us
                         }
-                        let relay = hello
-                            .relay
+                        let relay = relay_text
                             .as_deref()
                             .and_then(|url| url.parse::<RelayUrl>().ok());
                         let mut endpoint_addr = EndpointAddr::new(id);
@@ -396,7 +479,7 @@ async fn run_rendezvous<S: SignalStream>(
                         // Both relay and custom go into ONE `add_endpoint_info` so a
                         // later refresh never drops the relay fallback.
                         #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
-                        if peering.webrtc.is_some() && hello.rtc == Some(true) {
+                        if peering.webrtc.is_some() && rtc == Some(true) {
                             endpoint_addr = endpoint_addr.with_addrs([
                                 iroh::TransportAddr::Custom(
                                     super::webrtc_transport::webrtc_custom_addr(id.as_bytes()),
@@ -420,12 +503,12 @@ async fn run_rendezvous<S: SignalStream>(
                                     "join_peers for {id} failed: {error}"
                                 );
                             }
-                            on_discovered(id);
+                            on_discovered(id, lanes);
                             // Kick the WebRTC handshake for a newly discovered
                             // rtc-capable peer (browser only). The driver picks the
                             // role: lower endpoint id offers, the other answers.
                             #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
-                            if hello.rtc == Some(true) {
+                            if rtc == Some(true) {
                                 if let Some(port) = peering.webrtc.as_ref() {
                                     let _ = port.commands.unbounded_send(
                                         super::webrtc_transport::Command::Dial(*id.as_bytes()),
@@ -435,7 +518,7 @@ async fn run_rendezvous<S: SignalStream>(
                             // Reply so a newcomer learns us with zero server
                             // state. Only on first sight, else the ping-pong.
                             if let Err(error) =
-                                send_hello(socket, channel, peering, our_id).await
+                                send_hello(socket, channel, peering, our_id, generation).await
                             {
                                 tracing::debug!(
                                     target: "walkie::rendezvous",
@@ -538,16 +621,24 @@ fn route_rtc_envelope(peering: &RendezvousPeering, our_id: EndpointId, data: ser
 async fn rendezvous_main(
     peering: RendezvousPeering,
     topic: RoomTopic,
-    on_discovered: impl Fn(EndpointId),
+    generation: RendezvousGeneration,
+    on_discovered: impl Fn(EndpointId, Option<LaneSet>),
 ) {
-    let channel = rendezvous_channel(topic);
+    let channel = generation.channel(topic);
     let mut joined: HashSet<EndpointId> = HashSet::new();
     loop {
         match connect_signal(SIGNALING_SERVER_URL).await {
             Ok(mut socket) => {
                 if let Err(error) =
-                    run_rendezvous(&mut socket, &channel, &peering, &on_discovered, &mut joined)
-                        .await
+                    run_rendezvous(
+                        &mut socket,
+                        &channel,
+                        &peering,
+                        generation,
+                        &on_discovered,
+                        &mut joined,
+                    )
+                    .await
                 {
                     tracing::debug!(
                         target: "walkie::rendezvous",
@@ -603,7 +694,34 @@ pub fn spawn_rendezvous(
     on_discovered: impl Fn(EndpointId) + Send + Sync + 'static,
 ) -> RendezvousHandle {
     RendezvousHandle {
-        task: tokio::spawn(rendezvous_main(peering, topic, on_discovered)),
+        task: tokio::spawn(rendezvous_main(
+            peering,
+            topic,
+            RendezvousGeneration::V1,
+            move |id, _| on_discovered(id),
+        )),
+    }
+}
+
+/// Start room-v4 rendezvous and surface each peer's required lane capability.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn spawn_rendezvous_v4(
+    peering: RendezvousPeering,
+    topic: RoomTopic,
+    local_lanes: LaneSet,
+    on_discovered: impl Fn(EndpointId, LaneSet) + Send + Sync + 'static,
+) -> RendezvousHandle {
+    RendezvousHandle {
+        task: tokio::spawn(rendezvous_main(
+            peering,
+            topic,
+            RendezvousGeneration::V4 { local_lanes },
+            move |id, lanes| {
+                if let Some(lanes) = lanes {
+                    on_discovered(id, lanes);
+                }
+            },
+        )),
     }
 }
 
@@ -615,7 +733,34 @@ pub fn spawn_rendezvous(
     on_discovered: impl Fn(EndpointId) + 'static,
 ) -> RendezvousHandle {
     RendezvousHandle {
-        task: n0_future::task::spawn(rendezvous_main(peering, topic, on_discovered)),
+        task: n0_future::task::spawn(rendezvous_main(
+            peering,
+            topic,
+            RendezvousGeneration::V1,
+            move |id, _| on_discovered(id),
+        )),
+    }
+}
+
+/// Start room-v4 rendezvous in the browser and surface peer lane capabilities.
+#[cfg(target_arch = "wasm32")]
+pub fn spawn_rendezvous_v4(
+    peering: RendezvousPeering,
+    topic: RoomTopic,
+    local_lanes: LaneSet,
+    on_discovered: impl Fn(EndpointId, LaneSet) + 'static,
+) -> RendezvousHandle {
+    RendezvousHandle {
+        task: n0_future::task::spawn(rendezvous_main(
+            peering,
+            topic,
+            RendezvousGeneration::V4 { local_lanes },
+            move |id, lanes| {
+                if let Some(lanes) = lanes {
+                    on_discovered(id, lanes);
+                }
+            },
+        )),
     }
 }
 
@@ -876,6 +1021,63 @@ mod tests {
         assert!(!json.contains("rtc"));
         let decoded: Hello = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.rtc, None);
+    }
+
+    #[test]
+    fn room_v4_channel_and_hello_bytes_are_exact() {
+        let topic = RoomTopic::from_room_name_v4("quiet-cactus-song");
+        assert_eq!(
+            rendezvous_channel_v4(topic),
+            format!("walkie-rdv-v4-{}", topic.to_hex())
+        );
+        assert_ne!(rendezvous_channel_v4(topic), rendezvous_channel(topic));
+
+        let hello = HelloV4::new(
+            LaneSet::WALKIE,
+            "aa".repeat(32),
+            Some("https://relay.wondering.xyz/".to_owned()),
+            Some(true),
+        );
+        let json = serde_json::to_string(&hello).unwrap();
+        assert_eq!(
+            json,
+            format!(
+                "{{\"kind\":\"walkie-hello\",\"v\":4,\"lanes\":3,\"id\":\"{}\",\"relay\":\"https://relay.wondering.xyz/\",\"rtc\":true}}",
+                "aa".repeat(32)
+            )
+        );
+        assert_eq!(serde_json::from_str::<HelloV4>(&json).unwrap().validate(), Some(LaneSet::WALKIE));
+    }
+
+    #[test]
+    fn room_v4_hello_requires_and_validates_lanes_and_generation() {
+        let missing_lanes = format!(
+            "{{\"kind\":\"walkie-hello\",\"v\":4,\"id\":\"{}\",\"rtc\":true}}",
+            "bb".repeat(32)
+        );
+        assert!(serde_json::from_str::<HelloV4>(&missing_lanes).is_err());
+
+        for lanes in [0x00, 0x04, 0x80, 0xff] {
+            let hello = HelloV4 {
+                lanes,
+                ..HelloV4::new(LaneSet::MUSIC, "bb".repeat(32), None, Some(true))
+            };
+            assert_eq!(hello.validate(), None);
+        }
+        let wrong_version = HelloV4 {
+            v: HELLO_VERSION,
+            ..HelloV4::new(LaneSet::MUSIC, "bb".repeat(32), None, Some(true))
+        };
+        assert_eq!(wrong_version.validate(), None);
+
+        let v1 = Hello {
+            kind: HELLO_KIND.to_owned(),
+            v: HELLO_VERSION,
+            id: "bb".repeat(32),
+            relay: None,
+            rtc: Some(true),
+        };
+        assert!(serde_json::from_value::<HelloV4>(serde_json::to_value(v1).unwrap()).is_err());
     }
 
     #[test]

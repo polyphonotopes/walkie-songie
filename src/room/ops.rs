@@ -41,8 +41,8 @@ use crate::tuning::{MAX_SCALE_DEGREES, TunedDegree, TunedPeriodicPitch, TuningDe
 pub use tutti_core::{
     AuthorId, LogHead, MAX_OBSERVED_OPS, MAX_SIGNED_HEADER_BYTES, MAX_SIGNED_OP_WIRE_BYTES,
     MAX_SIGNED_PAYLOAD_BYTES, MAX_TOPIC_BYTES, OpId, OpLanguage, OpVerifyError, SignedOp,
-    SignedOpWireError, SigningKey, VerifiedOpG, VerifyingKey, VersionedOpG, sign_versioned_op,
-    signing_key_from_seed, verify_signed_op_in,
+    SignedOpWireError, SigningKey, VerifiedOpG, VerifyingKey, VersionedOpG, WindowIngest,
+    sign_versioned_op, signing_key_from_seed, verify_signed_op_in,
 };
 
 /// The current op-payload schema version (walkie domain).

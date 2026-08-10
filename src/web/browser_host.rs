@@ -300,6 +300,7 @@ impl BrowserHost {
             topic: RoomTopic::from_room_name(&room_name),
             relay: RelayPolicy::Production,
             bootstrap: None,
+            bootstrap_lanes: None,
         };
         self.start_room(Some(room_name), config).await
     }
@@ -313,6 +314,7 @@ impl BrowserHost {
             topic: ticket.topic(),
             relay: RelayPolicy::Production,
             bootstrap: Some(ticket.endpoint_addr().clone()),
+            bootstrap_lanes: None,
         };
         self.start_room(None, config).await
     }
@@ -1307,6 +1309,7 @@ async fn dial_repair(
         .map_err(|error| error.to_string())?;
     Ok(BrowserIncomingRepair {
         endpoint_id,
+        alpn: crate::net::RBSR_ALPN,
         connection,
         stream,
     })

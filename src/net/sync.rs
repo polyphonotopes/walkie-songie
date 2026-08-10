@@ -2,8 +2,8 @@
 //!
 //! Drives [`hhhs_sync::sync_session::SyncSession`] to completion over any
 //! [`SyncStream`], for both halves: the initiator (dialled via
-//! [`Transport::open_sync`](super::Transport::open_sync)) and the responder
-//! (accepted from [`TransportEvent::SyncRequested`](super::TransportEvent)).
+//! [`Transport::open_lane`](super::Transport::open_lane)) and the responder
+//! (accepted from [`TransportEvent::LaneRequested`](super::TransportEvent)).
 //! Nothing here names a backend, so the same driver serves iroh, a loopback
 //! pair, and any browser-bridged carrier.
 //!
@@ -15,8 +15,8 @@
 //! authenticated ALPN *is* the lane, so a peer that cannot speak a lane is
 //! refused at QUIC negotiation, before any signed-op byte. [`MusicLane`] is
 //! the tutti-music lane a bare (walkie-free) peer joins; [`ExtensionLane`] is
-//! walkie's own pieces/config lane; [`WalkieLane`] is the deployed v3
-//! single-lane wire, kept until the app hard-cuts onto the two-lane room.
+//! walkie's own pieces/config lane. [`WalkieLane`] remains only for the browser
+//! host and legacy compatibility tests while their separate cutover is pending.
 //!
 //! # The consistency invariant
 //!
@@ -64,7 +64,7 @@ use tutti_core::{
 
 use super::{SyncStream, TransportError};
 use crate::room::ops::{MAX_SIGNED_OP_WIRE_BYTES, MAX_SIGNED_PAYLOAD_BYTES, WalkieLang};
-use crate::room::v4::{ExtensionLang, MusicLang, require_topic};
+use crate::room::v4::{ExtensionLang, MusicLang, RoomLane, require_topic};
 
 /// The v3 single-lane protocol generation. A change here is an ALPN/mode
 /// change, never a silent reshape — peers compare this for equality and
@@ -74,8 +74,8 @@ use crate::room::v4::{ExtensionLang, MusicLang, require_topic};
 /// `Question { id, msg }` with a mandatory per-question `Ack(id)`, and
 /// `Entries(Vec<..>)` became the chunkable `Entries { pairs, more }`. The ALPN
 /// ([`RBSR_ALPN`]) bumps in lockstep so old and new peers never attempt to
-/// interop. [`WalkieLane`] carries these until the app hard-cuts onto the
-/// two-lane room; the v4 lanes ride [`LANE_STRATEGY_VERSION`] instead.
+/// interop. [`WalkieLane`] carries these for the remaining browser-v3 path;
+/// the v4 lanes ride [`LANE_STRATEGY_VERSION`] instead.
 pub const SYNC_STRATEGY_NAME: &str = "walkie-entryhash";
 pub const SYNC_STRATEGY_VERSION: u32 = 2;
 
@@ -100,8 +100,8 @@ pub const EXTENSION_STRATEGY_NAME: &str = "walkie-extension-entryhash";
 /// The extension lane's deep-laggard courier ALPN (see
 /// [`LaneSpec::COURIER_ALPN`]).
 pub const EXTENSION_COURIER_ALPN: &[u8] = b"walkie/extension/courier/1";
-/// The v3 single-lane wire's courier ALPN, kept beside [`RBSR_ALPN`] until the
-/// app hard-cuts onto the two-lane room and [`WalkieLane`] is deleted.
+/// The v3 single-lane wire's courier ALPN, retained for the browser-v3 path and
+/// legacy compatibility tests until [`WalkieLane`] can be deleted.
 pub const WALKIE_COURIER_ALPN: &[u8] = b"walkie/courier/1";
 
 /// One anti-entropy lane: an [`OpLanguage`] plus its network identity.
@@ -111,9 +111,9 @@ pub const WALKIE_COURIER_ALPN: &[u8] = b"walkie/courier/1";
 /// peer that does not register a lane's ALPN is refused before any RBSR or
 /// signed-op byte, and a demux bug cannot leak one lane's entries into
 /// another's session.
-pub trait LaneSpec: 'static {
+pub trait LaneSpec: 'static + Send {
     /// The lane's op language: wire magic, schema gate, payload cap, fold.
-    type Lang: OpLanguage;
+    type Lang: OpLanguage + Send;
     /// The lane's repair ALPN. Registering it IS declaring the capability.
     const ALPN: &'static [u8];
     /// The lane's deep-laggard courier ALPN (M3.2 §4.5): one
@@ -131,6 +131,45 @@ pub trait LaneSpec: 'static {
     /// The `Hello` strategy peers compare for equality (mismatch => `Abort`).
     fn strategy() -> StrategyId {
         StrategyId::new(Self::STRATEGY_NAME, LANE_STRATEGY_VERSION)
+    }
+}
+
+/// One lane-scoped QUIC protocol. The ALPN is the authoritative lane and
+/// purpose tag; no extra discriminator rides inside repair or courier frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LaneProtocol {
+    Repair(RoomLane),
+    Courier(RoomLane),
+}
+
+impl LaneProtocol {
+    pub const fn alpn(self) -> &'static [u8] {
+        match self {
+            Self::Repair(RoomLane::Music) => MUSIC_RBSR_ALPN,
+            Self::Repair(RoomLane::Extension) => EXTENSION_RBSR_ALPN,
+            Self::Courier(RoomLane::Music) => MUSIC_COURIER_ALPN,
+            Self::Courier(RoomLane::Extension) => EXTENSION_COURIER_ALPN,
+        }
+    }
+
+    pub fn from_alpn(alpn: &[u8]) -> Option<Self> {
+        if alpn == MUSIC_RBSR_ALPN {
+            Some(Self::Repair(RoomLane::Music))
+        } else if alpn == EXTENSION_RBSR_ALPN {
+            Some(Self::Repair(RoomLane::Extension))
+        } else if alpn == MUSIC_COURIER_ALPN {
+            Some(Self::Courier(RoomLane::Music))
+        } else if alpn == EXTENSION_COURIER_ALPN {
+            Some(Self::Courier(RoomLane::Extension))
+        } else {
+            None
+        }
+    }
+
+    pub const fn lane(self) -> RoomLane {
+        match self {
+            Self::Repair(lane) | Self::Courier(lane) => lane,
+        }
     }
 }
 
@@ -158,8 +197,8 @@ impl LaneSpec for ExtensionLane {
 
 /// The deployed v3 single-lane wire ([`WalkieLang`]), spelled as a lane so the
 /// one generic driver serves it too. Keeps the generation-2 strategy id — the
-/// deployed ALPN/strategy must not move until the app hard-cuts the room onto
-/// the two-lane stores, at which point this lane is deleted outright.
+/// deployed ALPN/strategy must not move while browser-v3 compatibility remains;
+/// this lane is deleted outright when that path is cut over.
 pub enum WalkieLane {}
 
 impl LaneSpec for WalkieLane {
@@ -276,8 +315,8 @@ pub struct LaneSyncSource<L: OpLanguage> {
     _lang: PhantomData<L>,
 }
 
-/// The v3 single-lane spelling, kept for the deployed call sites until the app
-/// hard-cut deletes [`WalkieLane`].
+/// The v3 single-lane spelling, kept for the browser-v3 call sites and legacy
+/// compatibility tests until that cutover deletes [`WalkieLane`].
 pub type RoomSyncSource = LaneSyncSource<WalkieLang>;
 
 impl<L: OpLanguage> LaneSyncSource<L> {
@@ -508,7 +547,7 @@ impl<L: OpLanguage> LaneStoreAccess<L> for Store<L> {
         pairs: &[(EntryHash, Vec<u8>)],
         source: &mut LaneSyncSource<L>,
     ) -> Result<SyncApply, SyncError> {
-        let report = ingest_pairs(self, topic, pairs);
+        let report = ingest_pairs(self, topic, pairs.iter().map(IncomingOp::from))?;
         source.absorb(self, &report.lifted)?;
         Ok(SyncApply {
             admitted: report.admitted,
@@ -522,12 +561,40 @@ impl<L: OpLanguage> LaneStoreAccess<L> for Store<L> {
 #[derive(Debug, Clone, Default)]
 pub struct IngestReport {
     /// The admitted set for `resume_admitted` — see [`SyncApply::admitted`].
+    /// Meaningful for RBSR ([`IncomingOp::claimed_entry`] `Some`) only; a pure
+    /// gossip delivery (`None`) never contributes here (see [`ingest_pairs`]).
     pub admitted: Vec<EntryHash>,
     /// Entries newly LIFTED, for folding into the snapshot via
     /// [`RoomSyncSource::absorb`].
     pub lifted: Vec<EntryHash>,
     /// Courier-deferred ops (windowed leaves only) — see [`SyncApply::courier`].
     pub courier: Vec<DeferredLift>,
+}
+
+/// One op delivered to [`ingest_pairs`], from either admission path.
+///
+/// * RBSR (`LaneStoreAccess::apply`, via the `From<&(EntryHash, Vec<u8>)>`
+///   impl below) always supplies `claimed_entry: Some(hash)` — the entry hash
+///   the peer's index advertised for this wire, which becomes the delivery's
+///   name in [`IngestReport::admitted`] while the op is still parked (it
+///   cannot resolve its own entry hash until it lifts).
+/// * Gossip supplies `claimed_entry: None` — a raw broadcast carries no
+///   RBSR index claim, and gossip does not call `resume_admitted`, so there
+///   is nothing for a parked gossip op to be named under; see
+///   [`IngestReport::admitted`]'s doc.
+#[derive(Debug, Clone, Copy)]
+pub struct IncomingOp<'a> {
+    pub claimed_entry: Option<EntryHash>,
+    pub wire: &'a [u8],
+}
+
+impl<'a> From<&'a (EntryHash, Vec<u8>)> for IncomingOp<'a> {
+    fn from((hash, wire): &'a (EntryHash, Vec<u8>)) -> Self {
+        Self {
+            claimed_entry: Some(*hash),
+            wire,
+        }
+    }
 }
 
 /// The one store surface the lane-generic repair ingress ([`ingest_pairs`])
@@ -539,8 +606,13 @@ pub trait LaneIngest<L: OpLanguage> {
     fn lifted_entry(&self, id: OpId) -> Option<EntryHash>;
     /// Whether `id` is already lifted or parked.
     fn knows_op(&self, id: OpId) -> bool;
-    /// Ingest through the store's production ingress.
-    fn ingest_lane(&mut self, op: VerifiedOpG<L>) -> WindowIngest;
+    /// Ingest through the store's production ingress. `wire` is the EXACT
+    /// bytes the op deframed from, so a durable implementation can journal-
+    /// append it (lane + verbatim wire) before admitting the op into memory —
+    /// `Err` means that append failed and the op must NOT become visible.
+    /// Both in-memory profiles ([`Store`], [`WindowedStore`]) never persist
+    /// and so never fail.
+    fn ingest_lane(&mut self, wire: &[u8], op: VerifiedOpG<L>) -> Result<WindowIngest, SyncError>;
 }
 
 impl<L: OpLanguage> LaneIngest<L> for Store<L> {
@@ -552,11 +624,11 @@ impl<L: OpLanguage> LaneIngest<L> for Store<L> {
         Store::knows_op(self, id)
     }
 
-    fn ingest_lane(&mut self, op: VerifiedOpG<L>) -> WindowIngest {
-        WindowIngest {
+    fn ingest_lane(&mut self, _wire: &[u8], op: VerifiedOpG<L>) -> Result<WindowIngest, SyncError> {
+        Ok(WindowIngest {
             lifted: self.ingest_verified(op),
             courier: Vec::new(),
-        }
+        })
     }
 }
 
@@ -569,8 +641,8 @@ impl<L: OpLanguage> LaneIngest<L> for WindowedStore<L> {
         WindowedStore::knows_op(self, id)
     }
 
-    fn ingest_lane(&mut self, op: VerifiedOpG<L>) -> WindowIngest {
-        self.ingest_verified(op)
+    fn ingest_lane(&mut self, _wire: &[u8], op: VerifiedOpG<L>) -> Result<WindowIngest, SyncError> {
+        Ok(self.ingest_verified(op))
     }
 }
 
@@ -584,14 +656,25 @@ impl<L: OpLanguage> LaneIngest<L> for WindowedStore<L> {
 /// from the wire, so a peer cannot inject an unverified entry. Frames that fail
 /// to decode or verify are dropped: a hostile peer wastes its own bandwidth,
 /// and the kernel counts the un-admitted hash as refused (re-fetchable).
-pub fn ingest_pairs<L: OpLanguage, K: LaneIngest<L>>(
+///
+/// Generic over the DELIVERY shape via [`IncomingOp`]: RBSR's `apply` (above)
+/// always supplies `claimed_entry: Some`; a gossip caller supplies `None` for
+/// every op (no RBSR index claim exists for a raw broadcast). This is purely
+/// additive over the pre-existing RBSR-only behavior — every existing call
+/// site converts its `(EntryHash, Vec<u8>)` pairs via `IncomingOp::from`, so
+/// the `Some` path is byte-for-byte the original semantics.
+pub fn ingest_pairs<'a, L, K>(
     store: &mut K,
     topic: &str,
-    pairs: &[(EntryHash, Vec<u8>)],
-) -> IngestReport {
+    incoming: impl IntoIterator<Item = IncomingOp<'a>>,
+) -> Result<IngestReport, SyncError>
+where
+    L: OpLanguage,
+    K: LaneIngest<L>,
+{
     let mut report = IngestReport::default();
-    for (wire_hash, bytes) in pairs {
-        let Ok(signed) = SignedOp::from_wire_bytes_in::<L>(bytes) else {
+    for op in incoming {
+        let Ok(signed) = SignedOp::from_wire_bytes_in::<L>(op.wire) else {
             continue;
         };
         let Ok(verified) = verify_signed_op_in::<L>(&signed) else {
@@ -604,32 +687,41 @@ pub fn ingest_pairs<L: OpLanguage, K: LaneIngest<L>>(
         if let Some(entry) = store.lifted_entry(id) {
             // Already materialized (gossip raced the session, or a duplicate
             // pair): kept, under the entry hash the store derived for it.
-            report.admitted.push(entry);
+            if op.claimed_entry.is_some() {
+                report.admitted.push(entry);
+            }
             continue;
         }
         if store.knows_op(id) {
-            // Already parked: kept, and the wire claim is its only name until
-            // its causal past resolves.
-            report.admitted.push(*wire_hash);
+            // Already parked: kept, and the wire claim (if any — RBSR only)
+            // is its only name until its causal past resolves.
+            if let Some(claimed) = op.claimed_entry {
+                report.admitted.push(claimed);
+            }
             continue;
         }
-        let ingest = store.ingest_lane(verified);
+        let ingest = store.ingest_lane(op.wire, verified)?;
         if ingest.lifted.is_empty() {
-            // Parked just now — kept, so it must be admitted or the kernel
-            // re-fetches bytes already in hand until "no progress" aborts. A
-            // courier-deferred op is exactly this case: its verified bytes are
-            // parked, so re-fetching them would only spin the fruitless-fetch
-            // budget; the courier round trip resolves it out of band.
-            report.admitted.push(*wire_hash);
+            // Parked just now — kept, so an RBSR delivery must admit
+            // it under the wire claim or the kernel re-fetches bytes
+            // already in hand until "no progress" aborts. A courier-
+            // deferred op is exactly this case. Gossip has no claim
+            // to admit under, and does not need one.
+            if let Some(claimed) = op.claimed_entry {
+                report.admitted.push(claimed);
+            }
         } else {
-            // Lifted, possibly unblocking earlier parked deliveries; admit the
-            // store-derived hashes (all of them are kept AND indexed).
-            report.admitted.extend(ingest.lifted.iter().copied());
+            // Lifted, possibly unblocking earlier parked deliveries. Only
+            // RBSR needs acknowledgements; gossip deliberately contributes no
+            // admitted hashes.
+            if op.claimed_entry.is_some() {
+                report.admitted.extend(ingest.lifted.iter().copied());
+            }
             report.lifted.extend(ingest.lifted);
         }
         report.courier.extend(ingest.courier);
     }
-    report
+    Ok(report)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -644,6 +736,8 @@ pub enum SyncError {
     Snapshot(#[from] SignedOpWireError),
     #[error("sync session failed: {0}")]
     Session(String),
+    #[error("lane sink refused to persist an admitted op: {0}")]
+    Persistence(String),
     #[error("sync frame could not be decoded: {0}")]
     Decode(String),
     #[error("peer opened a sync session we refused: {0}")]
@@ -1059,15 +1153,21 @@ mod tests {
     ) -> (Result<SyncOutcome, SyncError>, Result<SyncOutcome, SyncError>) {
         let (a, mut b) = loopback_pair();
         futures::executor::block_on(async {
-            // The dial side opens a stream; the accept side sees SyncRequested.
-            let initiator_stream = a.open_sync(a.remote_id()).await.unwrap();
+            // The dial side opens a stream; the accept side sees LaneRequested.
+            let initiator_stream = a
+                .open_lane(
+                    a.remote_id(),
+                    LaneProtocol::Repair(RoomLane::Music),
+                )
+                .await
+                .unwrap();
             // Dispatch on event type exactly as the real room loop does: the
             // pair is seeded with a `PeerUp` ahead of the sync request.
             let responder_stream = loop {
                 match b.next_event().await {
-                    Some(TransportEvent::SyncRequested { stream, .. }) => break stream,
+                    Some(TransportEvent::LaneRequested { stream, .. }) => break stream,
                     Some(TransportEvent::PeerUp { .. }) => continue,
-                    other => panic!("expected SyncRequested, got {other:?}"),
+                    other => panic!("expected LaneRequested, got {other:?}"),
                 }
             };
 
@@ -1529,7 +1629,7 @@ mod tests {
             .map(|(hash, (signed, _))| (hash, signed.to_wire_bytes().unwrap()))
             .collect();
         let mut source = source;
-        let report = ingest_pairs(&mut store, TOPIC, &pairs);
+        let report = ingest_pairs(&mut store, TOPIC, pairs.iter().map(IncomingOp::from)).unwrap();
         assert_eq!(report.lifted.len(), 1);
         assert_eq!(
             report.admitted, report.lifted,
@@ -1564,21 +1664,22 @@ mod tests {
 
         // Garbage is refused: not admitted, so the kernel may re-ask.
         let garbage = vec![(bogus_hash(0xAA), vec![0xFF; 16])];
-        let report = ingest_pairs(&mut store, TOPIC, &garbage);
+        let report =
+            ingest_pairs(&mut store, TOPIC, garbage.iter().map(IncomingOp::from)).unwrap();
         assert!(report.admitted.is_empty(), "garbage must never be admitted");
         assert!(report.lifted.is_empty());
 
         // The child alone parks — kept, so it MUST be admitted (under the wire
         // claim; a parked op cannot resolve its entry hash yet), or the kernel
         // would re-fetch bytes already in hand until "no progress" aborts.
-        let report = ingest_pairs(&mut store, TOPIC, std::slice::from_ref(&child));
+        let report = ingest_pairs(&mut store, TOPIC, [IncomingOp::from(&child)]).unwrap();
         assert_eq!(report.admitted, vec![child.0], "a parked op is kept");
         assert!(report.lifted.is_empty(), "parked is not lifted");
         assert_eq!(store.pending_len(), 1);
 
         // The parent lifts itself AND drains the parked child; both are
         // admitted under their store-derived hashes.
-        let report = ingest_pairs(&mut store, TOPIC, std::slice::from_ref(&parent));
+        let report = ingest_pairs(&mut store, TOPIC, [IncomingOp::from(&parent)]).unwrap();
         assert_eq!(report.lifted.len(), 2, "parent + drained child lift");
         assert_eq!(report.admitted, report.lifted);
         assert_eq!(store.pending_len(), 0);
@@ -1586,7 +1687,7 @@ mod tests {
         // A duplicate delivery of an already-lifted op is KEPT (admitted under
         // the derived hash), never refused — marking it refused would spin an
         // honest re-serve loop into `Abort{"no progress"}`.
-        let report = ingest_pairs(&mut store, TOPIC, std::slice::from_ref(&parent));
+        let report = ingest_pairs(&mut store, TOPIC, [IncomingOp::from(&parent)]).unwrap();
         assert_eq!(report.admitted, vec![parent.0]);
         assert!(report.lifted.is_empty(), "nothing new lifts");
     }
@@ -1760,7 +1861,7 @@ mod tests {
         for hash in &requested {
             included.remove(hash);
             let pairs = source.bytes_with_closure(hash, &mut included);
-            ingest_pairs(&mut joiner, TOPIC, &pairs);
+            ingest_pairs(&mut joiner, TOPIC, pairs.iter().map(IncomingOp::from)).unwrap();
         }
         assert_eq!(joiner.entry_hashes().len(), 16, "every entry lifts");
         assert_eq!(joiner.pending_len(), 0, "nothing may stay parked");
@@ -1925,9 +2026,264 @@ mod tests {
             .map(|(hash, (bytes, _))| (*hash, bytes.clone()))
             .collect();
         let mut foreign = Store::<ExtensionLang>::new();
-        let report = ingest_pairs(&mut foreign, TOPIC, &music_pairs);
+        let report =
+            ingest_pairs(&mut foreign, TOPIC, music_pairs.iter().map(IncomingOp::from)).unwrap();
         assert!(report.admitted.is_empty(), "nothing admits cross-lane");
         assert!(report.lifted.is_empty(), "nothing lifts cross-lane");
         assert!(foreign.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // The `IncomingOp`/`LaneIngest` admission matrix, run once per lane
+    // language.
+    // -----------------------------------------------------------------
+
+    /// A [`LaneIngest`] sink that verifies fine but always refuses to
+    /// persist — simulates a durable journal-append failure so the
+    /// persistence-refusal branch of [`ingest_pairs`] is exercised for real.
+    struct RefusingSink<L: OpLanguage>(Store<L>);
+
+    impl<L: OpLanguage> LaneIngest<L> for RefusingSink<L> {
+        fn lifted_entry(&self, id: OpId) -> Option<EntryHash> {
+            self.0.lifted_entry(id)
+        }
+        fn knows_op(&self, id: OpId) -> bool {
+            self.0.knows_op(id)
+        }
+        fn ingest_lane(
+            &mut self,
+            _wire: &[u8],
+            _op: VerifiedOpG<L>,
+        ) -> Result<WindowIngest, SyncError> {
+            Err(SyncError::Persistence(
+                "simulated journal-append failure".into(),
+            ))
+        }
+    }
+
+    /// The admission matrix, generic over one lane's [`OpLanguage`]: valid,
+    /// duplicate, parked, later-lifted, wrong-topic, wrong-lane-magic, and
+    /// persistence-refusal. `op_a`/`op_b` must be causally chainable from the
+    /// SAME author (i.e. `op_b` committed right after `op_a` from one donor
+    /// store) — `foreign_wire` is a fully valid signed frame from the OTHER
+    /// lane's language, used for the wrong-lane-magic case.
+    fn admission_matrix<L: OpLanguage>(
+        seed: &[u8; 32],
+        topic: &str,
+        other_topic: &str,
+        op_a: L::Op,
+        op_b: L::Op,
+        foreign_wire: &[u8],
+    ) {
+        let key = signing_key_from_seed(seed);
+
+        let mut donor = Store::<L>::new();
+        let signed_a = donor.commit(&key, topic, 1, op_a);
+        let signed_b = donor.commit(&key, topic, 2, op_b);
+        let id_a = verify_signed_op_in::<L>(&signed_a).unwrap().id();
+        let id_b = verify_signed_op_in::<L>(&signed_b).unwrap().id();
+        let hash_a = donor.lifted_entry(id_a).expect("op_a lifts in the donor");
+        let hash_b = donor.lifted_entry(id_b).expect("op_b lifts in the donor (observes op_a)");
+        let wire_a = signed_a.to_wire_bytes_in::<L>().unwrap();
+        let wire_b = signed_b.to_wire_bytes_in::<L>().unwrap();
+
+        // valid: a fresh store lifts op_a immediately under its real hash.
+        let mut store = Store::<L>::new();
+        let report = ingest_pairs::<L, _>(
+            &mut store,
+            topic,
+            [IncomingOp {
+                claimed_entry: Some(hash_a),
+                wire: &wire_a,
+            }],
+        )
+        .unwrap();
+        assert_eq!(report.lifted, vec![hash_a], "valid delivery lifts");
+        assert_eq!(report.admitted, vec![hash_a]);
+
+        // duplicate: redelivering op_a is kept, never re-lifted.
+        let report = ingest_pairs::<L, _>(
+            &mut store,
+            topic,
+            [IncomingOp {
+                claimed_entry: Some(hash_a),
+                wire: &wire_a,
+            }],
+        )
+        .unwrap();
+        assert_eq!(report.admitted, vec![hash_a], "duplicate is kept");
+        assert!(report.lifted.is_empty(), "duplicate never re-lifts");
+
+        // gossip: the same verified frame lifts, but there is no RBSR claim
+        // to acknowledge — on first delivery or a duplicate.
+        let mut gossip = Store::<L>::new();
+        let report = ingest_pairs::<L, _>(
+            &mut gossip,
+            topic,
+            [IncomingOp {
+                claimed_entry: None,
+                wire: &wire_a,
+            }],
+        )
+        .unwrap();
+        assert_eq!(report.lifted, vec![hash_a]);
+        assert!(report.admitted.is_empty());
+        let report = ingest_pairs::<L, _>(
+            &mut gossip,
+            topic,
+            [IncomingOp {
+                claimed_entry: None,
+                wire: &wire_a,
+            }],
+        )
+        .unwrap();
+        assert!(report.lifted.is_empty());
+        assert!(report.admitted.is_empty());
+
+        // parked: a store that has NOT seen op_a parks op_b under the claim.
+        let mut fresh = Store::<L>::new();
+        let report = ingest_pairs::<L, _>(
+            &mut fresh,
+            topic,
+            [IncomingOp {
+                claimed_entry: Some(hash_b),
+                wire: &wire_b,
+            }],
+        )
+        .unwrap();
+        assert_eq!(report.admitted, vec![hash_b], "parked is kept under the claim");
+        assert!(report.lifted.is_empty(), "parked is not lifted");
+        assert_eq!(fresh.pending_len(), 1);
+
+        // later-lifted: delivering op_a afterward drains the parked op_b too.
+        let report = ingest_pairs::<L, _>(
+            &mut fresh,
+            topic,
+            [IncomingOp {
+                claimed_entry: Some(hash_a),
+                wire: &wire_a,
+            }],
+        )
+        .unwrap();
+        assert_eq!(report.lifted.len(), 2, "parent + drained child both lift");
+        assert_eq!(report.admitted, report.lifted);
+        assert_eq!(fresh.pending_len(), 0);
+
+        // wrong-topic: signed for `topic`, delivered under `other_topic`.
+        let mut wrong_topic = Store::<L>::new();
+        let report = ingest_pairs::<L, _>(
+            &mut wrong_topic,
+            other_topic,
+            [IncomingOp {
+                claimed_entry: Some(hash_a),
+                wire: &wire_a,
+            }],
+        )
+        .unwrap();
+        assert!(report.admitted.is_empty(), "wrong topic is never admitted");
+        assert!(report.lifted.is_empty());
+        assert!(wrong_topic.is_empty(), "the op never enters the store");
+
+        // wrong-lane-magic: the OTHER lane's fully valid wire, fed to THIS
+        // lane's ingress — must fail to deframe, not merely fail to verify.
+        let mut cross_lane = Store::<L>::new();
+        let report = ingest_pairs::<L, _>(
+            &mut cross_lane,
+            topic,
+            [IncomingOp {
+                claimed_entry: Some(bogus_hash(0xCE)),
+                wire: foreign_wire,
+            }],
+        )
+        .unwrap();
+        assert!(report.admitted.is_empty(), "cross-lane wire is never admitted");
+        assert!(cross_lane.is_empty());
+
+        // persistence-refusal: verified fine, but the sink refuses to persist.
+        let mut refusing = RefusingSink::<L>(Store::new());
+        let error = ingest_pairs::<L, _>(
+            &mut refusing,
+            topic,
+            [IncomingOp {
+                claimed_entry: Some(hash_a),
+                wire: &wire_a,
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(error, SyncError::Persistence(_)));
+        assert_eq!(
+            refusing.0.pending_len(),
+            0,
+            "a refused op must not even enter the sink's own memory"
+        );
+    }
+
+    #[test]
+    fn music_lane_admission_matrix() {
+        use crate::room::test_support::{tet_degree, tet_pitch};
+        use crate::room::v4::ExtensionOp;
+        use tutti_music::MusicOp;
+
+        let other_topic = "another-room-topic";
+        let extension_key = signing_key_from_seed(&[81; 32]);
+        let mut extension_donor = Store::<ExtensionLang>::new();
+        let foreign_signed = extension_donor.commit(
+            &extension_key,
+            TOPIC,
+            1,
+            ExtensionOp::PutPiece {
+                emoji: "🌵".into(),
+                pitch: tet_pitch(60),
+            },
+        );
+        let foreign_wire = foreign_signed.to_wire_bytes_in::<ExtensionLang>().unwrap();
+
+        admission_matrix::<MusicLang>(
+            &[82; 32],
+            TOPIC,
+            other_topic,
+            MusicOp::AddDegree {
+                degree: tet_degree(0),
+            },
+            MusicOp::AddDegree {
+                degree: tet_degree(4),
+            },
+            &foreign_wire,
+        );
+    }
+
+    #[test]
+    fn extension_lane_admission_matrix() {
+        use crate::room::test_support::{tet_degree, tet_pitch};
+        use crate::room::v4::ExtensionOp;
+        use tutti_music::MusicOp;
+
+        let other_topic = "another-room-topic";
+        let music_key = signing_key_from_seed(&[83; 32]);
+        let mut music_donor = Store::<MusicLang>::new();
+        let foreign_signed = music_donor.commit(
+            &music_key,
+            TOPIC,
+            1,
+            MusicOp::AddDegree {
+                degree: tet_degree(0),
+            },
+        );
+        let foreign_wire = foreign_signed.to_wire_bytes_in::<MusicLang>().unwrap();
+
+        admission_matrix::<ExtensionLang>(
+            &[84; 32],
+            TOPIC,
+            other_topic,
+            ExtensionOp::PutPiece {
+                emoji: "🌵".into(),
+                pitch: tet_pitch(60),
+            },
+            ExtensionOp::SetConfig {
+                pieces_locked: Some(true),
+                available_emojis: None,
+            },
+            &foreign_wire,
+        );
     }
 }

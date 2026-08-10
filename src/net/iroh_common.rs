@@ -11,18 +11,24 @@
 use std::{fmt, str::FromStr, time::Duration};
 
 use iroh::{EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode, RelayUrl};
-use iroh_gossip::TopicId;
+use iroh_gossip::{TopicId, net::GOSSIP_ALPN};
 use iroh_tickets::{ParseError as TicketParseError, Ticket, endpoint::EndpointTicket};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tutti_core::OpLanguage;
 
 use super::PeerId;
 use crate::client::PeerPath;
+use crate::room::v4::{
+    ExtensionLang, LaneSet, MusicLang, ROOM_PROTOCOL_GENERATION, room_topic_v4,
+};
 
 /// Domain separator used when a human room name is converted into an Iroh topic.
 const ROOM_TOPIC_CONTEXT: &str = "walkie-songie room topic v1";
 /// Current room-ticket payload version.
 const ROOM_TICKET_VERSION: u16 = 1;
+/// The v4 ticket payload format, independent of the room protocol generation.
+pub const ROOM_TICKET_FORMAT_V4: u16 = 2;
 /// Tickets are user-facing bootstrap material, not an unbounded data channel.
 const MAX_ROOM_TICKET_BYTES: usize = 64 * 1024;
 /// Includes the largest accepted tuning definition plus signed framing overhead.
@@ -39,12 +45,29 @@ const _: () = assert!(
     "gossip must not accept an op that anti-entropy could never carry"
 );
 
+const MUSIC_MAX_WIRE_BYTES: usize = MusicLang::WIRE_MAGIC.len()
+    + 8
+    + tutti_core::MAX_SIGNED_HEADER_BYTES
+    + MusicLang::MAX_PAYLOAD_BYTES;
+const EXTENSION_MAX_WIRE_BYTES: usize = ExtensionLang::WIRE_MAGIC.len()
+    + 8
+    + tutti_core::MAX_SIGNED_HEADER_BYTES
+    + ExtensionLang::MAX_PAYLOAD_BYTES;
+const _: () = assert!(
+    MAX_GOSSIP_MESSAGE_BYTES >= MUSIC_MAX_WIRE_BYTES,
+    "gossip must carry the largest music-lane frame"
+);
+const _: () = assert!(
+    MAX_GOSSIP_MESSAGE_BYTES >= EXTENSION_MAX_WIRE_BYTES,
+    "gossip must carry the largest extension-lane frame"
+);
+
 /// How long an accepted repair connection may take to open its stream before we
 /// give up on it. Without this a peer that dials and then says nothing pins a
 /// handler task (and a queue slot) forever.
 pub(crate) const REPAIR_ACCEPT_TIMEOUT: Duration = Duration::from_secs(20);
-/// The repair ALPNs, re-exported from the lane layer so both iroh transports
-/// name them from the one shared place.
+/// Repair ALPNs re-exported from the lane layer so every transport names them
+/// from one shared place.
 ///
 /// * [`RBSR_ALPN`] — the deployed v3 single-lane generation ([`super::sync::WalkieLane`]).
 ///   Generation 2 is the hardened kernel's breaking wire reshape
@@ -55,11 +78,24 @@ pub(crate) const REPAIR_ACCEPT_TIMEOUT: Duration = Duration::from_secs(20);
 ///   tutti-music itself so a bare peer speaks it without walkie.
 /// * [`EXTENSION_RBSR_ALPN`] — walkie's extension lane (generation 3).
 ///
-/// The registered ALPN set IS a peer's live lane-capability declaration: an
-/// unsupported lane fails at QUIC negotiation, before any RBSR byte. Lane
-/// capability deliberately does NOT ride [`NativeRoomTicket`], which stays at
-/// version 1.
-pub use super::sync::{EXTENSION_RBSR_ALPN, MUSIC_RBSR_ALPN, RBSR_ALPN};
+/// The registered ALPN set IS a peer's authoritative live lane-capability
+/// declaration: an unsupported lane fails at QUIC negotiation, before any RBSR
+/// byte. [`NativeRoomTicketV4`] and v4 rendezvous also advertise lane bits so a
+/// dialer can avoid unsupported attempts; negotiation still decides.
+pub use super::sync::{
+    EXTENSION_COURIER_ALPN, EXTENSION_RBSR_ALPN, MUSIC_COURIER_ALPN, MUSIC_RBSR_ALPN,
+    RBSR_ALPN,
+};
+
+/// The exact room-v4 endpoint surface. A v4 endpoint registers no v3 repair
+/// or courier ALPN.
+pub const ROOM_V4_ALPNS: [&[u8]; 5] = [
+    GOSSIP_ALPN,
+    MUSIC_RBSR_ALPN,
+    EXTENSION_RBSR_ALPN,
+    MUSIC_COURIER_ALPN,
+    EXTENSION_COURIER_ALPN,
+];
 /// Production home relay. A trailing dot avoids relative DNS interpretation.
 pub const PRODUCTION_RELAY_URL: &str = "https://relay.wondering.xyz/";
 /// Topic-rendezvous signaling server (y-webrtc `funnyzak/y-webrtc-signaling`,
@@ -69,9 +105,9 @@ pub const PRODUCTION_RELAY_URL: &str = "https://relay.wondering.xyz/";
 /// owned rendezvous (design §3 Option 2) is a one-line change here.
 pub const SIGNALING_SERVER_URL: &str = "wss://signal.wondering.xyz";
 
-/// Inbound repair connections are queued separately from gossip so a peer that
-/// opens repair sessions cannot head-of-line block op delivery, and so a slow
-/// consumer of one never stalls the other.
+/// Inbound lane-protocol connections are queued separately from gossip so a
+/// peer that opens repair or courier sessions cannot head-of-line block op
+/// delivery, and so a slow consumer of one never stalls the other.
 pub(crate) const REPAIR_QUEUE_DEPTH: usize = 16;
 /// Gossip event queue. Deliberately shallow: each slot may hold up to
 /// [`MAX_GOSSIP_MESSAGE_BYTES`], so depth is a memory budget, not a comfort knob.
@@ -86,6 +122,11 @@ impl RoomTopic {
     /// Derive the room topic without exposing the human-readable room name.
     pub fn from_room_name(room_name: &str) -> Self {
         Self(blake3::derive_key(ROOM_TOPIC_CONTEXT, room_name.as_bytes()))
+    }
+
+    /// Construct the room-v4 topic from its human-readable room name.
+    pub fn from_room_name_v4(room_name: &str) -> Self {
+        Self(room_topic_v4(room_name))
     }
 
     pub const fn from_bytes(bytes: [u8; 32]) -> Self {
@@ -114,6 +155,12 @@ impl fmt::Display for RoomTopic {
 /// Room-isolated DNS-SD label. Only a truncated topic hash is advertised.
 pub fn room_mdns_service_name(topic: RoomTopic) -> String {
     format!("walkie-{}-v1", encode_hex(&topic.as_bytes()[..10]))
+}
+
+/// Room-v4 DNS-SD label. The suffix isolates discovery generations before
+/// ALPN negotiation; ALPN remains the authoritative lane capability check.
+pub fn room_mdns_service_name_v4(topic: RoomTopic) -> String {
+    format!("walkie-{}-v4", encode_hex(&topic.as_bytes()[..10]))
 }
 
 /// Relay selection is explicit so offline-LAN tests never silently use Internet
@@ -195,14 +242,19 @@ pub struct NativeRoomNetworkConfig {
     pub relay: RelayPolicy,
     /// Optional ticket endpoint used to bootstrap the topic.
     pub bootstrap: Option<EndpointAddr>,
+    /// Capabilities advertised by the bootstrap ticket. Discovery paths that
+    /// do not carry capabilities leave this `None` and optimistically try both
+    /// repair lanes.
+    pub bootstrap_lanes: Option<LaneSet>,
 }
 
 impl NativeRoomNetworkConfig {
     pub fn for_room(room_name: &str) -> Self {
         Self {
-            topic: RoomTopic::from_room_name(room_name),
+            topic: RoomTopic::from_room_name_v4(room_name),
             relay: RelayPolicy::default(),
             bootstrap: None,
+            bootstrap_lanes: None,
         }
     }
 }
@@ -371,6 +423,106 @@ impl FromStr for NativeRoomTicket {
     }
 }
 
+/// Room-v4 bootstrap ticket.
+///
+/// Payload: `[format=2:u16le][generation=4:u16le][lane_bits:u8][topic:32]
+/// [endpoint_len:u32le][endpoint]`. The distinct ticket kind and strict
+/// generation/lane validation make every v3 artifact fail closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeRoomTicketV4 {
+    topic: RoomTopic,
+    lanes: LaneSet,
+    endpoint: EndpointTicket,
+}
+
+impl NativeRoomTicketV4 {
+    pub fn new(topic: RoomTopic, lanes: LaneSet, endpoint: EndpointAddr) -> Self {
+        Self {
+            topic,
+            lanes,
+            endpoint: EndpointTicket::new(endpoint),
+        }
+    }
+
+    pub const fn topic(&self) -> RoomTopic {
+        self.topic
+    }
+
+    pub const fn lanes(&self) -> LaneSet {
+        self.lanes
+    }
+
+    pub fn endpoint_addr(&self) -> &EndpointAddr {
+        self.endpoint.endpoint_addr()
+    }
+}
+
+impl Ticket for NativeRoomTicketV4 {
+    const KIND: &'static str = "walkieroom4";
+
+    fn encode_bytes(&self) -> Vec<u8> {
+        let endpoint = self.endpoint.encode_bytes();
+        let mut bytes = Vec::with_capacity(41 + endpoint.len());
+        bytes.extend_from_slice(&ROOM_TICKET_FORMAT_V4.to_le_bytes());
+        bytes.extend_from_slice(&ROOM_PROTOCOL_GENERATION.to_le_bytes());
+        bytes.push(self.lanes.bits());
+        bytes.extend_from_slice(self.topic.as_bytes());
+        bytes.extend_from_slice(&(endpoint.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&endpoint);
+        bytes
+    }
+
+    fn decode_bytes(bytes: &[u8]) -> Result<Self, TicketParseError> {
+        const FIXED: usize = 41;
+        if bytes.len() < FIXED || bytes.len() > MAX_ROOM_TICKET_BYTES {
+            return Err(TicketParseError::verification_failed(
+                "room-v4 ticket has an invalid length",
+            ));
+        }
+        if u16::from_le_bytes([bytes[0], bytes[1]]) != ROOM_TICKET_FORMAT_V4 {
+            return Err(TicketParseError::verification_failed(
+                "unsupported room-v4 ticket format",
+            ));
+        }
+        if u16::from_le_bytes([bytes[2], bytes[3]]) != ROOM_PROTOCOL_GENERATION {
+            return Err(TicketParseError::verification_failed(
+                "unsupported room protocol generation",
+            ));
+        }
+        let lanes = LaneSet::from_bits(bytes[4]).ok_or_else(|| {
+            TicketParseError::verification_failed("room-v4 ticket has invalid lane bits")
+        })?;
+        let mut topic = [0_u8; 32];
+        topic.copy_from_slice(&bytes[5..37]);
+        let endpoint_len =
+            u32::from_le_bytes(bytes[37..41].try_into().expect("fixed slice")) as usize;
+        if endpoint_len != bytes.len() - FIXED {
+            return Err(TicketParseError::verification_failed(
+                "room-v4 ticket endpoint length mismatch",
+            ));
+        }
+        Ok(Self {
+            topic: RoomTopic::from_bytes(topic),
+            lanes,
+            endpoint: EndpointTicket::decode_bytes(&bytes[FIXED..])?,
+        })
+    }
+}
+
+impl fmt::Display for NativeRoomTicketV4 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.encode_string())
+    }
+}
+
+impl FromStr for NativeRoomTicketV4 {
+    type Err = TicketParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::decode_string(value)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum NativeNetError {
     #[error("invalid relay configuration: {0}")]
@@ -403,6 +555,8 @@ pub(crate) fn encode_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::sync::LaneProtocol;
+    use crate::room::v4::RoomLane;
 
     #[test]
     fn room_topics_and_mdns_names_are_stable_and_room_scoped() {
@@ -436,6 +590,80 @@ mod tests {
         let mut bytes = ticket.encode_bytes();
         bytes[34..38].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(NativeRoomTicket::decode_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn room_v4_topic_mdns_and_ticket_bytes_are_exact() {
+        let topic = RoomTopic::from_room_name_v4("Quiet-Cactus-Song");
+        assert_eq!(topic, RoomTopic::from_room_name_v4("quiet-cactus-song"));
+        assert_eq!(topic.as_bytes(), &room_topic_v4("quiet-cactus-song"));
+        assert_eq!(
+            room_mdns_service_name_v4(topic),
+            format!("walkie-{}-v4", encode_hex(&topic.as_bytes()[..10]))
+        );
+
+        let endpoint = EndpointAddr::new(iroh::SecretKey::from_bytes(&[41; 32]).public());
+        let ticket = NativeRoomTicketV4::new(topic, LaneSet::WALKIE, endpoint);
+        let endpoint_bytes = ticket.endpoint.encode_bytes();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&[0x02, 0x00, 0x04, 0x00, 0x03]);
+        expected.extend_from_slice(topic.as_bytes());
+        expected.extend_from_slice(&(endpoint_bytes.len() as u32).to_le_bytes());
+        expected.extend_from_slice(&endpoint_bytes);
+        assert_eq!(ticket.encode_bytes(), expected);
+        assert_eq!(NativeRoomTicketV4::KIND, "walkieroom4");
+        assert_eq!(ticket.to_string().parse::<NativeRoomTicketV4>().unwrap(), ticket);
+    }
+
+    #[test]
+    fn room_v4_ticket_rejects_every_foreign_generation_and_lane_set() {
+        let topic = RoomTopic::from_room_name_v4("quiet-cactus-song");
+        let endpoint = EndpointAddr::new(iroh::SecretKey::from_bytes(&[42; 32]).public());
+        let ticket = NativeRoomTicketV4::new(topic, LaneSet::MUSIC, endpoint);
+        let valid = ticket.encode_bytes();
+
+        for (offset, bytes) in [
+            (0, [0x01, 0x00]),
+            (2, [0x03, 0x00]),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[offset..offset + 2].copy_from_slice(&bytes);
+            assert!(NativeRoomTicketV4::decode_bytes(&invalid).is_err());
+        }
+        for bits in [0x00, 0x04, 0x80, 0xff] {
+            let mut invalid = valid.clone();
+            invalid[4] = bits;
+            assert!(NativeRoomTicketV4::decode_bytes(&invalid).is_err());
+        }
+
+        let v3 = NativeRoomTicket::new(topic, ticket.endpoint_addr().clone()).encode_bytes();
+        assert!(NativeRoomTicketV4::decode_bytes(&v3).is_err());
+        assert!(NativeRoomTicket::decode_bytes(&valid).is_err());
+    }
+
+    #[test]
+    fn room_v4_alpn_set_and_dispatch_are_exact() {
+        assert_eq!(
+            ROOM_V4_ALPNS,
+            [
+                GOSSIP_ALPN,
+                MUSIC_RBSR_ALPN,
+                EXTENSION_RBSR_ALPN,
+                MUSIC_COURIER_ALPN,
+                EXTENSION_COURIER_ALPN,
+            ]
+        );
+        assert!(!ROOM_V4_ALPNS.contains(&RBSR_ALPN));
+        for protocol in [
+            LaneProtocol::Repair(RoomLane::Music),
+            LaneProtocol::Repair(RoomLane::Extension),
+            LaneProtocol::Courier(RoomLane::Music),
+            LaneProtocol::Courier(RoomLane::Extension),
+        ] {
+            assert_eq!(LaneProtocol::from_alpn(protocol.alpn()), Some(protocol));
+        }
+        assert_eq!(LaneProtocol::from_alpn(RBSR_ALPN), None);
+        assert_eq!(LaneProtocol::from_alpn(b"walkie/unknown/1"), None);
     }
 
     #[test]

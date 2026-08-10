@@ -25,13 +25,15 @@ use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use super::iroh_common::{
-    EVENT_QUEUE_DEPTH, EXTENSION_RBSR_ALPN, MAX_GOSSIP_MESSAGE_BYTES, MUSIC_RBSR_ALPN,
-    NativeNetError, NativeNetworkEvent, NativeRoomNetworkConfig, NativeRoomTicket,
-    PeerTransportPath, RBSR_ALPN, REPAIR_ACCEPT_TIMEOUT, REPAIR_QUEUE_DEPTH, RoomTopic,
-    classify_peer_path, peer_of, room_mdns_service_name,
+    EVENT_QUEUE_DEPTH, EXTENSION_COURIER_ALPN, EXTENSION_RBSR_ALPN,
+    MAX_GOSSIP_MESSAGE_BYTES, MUSIC_COURIER_ALPN, MUSIC_RBSR_ALPN, NativeNetError,
+    NativeNetworkEvent, NativeRoomNetworkConfig, NativeRoomTicketV4, PeerTransportPath,
+    REPAIR_ACCEPT_TIMEOUT, REPAIR_QUEUE_DEPTH, ROOM_V4_ALPNS, RoomTopic, classify_peer_path,
+    peer_of, room_mdns_service_name_v4,
 };
 use super::repair::IrohSyncStream;
-use super::{PeerId, Transport, TransportError, TransportEvent, TransportMode};
+use super::{LaneProtocol, PeerId, Transport, TransportError, TransportEvent, TransportMode};
+use crate::room::v4::LaneSet;
 use crate::client::{DiscoverySource, PeerPath};
 
 /// A bound native Iroh endpoint and its active gossip topic.
@@ -48,14 +50,16 @@ pub struct NativeRoomNetwork {
     event_task: JoinHandle<()>,
 }
 
-/// One item from either of the room's two inbound queues.
+/// One item from either of the room's two inbound queues. The `Repair` variant
+/// is the legacy public name for any lane-protocol stream; its ALPN determines
+/// whether it carries repair or courier traffic.
 #[derive(Debug)]
 pub enum RoomInbound {
     Event(NativeNetworkEvent),
     Repair(IncomingRepair),
 }
 
-/// An inbound repair connection, delivered on its own queue.
+/// An inbound lane-protocol connection, delivered on its own queue.
 ///
 /// The bi-stream is already accepted: the wait happens inside the per-connection
 /// protocol handler, so a peer that dials and stalls cannot delay anything the
@@ -64,9 +68,9 @@ pub enum RoomInbound {
 #[derive(Debug)]
 pub struct IncomingRepair {
     pub endpoint_id: EndpointId,
-    /// The ALPN the connection was accepted under — the lane tag. The ALPN is
-    /// the ONLY place the lane is named (no lane byte rides inside an RBSR
-    /// frame), so the responder dispatches on this to pick the lane driver.
+    /// The ALPN the connection was accepted under — both purpose and lane tag.
+    /// It is the ONLY place a repair/courier connection names its lane, so the
+    /// responder dispatches on this to pick the lane handler.
     pub alpn: &'static [u8],
     pub connection: Connection,
     pub stream: IrohSyncStream,
@@ -89,18 +93,12 @@ impl NativeRoomNetwork {
         // N0 supplies the native IP and relay transports. Address lookup is
         // deliberately rebuilt from memory + room-scoped mDNS below.
         // The registered ALPN set is this peer's live lane-capability
-        // declaration: walkie speaks the deployed v3 single lane plus BOTH v4
-        // lanes (music + extension); a bare tutti-music peer registers the
-        // music ALPN alone. An unsupported lane fails at QUIC negotiation,
-        // before any RBSR byte.
+        // declaration. Room v4 registers gossip plus both repair and courier
+        // protocols, with no v3 ALPN. An unsupported lane fails at QUIC
+        // negotiation before any lane frame.
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(secret_key)
-            .alpns(vec![
-                GOSSIP_ALPN.to_vec(),
-                RBSR_ALPN.to_vec(),
-                MUSIC_RBSR_ALPN.to_vec(),
-                EXTENSION_RBSR_ALPN.to_vec(),
-            ])
+            .alpns(ROOM_V4_ALPNS.iter().map(|alpn| alpn.to_vec()).collect())
             .relay_mode(relay_mode)
             .clear_address_lookup()
             .address_lookup(memory.clone())
@@ -116,7 +114,7 @@ impl NativeRoomNetwork {
             .map_err(|error| NativeNetError::Bind(error.to_string()))?;
 
         let mdns = MdnsAddressLookup::builder()
-            .service_name(room_mdns_service_name(config.topic))
+            .service_name(room_mdns_service_name_v4(config.topic))
             .build(endpoint.id())
             .map_err(|error| NativeNetError::Mdns(error.to_string()))?;
         endpoint
@@ -128,18 +126,11 @@ impl NativeRoomNetwork {
         let gossip = Gossip::builder()
             .max_message_size(MAX_GOSSIP_MESSAGE_BYTES)
             .spawn(endpoint.clone());
-        // One accept handler per repair lane, each stamping the queued
-        // connection with the ALPN it arrived under. All three feed the same
-        // bounded repair queue; the room loop dispatches per lane.
+        // One accept handler per lane protocol, each stamping the queued
+        // connection with its authoritative ALPN. All four feed the same
+        // bounded lane queue; gossip remains separately bounded.
         let router = Router::builder(endpoint.clone())
             .accept(GOSSIP_ALPN, gossip.clone())
-            .accept(
-                RBSR_ALPN,
-                RepairProtocol {
-                    repairs: repairs_tx.clone(),
-                    alpn: RBSR_ALPN,
-                },
-            )
             .accept(
                 MUSIC_RBSR_ALPN,
                 RepairProtocol {
@@ -150,8 +141,22 @@ impl NativeRoomNetwork {
             .accept(
                 EXTENSION_RBSR_ALPN,
                 RepairProtocol {
-                    repairs: repairs_tx,
+                    repairs: repairs_tx.clone(),
                     alpn: EXTENSION_RBSR_ALPN,
+                },
+            )
+            .accept(
+                MUSIC_COURIER_ALPN,
+                RepairProtocol {
+                    repairs: repairs_tx.clone(),
+                    alpn: MUSIC_COURIER_ALPN,
+                },
+            )
+            .accept(
+                EXTENSION_COURIER_ALPN,
+                RepairProtocol {
+                    repairs: repairs_tx,
+                    alpn: EXTENSION_COURIER_ALPN,
                 },
             )
             .spawn();
@@ -301,19 +306,19 @@ impl NativeRoomNetwork {
 
     /// Current ticket. The relay address appears after Iroh has selected a home
     /// relay; direct addresses are available immediately after bind.
-    pub fn ticket(&self) -> NativeRoomTicket {
-        NativeRoomTicket::new(self.topic, self.endpoint().addr())
+    pub fn ticket(&self) -> NativeRoomTicketV4 {
+        NativeRoomTicketV4::new(self.topic, LaneSet::WALKIE, self.endpoint().addr())
     }
 
     /// Wait briefly for relay readiness without preventing offline-LAN use.
-    pub async fn settle_ticket(&self, timeout: Duration) -> NativeRoomTicket {
+    pub async fn settle_ticket(&self, timeout: Duration) -> NativeRoomTicketV4 {
         let endpoint = self.endpoint().clone();
         let _ = tokio::time::timeout(timeout, endpoint.online()).await;
         self.ticket()
     }
 
     /// Add or refresh ticket addressing, then ask gossip to join that peer.
-    pub async fn join_ticket(&self, ticket: &NativeRoomTicket) -> Result<(), NativeNetError> {
+    pub async fn join_ticket(&self, ticket: &NativeRoomTicketV4) -> Result<(), NativeNetError> {
         if ticket.topic() != self.topic {
             return Err(NativeNetError::Gossip(
                 "ticket belongs to a different room topic".into(),
@@ -343,23 +348,29 @@ impl NativeRoomNetwork {
             .map_err(|error| NativeNetError::Gossip(error.to_string()))
     }
 
-    /// Open an authenticated Iroh connection for one HHHS H6 repair session.
-    pub async fn begin_repair(
+    /// Open one authenticated lane-scoped repair or courier connection.
+    pub async fn begin_lane(
         &self,
         endpoint_id: EndpointId,
+        protocol: LaneProtocol,
     ) -> Result<Connection, NativeNetError> {
         self.endpoint()
-            .connect(endpoint_id, RBSR_ALPN)
+            .connect(endpoint_id, protocol.alpn())
             .await
-            .map_err(|error| NativeNetError::Gossip(format!("repair connection failed: {error}")))
+            .map_err(|error| {
+                NativeNetError::Gossip(format!(
+                    "{} connection failed: {error}",
+                    String::from_utf8_lossy(protocol.alpn())
+                ))
+            })
     }
 
     pub async fn next_event(&mut self) -> Option<NativeNetworkEvent> {
         self.events.recv().await
     }
 
-    /// Next inbound repair connection. A queue of its own, so a peer opening
-    /// repair sessions can never head-of-line block op delivery.
+    /// Next inbound lane-protocol connection. A queue of its own, so a peer
+    /// opening repair or courier sessions cannot head-of-line block op delivery.
     pub async fn next_repair(&mut self) -> Option<IncomingRepair> {
         self.repairs.recv().await
     }
@@ -367,7 +378,7 @@ impl NativeRoomNetwork {
     /// Whichever of the two queues is ready first.
     ///
     /// The queues stay SEPARATE and separately bounded — that is the whole point
-    /// of the repair queue, and merging them would let a peer opening repair
+    /// of the lane queue, and merging them would let a peer opening lane
     /// sessions fill the gossip queue and head-of-line block op delivery. This
     /// only spares the caller from borrowing `self` mutably twice inside one
     /// `select!`; it does not couple the producers.
@@ -498,8 +509,16 @@ impl Transport for NativeRoomNetwork {
             RoomInbound::Repair(repair) => {
                 // The connection rides along on the stream so QUIC state
                 // outlives the handler task that accepted it.
-                return Some(TransportEvent::SyncRequested {
+                let Some(protocol) = LaneProtocol::from_alpn(repair.alpn) else {
+                    repair.connection.close(4u32.into(), b"unsupported lane protocol");
+                    return Some(TransportEvent::Diagnostic(format!(
+                        "accepted unrecognized ALPN {}",
+                        String::from_utf8_lossy(repair.alpn)
+                    )));
+                };
+                return Some(TransportEvent::LaneRequested {
                     peer: peer_of(repair.endpoint_id),
+                    protocol,
                     stream: repair.stream.owning(repair.connection),
                 });
             }
@@ -538,11 +557,15 @@ impl Transport for NativeRoomNetwork {
             })
     }
 
-    async fn open_sync(&self, peer: PeerId) -> Result<Self::Stream, TransportError> {
+    async fn open_lane(
+        &self,
+        peer: PeerId,
+        protocol: LaneProtocol,
+    ) -> Result<Self::Stream, TransportError> {
         let endpoint_id = EndpointId::from_bytes(peer.as_bytes())
             .map_err(|_| TransportError::Unreachable(peer.to_hex()))?;
         let connection = self
-            .begin_repair(endpoint_id)
+            .begin_lane(endpoint_id, protocol)
             .await
             .map_err(|error| TransportError::Backend(error.to_string()))?;
         // The connection must outlive this call: dropping the last handle closes
@@ -591,11 +614,12 @@ mod tests {
             tuning::{TunedDegree, Tuning},
         };
 
-        let topic = RoomTopic::from_room_name("quiet-cactus-song");
+        let topic = RoomTopic::from_room_name_v4("quiet-cactus-song");
         let config = NativeRoomNetworkConfig {
             topic,
             relay: RelayPolicy::Disabled,
             bootstrap: None,
+            bootstrap_lanes: None,
         };
         let mut first = NativeRoomNetwork::bind(iroh::SecretKey::from_bytes(&[21; 32]), config)
             .await
@@ -606,6 +630,7 @@ mod tests {
                 topic,
                 relay: RelayPolicy::Disabled,
                 bootstrap: None,
+                bootstrap_lanes: None,
             },
         )
         .await
@@ -613,9 +638,10 @@ mod tests {
         let mut other_room = NativeRoomNetwork::bind(
             iroh::SecretKey::from_bytes(&[23; 32]),
             NativeRoomNetworkConfig {
-                topic: RoomTopic::from_room_name("different-cactus-song"),
+                topic: RoomTopic::from_room_name_v4("different-cactus-song"),
                 relay: RelayPolicy::Disabled,
                 bootstrap: None,
+                bootstrap_lanes: None,
             },
         )
         .await

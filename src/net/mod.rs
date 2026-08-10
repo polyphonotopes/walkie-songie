@@ -60,7 +60,8 @@ pub use loopback::{LoopbackStream, LoopbackTransport, loopback_pair};
 ))]
 pub use iroh_common::{
     MAX_GOSSIP_MESSAGE_BYTES, NativeNetError, NativeNetworkEvent, NativeRoomNetworkConfig,
-    NativeRoomTicket, PeerTransportPath, RelayPolicy, RoomTopic, room_mdns_service_name,
+    NativeRoomTicket, NativeRoomTicketV4, PeerTransportPath, RelayPolicy, RoomTopic,
+    ROOM_V4_ALPNS, room_mdns_service_name, room_mdns_service_name_v4,
 };
 #[cfg(any(
     all(not(target_arch = "wasm32"), feature = "native-net"),
@@ -71,7 +72,10 @@ pub use repair::{IrohSyncStream, MAX_REPAIR_FRAME_BYTES, read_sync_frame, write_
     all(not(target_arch = "wasm32"), feature = "native-net"),
     all(target_arch = "wasm32", feature = "browser-net")
 ))]
-pub use rendezvous::{RendezvousHandle, RendezvousPeering, spawn_rendezvous};
+pub use rendezvous::{
+    HelloV4, RendezvousHandle, RendezvousPeering, rendezvous_channel_v4, spawn_rendezvous,
+    spawn_rendezvous_v4,
+};
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-net"))]
 pub use native::{IncomingRepair, NativeRoomNetwork, RoomInbound};
@@ -91,10 +95,11 @@ pub use webrtc_transport::{
 
 pub use sync::{
     DEFAULT_RECV_TIMEOUT, EXTENSION_COURIER_ALPN, EXTENSION_RBSR_ALPN, EXTENSION_STRATEGY_NAME,
-    ExtensionLane, LANE_STRATEGY_VERSION, LaneIngest, LaneSpec, LaneStoreAccess, LaneSyncSource,
-    MAX_SYNC_FRAME_BYTES, MUSIC_COURIER_ALPN, MUSIC_RBSR_ALPN, MUSIC_STRATEGY_NAME, MusicLane,
-    RBSR_ALPN, RoomSyncSource, SyncApply, SyncError, SyncLimits, SyncOutcome, SyncTimer,
-    WALKIE_COURIER_ALPN, WalkieLane, drive_initiator, drive_responder, ingest_pairs,
+    ExtensionLane, IncomingOp, LANE_STRATEGY_VERSION, LaneIngest, LaneProtocol, LaneSpec,
+    LaneStoreAccess, LaneSyncSource, MAX_SYNC_FRAME_BYTES, MUSIC_COURIER_ALPN, MUSIC_RBSR_ALPN,
+    MUSIC_STRATEGY_NAME, MusicLane, RBSR_ALPN, RoomSyncSource, SyncApply, SyncError, SyncLimits,
+    SyncOutcome, SyncTimer, WALKIE_COURIER_ALPN, WalkieLane, drive_initiator, drive_responder,
+    ingest_pairs,
 };
 
 pub use courier::{
@@ -234,8 +239,9 @@ pub enum TransportEvent<S> {
     /// one here. Whoever handles this must also SPAWN the session rather than
     /// drive it inline: a session lasts as long as the peer takes to answer, and
     /// the room loop has commits and gossip to serve meanwhile.
-    SyncRequested {
+    LaneRequested {
         peer: PeerId,
+        protocol: LaneProtocol,
         stream: S,
     },
     /// Inbound broadcasts were dropped, so anti-entropy owes us the difference.
@@ -286,15 +292,15 @@ pub trait Transport {
     /// Single-consumer event stream. `None` once the transport is finished.
     ///
     /// One consumer, but NOT one queue: a backend with back-pressure must keep
-    /// broadcast delivery and [`TransportEvent::SyncRequested`] on separately
+    /// broadcast delivery and [`TransportEvent::LaneRequested`] on separately
     /// bounded queues and select between them. Sharing one bounded queue lets a
     /// peer that opens repair sessions head-of-line block op delivery, and lets a
     /// slow consumer of either stall the other's producer.
     /// `NativeRoomNetwork::next_inbound` is the reference shape.
     fn next_event(&mut self) -> impl Future<Output = Option<TransportEvent<Self::Stream>>>;
 
-    /// Dial `peer` for one anti-entropy session (the initiator half).
-    fn open_sync(&self, peer: PeerId)
+    /// Dial `peer` for one lane-scoped repair or courier exchange.
+    fn open_lane(&self, peer: PeerId, protocol: LaneProtocol)
     -> impl Future<Output = Result<Self::Stream, TransportError>>;
 
     /// Honest reachability for `peer`, for UI only.

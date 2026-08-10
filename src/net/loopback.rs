@@ -11,7 +11,7 @@
 use async_channel::{Receiver, Sender, unbounded};
 
 use super::{
-    PeerId, SyncStream, Transport, TransportError, TransportEvent, TransportMode,
+    LaneProtocol, PeerId, SyncStream, Transport, TransportError, TransportEvent, TransportMode,
 };
 use crate::client::{DiscoverySource, PeerPath};
 
@@ -144,14 +144,19 @@ impl Transport for LoopbackTransport {
         self.inbox.recv().await.ok()
     }
 
-    async fn open_sync(&self, peer: PeerId) -> Result<Self::Stream, TransportError> {
+    async fn open_lane(
+        &self,
+        peer: PeerId,
+        protocol: LaneProtocol,
+    ) -> Result<Self::Stream, TransportError> {
         if peer != self.peer {
             return Err(TransportError::Unreachable(peer.to_hex()));
         }
         let (mine, theirs) = LoopbackStream::pair();
         self.to_peer
-            .send(TransportEvent::SyncRequested {
+            .send(TransportEvent::LaneRequested {
                 peer: self.me,
+                protocol,
                 stream: theirs,
             })
             .await
@@ -206,14 +211,22 @@ mod tests {
     }
 
     #[test]
-    fn open_sync_delivers_the_far_end_and_frames_round_trip() {
+    fn open_lane_delivers_the_protocol_and_far_end_then_frames_round_trip() {
         let (a, mut b) = loopback_pair();
         block_on(async {
             let _ = b.next_event().await; // drain PeerUp
-            let mut mine = a.open_sync(b.peer_id()).await.unwrap();
+            let protocol = LaneProtocol::Repair(crate::room::v4::RoomLane::Music);
+            let mut mine = a.open_lane(b.peer_id(), protocol).await.unwrap();
             let mut theirs = match b.next_event().await {
-                Some(TransportEvent::SyncRequested { stream, .. }) => stream,
-                other => panic!("expected SyncRequested, got {other:?}"),
+                Some(TransportEvent::LaneRequested {
+                    protocol: requested,
+                    stream,
+                    ..
+                }) => {
+                    assert_eq!(requested, protocol);
+                    stream
+                }
+                other => panic!("expected LaneRequested, got {other:?}"),
             };
 
             mine.send_frame(b"ping").await.unwrap();
@@ -227,11 +240,15 @@ mod tests {
     }
 
     #[test]
-    fn open_sync_rejects_an_unknown_peer() {
+    fn open_lane_rejects_an_unknown_peer() {
         let (a, _b) = loopback_pair();
         block_on(async {
             assert!(matches!(
-                a.open_sync(PeerId([0xff; 32])).await,
+                a.open_lane(
+                    PeerId([0xff; 32]),
+                    LaneProtocol::Repair(crate::room::v4::RoomLane::Music),
+                )
+                .await,
                 Err(TransportError::Unreachable(_))
             ));
         });

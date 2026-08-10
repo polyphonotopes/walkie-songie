@@ -17,6 +17,8 @@ pub const DEFAULT_PRESENCE_LEASE_MS: u32 = 1_500;
 pub const MAX_PRESENCE_LEASE_MS: u32 = 5_000;
 pub const MAX_PRESENCE_BODY_BYTES: usize = 8 * 1024;
 const PRESENCE_WIRE_MAGIC: &[u8] = b"walkie.voice-presence/1\0";
+pub const PRESENCE_VERSION_V4: u16 = 4;
+pub const PRESENCE_WIRE_MAGIC_V4: &[u8] = b"walkie.voice-presence/4\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PresenceBody {
@@ -48,10 +50,35 @@ impl PresenceBody {
         }
     }
 
+    /// Construct the same presence body under the room-v4 generation.
+    pub fn new_v4(
+        topic: [u8; 32],
+        session: u64,
+        sequence: u64,
+        issued_at_ms: u64,
+        pitch: Option<TunedPeriodicPitch>,
+    ) -> Self {
+        Self {
+            version: PRESENCE_VERSION_V4,
+            ..Self::new(topic, session, sequence, issued_at_ms, pitch)
+        }
+    }
+
     fn validate(&self) -> Result<(), PresenceError> {
         if self.version != PRESENCE_VERSION {
             return Err(PresenceError::UnsupportedVersion(self.version));
         }
+        self.validate_domain()
+    }
+
+    fn validate_v4(&self) -> Result<(), PresenceError> {
+        if self.version != PRESENCE_VERSION_V4 {
+            return Err(PresenceError::UnsupportedVersion(self.version));
+        }
+        self.validate_domain()
+    }
+
+    fn validate_domain(&self) -> Result<(), PresenceError> {
         if self.session == 0 {
             return Err(PresenceError::InvalidDomain(
                 "presence session must be non-zero".into(),
@@ -168,6 +195,93 @@ pub struct VerifiedPresence {
     pub body: PresenceBody,
 }
 
+/// The room-v4 presence codec. Its body fields and signing rules are unchanged;
+/// version 4 and the `/4` magic keep presence outside both durable lanes while
+/// preventing cross-generation replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedPresenceV4 {
+    pub author: AuthorId,
+    pub signature: [u8; 64],
+    body: Vec<u8>,
+}
+
+impl SignedPresenceV4 {
+    pub fn sign(signing_key: &SigningKey, body: PresenceBody) -> Result<Self, PresenceError> {
+        body.validate_v4()?;
+        let encoded =
+            encode_cbor(&body).map_err(|error| PresenceError::Encode(error.to_string()))?;
+        if encoded.len() > MAX_PRESENCE_BODY_BYTES {
+            return Err(PresenceError::BodyTooLarge(encoded.len()));
+        }
+        Ok(Self {
+            author: AuthorId(*signing_key.verifying_key().as_bytes()),
+            signature: signing_key.sign(&encoded).to_bytes(),
+            body: encoded,
+        })
+    }
+
+    pub fn to_wire_bytes(&self) -> Result<Vec<u8>, PresenceError> {
+        if self.body.len() > MAX_PRESENCE_BODY_BYTES {
+            return Err(PresenceError::BodyTooLarge(self.body.len()));
+        }
+        let mut bytes =
+            Vec::with_capacity(PRESENCE_WIRE_MAGIC_V4.len() + 32 + 64 + 4 + self.body.len());
+        bytes.extend_from_slice(PRESENCE_WIRE_MAGIC_V4);
+        bytes.extend_from_slice(&self.author.0);
+        bytes.extend_from_slice(&self.signature);
+        bytes.extend_from_slice(&(self.body.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&self.body);
+        Ok(bytes)
+    }
+
+    pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self, PresenceError> {
+        let prefix = PRESENCE_WIRE_MAGIC_V4.len();
+        let fixed = prefix + 32 + 64 + 4;
+        if bytes.len() < fixed || &bytes[..prefix] != PRESENCE_WIRE_MAGIC_V4 {
+            return Err(PresenceError::InvalidMagic);
+        }
+        let mut author = [0_u8; 32];
+        author.copy_from_slice(&bytes[prefix..prefix + 32]);
+        let mut signature = [0_u8; 64];
+        signature.copy_from_slice(&bytes[prefix + 32..prefix + 96]);
+        let body_len =
+            u32::from_le_bytes(bytes[prefix + 96..fixed].try_into().expect("fixed slice")) as usize;
+        if body_len > MAX_PRESENCE_BODY_BYTES {
+            return Err(PresenceError::BodyTooLarge(body_len));
+        }
+        if bytes.len() != fixed + body_len {
+            return Err(PresenceError::LengthMismatch);
+        }
+        Ok(Self {
+            author: AuthorId(author),
+            signature,
+            body: bytes[fixed..].to_vec(),
+        })
+    }
+
+    pub fn verify(&self, expected_topic: [u8; 32]) -> Result<VerifiedPresence, PresenceError> {
+        if self.body.len() > MAX_PRESENCE_BODY_BYTES {
+            return Err(PresenceError::BodyTooLarge(self.body.len()));
+        }
+        let key = VerifyingKey::from_bytes(&self.author.0)
+            .map_err(|error| PresenceError::InvalidAuthor(error.to_string()))?;
+        let signature = Signature::from_bytes(&self.signature);
+        if !key.verify(&self.body, &signature) {
+            return Err(PresenceError::Signature);
+        }
+        let body: PresenceBody = decode_cbor(self.body.as_slice())
+            .map_err(|error| PresenceError::Decode(error.to_string()))?;
+        body.validate_v4()?;
+        if body.topic != expected_topic {
+            return Err(PresenceError::TopicMismatch);
+        }
+        Ok(VerifiedPresence {
+            author: self.author,
+            body,
+        })
+    }
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum PresenceError {
     #[error("presence frame has an invalid generation marker")]
@@ -233,6 +347,44 @@ mod tests {
         assert!(matches!(
             SignedPresence::sign(&key, body),
             Err(PresenceError::InvalidDomain(_))
+        ));
+    }
+
+    #[test]
+    fn room_v4_presence_round_trips_and_rejects_v1_both_ways() {
+        let key = signing_key_from_seed(&[33; 32]);
+        let topic = [6; 32];
+        let body_v4 = PresenceBody::new_v4(topic, 9, 12, 1_234, None);
+        let signed_v4 = SignedPresenceV4::sign(&key, body_v4).unwrap();
+        let wire_v4 = signed_v4.to_wire_bytes().unwrap();
+        assert!(wire_v4.starts_with(PRESENCE_WIRE_MAGIC_V4));
+        assert_eq!(
+            SignedPresenceV4::from_wire_bytes(&wire_v4)
+                .unwrap()
+                .verify(topic)
+                .unwrap()
+                .body,
+            body_v4,
+        );
+
+        let signed_v1 =
+            SignedPresence::sign(&key, PresenceBody::new(topic, 9, 12, 1_234, None)).unwrap();
+        let wire_v1 = signed_v1.to_wire_bytes().unwrap();
+        assert_eq!(
+            SignedPresenceV4::from_wire_bytes(&wire_v1),
+            Err(PresenceError::InvalidMagic)
+        );
+        assert_eq!(
+            SignedPresence::from_wire_bytes(&wire_v4),
+            Err(PresenceError::InvalidMagic)
+        );
+        assert!(matches!(
+            SignedPresenceV4::sign(&key, PresenceBody::new(topic, 9, 12, 1_234, None)),
+            Err(PresenceError::UnsupportedVersion(1))
+        ));
+        assert!(matches!(
+            SignedPresence::sign(&key, body_v4),
+            Err(PresenceError::UnsupportedVersion(4))
         ));
     }
 }

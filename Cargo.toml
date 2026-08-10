@@ -52,11 +52,12 @@ web-ui = [
     "dep:dominator",
     "browser-net",
 ]
-# Browser (wasm) iroh transport: relay-only Endpoint + iroh-gossip + Router,
-# the `TransportMode::Iroh` variant compiled for wasm32 — the same ALPNs,
-# tickets, and RBSR protocol as `native-net`, minus mDNS. Enabled by `web-ui`
-# so the plain-browser build (no Tauri) stands up a peer-to-peer room. The iroh
-# crates are declared under the wasm target table below; native uses `native-net`.
+# Browser (wasm) iroh transport: relay-only Endpoint + iroh-gossip + Router.
+# The browser host intentionally remains on room v3 while native is room v4;
+# its live two-lane transport and IndexedDB cutover are a separate milestone.
+# Enabled by `web-ui` so the plain-browser build (no Tauri) stands up a
+# peer-to-peer room. The iroh crates are declared under the wasm target table
+# below; native uses `native-net`.
 # NOTE: `ring` (via iroh tls) needs a wasm-capable C compiler:
 #   CC_wasm32_unknown_unknown=<unwrapped clang> AR_wasm32_unknown_unknown=llvm-ar
 # The browser rendezvous WebSocket client (`net::rendezvous`) uses raw

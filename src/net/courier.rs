@@ -761,10 +761,10 @@ mod tests {
     };
     use tutti_music::{MusicOp, MusicView};
 
-    use crate::net::sync::{LaneSpec, LaneSyncSource, MusicLane, ingest_pairs};
-    use crate::net::{Transport, TransportEvent, loopback::loopback_pair};
+    use crate::net::sync::{IncomingOp, LaneSpec, LaneSyncSource, MusicLane, ingest_pairs};
+    use crate::net::{LaneProtocol, Transport, TransportEvent, loopback::loopback_pair};
     use crate::room::test_support::{SEED_A, SEED_B, tet_degree};
-    use crate::room::v4::MusicLang;
+    use crate::room::v4::{MusicLang, RoomLane};
 
     const TOPIC: &str = "courier-deep-laggard";
 
@@ -852,7 +852,12 @@ mod tests {
             x_wire_hash,
             x_signed.to_wire_bytes_in::<MusicLang>().expect("X serializes"),
         )];
-        let report = ingest_pairs::<MusicLang, _>(&mut leaf, TOPIC, &pairs);
+        let report = ingest_pairs::<MusicLang, _>(
+            &mut leaf,
+            TOPIC,
+            pairs.iter().map(IncomingOp::from),
+        )
+        .unwrap();
 
         // Pre-courier assertions (design C).
         assert_eq!(leaf.pending_len(), 1);
@@ -885,9 +890,9 @@ mod tests {
     ) -> crate::net::loopback::LoopbackStream {
         loop {
             match transport.next_event().await {
-                Some(TransportEvent::SyncRequested { stream, .. }) => break stream,
+                Some(TransportEvent::LaneRequested { stream, .. }) => break stream,
                 Some(TransportEvent::PeerUp { .. }) => continue,
-                other => panic!("expected SyncRequested, got {other:?}"),
+                other => panic!("expected LaneRequested, got {other:?}"),
             }
         }
     }
@@ -912,8 +917,13 @@ mod tests {
         let (requester_end, mut responder_end) = loopback_pair();
 
         let admitted = block_on(async {
-            let mut requester_stream =
-                requester_end.open_sync(requester_end.remote_id()).await.unwrap();
+            let mut requester_stream = requester_end
+                .open_lane(
+                    requester_end.remote_id(),
+                    LaneProtocol::Courier(RoomLane::Music),
+                )
+                .await
+                .unwrap();
             let mut responder_stream = accept_courier(&mut responder_end).await;
 
             let responder = CourierResponder {
@@ -982,8 +992,13 @@ mod tests {
 
         let (requester_end, mut responder_end) = loopback_pair();
         let result = block_on(async {
-            let mut requester_stream =
-                requester_end.open_sync(requester_end.remote_id()).await.unwrap();
+            let mut requester_stream = requester_end
+                .open_lane(
+                    requester_end.remote_id(),
+                    LaneProtocol::Courier(RoomLane::Music),
+                )
+                .await
+                .unwrap();
             let mut responder_stream = accept_courier(&mut responder_end).await;
 
             let responder = CourierResponder {
@@ -1048,8 +1063,13 @@ mod tests {
         let (requester_end, mut responder_end) = loopback_pair();
 
         let result = block_on(async {
-            let mut requester_stream =
-                requester_end.open_sync(requester_end.remote_id()).await.unwrap();
+            let mut requester_stream = requester_end
+                .open_lane(
+                    requester_end.remote_id(),
+                    LaneProtocol::Courier(RoomLane::Music),
+                )
+                .await
+                .unwrap();
             let mut responder_stream = accept_courier(&mut responder_end).await;
             let responder = CourierResponder {
                 history: &foreign,
@@ -1088,8 +1108,13 @@ mod tests {
         let (requester_end, mut responder_end) = loopback_pair();
 
         let admitted = block_on(async {
-            let mut requester_stream =
-                requester_end.open_sync(requester_end.remote_id()).await.unwrap();
+            let mut requester_stream = requester_end
+                .open_lane(
+                    requester_end.remote_id(),
+                    LaneProtocol::Courier(RoomLane::Music),
+                )
+                .await
+                .unwrap();
             let mut responder_stream = accept_courier(&mut responder_end).await;
             let responder = CourierResponder {
                 history: &fx.tracked,

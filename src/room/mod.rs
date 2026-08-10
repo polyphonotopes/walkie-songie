@@ -10,6 +10,12 @@
 pub mod events;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod journal;
+/// v4 lane-tagged journal codecs (native file + browser IndexedDB blob),
+/// additive beside the v3 [`journal`] this module does not touch. Unconditional
+/// (like [`presence`]) because the browser codec must compile under
+/// `--features web-ui`; only its native [`lane_journal::FileLaneJournal`] is
+/// gated non-wasm internally.
+pub mod lane_journal;
 /// Additive Merkle commitment/proof layer (`ops_root` + `state_root`), beside RBSR.
 #[cfg(feature = "merkle")]
 pub mod merkle;
@@ -20,8 +26,8 @@ pub mod streams;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 /// Room v4: the two-lane room (music lane + walkie extension lane) a bare
-/// tutti-music peer can join. The deployed wire is still the v3 single-lane
-/// `RoomStore` until the v4 net-layer generation lands.
+/// tutti-music peer can join. Native rooms use this generation; the browser
+/// host retains the v3 single-lane path until its separate transport cutover.
 pub mod v4;
 pub mod yrs_state;
 

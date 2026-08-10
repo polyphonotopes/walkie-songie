@@ -36,4 +36,5 @@ pub use tuning::{
 };
 pub use words::{
     generate_room_name, generate_room_qr_svg, is_valid_room_name, room_name_to_topic_id,
+    room_name_to_topic_id_v4,
 };

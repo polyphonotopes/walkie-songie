@@ -34,7 +34,7 @@ use super::iroh_common::{
 };
 use super::repair::IrohSyncStream;
 use super::sync::SyncTimer;
-use super::{PeerId, Transport, TransportError, TransportEvent, TransportMode};
+use super::{LaneProtocol, PeerId, Transport, TransportError, TransportEvent, TransportMode};
 use crate::client::{DiscoverySource, PeerPath};
 
 /// The browser runtime's clock for [`SyncTimer`]: `n0-future`'s wasm sleep
@@ -54,6 +54,7 @@ impl SyncTimer for BrowserTimer {
 #[derive(Debug)]
 pub struct BrowserIncomingRepair {
     pub endpoint_id: EndpointId,
+    pub alpn: &'static [u8],
     pub connection: Connection,
     pub stream: IrohSyncStream,
 }
@@ -395,6 +396,7 @@ impl ProtocolHandler for BrowserRepairProtocol {
         let mut repairs = self.repairs.clone();
         match repairs.try_send(BrowserIncomingRepair {
             endpoint_id,
+            alpn: RBSR_ALPN,
             connection,
             stream,
         }) {
@@ -451,8 +453,16 @@ impl Transport for BrowserRoomNetwork {
     async fn next_event(&mut self) -> Option<TransportEvent<Self::Stream>> {
         let event = match self.next_inbound().await? {
             BrowserRoomInbound::Repair(repair) => {
-                return Some(TransportEvent::SyncRequested {
+                let Some(protocol) = LaneProtocol::from_alpn(repair.alpn) else {
+                    repair.connection.close(4u32.into(), b"unsupported lane protocol");
+                    return Some(TransportEvent::Diagnostic(format!(
+                        "accepted legacy ALPN {} outside the room-v4 lane seam",
+                        String::from_utf8_lossy(repair.alpn)
+                    )));
+                };
+                return Some(TransportEvent::LaneRequested {
                     peer: peer_of(repair.endpoint_id),
+                    protocol,
                     stream: repair.stream.owning(repair.connection),
                 });
             }
@@ -488,12 +498,17 @@ impl Transport for BrowserRoomNetwork {
         })
     }
 
-    async fn open_sync(&self, peer: PeerId) -> Result<Self::Stream, TransportError> {
+    async fn open_lane(
+        &self,
+        peer: PeerId,
+        protocol: LaneProtocol,
+    ) -> Result<Self::Stream, TransportError> {
         let endpoint_id = EndpointId::from_bytes(peer.as_bytes())
             .map_err(|_| TransportError::Unreachable(peer.to_hex()))?;
         let connection = self
             .handle
-            .begin_repair(endpoint_id)
+            .endpoint
+            .connect(endpoint_id, protocol.alpn())
             .await
             .map_err(|error| TransportError::Backend(error.to_string()))?;
         Ok(IrohSyncStream::open(&connection).await?.owning(connection))

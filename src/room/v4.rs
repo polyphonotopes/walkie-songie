@@ -56,20 +56,17 @@
 //! an author signed ([`Store`] lifts verbatim frames); nothing here re-signs,
 //! re-wraps, or reserializes a verified op.
 //!
-//! **Deferred to the net-layer generation pass** (see
-//! `docs/vision/wire-embedding-design.md` §"Migration"): the v4 repair ALPN,
-//! versioned gossip topics, the room-ticket format, journal magic, and wiring
-//! the app/sync layer from the v3 single-lane store onto this room. Until that
-//! lands the deployed wire is still v3; this module is the correctness core it
-//! migrates onto.
+//! The native app and endpoint use the v4 identity suite, lane journals, and
+//! separate repair/courier ALPNs. The browser host deliberately retains the
+//! v3 single-lane path until its own live-runtime and IndexedDB cutover.
 
 use std::collections::BTreeMap;
 
 use hhhs::EntryHash;
 use serde::{Deserialize, Serialize};
 use tutti_core::{
-    FoldCtx, OpLanguage, OpVerifyError, SignedOp, SigningKey, Store, VerifiedOpG,
-    verify_signed_op_in,
+    FoldCtx, OpLanguage, OpVerifyError, SignedOp, SignedOpWireError, SigningKey, Store,
+    VerifiedOpG, verify_signed_op_in,
 };
 use tutti_music::fold::register;
 
@@ -83,6 +80,115 @@ use crate::room::ops::{
 };
 use crate::room::store::{Piece, PieceEvent, RoomView, fold_pieces};
 use crate::tuning::{MAX_SCALE_DEGREES, TunedPeriodicPitch};
+
+// ---------------------------------------------------------------------------
+// v4 lane identity. `RoomLane`/`LaneSet` name the two causal lanes on the wire:
+// journal records, tickets/rendezvous capabilities, and ALPN dispatch. See
+// `room::lane_journal` for the v4 journal codecs and `net::sync::IncomingOp` /
+// `LaneIngest` for the lane-generic admission path.
+// ---------------------------------------------------------------------------
+
+/// The room-v4 protocol generation carried by every generation-sensitive
+/// identity codec (ticket, presence, rendezvous, journals, and discovery).
+pub const ROOM_PROTOCOL_GENERATION: u16 = 4;
+
+/// The single domain separator for room-v4 topic derivation.
+pub const ROOM_TOPIC_CONTEXT_V4: &str = "walkie-songie room topic v4";
+
+/// Derive the room-v4 topic shared by gossip, tickets, discovery, and signed
+/// operations. Human room names are ASCII-case-insensitive everywhere.
+pub fn room_topic_v4(room_name: &str) -> [u8; 32] {
+    blake3::derive_key(
+        ROOM_TOPIC_CONTEXT_V4,
+        room_name.to_ascii_lowercase().as_bytes(),
+    )
+}
+
+/// One of the room's two causal lanes, as it tags a journal record and selects
+/// an ALPN. Explicit discriminants are the wire byte — never
+/// renumber; a `RoomLane` is exactly one bit of a [`LaneSet`].
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RoomLane {
+    Music = 0x01,
+    Extension = 0x02,
+}
+
+impl RoomLane {
+    /// The one-byte wire tag — identical to the `#[repr(u8)]` discriminant,
+    /// spelled out so callers never need `as u8` (which would silently accept
+    /// a future non-lane variant).
+    pub const fn tag(self) -> u8 {
+        self as u8
+    }
+
+    /// Recover a lane from a wire tag. `None` for anything but `0x01`/`0x02` —
+    /// a journal or wire decoder MUST treat an unknown tag as corruption, not
+    /// guess a lane.
+    pub const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0x01 => Some(Self::Music),
+            0x02 => Some(Self::Extension),
+            _ => None,
+        }
+    }
+
+    /// This lane's [`OpLanguage::WIRE_MAGIC`] — what a record's payload must
+    /// start with. A journal (or any lane-tagged frame) checks this so a
+    /// music frame can never be filed under the extension tag or vice versa.
+    pub const fn wire_magic(self) -> &'static [u8] {
+        match self {
+            Self::Music => MusicLang::WIRE_MAGIC,
+            Self::Extension => ExtensionLang::WIRE_MAGIC,
+        }
+    }
+}
+
+/// A bitset of [`RoomLane`]s — a peer's advertised lane capability (ticket
+/// `lane_bits`, a rendezvous hello's `lanes`, and repair selection at dial
+/// time). `0x03` (`WALKIE`) is the only value with
+/// both bits set; `0` is deliberately unrepresentable — a capability set
+/// naming no lane is not a valid peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LaneSet(u8);
+
+impl LaneSet {
+    pub const MUSIC: Self = Self(0x01);
+    pub const EXTENSION: Self = Self(0x02);
+    /// Both lanes — a full walkie peer's capability.
+    pub const WALKIE: Self = Self(0x03);
+
+    /// The raw bitset byte, as it rides a ticket or hello.
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Validate a wire-supplied bitset: non-zero, and no bit outside
+    /// `Self::WALKIE` (`0x03`). Every v4 lane-capability decoder (ticket,
+    /// hello) routes through this so "unknown lane bit" and "no lane at all"
+    /// fail identically everywhere.
+    pub const fn from_bits(bits: u8) -> Option<Self> {
+        if bits == 0 || bits & !Self::WALKIE.0 != 0 {
+            None
+        } else {
+            Some(Self(bits))
+        }
+    }
+
+    pub const fn contains(self, lane: RoomLane) -> bool {
+        self.0 & lane.tag() != 0
+    }
+}
+
+/// One lane-tagged journal record: a lane plus the EXACT verbatim wire bytes
+/// an author signed (`SignedOp::to_wire_bytes_in::<L>()` for that lane's
+/// language). Shared shape for both journal containers in
+/// [`crate::room::lane_journal`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneRecord {
+    pub lane: RoomLane,
+    pub wire: Vec<u8>,
+}
 
 /// The walkie-only extension operation (v4): emoji pieces and room config.
 /// Everything musical — degrees, envelopes, tuning — travels the music lane as
@@ -266,12 +372,11 @@ pub(crate) fn require_topic<L: OpLanguage>(
 /// and require the op to be bound to `expected_topic`.
 ///
 /// The topic is part of the room contract, not a walkie extra: production signs
-/// the DERIVED topic's hex string (`RoomTopic::from_room_name(name).to_string()`
-/// in `net::iroh_common` — `blake3::derive_key("walkie-songie room topic v1",
-/// name)`), never the human room name, and every conforming peer — walkie or a
-/// bare ESP32 — enforces that exact string at ingress just as v3's
-/// `verify_signed_op_for_topic` does. `tests/music_lane_interop.rs` pins the
-/// derivation and the signed value.
+/// the DERIVED topic's hex string (`RoomTopic::from_room_name_v4(name)` in
+/// `net::iroh_common` — `blake3::derive_key("walkie-songie room topic v4",
+/// ascii_lowercase(name))`), never the human room name, and every conforming
+/// peer — walkie or a bare ESP32 — enforces that exact string at ingress.
+/// `tests/music_lane_interop.rs` pins the derivation and signed value.
 pub fn verify_music_op(
     signed: &SignedOp,
     expected_topic: &str,
@@ -280,8 +385,8 @@ pub fn verify_music_op(
 }
 
 /// Verify an extension-lane [`SignedOp`] against [`ExtensionLang`] and require it
-/// to be bound to `expected_topic` (the same derived-topic contract as
-/// [`verify_music_op`]; lane-separate topics are net-layer generation work).
+/// to be bound to `expected_topic` (the same shared v4 topic contract as
+/// [`verify_music_op`]).
 pub fn verify_extension_op(
     signed: &SignedOp,
     expected_topic: &str,
@@ -290,6 +395,97 @@ pub fn verify_extension_op(
         verify_signed_op_in::<ExtensionLang>(signed)?,
         expected_topic,
     )
+}
+
+/// A local command, already resolved to the lane it belongs on. This is the
+/// typed authoring surface used by app-layer command handlers. The mapping is:
+///
+/// ```text
+/// SetTuning, AddDegree, RemoveDegree, SetEnvelope           -> Music
+/// PutPiece, MovePiece, RemovePiece, UnremovePiece, SetConfig -> Extension
+/// ```
+///
+/// which is structural here, not a lookup table: [`MusicOp`] contains only
+/// the music-lane variants and [`ExtensionOp`] only the extension-lane ones,
+/// so wrapping the right op enum in the matching [`LocalRoomOp`] variant IS
+/// the mapping. Voice preview is deliberately absent — presence is signed and
+/// leased but never durable, on neither lane (see [`crate::room::presence`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalRoomOp {
+    Music(MusicOp),
+    Extension(ExtensionOp),
+}
+
+impl LocalRoomOp {
+    /// Which lane this command commits to.
+    pub const fn lane(&self) -> RoomLane {
+        match self {
+            Self::Music(_) => RoomLane::Music,
+            Self::Extension(_) => RoomLane::Extension,
+        }
+    }
+}
+
+impl From<MusicOp> for LocalRoomOp {
+    fn from(op: MusicOp) -> Self {
+        Self::Music(op)
+    }
+}
+
+impl From<ExtensionOp> for LocalRoomOp {
+    fn from(op: ExtensionOp) -> Self {
+        Self::Extension(op)
+    }
+}
+
+/// Phase one of a two-phase local commit ([`Room::prepare`]): a signed op,
+/// lane-tagged, not yet ingested. The caller must frame it
+/// ([`LocalRoomPrepared::to_wire_bytes`]), durably journal-append + fsync
+/// THAT lane's wire bytes, and only then call [`Room::ingest_prepared`] —
+/// durability precedes visibility, so a crash between fsync and ingest still
+/// recovers the op on reopen (see [`Room::recover`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalRoomPrepared {
+    Music(SignedOp),
+    Extension(SignedOp),
+}
+
+impl LocalRoomPrepared {
+    pub const fn lane(&self) -> RoomLane {
+        match self {
+            Self::Music(_) => RoomLane::Music,
+            Self::Extension(_) => RoomLane::Extension,
+        }
+    }
+
+    /// The signed op, whichever lane it's bound for.
+    pub const fn signed(&self) -> &SignedOp {
+        match self {
+            Self::Music(signed) | Self::Extension(signed) => signed,
+        }
+    }
+
+    /// Frame under the lane's own [`OpLanguage::WIRE_MAGIC`] — the EXACT bytes
+    /// a journal record or gossip broadcast carries.
+    pub fn to_wire_bytes(&self) -> Result<Vec<u8>, SignedOpWireError> {
+        match self {
+            Self::Music(signed) => signed.to_wire_bytes_in::<MusicLang>(),
+            Self::Extension(signed) => signed.to_wire_bytes_in::<ExtensionLang>(),
+        }
+    }
+}
+
+/// [`Room::recover`] failure: a lane-tagged record that does not deframe or
+/// verify under its own tag's language. Cannot happen for anything the SAME
+/// two-phase commit wrote (frame + verify share the tag's language on both
+/// sides), only for a hand-tampered or foreign-generation file — [`Room::recover`]
+/// fails loudly rather than silently dropping the record.
+#[derive(Debug, thiserror::Error)]
+pub enum RoomRecoverError {
+    #[error("lane record failed to deframe: {0}")]
+    Wire(SignedOpWireError),
+    #[error("lane record failed verification: {0}")]
+    Verify(OpVerifyError),
 }
 
 /// A v4 room: the music lane and the extension lane, composed on read.
@@ -337,6 +533,22 @@ impl Room {
         &self.music
     }
 
+    /// Phase one of a two-phase local commit: author and sign a music op
+    /// against the CURRENT music-lane frontier, WITHOUT ingesting it. `&self`
+    /// — signing never mutates the store, so a durable caller can fsync the
+    /// framed bytes before anything becomes visible. See [`Room::prepare`]
+    /// for the lane-generic entry point and [`Room::ingest_prepared`] for
+    /// phase two.
+    pub fn prepare_music(
+        &self,
+        key: &SigningKey,
+        topic: &str,
+        ts_micros: u64,
+        op: MusicOp,
+    ) -> SignedOp {
+        self.music.prepare_commit(key, topic, ts_micros, op)
+    }
+
     // --- extension lane ---------------------------------------------------
 
     /// Author, sign, and ingest a local extension op (pieces/config), returning
@@ -359,6 +571,91 @@ impl Room {
     /// The extension lane, read-only.
     pub fn extension(&self) -> &ExtensionStore {
         &self.extension
+    }
+
+    /// Phase one, extension lane: see [`Room::prepare_music`].
+    pub fn prepare_extension(
+        &self,
+        key: &SigningKey,
+        topic: &str,
+        ts_micros: u64,
+        op: ExtensionOp,
+    ) -> SignedOp {
+        self.extension.prepare_commit(key, topic, ts_micros, op)
+    }
+
+    // --- two-phase local commit (lane-generic) ----------------------------
+
+    /// Phase one: sign `op` against its lane's current frontier without
+    /// ingesting. The lane a command lands on is exactly its [`LocalRoomOp`]
+    /// variant (see its docs for the full command mapping) — `&self`, so
+    /// nothing is visible yet.
+    pub fn prepare(
+        &self,
+        key: &SigningKey,
+        topic: &str,
+        ts_micros: u64,
+        op: LocalRoomOp,
+    ) -> LocalRoomPrepared {
+        match op {
+            LocalRoomOp::Music(op) => {
+                LocalRoomPrepared::Music(self.prepare_music(key, topic, ts_micros, op))
+            }
+            LocalRoomOp::Extension(op) => {
+                LocalRoomPrepared::Extension(self.prepare_extension(key, topic, ts_micros, op))
+            }
+        }
+    }
+
+    /// Phase two: verify `prepared` against `topic` and ingest it into its
+    /// lane. Call ONLY after the wire bytes from
+    /// [`LocalRoomPrepared::to_wire_bytes`] are durably journaled (fsynced) —
+    /// see [`Room::prepare`]'s docs for the full two-phase discipline. Returns
+    /// the newly lifted entry hashes on that lane (may be empty: a causally
+    /// deferred op parks like any ingest).
+    pub fn ingest_prepared(
+        &mut self,
+        topic: &str,
+        prepared: &LocalRoomPrepared,
+    ) -> Result<Vec<EntryHash>, OpVerifyError> {
+        match prepared {
+            LocalRoomPrepared::Music(signed) => {
+                Ok(self.ingest_music(verify_music_op(signed, topic)?))
+            }
+            LocalRoomPrepared::Extension(signed) => {
+                Ok(self.ingest_extension(verify_extension_op(signed, topic)?))
+            }
+        }
+    }
+
+    /// Rebuild a room from lane-tagged records recovered from a journal
+    /// (native [`crate::room::lane_journal::FileLaneJournal::open`] or the
+    /// browser blob decoder), in file order. Each record is re-verified
+    /// against `topic` under ITS OWN tag's language and ingested into that
+    /// lane alone — the same per-lane gate [`Room::ingest_music`]/
+    /// [`Room::ingest_extension`] apply at ingress, so recovery can never
+    /// admit a record neither lane would have accepted live.
+    pub fn recover(topic: &str, records: &[LaneRecord]) -> Result<Self, RoomRecoverError> {
+        let mut room = Self::new();
+        for record in records {
+            match record.lane {
+                RoomLane::Music => {
+                    let signed = SignedOp::from_wire_bytes_in::<MusicLang>(&record.wire)
+                        .map_err(RoomRecoverError::Wire)?;
+                    let verified =
+                        verify_music_op(&signed, topic).map_err(RoomRecoverError::Verify)?;
+                    room.ingest_music(verified);
+                }
+                RoomLane::Extension => {
+                    let signed = SignedOp::from_wire_bytes_in::<ExtensionLang>(&record.wire)
+                        .map_err(RoomRecoverError::Wire)?;
+                    let verified =
+                        verify_extension_op(&signed, topic).map_err(RoomRecoverError::Verify)?;
+                    room.ingest_extension(verified);
+                }
+            }
+        }
+        Ok(room)
     }
 
     // --- composed read model ---------------------------------------------
@@ -1394,5 +1691,302 @@ mod tests {
                 available_emojis: None,
             }
         );
+    }
+
+    // -----------------------------------------------------------------
+    // `RoomLane`/`LaneSet` golden bytes, `LocalRoomOp` command mapping, and
+    // the two-phase prepare/ingest/recover surface.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn room_lane_tags_are_pinned_and_round_trip() {
+        assert_eq!(ROOM_PROTOCOL_GENERATION.to_le_bytes(), [0x04, 0x00]);
+        // The wire byte IS the plan's exact value — pinned, never renumber.
+        assert_eq!(RoomLane::Music.tag(), 0x01);
+        assert_eq!(RoomLane::Extension.tag(), 0x02);
+        assert_eq!(RoomLane::from_tag(0x01), Some(RoomLane::Music));
+        assert_eq!(RoomLane::from_tag(0x02), Some(RoomLane::Extension));
+        for unknown in [0x00, 0x03, 0x04, 0xFF] {
+            assert_eq!(
+                RoomLane::from_tag(unknown),
+                None,
+                "tag {unknown:#04x} must not resolve to a lane"
+            );
+        }
+        assert_eq!(RoomLane::Music.wire_magic(), MusicLang::WIRE_MAGIC);
+        assert_eq!(RoomLane::Extension.wire_magic(), ExtensionLang::WIRE_MAGIC);
+    }
+
+    #[test]
+    fn room_topic_v4_is_case_insensitive_and_pinned() {
+        let topic = room_topic_v4("Sunny-Garden-Melody");
+        assert_eq!(topic, room_topic_v4("sunny-garden-melody"));
+        assert_ne!(topic, room_topic_v4("sunny-garden-drum"));
+        assert_eq!(
+            topic,
+            [
+                0xd6, 0x47, 0x91, 0x6c, 0x84, 0xfa, 0x2e, 0x11, 0x5b, 0x39, 0xf4, 0xcc,
+                0xe4, 0x8e, 0x46, 0x78, 0xcf, 0xce, 0xa3, 0x15, 0x69, 0xdb, 0xb0, 0x4b,
+                0xd9, 0xfe, 0x69, 0xa0, 0x7a, 0x64, 0x6c, 0x9a,
+            ],
+            "room-v4 topic golden",
+        );
+    }
+
+    #[test]
+    fn lane_set_rejects_zero_and_unknown_bits() {
+        assert_eq!(LaneSet::from_bits(0x01), Some(LaneSet::MUSIC));
+        assert_eq!(LaneSet::from_bits(0x02), Some(LaneSet::EXTENSION));
+        assert_eq!(LaneSet::from_bits(0x03), Some(LaneSet::WALKIE));
+        assert_eq!(LaneSet::WALKIE.bits(), LaneSet::MUSIC.bits() | LaneSet::EXTENSION.bits());
+        for bad in [0x00, 0x04, 0x05, 0x80, 0xFF] {
+            assert_eq!(
+                LaneSet::from_bits(bad),
+                None,
+                "{bad:#04x} names no lane or a bit outside WALKIE"
+            );
+        }
+        assert!(LaneSet::WALKIE.contains(RoomLane::Music));
+        assert!(LaneSet::WALKIE.contains(RoomLane::Extension));
+        assert!(LaneSet::MUSIC.contains(RoomLane::Music));
+        assert!(!LaneSet::MUSIC.contains(RoomLane::Extension));
+    }
+
+    /// The command->lane mapping is structural (see [`LocalRoomOp`] docs);
+    /// this pins that every variant actually resolves to its protocol lane.
+    #[test]
+    fn local_room_op_maps_commands_to_the_planned_lane() {
+        let music_ops = [
+            MusicOp::SetTuning {
+                definition: TuningDefinition::twelve_tet(),
+            },
+            MusicOp::AddDegree {
+                degree: tet_degree(0),
+            },
+            MusicOp::RemoveDegree {
+                degree: tet_degree(0),
+            },
+            MusicOp::SetEnvelope {
+                degree: tet_degree(0),
+                env: tutti_music::Envelope {
+                    points: vec![(0, 0)],
+                    interp: tutti_music::Interp::Step,
+                },
+            },
+        ];
+        for op in music_ops {
+            let local: LocalRoomOp = op.into();
+            assert_eq!(local.lane(), RoomLane::Music);
+        }
+
+        let extension_ops = [
+            ExtensionOp::PutPiece {
+                emoji: "🌵".into(),
+                pitch: tet_pitch(60),
+            },
+            ExtensionOp::MovePiece {
+                piece: OpId([0; 32]),
+                pitch: tet_pitch(60),
+            },
+            ExtensionOp::RemovePiece {
+                piece: OpId([0; 32]),
+            },
+            ExtensionOp::UnremovePiece {
+                remove: OpId([0; 32]),
+            },
+            ExtensionOp::SetConfig {
+                pieces_locked: Some(true),
+                available_emojis: None,
+            },
+        ];
+        for op in extension_ops {
+            let local: LocalRoomOp = op.into();
+            assert_eq!(local.lane(), RoomLane::Extension);
+        }
+    }
+
+    /// The two-phase discipline's visibility half: `prepare` alone changes
+    /// nothing (it takes `&self`), and the op is invisible until
+    /// `ingest_prepared` runs — the durability half (fsync sits between the
+    /// two, before ingest) is pinned in `room::lane_journal`'s
+    /// `fsync_before_visible_and_recoverable_after_a_simulated_crash`.
+    #[test]
+    fn prepare_does_not_mutate_ingest_prepared_makes_it_visible() {
+        let key = signing_key_from_seed(&SEED_A);
+        let room = Room::new();
+        let prepared = room.prepare(
+            &key,
+            TOPIC,
+            TS,
+            LocalRoomOp::Music(MusicOp::AddDegree {
+                degree: tet_degree(0),
+            }),
+        );
+        assert_eq!(prepared.lane(), RoomLane::Music);
+        assert!(
+            room.view().pitches.is_empty(),
+            "prepare (&self) must not mutate the room"
+        );
+
+        let mut room = room;
+        let lifted = room.ingest_prepared(TOPIC, &prepared).unwrap();
+        assert_eq!(lifted.len(), 1);
+        assert!(room.view().pitches.contains(&tet_degree(0)));
+
+        // Wrong topic refuses at phase two, exactly like direct ingest.
+        let extension_prepared = room.prepare(
+            &key,
+            TOPIC,
+            TS + 1,
+            LocalRoomOp::Extension(ExtensionOp::SetConfig {
+                pieces_locked: Some(true),
+                available_emojis: None,
+            }),
+        );
+        assert!(matches!(
+            room.ingest_prepared("another-room-topic", &extension_prepared),
+            Err(OpVerifyError::TopicMismatch { .. })
+        ));
+        assert!(!room.view().pieces_locked, "the refused op never applied");
+    }
+
+    /// [`Room::recover`] rebuilds the identical room from lane-tagged,
+    /// interleaved wire records — both lane roots and the composed
+    /// `state_root` match a room built by direct commit.
+    #[cfg(feature = "merkle")]
+    #[test]
+    fn recover_rebuilds_an_identical_room_from_interleaved_records() {
+        let key_a = signing_key_from_seed(&SEED_A);
+        let key_b = signing_key_from_seed(&SEED_B);
+
+        let mut direct = Room::new();
+        direct.commit_music(
+            &key_a,
+            TOPIC,
+            TS,
+            MusicOp::AddDegree {
+                degree: tet_degree(0),
+            },
+        );
+        let put = direct.commit_extension(
+            &key_b,
+            TOPIC,
+            TS + 1,
+            ExtensionOp::PutPiece {
+                emoji: "🌵".into(),
+                pitch: tet_pitch(60),
+            },
+        );
+        let piece = verify_extension_op(&put, TOPIC).unwrap().id();
+        direct.commit_music(
+            &key_b,
+            TOPIC,
+            TS + 2,
+            MusicOp::AddDegree {
+                degree: tet_degree(4),
+            },
+        );
+        direct.commit_extension(
+            &key_a,
+            TOPIC,
+            TS + 3,
+            ExtensionOp::MovePiece {
+                piece,
+                pitch: tet_pitch(64),
+            },
+        );
+
+        // The SAME history, authored through the two-phase surface, framed
+        // into interleaved lane records exactly as a journal would hold them.
+        let mut room = Room::new();
+        let p1 = room.prepare(
+            &key_a,
+            TOPIC,
+            TS,
+            MusicOp::AddDegree {
+                degree: tet_degree(0),
+            }
+            .into(),
+        );
+        room.ingest_prepared(TOPIC, &p1).unwrap();
+        let p2 = room.prepare(
+            &key_b,
+            TOPIC,
+            TS + 1,
+            ExtensionOp::PutPiece {
+                emoji: "🌵".into(),
+                pitch: tet_pitch(60),
+            }
+            .into(),
+        );
+        let piece2 = verify_extension_op(p2.signed(), TOPIC).unwrap().id();
+        assert_eq!(piece2, piece, "identical signed bytes -> identical op id");
+        room.ingest_prepared(TOPIC, &p2).unwrap();
+        let p3 = room.prepare(
+            &key_b,
+            TOPIC,
+            TS + 2,
+            MusicOp::AddDegree {
+                degree: tet_degree(4),
+            }
+            .into(),
+        );
+        room.ingest_prepared(TOPIC, &p3).unwrap();
+        let p4 = room.prepare(
+            &key_a,
+            TOPIC,
+            TS + 3,
+            ExtensionOp::MovePiece {
+                piece: piece2,
+                pitch: tet_pitch(64),
+            }
+            .into(),
+        );
+        room.ingest_prepared(TOPIC, &p4).unwrap();
+        let records: Vec<LaneRecord> = [p1, p2, p3, p4]
+            .iter()
+            .map(|prepared| LaneRecord {
+                lane: prepared.lane(),
+                wire: prepared.to_wire_bytes().unwrap(),
+            })
+            .collect();
+
+        let recovered = Room::recover(TOPIC, &records).unwrap();
+        assert_eq!(recovered.music().pending_len(), 0);
+        assert_eq!(recovered.extension().pending_len(), 0);
+        assert_eq!(recovered.view(), direct.view());
+        assert_eq!(recovered.music().ops_root(), direct.music().ops_root());
+        assert_eq!(
+            recovered.extension().ops_root(),
+            direct.extension().ops_root()
+        );
+        assert_eq!(recovered.state_root(), direct.state_root());
+    }
+
+    /// A malformed lane record — an extension frame filed under the music
+    /// tag — fails recovery loudly rather than silently dropping or
+    /// misfiling it.
+    #[test]
+    fn recover_rejects_a_lane_wire_mismatch() {
+        let key = signing_key_from_seed(&SEED_A);
+        let room = Room::new();
+        let ext = room.prepare(
+            &key,
+            TOPIC,
+            TS,
+            ExtensionOp::SetConfig {
+                pieces_locked: Some(true),
+                available_emojis: None,
+            }
+            .into(),
+        );
+        let tampered = LaneRecord {
+            lane: RoomLane::Music,
+            wire: ext.to_wire_bytes().unwrap(),
+        };
+        assert!(matches!(
+            Room::recover(TOPIC, &[tampered]),
+            Err(RoomRecoverError::Wire(_))
+        ));
     }
 }
