@@ -131,11 +131,8 @@ fn run_session(
             stats.control_bytes += postcard::to_allocvec(m).expect("Message encodes").len();
         }
 
-        let (recv, send): (&mut RoomStore, &RoomStore) = if to_b {
-            (&mut *b, &*a)
-        } else {
-            (&mut *a, &*b)
-        };
+        let (recv, send): (&mut RoomStore, &RoomStore) =
+            if to_b { (&mut *b, &*a) } else { (&mut *a, &*b) };
 
         // Transfer entries the receiver lacks for each terminal Items message.
         let hash_to_id = send.lifted_op_ids();

@@ -151,8 +151,8 @@ impl BareMusicPeer {
                 return Ok(outcome);
             };
             self.music_frames_received += 1;
-            let message =
-                SyncMessage::decode(&frame).map_err(|error| BareError::Decode(error.to_string()))?;
+            let message = SyncMessage::decode(&frame)
+                .map_err(|error| BareError::Decode(error.to_string()))?;
             let answered_a_fetch = matches!(message, SyncMessage::Entries { .. });
             let output = session
                 .on_message(message, &source)
@@ -399,9 +399,7 @@ mod tests {
             .store
             .repair_records()
             .into_iter()
-            .map(|(hash, (signed, _))| {
-                (hash, signed.to_wire_bytes_in::<MusicLang>().unwrap())
-            })
+            .map(|(hash, (signed, _))| (hash, signed.to_wire_bytes_in::<MusicLang>().unwrap()))
             .collect();
         let (admitted, lifted) = peer.ingest_music(TOPIC, &pairs);
         assert_eq!(lifted.len(), 1);
@@ -431,7 +429,10 @@ mod tests {
         let mut emitted: BTreeSet<EntryHash> = BTreeSet::new();
         for (hash, _) in &full {
             for predecessor in &source.records[hash].1 {
-                assert!(emitted.contains(predecessor), "ancestors precede descendants");
+                assert!(
+                    emitted.contains(predecessor),
+                    "ancestors precede descendants"
+                );
             }
             emitted.insert(*hash);
         }

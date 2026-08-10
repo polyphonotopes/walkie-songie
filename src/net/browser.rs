@@ -437,10 +437,7 @@ impl ProtocolHandler for BrowserRepairProtocol {
                 } else {
                     b"shutting down"
                 };
-                refused
-                    .into_inner()
-                    .connection
-                    .close(1u32.into(), reason);
+                refused.into_inner().connection.close(1u32.into(), reason);
                 Ok(())
             }
         }
@@ -484,7 +481,9 @@ impl Transport for BrowserRoomNetwork {
         let event = match self.next_inbound().await? {
             BrowserRoomInbound::Repair(repair) => {
                 let Some(protocol) = LaneProtocol::from_alpn(repair.alpn) else {
-                    repair.connection.close(4u32.into(), b"unsupported lane protocol");
+                    repair
+                        .connection
+                        .close(4u32.into(), b"unsupported lane protocol");
                     return Some(TransportEvent::Diagnostic(format!(
                         "accepted legacy ALPN {} outside the room-v4 lane seam",
                         String::from_utf8_lossy(repair.alpn)

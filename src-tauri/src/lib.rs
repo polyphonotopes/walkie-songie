@@ -21,13 +21,12 @@ use walkie_songie::{
         MidiSource, NativeMidiService, PhysicalMidiKey,
     },
     net::{
-        CourierFrame, CourierResponder, ExtensionLane, FileSeedStore, IncomingOp,
-        IrohSyncStream, LaneIngest, LaneProtocol, LaneSpec, LaneStoreAccess, LaneSyncSource,
-        MusicLane, NativeNetworkEvent, NativeRoomNetwork, NativeRoomNetworkConfig,
-        NativeRoomTicketV4, PeerId, PeerTransportPath, RelayPolicy, RoomInbound, RoomTopic,
-        SyncApply, SyncError, SyncLimits, SyncOutcome, SyncStream, TokioTimer,
-        TrackedDiscardHistory, WalkieIdentity, drive_initiator, drive_responder, ingest_pairs,
-        spawn_rendezvous_v4,
+        CourierFrame, CourierResponder, ExtensionLane, FileSeedStore, IncomingOp, IrohSyncStream,
+        LaneIngest, LaneProtocol, LaneSpec, LaneStoreAccess, LaneSyncSource, MusicLane,
+        NativeNetworkEvent, NativeRoomNetwork, NativeRoomNetworkConfig, NativeRoomTicketV4, PeerId,
+        PeerTransportPath, RelayPolicy, RoomInbound, RoomTopic, SyncApply, SyncError, SyncLimits,
+        SyncOutcome, SyncStream, TokioTimer, TrackedDiscardHistory, WalkieIdentity,
+        drive_initiator, drive_responder, ingest_pairs, spawn_rendezvous_v4,
     },
     room::{
         lane_journal::FileLaneJournal,
@@ -35,8 +34,7 @@ use walkie_songie::{
         presence::{PresenceBody, SignedPresenceV4},
         store::{RoomView, Store},
         v4::{
-            ExtensionLang, ExtensionOp, LaneSet, LocalRoomOp, MusicLang, MusicOp, Room,
-            RoomLane,
+            ExtensionLang, ExtensionOp, LaneSet, LocalRoomOp, MusicLang, MusicOp, Room, RoomLane,
         },
     },
 };
@@ -189,11 +187,13 @@ impl AppRuntime {
                 pieces_locked,
                 available_emojis,
             } => {
-                self.submit_durable(ExtensionOp::SetConfig {
-                    pieces_locked,
-                    available_emojis,
-                }
-                .into())
+                self.submit_durable(
+                    ExtensionOp::SetConfig {
+                        pieces_locked,
+                        available_emojis,
+                    }
+                    .into(),
+                )
                 .await
             }
             ClientCommand::SetVoicePreview { session, pitch } => {
@@ -1640,11 +1640,7 @@ impl<P: AppLane> LaneStoreAccess<P::Lang> for DurableLaneAccess<P> {
                     durable: &mut durable,
                     lane: PhantomData,
                 };
-                ingest_pairs::<P::Lang, _>(
-                    &mut sink,
-                    topic,
-                    pairs.iter().map(IncomingOp::from),
-                )?
+                ingest_pairs::<P::Lang, _>(&mut sink, topic, pairs.iter().map(IncomingOp::from))?
             };
             source.absorb(P::store(&durable.room), &report.lifted)?;
             let view = durable.room.view();
@@ -1753,7 +1749,15 @@ fn spawn_repair<P: AppLane>(
             runtime.clone(),
         )
         .await;
-        finish_repair::<P>(result, &runtime, &progress, expected, endpoint_id, &telemetry).await;
+        finish_repair::<P>(
+            result,
+            &runtime,
+            &progress,
+            expected,
+            endpoint_id,
+            &telemetry,
+        )
+        .await;
     });
 }
 
@@ -1883,14 +1887,7 @@ async fn dial_and_run<P: AppLane>(
             return None;
         }
     };
-    let result = run_repair_session::<P>(
-        stream,
-        true,
-        durable,
-        signed_topic,
-        runtime,
-    )
-    .await;
+    let result = run_repair_session::<P>(stream, true, durable, signed_topic, runtime).await;
     Some((connection, result))
 }
 
@@ -1904,11 +1901,9 @@ async fn run_repair_session<P: AppLane>(
     let mut access = DurableLaneAccess::<P>::new(durable, runtime);
     let limits = SyncLimits::default();
     if initiator {
-        drive_initiator::<P, _, _, _>(stream, &TokioTimer, &mut access, &signed_topic, limits)
-            .await
+        drive_initiator::<P, _, _, _>(stream, &TokioTimer, &mut access, &signed_topic, limits).await
     } else {
-        drive_responder::<P, _, _, _>(stream, &TokioTimer, &mut access, &signed_topic, limits)
-            .await
+        drive_responder::<P, _, _, _>(stream, &TokioTimer, &mut access, &signed_topic, limits).await
     }
     .map_err(|error| error.to_string())
 }
@@ -1922,7 +1917,11 @@ fn spawn_courier<P: AppLane>(
 ) {
     tauri::async_runtime::spawn(async move {
         let result: Result<(), String> = async {
-            let Some(frame) = stream.recv_frame().await.map_err(|error| error.to_string())? else {
+            let Some(frame) = stream
+                .recv_frame()
+                .await
+                .map_err(|error| error.to_string())?
+            else {
                 return Ok(());
             };
             let request = match CourierFrame::decode(&frame).map_err(|error| error.to_string())? {
@@ -1943,7 +1942,10 @@ fn spawn_courier<P: AppLane>(
             let bytes = CourierFrame::Response(response)
                 .encode()
                 .map_err(|error| error.to_string())?;
-            stream.send_frame(&bytes).await.map_err(|error| error.to_string())?;
+            stream
+                .send_frame(&bytes)
+                .await
+                .map_err(|error| error.to_string())?;
             Ok(())
         }
         .await;
@@ -1971,10 +1973,9 @@ async fn commit_room_op(
 ) -> Result<u64, AppError> {
     let (wire, view) = {
         let mut durable = durable.lock().await;
-        let prepared =
-            durable
-                .room
-                .prepare(signing_key, signed_topic, unix_time_micros(), op);
+        let prepared = durable
+            .room
+            .prepare(signing_key, signed_topic, unix_time_micros(), op);
         let wire = prepared.to_wire_bytes().map_err(persistence_error)?;
         durable
             .journal

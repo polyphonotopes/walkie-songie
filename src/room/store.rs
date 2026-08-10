@@ -1169,11 +1169,7 @@ mod tests {
 
         for order in [identity.clone(), reversed, interleave] {
             let store = ingest_in_order(&base, &order);
-            assert_eq!(
-                store.pending_len(),
-                0,
-                "order {order:?} must fully drain"
-            );
+            assert_eq!(store.pending_len(), 0, "order {order:?} must fully drain");
             assert_eq!(
                 store.view(),
                 baseline_view,
@@ -1440,7 +1436,11 @@ mod tests {
         let _ = store.state_root();
         let _ = store.prove_op(store.entry_hashes().iter().next().unwrap());
 
-        assert_eq!(store.view(), view_before, "view unchanged by merkle queries");
+        assert_eq!(
+            store.view(),
+            view_before,
+            "view unchanged by merkle queries"
+        );
         assert_eq!(store.entry_hashes(), hashes_before, "entry set unchanged");
         assert_eq!(store.sync_root(), sync_before, "sync_root unchanged");
 
@@ -1500,7 +1500,11 @@ mod reach_equiv {
             z ^ (z >> 31)
         }
         fn upto(&mut self, n: usize) -> usize {
-            if n == 0 { 0 } else { (self.next() % n as u64) as usize }
+            if n == 0 {
+                0
+            } else {
+                (self.next() % n as u64) as usize
+            }
         }
         fn pct(&mut self, p: u64) -> bool {
             self.next() % 100 < p
@@ -1565,15 +1569,21 @@ mod reach_equiv {
                         piece,
                         pitch: tet_pitch(60 + rng.upto(7) as i32),
                     },
-                    None => WalkieOp::AddDegree { pitch: tet_degree(0) },
+                    None => WalkieOp::AddDegree {
+                        pitch: tet_degree(0),
+                    },
                 },
                 5 => match pick(&piece_ids, &mut rng) {
                     Some(piece) => WalkieOp::RemovePiece { piece },
-                    None => WalkieOp::AddDegree { pitch: tet_degree(1) },
+                    None => WalkieOp::AddDegree {
+                        pitch: tet_degree(1),
+                    },
                 },
                 6 => match pick(&remove_ids, &mut rng) {
                     Some(remove) => WalkieOp::UnremovePiece { remove },
-                    None => WalkieOp::AddDegree { pitch: tet_degree(2) },
+                    None => WalkieOp::AddDegree {
+                        pitch: tet_degree(2),
+                    },
                 },
                 7 => WalkieOp::SetConfig {
                     pieces_locked: Some(rng.pct(50)),
@@ -1666,11 +1676,8 @@ mod reach_equiv {
             let hashes: Vec<EntryHash> = store.entry_hashes().into_iter().collect();
             let mut rng = Rng::new(seed ^ 0x1357_9BDF);
             for _ in 0..8 {
-                let candidates: BTreeSet<EntryHash> = hashes
-                    .iter()
-                    .copied()
-                    .filter(|_| rng.pct(35))
-                    .collect();
+                let candidates: BTreeSet<EntryHash> =
+                    hashes.iter().copied().filter(|_| rng.pct(35)).collect();
                 assert_eq!(
                     Reach::resolve(&reach, &candidates),
                     register::resolve(&candidates, &kernel),

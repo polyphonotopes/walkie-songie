@@ -6,6 +6,8 @@
 mod app;
 #[cfg(target_arch = "wasm32")]
 mod audio;
+#[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+mod browser_host;
 #[cfg(target_arch = "wasm32")]
 mod components;
 #[cfg(target_arch = "wasm32")]
@@ -14,8 +16,6 @@ pub mod graph;
 mod keyboard;
 #[cfg(target_arch = "wasm32")]
 pub mod midi;
-#[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
-mod browser_host;
 #[cfg(target_arch = "wasm32")]
 mod native_bridge;
 #[cfg(target_arch = "wasm32")]

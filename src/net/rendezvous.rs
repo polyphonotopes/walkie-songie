@@ -23,9 +23,7 @@
 
 use std::{collections::HashSet, time::Duration};
 
-use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayUrl, address_lookup::MemoryLookup,
-};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, address_lookup::MemoryLookup};
 use iroh_gossip::api::GossipSender;
 use serde::{Deserialize, Serialize};
 
@@ -119,7 +117,9 @@ pub struct RendezvousPeering {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum ClientMessage {
-    Subscribe { topics: Vec<String> },
+    Subscribe {
+        topics: Vec<String>,
+    },
     /// `data` is an opaque JSON blob the server fans out verbatim. It carries either
     /// a [`Hello`] or (browser only) a WebRTC signaling envelope, discriminated by
     /// its `kind` field — so both kinds share the one publish shape.
@@ -252,8 +252,10 @@ pub trait SignalStream: Send {
 #[cfg(target_arch = "wasm32")]
 pub trait SignalStream {
     /// Send one text frame.
-    fn send(&mut self, text: String)
-    -> impl std::future::Future<Output = Result<(), RendezvousError>>;
+    fn send(
+        &mut self,
+        text: String,
+    ) -> impl std::future::Future<Output = Result<(), RendezvousError>>;
 
     /// Await the next text frame. `Ok(None)` is a clean/close end of stream.
     fn recv(
@@ -426,7 +428,9 @@ async fn run_rendezvous<S: SignalStream>(
                 };
                 match message {
                     ServerMessage::Ping => {
-                        socket.send(serde_json::to_string(&ClientMessage::Pong)?).await?;
+                        socket
+                            .send(serde_json::to_string(&ClientMessage::Pong)?)
+                            .await?;
                     }
                     ServerMessage::Other => {}
                     ServerMessage::Publish { data, .. } => {
@@ -480,11 +484,10 @@ async fn run_rendezvous<S: SignalStream>(
                         // later refresh never drops the relay fallback.
                         #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
                         if peering.webrtc.is_some() && rtc == Some(true) {
-                            endpoint_addr = endpoint_addr.with_addrs([
-                                iroh::TransportAddr::Custom(
+                            endpoint_addr =
+                                endpoint_addr.with_addrs([iroh::TransportAddr::Custom(
                                     super::webrtc_transport::webrtc_custom_addr(id.as_bytes()),
-                                ),
-                            ]);
+                                )]);
                         }
 
                         if joined.contains(&id) {
@@ -495,9 +498,7 @@ async fn run_rendezvous<S: SignalStream>(
                         } else if joined.len() < MAX_RENDEZVOUS_PEERS {
                             joined.insert(id);
                             peering.memory_lookup.add_endpoint_info(endpoint_addr);
-                            if let Err(error) =
-                                peering.gossip_sender.join_peers(vec![id]).await
-                            {
+                            if let Err(error) = peering.gossip_sender.join_peers(vec![id]).await {
                                 tracing::debug!(
                                     target: "walkie::rendezvous",
                                     "join_peers for {id} failed: {error}"
@@ -610,10 +611,12 @@ fn route_rtc_envelope(peering: &RendezvousPeering, our_id: EndpointId, data: ser
     if from == our_id {
         return; // our own signaling, fanned back to us
     }
-    let _ = port.commands.unbounded_send(super::webrtc_transport::Command::Signal {
-        from: *from.as_bytes(),
-        payload: envelope.payload,
-    });
+    let _ = port
+        .commands
+        .unbounded_send(super::webrtc_transport::Command::Signal {
+            from: *from.as_bytes(),
+            payload: envelope.payload,
+        });
 }
 
 /// The reconnecting outer loop. Owns `joined` so a socket drop does not re-spam
@@ -629,16 +632,15 @@ async fn rendezvous_main(
     loop {
         match connect_signal(SIGNALING_SERVER_URL).await {
             Ok(mut socket) => {
-                if let Err(error) =
-                    run_rendezvous(
-                        &mut socket,
-                        &channel,
-                        &peering,
-                        generation,
-                        &on_discovered,
-                        &mut joined,
-                    )
-                    .await
+                if let Err(error) = run_rendezvous(
+                    &mut socket,
+                    &channel,
+                    &peering,
+                    generation,
+                    &on_discovered,
+                    &mut joined,
+                )
+                .await
                 {
                     tracing::debug!(
                         target: "walkie::rendezvous",
@@ -778,9 +780,7 @@ mod native_socket {
     use super::{RendezvousError, SignalStream};
     use futures::{SinkExt, StreamExt};
     use tokio::net::TcpStream;
-    use tokio_tungstenite::{
-        MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message,
-    };
+    use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
     pub struct NativeSignalStream {
         inner: WebSocketStream<MaybeTlsStream<TcpStream>>,
@@ -945,9 +945,9 @@ mod browser_socket {
         socket.set_onerror(Some(on_fail.as_ref().unchecked_ref()));
         socket.set_onclose(Some(on_fail.as_ref().unchecked_ref()));
 
-        let result = rx.await.unwrap_or_else(|_| {
-            Err(RendezvousError::Connect("open notifier dropped".to_owned()))
-        });
+        let result = rx
+            .await
+            .unwrap_or_else(|_| Err(RendezvousError::Connect("open notifier dropped".to_owned())));
 
         // Detach the handshake handlers; `connect` installs the pump handlers.
         socket.set_onopen(None);
@@ -1004,7 +1004,10 @@ mod tests {
         assert_eq!(data.get("kind").and_then(|k| k.as_str()), Some(HELLO_KIND));
         let decoded: Hello = serde_json::from_value(data).unwrap();
         assert_eq!(decoded.id, "aa".repeat(32));
-        assert_eq!(decoded.relay.as_deref(), Some("https://relay.wondering.xyz/"));
+        assert_eq!(
+            decoded.relay.as_deref(),
+            Some("https://relay.wondering.xyz/")
+        );
         assert_eq!(decoded.rtc, Some(true));
     }
 
@@ -1046,7 +1049,10 @@ mod tests {
                 "aa".repeat(32)
             )
         );
-        assert_eq!(serde_json::from_str::<HelloV4>(&json).unwrap().validate(), Some(LaneSet::WALKIE));
+        assert_eq!(
+            serde_json::from_str::<HelloV4>(&json).unwrap().validate(),
+            Some(LaneSet::WALKIE)
+        );
     }
 
     #[test]

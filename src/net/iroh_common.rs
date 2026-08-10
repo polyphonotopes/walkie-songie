@@ -19,9 +19,7 @@ use tutti_core::OpLanguage;
 
 use super::PeerId;
 use crate::client::PeerPath;
-use crate::room::v4::{
-    ExtensionLang, LaneSet, MusicLang, ROOM_PROTOCOL_GENERATION, room_topic_v4,
-};
+use crate::room::v4::{ExtensionLang, LaneSet, MusicLang, ROOM_PROTOCOL_GENERATION, room_topic_v4};
 
 /// Domain separator used when a human room name is converted into an Iroh topic.
 const ROOM_TOPIC_CONTEXT: &str = "walkie-songie room topic v1";
@@ -83,8 +81,7 @@ pub(crate) const REPAIR_ACCEPT_TIMEOUT: Duration = Duration::from_secs(20);
 /// byte. [`NativeRoomTicketV4`] and v4 rendezvous also advertise lane bits so a
 /// dialer can avoid unsupported attempts; negotiation still decides.
 pub use super::sync::{
-    EXTENSION_COURIER_ALPN, EXTENSION_RBSR_ALPN, MUSIC_COURIER_ALPN, MUSIC_RBSR_ALPN,
-    RBSR_ALPN,
+    EXTENSION_COURIER_ALPN, EXTENSION_RBSR_ALPN, MUSIC_COURIER_ALPN, MUSIC_RBSR_ALPN, RBSR_ALPN,
 };
 
 /// The exact room-v4 endpoint surface. A v4 endpoint registers no v3 repair
@@ -292,10 +289,7 @@ pub(crate) async fn classify_peer_path(
     };
     let mut active_relay = false;
     for address in info.addrs() {
-        if !matches!(
-            address.usage(),
-            iroh::endpoint::TransportAddrUsage::Active
-        ) {
+        if !matches!(address.usage(), iroh::endpoint::TransportAddrUsage::Active) {
             continue;
         }
         match address.addr() {
@@ -612,7 +606,10 @@ mod tests {
         expected.extend_from_slice(&endpoint_bytes);
         assert_eq!(ticket.encode_bytes(), expected);
         assert_eq!(NativeRoomTicketV4::KIND, "walkieroom4");
-        assert_eq!(ticket.to_string().parse::<NativeRoomTicketV4>().unwrap(), ticket);
+        assert_eq!(
+            ticket.to_string().parse::<NativeRoomTicketV4>().unwrap(),
+            ticket
+        );
     }
 
     #[test]
@@ -622,10 +619,7 @@ mod tests {
         let ticket = NativeRoomTicketV4::new(topic, LaneSet::MUSIC, endpoint);
         let valid = ticket.encode_bytes();
 
-        for (offset, bytes) in [
-            (0, [0x01, 0x00]),
-            (2, [0x03, 0x00]),
-        ] {
+        for (offset, bytes) in [(0, [0x01, 0x00]), (2, [0x03, 0x00])] {
             let mut invalid = valid.clone();
             invalid[offset..offset + 2].copy_from_slice(&bytes);
             assert!(NativeRoomTicketV4::decode_bytes(&invalid).is_err());

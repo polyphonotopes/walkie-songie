@@ -8,7 +8,7 @@
 
 mod support;
 
-use support::{random_op, Policy, Rng, SimNet, TraceEvent};
+use support::{Policy, Rng, SimNet, TraceEvent, random_op};
 
 /// Run one fully-seeded scenario and return its trace.
 fn run_scenario(seed: u64) -> Vec<TraceEvent> {
@@ -69,7 +69,10 @@ fn w15_n_peer_randomized_property() {
             let first = run_scenario(seed);
             if seed < DETERMINISM_GUARD_SEEDS {
                 let second = run_scenario(seed);
-                assert_eq!(first, second, "scenario is not deterministic at seed {seed}");
+                assert_eq!(
+                    first, second,
+                    "scenario is not deterministic at seed {seed}"
+                );
             }
         });
         if let Err(payload) = outcome {

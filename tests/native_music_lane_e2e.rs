@@ -175,7 +175,9 @@ impl SyncTimer for NoTimeout {
 }
 
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 // ---------------------------------------------------------------------------
@@ -209,7 +211,9 @@ fn bare_music_peer_joins_the_music_lane_and_never_sees_an_extension_byte() {
             pitch: tet_pitch(60),
         },
     );
-    let piece = verify_extension_op(&put, TOPIC).expect("extension op verifies").id();
+    let piece = verify_extension_op(&put, TOPIC)
+        .expect("extension op verifies")
+        .id();
     walkie_extension.commit(
         &walkie_extension_key,
         TOPIC,
@@ -220,7 +224,10 @@ fn bare_music_peer_joins_the_music_lane_and_never_sees_an_extension_byte() {
         },
     );
     let extension_len_before = walkie_extension.len();
-    assert_eq!(extension_len_before, 2, "extension state exists BEFORE the join");
+    assert_eq!(
+        extension_len_before, 2,
+        "extension state exists BEFORE the join"
+    );
 
     // -- The bare peer: an independently authored, divergent music op.
     let mut bare = BareMusicPeer::new();
@@ -345,12 +352,19 @@ fn bare_music_peer_joins_the_music_lane_and_never_sees_an_extension_byte() {
         walkie_music.sync_root(),
         "identical music sync roots"
     );
-    assert_eq!(bare.store.view(), walkie_music.view(), "identical music read models");
+    assert_eq!(
+        bare.store.view(),
+        walkie_music.view(),
+        "identical music read models"
+    );
     assert!(
         walkie_music.knows_op(bare_op),
         "the bare peer's divergent op flowed INTO walkie"
     );
-    assert!(bare.store.len() > 1, "the bare peer actually received the room");
+    assert!(
+        bare.store.len() > 1,
+        "the bare peer actually received the room"
+    );
     assert_eq!(bare.store.len(), 25, "24 walkie ops + the bare op");
     assert!(!bare_outcome.incomplete && !walkie_outcome.incomplete);
     assert!(!bare_outcome.root_mismatch && !walkie_outcome.root_mismatch);
@@ -362,7 +376,10 @@ fn bare_music_peer_joins_the_music_lane_and_never_sees_an_extension_byte() {
         bare.domain_decode_failures, 0,
         "not one delivered entry fell outside the pure-music vocabulary"
     );
-    assert!(bare.music_frames_received > 0, "the session was not vacuous");
+    assert!(
+        bare.music_frames_received > 0,
+        "the session was not vacuous"
+    );
 
     // -- GATE: extension state existed before AND changed mid-session.
     let extension_len_after = walkie_extension.len();
@@ -371,13 +388,19 @@ fn bare_music_peer_joins_the_music_lane_and_never_sees_an_extension_byte() {
         "the extension lane churned DURING the music exchange"
     );
     assert!(!walkie_extension.is_empty());
-    assert!(walkie_extension.view().pieces_locked, "the churned config applied");
+    assert!(
+        walkie_extension.view().pieces_locked,
+        "the churned config applied"
+    );
 
     // -- GATE: the transcript. Every frame rode the music ALPN; every
     //    delivered entry deframes as pure music; no frame anywhere contains
     //    the extension wire magic or any extension entry hash.
     let transcript = transcript.lock().unwrap();
-    assert!(!transcript.is_empty(), "the transcript recorded the session");
+    assert!(
+        !transcript.is_empty(),
+        "the transcript recorded the session"
+    );
     let negotiated: std::collections::BTreeSet<&[u8]> =
         transcript.iter().map(|frame| frame.alpn).collect();
     assert_eq!(
@@ -387,10 +410,17 @@ fn bare_music_peer_joins_the_music_lane_and_never_sees_an_extension_byte() {
     );
 
     let extension_hashes = walkie_extension.entry_hashes();
-    assert_eq!(extension_hashes.len(), 4, "put + config + the two churn ops");
+    assert_eq!(
+        extension_hashes.len(),
+        4,
+        "put + config + the two churn ops"
+    );
     let mut entries_seen = 0_usize;
     for frame in transcript.iter() {
-        assert_eq!(frame.alpn, MUSIC_RBSR_ALPN, "no frame outside the music lane");
+        assert_eq!(
+            frame.alpn, MUSIC_RBSR_ALPN,
+            "no frame outside the music lane"
+        );
         // Byte-level scan of the WHOLE frame — headers, ranges, everything —
         // for extension material.
         assert!(
@@ -407,7 +437,8 @@ fn bare_music_peer_joins_the_music_lane_and_never_sees_an_extension_byte() {
             );
         }
         // Structural check of every delivered entry.
-        let message = SyncMessage::decode(&frame.bytes).expect("transcript frames are SyncMessages");
+        let message =
+            SyncMessage::decode(&frame.bytes).expect("transcript frames are SyncMessages");
         if let SyncMessage::Entries { pairs, .. } = message {
             for (hash, bytes) in pairs {
                 entries_seen += 1;

@@ -60,14 +60,9 @@ pub use loopback::{LoopbackStream, LoopbackTransport, loopback_pair};
 ))]
 pub use iroh_common::{
     MAX_GOSSIP_MESSAGE_BYTES, NativeNetError, NativeNetworkEvent, NativeRoomNetworkConfig,
-    NativeRoomTicket, NativeRoomTicketV4, PeerTransportPath, RelayPolicy, RoomTopic,
-    ROOM_V4_ALPNS, room_mdns_service_name, room_mdns_service_name_v4,
+    NativeRoomTicket, NativeRoomTicketV4, PeerTransportPath, ROOM_V4_ALPNS, RelayPolicy, RoomTopic,
+    room_mdns_service_name, room_mdns_service_name_v4,
 };
-#[cfg(any(
-    all(not(target_arch = "wasm32"), feature = "native-net"),
-    all(target_arch = "wasm32", feature = "browser-net")
-))]
-pub use repair::{IrohSyncStream, MAX_REPAIR_FRAME_BYTES, read_sync_frame, write_sync_frames};
 #[cfg(any(
     all(not(target_arch = "wasm32"), feature = "native-net"),
     all(target_arch = "wasm32", feature = "browser-net")
@@ -76,6 +71,11 @@ pub use rendezvous::{
     HelloV4, RendezvousHandle, RendezvousPeering, rendezvous_channel_v4, spawn_rendezvous,
     spawn_rendezvous_v4,
 };
+#[cfg(any(
+    all(not(target_arch = "wasm32"), feature = "native-net"),
+    all(target_arch = "wasm32", feature = "browser-net")
+))]
+pub use repair::{IrohSyncStream, MAX_REPAIR_FRAME_BYTES, read_sync_frame, write_sync_frames};
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-net"))]
 pub use native::{IncomingRepair, NativeRoomNetwork, RoomInbound};
@@ -105,9 +105,8 @@ pub use sync::{
 pub use courier::{
     CourierFrame, CourierRefusal, CourierRequest, CourierResponder, CourierResponse,
     CourierWireAnswer, MAX_COURIER_CONTEXT_ENTRIES, MAX_COURIER_FRAME_BYTES,
-    MAX_COURIER_LATER_BATCHES, MAX_COURIER_SIBLINGS, TrackedDiscardHistory,
-    apply_courier_response, courier_request_for, exchange_courier, lift_deferred_over_stream,
-    serve_courier_once,
+    MAX_COURIER_LATER_BATCHES, MAX_COURIER_SIBLINGS, TrackedDiscardHistory, apply_courier_response,
+    courier_request_for, exchange_courier, lift_deferred_over_stream, serve_courier_once,
 };
 
 // ---------------------------------------------------------------------------
@@ -300,8 +299,11 @@ pub trait Transport {
     fn next_event(&mut self) -> impl Future<Output = Option<TransportEvent<Self::Stream>>>;
 
     /// Dial `peer` for one lane-scoped repair or courier exchange.
-    fn open_lane(&self, peer: PeerId, protocol: LaneProtocol)
-    -> impl Future<Output = Result<Self::Stream, TransportError>>;
+    fn open_lane(
+        &self,
+        peer: PeerId,
+        protocol: LaneProtocol,
+    ) -> impl Future<Output = Result<Self::Stream, TransportError>>;
 
     /// Honest reachability for `peer`, for UI only.
     fn peer_path(&self, peer: PeerId) -> impl Future<Output = PeerPath>;

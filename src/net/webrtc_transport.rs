@@ -65,7 +65,9 @@ use std::{
 };
 
 use futures::{StreamExt, channel::mpsc};
-use iroh::endpoint::transports::{CustomEndpoint, CustomSender, CustomTransport, RecvInfo, Transmit};
+use iroh::endpoint::transports::{
+    CustomEndpoint, CustomSender, CustomTransport, RecvInfo, Transmit,
+};
 use iroh_base::CustomAddr;
 use noq_udp::RecvMeta;
 use send_wrapper::SendWrapper;
@@ -331,7 +333,11 @@ impl CustomEndpoint for WebRtcEndpoint {
         recv_infos: &mut [RecvInfo],
     ) -> Poll<io::Result<usize>> {
         assert_eq!(bufs.len(), metas.len(), "non matching bufs & metas");
-        assert_eq!(bufs.len(), recv_infos.len(), "non matching bufs & recv_infos");
+        assert_eq!(
+            bufs.len(),
+            recv_infos.len(),
+            "non matching bufs & recv_infos"
+        );
         let n = bufs.len();
         if n == 0 {
             return Poll::Ready(Ok(0));
@@ -744,7 +750,11 @@ async fn handle_signal(
             }
             flush_after_remote_desc(shared, from, &pc).await;
         }
-        RtcPayload::Ice { candidate, mid, index } => {
+        RtcPayload::Ice {
+            candidate,
+            mid,
+            index,
+        } => {
             // Add now if the remote description is set; otherwise buffer (adding a
             // candidate before setRemoteDescription throws). Create an answerer link
             // if ICE somehow beat the offer.

@@ -191,7 +191,11 @@ pub fn hot_key_ops(adds: usize, removes: usize) -> Vec<VerifiedOp> {
     }
     for j in 0..removes {
         let mut r = Author::new((1 + adds + j) as u8);
-        out.push(r.sign(2_000 + j as u64, vec![], WalkieOp::RemoveDegree { pitch: d }));
+        out.push(r.sign(
+            2_000 + j as u64,
+            vec![],
+            WalkieOp::RemoveDegree { pitch: d },
+        ));
     }
     out
 }

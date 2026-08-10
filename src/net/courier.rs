@@ -235,7 +235,10 @@ impl CourierFrame {
                 }
             }
         }
-        debug_assert!(out.len() <= MAX_COURIER_FRAME_BYTES, "bounds imply the frame cap");
+        debug_assert!(
+            out.len() <= MAX_COURIER_FRAME_BYTES,
+            "bounds imply the frame cap"
+        );
         Ok(out)
     }
 
@@ -425,10 +428,7 @@ impl TrackedDiscardHistory {
     /// Copy every not-yet-tracked batch out of `leaf`'s journal, in order.
     /// Returns how many were copied, or [`JournalGap`] if the journal's oldest
     /// retained batch is already past this copy's horizon.
-    pub fn track<L: OpLanguage>(
-        &mut self,
-        leaf: &WindowedStore<L>,
-    ) -> Result<usize, JournalGap> {
+    pub fn track<L: OpLanguage>(&mut self, leaf: &WindowedStore<L>) -> Result<usize, JournalGap> {
         let mut copied = 0;
         for batch in leaf.discard_batches() {
             if batch.seq.0 < self.next_seq {
@@ -466,7 +466,10 @@ impl TrackedDiscardHistory {
         if self.current_root() != expected_root {
             return None;
         }
-        let idx = self.batches.iter().position(|batch| batch.contains(member))?;
+        let idx = self
+            .batches
+            .iter()
+            .position(|batch| batch.contains(member))?;
         let mut pinned_before = self.initial;
         for earlier in &self.batches[..idx] {
             pinned_before =
@@ -622,7 +625,9 @@ pub async fn exchange_courier<S: SyncStream>(
     let bytes = CourierFrame::Request(request.clone()).encode()?;
     stream.send_frame(&bytes).await?;
     let Some(frame) = stream.recv_frame().await? else {
-        return Err(SyncError::Session("courier peer closed without answering".into()));
+        return Err(SyncError::Session(
+            "courier peer closed without answering".into(),
+        ));
     };
     let response = match CourierFrame::decode(&frame)? {
         CourierFrame::Response(response) => response,
@@ -814,16 +819,35 @@ mod tests {
         let mut offline = Store::<MusicLang>::new();
 
         // 1. P, fed to leaf, full, and offline.
-        let p_signed = full.commit(&key_a, TOPIC, 1, MusicOp::AddDegree { degree: tet_degree(0) });
+        let p_signed = full.commit(
+            &key_a,
+            TOPIC,
+            1,
+            MusicOp::AddDegree {
+                degree: tet_degree(0),
+            },
+        );
         let p_id = verify(&p_signed).id();
         leaf.ingest_verified(verify(&p_signed));
         offline.ingest_verified(verify(&p_signed));
 
         // 2. The removes that consume P — fed to leaf and full, NOT offline.
-        let r1_signed =
-            full.commit(&key_a, TOPIC, 2, MusicOp::RemoveDegree { degree: tet_degree(0) });
-        let r2_signed =
-            full.commit(&key_a, TOPIC, 3, MusicOp::RemoveDegree { degree: tet_degree(0) });
+        let r1_signed = full.commit(
+            &key_a,
+            TOPIC,
+            2,
+            MusicOp::RemoveDegree {
+                degree: tet_degree(0),
+            },
+        );
+        let r2_signed = full.commit(
+            &key_a,
+            TOPIC,
+            3,
+            MusicOp::RemoveDegree {
+                degree: tet_degree(0),
+            },
+        );
         leaf.ingest_verified(verify(&r1_signed));
         leaf.ingest_verified(verify(&r2_signed));
         let p_entry = leaf.lifted_entry(p_id).expect("P lifted");
@@ -831,18 +855,29 @@ mod tests {
         // 3. The real compaction: {P, r1} is one non-empty discard batch; with
         //    reach cap 1 the second discarded row evicts P's.
         let stats = leaf.compact();
-        assert_eq!(stats.discarded, 2, "the add and the consumed remove discard");
+        assert_eq!(
+            stats.discarded, 2,
+            "the add and the consumed remove discard"
+        );
         assert_eq!(leaf.courier_gap_entries(), 1, "reach cap enforced");
 
         // 4. The fuller peer copies the leaf's exposed batch journal.
         let mut tracked = TrackedDiscardHistory::new();
-        let copied = tracked.track(&leaf).expect("journal copy is seq-continuous");
+        let copied = tracked
+            .track(&leaf)
+            .expect("journal copy is seq-continuous");
         assert_eq!(copied, 1, "one discard batch journaled");
         assert_eq!(Some(tracked.current_root()), leaf.discard_root());
 
         // 5. Offline author B writes the deep laggard X with P on its frontier.
-        let x_signed =
-            offline.commit(&key_b, TOPIC, 10, MusicOp::AddDegree { degree: tet_degree(7) });
+        let x_signed = offline.commit(
+            &key_b,
+            TOPIC,
+            10,
+            MusicOp::AddDegree {
+                degree: tet_degree(7),
+            },
+        );
         let x_id = verify(&x_signed).id();
         full.ingest_verified(verify(&x_signed));
         let x_wire_hash = full.lifted_entry(x_id).expect("full lifts X");
@@ -850,14 +885,13 @@ mod tests {
         // 6. X reaches the leaf through the production windowed ingest_pairs path.
         let pairs = vec![(
             x_wire_hash,
-            x_signed.to_wire_bytes_in::<MusicLang>().expect("X serializes"),
+            x_signed
+                .to_wire_bytes_in::<MusicLang>()
+                .expect("X serializes"),
         )];
-        let report = ingest_pairs::<MusicLang, _>(
-            &mut leaf,
-            TOPIC,
-            pairs.iter().map(IncomingOp::from),
-        )
-        .unwrap();
+        let report =
+            ingest_pairs::<MusicLang, _>(&mut leaf, TOPIC, pairs.iter().map(IncomingOp::from))
+                .unwrap();
 
         // Pre-courier assertions (design C).
         assert_eq!(leaf.pending_len(), 1);
@@ -942,7 +976,10 @@ mod tests {
             .await;
             served.expect("responder serves one exchange");
             let response = wire.expect("wire round trip");
-            assert!(response.result.is_ok(), "the genuine answer is not a refusal");
+            assert!(
+                response.result.is_ok(),
+                "the genuine answer is not a refusal"
+            );
 
             // Reacquire the leaf after the round trip and admit.
             apply_courier_response(
@@ -961,7 +998,11 @@ mod tests {
             fx.full.lifted_entry(fx.x_id),
             "byte-compatible admission: leaf and full derive the same entry hash"
         );
-        assert_eq!(fx.leaf.view(), fx.full.view(), "full-reference view equivalence");
+        assert_eq!(
+            fx.leaf.view(),
+            fx.full.view(),
+            "full-reference view equivalence"
+        );
         assert_eq!(
             state_root(&fx.leaf.view()),
             state_root(&fx.full.view()),
@@ -1008,9 +1049,8 @@ mod tests {
             let (request, sent_context) =
                 courier_request_for(&fx.leaf, fx.p_entry).expect("leaf has a courier context");
 
-            let (wire, ()) = futures::future::join(
-                exchange_courier(&mut requester_stream, &request),
-                async {
+            let (wire, ()) =
+                futures::future::join(exchange_courier(&mut requester_stream, &request), async {
                     // The REAL responder generates the genuine proof; ONE bit of
                     // `pinned_before` is flipped before encoding.
                     let frame = responder_stream
@@ -1027,9 +1067,8 @@ mod tests {
                     answer.pinned_before[0] ^= 1;
                     let bytes = CourierFrame::Response(response).encode().unwrap();
                     responder_stream.send_frame(&bytes).await.unwrap();
-                },
-            )
-            .await;
+                })
+                .await;
             let response = wire.expect("the forged frame still decodes and echoes");
 
             apply_courier_response(
@@ -1051,7 +1090,11 @@ mod tests {
         assert!(fx.leaf.lifted_entry(fx.x_id).is_none(), "nothing admitted");
         assert_eq!(fx.leaf.view(), before_view, "view unchanged");
         assert_eq!(state_root(&fx.leaf.view()), before_root, "root unchanged");
-        assert_eq!(fx.leaf.sync_root(), before_sync_root, "identity set unchanged");
+        assert_eq!(
+            fx.leaf.sync_root(),
+            before_sync_root,
+            "identity set unchanged"
+        );
     }
 
     /// A responder refusal (here: a root the responder does not track) is a
@@ -1097,7 +1140,11 @@ mod tests {
             result,
             Err(DeferredLiftError::Courier(CourierFault::Unanswered(hash))) if hash == fx.p_entry
         ));
-        assert_eq!(fx.leaf.pending_len(), 1, "still parked; a later peer may answer");
+        assert_eq!(
+            fx.leaf.pending_len(),
+            1,
+            "still parked; a later peer may answer"
+        );
     }
 
     /// The one-shot requester wiring (`lift_deferred_over_stream`) drives the
@@ -1187,10 +1234,7 @@ mod tests {
     #[test]
     fn the_codec_rejects_malformed_frames() {
         // Unsorted / duplicate retained sets never encode…
-        for retained in [
-            vec![hash_of(2), hash_of(1)],
-            vec![hash_of(1), hash_of(1)],
-        ] {
+        for retained in [vec![hash_of(2), hash_of(1)], vec![hash_of(1), hash_of(1)]] {
             let frame = CourierFrame::Request(CourierRequest {
                 missing_prev: hash_of(7),
                 context: CourierContextWire {
@@ -1198,7 +1242,10 @@ mod tests {
                     retained,
                 },
             });
-            assert!(frame.encode().is_err(), "unsorted/duplicate must not encode");
+            assert!(
+                frame.encode().is_err(),
+                "unsorted/duplicate must not encode"
+            );
         }
         // …and never decode either (a hostile peer skips our encoder).
         let good = CourierFrame::Request(CourierRequest {
@@ -1272,8 +1319,7 @@ mod tests {
             history: &fx.tracked,
             full: &fx.full,
         };
-        let (request, sent_context) =
-            courier_request_for(&fx.leaf, fx.p_entry).expect("context");
+        let (request, sent_context) = courier_request_for(&fx.leaf, fx.p_entry).expect("context");
         let genuine = responder.answer(&request);
 
         // Wrong length.

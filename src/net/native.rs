@@ -25,16 +25,16 @@ use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use super::iroh_common::{
-    EVENT_QUEUE_DEPTH, EXTENSION_COURIER_ALPN, EXTENSION_RBSR_ALPN,
-    MAX_GOSSIP_MESSAGE_BYTES, MUSIC_COURIER_ALPN, MUSIC_RBSR_ALPN, NativeNetError,
-    NativeNetworkEvent, NativeRoomNetworkConfig, NativeRoomTicketV4, PeerTransportPath,
-    REPAIR_ACCEPT_TIMEOUT, REPAIR_QUEUE_DEPTH, ROOM_V4_ALPNS, RoomTopic, classify_peer_path,
-    peer_of, room_mdns_service_name_v4,
+    EVENT_QUEUE_DEPTH, EXTENSION_COURIER_ALPN, EXTENSION_RBSR_ALPN, MAX_GOSSIP_MESSAGE_BYTES,
+    MUSIC_COURIER_ALPN, MUSIC_RBSR_ALPN, NativeNetError, NativeNetworkEvent,
+    NativeRoomNetworkConfig, NativeRoomTicketV4, PeerTransportPath, REPAIR_ACCEPT_TIMEOUT,
+    REPAIR_QUEUE_DEPTH, ROOM_V4_ALPNS, RoomTopic, classify_peer_path, peer_of,
+    room_mdns_service_name_v4,
 };
 use super::repair::IrohSyncStream;
 use super::{LaneProtocol, PeerId, Transport, TransportError, TransportEvent, TransportMode};
-use crate::room::v4::LaneSet;
 use crate::client::{DiscoverySource, PeerPath};
+use crate::room::v4::LaneSet;
 
 /// A bound native Iroh endpoint and its active gossip topic.
 pub struct NativeRoomNetwork {
@@ -426,18 +426,16 @@ impl ProtocolHandler for RepairProtocol {
         // than making the room loop await it: `Transport::next_event` hands out
         // a ready stream, and a peer that dials without opening one wastes only
         // its own connection.
-        let stream = match tokio::time::timeout(
-            REPAIR_ACCEPT_TIMEOUT,
-            IrohSyncStream::accept(&connection),
-        )
-        .await
-        {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(_)) | Err(_) => {
-                connection.close(3u32.into(), b"no repair stream");
-                return Ok(());
-            }
-        };
+        let stream =
+            match tokio::time::timeout(REPAIR_ACCEPT_TIMEOUT, IrohSyncStream::accept(&connection))
+                .await
+            {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(_)) | Err(_) => {
+                    connection.close(3u32.into(), b"no repair stream");
+                    return Ok(());
+                }
+            };
         // Reject rather than queue when the app is already saturated: a dropped
         // dial is recoverable, an unbounded backlog of live QUIC state is not.
         // Note this returns as soon as the connection is handed off, so the
@@ -510,7 +508,9 @@ impl Transport for NativeRoomNetwork {
                 // The connection rides along on the stream so QUIC state
                 // outlives the handler task that accepted it.
                 let Some(protocol) = LaneProtocol::from_alpn(repair.alpn) else {
-                    repair.connection.close(4u32.into(), b"unsupported lane protocol");
+                    repair
+                        .connection
+                        .close(4u32.into(), b"unsupported lane protocol");
                     return Some(TransportEvent::Diagnostic(format!(
                         "accepted unrecognized ALPN {}",
                         String::from_utf8_lossy(repair.alpn)
@@ -528,33 +528,33 @@ impl Transport for NativeRoomNetwork {
         // diagnostics rather than dropped, so a backend swap does not lose
         // observability.
         Some(match native {
-                NativeNetworkEvent::NeighborUp {
-                    endpoint_id,
-                    discovery,
-                } => TransportEvent::PeerUp {
-                    peer: peer_of(endpoint_id),
-                    discovery,
-                },
-                NativeNetworkEvent::NeighborDown { endpoint_id } => TransportEvent::PeerDown {
-                    peer: peer_of(endpoint_id),
-                },
-                NativeNetworkEvent::Message {
-                    delivered_from,
-                    bytes,
-                } => TransportEvent::Message {
-                    from: peer_of(delivered_from),
-                    bytes,
-                },
-                NativeNetworkEvent::Lagged => TransportEvent::Lagged,
-                NativeNetworkEvent::Closed => TransportEvent::Closed,
-                NativeNetworkEvent::Diagnostic(message) => TransportEvent::Diagnostic(message),
-                NativeNetworkEvent::MdnsDiscovered { endpoint_id } => {
-                    TransportEvent::Diagnostic(format!("mdns discovered {endpoint_id}"))
-                }
-                NativeNetworkEvent::MdnsExpired { endpoint_id } => {
-                    TransportEvent::Diagnostic(format!("mdns expired {endpoint_id}"))
-                }
-            })
+            NativeNetworkEvent::NeighborUp {
+                endpoint_id,
+                discovery,
+            } => TransportEvent::PeerUp {
+                peer: peer_of(endpoint_id),
+                discovery,
+            },
+            NativeNetworkEvent::NeighborDown { endpoint_id } => TransportEvent::PeerDown {
+                peer: peer_of(endpoint_id),
+            },
+            NativeNetworkEvent::Message {
+                delivered_from,
+                bytes,
+            } => TransportEvent::Message {
+                from: peer_of(delivered_from),
+                bytes,
+            },
+            NativeNetworkEvent::Lagged => TransportEvent::Lagged,
+            NativeNetworkEvent::Closed => TransportEvent::Closed,
+            NativeNetworkEvent::Diagnostic(message) => TransportEvent::Diagnostic(message),
+            NativeNetworkEvent::MdnsDiscovered { endpoint_id } => {
+                TransportEvent::Diagnostic(format!("mdns discovered {endpoint_id}"))
+            }
+            NativeNetworkEvent::MdnsExpired { endpoint_id } => {
+                TransportEvent::Diagnostic(format!("mdns expired {endpoint_id}"))
+            }
+        })
     }
 
     async fn open_lane(

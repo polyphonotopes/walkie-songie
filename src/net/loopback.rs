@@ -230,9 +230,15 @@ mod tests {
             };
 
             mine.send_frame(b"ping").await.unwrap();
-            assert_eq!(theirs.recv_frame().await.unwrap().as_deref(), Some(&b"ping"[..]));
+            assert_eq!(
+                theirs.recv_frame().await.unwrap().as_deref(),
+                Some(&b"ping"[..])
+            );
             theirs.send_frame(b"pong").await.unwrap();
-            assert_eq!(mine.recv_frame().await.unwrap().as_deref(), Some(&b"pong"[..]));
+            assert_eq!(
+                mine.recv_frame().await.unwrap().as_deref(),
+                Some(&b"pong"[..])
+            );
 
             theirs.close().await;
             assert_eq!(mine.recv_frame().await.unwrap(), None, "clean EOF");

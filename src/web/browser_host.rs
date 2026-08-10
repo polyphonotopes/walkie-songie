@@ -34,9 +34,8 @@ use web_time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     client::{
-        AppError, AppErrorCode, AppEvent, AppEventEnvelope, AppSnapshot, Capabilities,
-        CLIENT_PROTOCOL_VERSION, ClientCommand, CommandAck, DiscoverySource, PeerPath,
-        PeerSnapshot,
+        AppError, AppErrorCode, AppEvent, AppEventEnvelope, AppSnapshot, CLIENT_PROTOCOL_VERSION,
+        Capabilities, ClientCommand, CommandAck, DiscoverySource, PeerPath, PeerSnapshot,
     },
     is_valid_room_name,
     net::{
@@ -280,11 +279,13 @@ impl BrowserHost {
                 pieces_locked,
                 available_emojis,
             } => {
-                self.submit_durable(ExtensionOp::SetConfig {
-                    pieces_locked,
-                    available_emojis,
-                }
-                .into())
+                self.submit_durable(
+                    ExtensionOp::SetConfig {
+                        pieces_locked,
+                        available_emojis,
+                    }
+                    .into(),
+                )
                 .await
             }
             ClientCommand::SetVoicePreview { session, pitch } => {
@@ -484,15 +485,9 @@ impl BrowserHost {
                 loop {
                     match control_rx.next().await {
                         Some(RoomControl::Commit { op, response }) => {
-                            let result = commit_room_op(
-                                &durable,
-                                &signing_key,
-                                &topic,
-                                op,
-                                &handle,
-                                &host,
-                            )
-                            .await;
+                            let result =
+                                commit_room_op(&durable, &signing_key, &topic, op, &handle, &host)
+                                    .await;
                             let _ = response.send(
                                 result.map(|accepted_sequence| CommandAck { accepted_sequence }),
                             );
@@ -503,8 +498,7 @@ impl BrowserHost {
                             response,
                         }) => {
                             if session == local_presence_session {
-                                local_presence_sequence =
-                                    local_presence_sequence.saturating_add(1);
+                                local_presence_sequence = local_presence_sequence.saturating_add(1);
                             } else {
                                 local_presence_session = session;
                                 local_presence_sequence = 0;
@@ -525,10 +519,8 @@ impl BrowserHost {
                                         .verify(presence_topic)
                                         .expect("just-signed presence verifies")
                                         .body;
-                                    let expires =
-                                        now.saturating_add(u64::from(body.lease_ms));
-                                    let author =
-                                        AuthorId(*signing_key.verifying_key().as_bytes());
+                                    let expires = now.saturating_add(u64::from(body.lease_ms));
+                                    let author = AuthorId(*signing_key.verifying_key().as_bytes());
                                     presence_order.borrow_mut().insert(
                                         author,
                                         (body.session, body.sequence, body.issued_at_ms, expires),
@@ -806,8 +798,7 @@ impl BrowserHost {
                                 .collect::<Vec<_>>();
                             for endpoint_id in endpoint_ids {
                                 if own_endpoint.as_bytes() < endpoint_id.as_bytes() {
-                                    let advertised =
-                                        peer_lanes.borrow().get(&endpoint_id).copied();
+                                    let advertised = peer_lanes.borrow().get(&endpoint_id).copied();
                                     spawn_repair_round(
                                         host.clone(),
                                         durable.clone(),
@@ -1461,12 +1452,9 @@ impl<P: BrowserLane> BrowserLaneAccess<P> {
                 )?
             };
             if staged_journal.len() != before {
-                super::storage::set_op_journal_v4(
-                    &durable.topic_hex,
-                    staged_journal.records(),
-                )
-                .await
-                .map_err(SyncError::Persistence)?;
+                super::storage::set_op_journal_v4(&durable.topic_hex, staged_journal.records())
+                    .await
+                    .map_err(SyncError::Persistence)?;
             }
             let view = staged_room.view();
             durable.room = staged_room;
@@ -1504,19 +1492,12 @@ impl<P: BrowserLane> LaneStoreAccess<P::Lang> for BrowserLaneAccess<P> {
                     journal: &mut staged_journal,
                     lane: PhantomData,
                 };
-                ingest_pairs::<P::Lang, _>(
-                    &mut sink,
-                    topic,
-                    pairs.iter().map(IncomingOp::from),
-                )?
+                ingest_pairs::<P::Lang, _>(&mut sink, topic, pairs.iter().map(IncomingOp::from))?
             };
             if staged_journal.len() != before {
-                super::storage::set_op_journal_v4(
-                    &durable.topic_hex,
-                    staged_journal.records(),
-                )
-                .await
-                .map_err(SyncError::Persistence)?;
+                super::storage::set_op_journal_v4(&durable.topic_hex, staged_journal.records())
+                    .await
+                    .map_err(SyncError::Persistence)?;
             }
             source.absorb(P::store(&staged_room), &report.lifted)?;
             let view = staged_room.view();
@@ -1729,14 +1710,8 @@ async fn dial_and_run<P: BrowserLane>(
         }
     };
     let telemetry = connection.clone();
-    let result = run_repair_session::<P>(
-        stream.owning(connection),
-        true,
-        durable,
-        topic,
-        host,
-    )
-    .await;
+    let result =
+        run_repair_session::<P>(stream.owning(connection), true, durable, topic, host).await;
     Some((telemetry, result))
 }
 
@@ -1766,7 +1741,11 @@ fn spawn_courier<P: BrowserLane>(
         let endpoint_id = repair.endpoint_id;
         let mut stream = repair.stream.owning(repair.connection);
         let result: Result<(), String> = async {
-            let Some(frame) = stream.recv_frame().await.map_err(|error| error.to_string())? else {
+            let Some(frame) = stream
+                .recv_frame()
+                .await
+                .map_err(|error| error.to_string())?
+            else {
                 return Ok(());
             };
             let request = match CourierFrame::decode(&frame).map_err(|error| error.to_string())? {

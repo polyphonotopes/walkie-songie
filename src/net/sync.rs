@@ -50,16 +50,15 @@ use std::time::Duration;
 
 use futures::future::{Either, select};
 use hhhs_sync::{
-    EntryHash, SortKey,
+    EntryHash, SortKey, StrategyId,
     reconciliation::{Config, Index, SessionHello},
-    StrategyId,
     sync_session::{
         EntrySource, SessionBudget, SessionError, SessionStatus, SyncMessage, SyncSession,
     },
 };
 use tutti_core::{
-    DeferredLift, OpId, OpLanguage, SignedOp, SignedOpWireError, Store, VerifiedOpG,
-    WindowIngest, WindowedStore, sync_root_of, verify_signed_op_in,
+    DeferredLift, OpId, OpLanguage, SignedOp, SignedOpWireError, Store, VerifiedOpG, WindowIngest,
+    WindowedStore, sync_root_of, verify_signed_op_in,
 };
 
 use super::{SyncStream, TransportError};
@@ -353,14 +352,22 @@ impl<L: OpLanguage> LaneSyncSource<L> {
     /// re-serialization plus full index rebuild — which the driver used to run
     /// once per `Entries` frame. Index, records and root move together, so the
     /// consistency invariant holds through the update as well as at capture.
-    pub fn absorb(&mut self, store: &Store<L>, lifted: &[EntryHash]) -> Result<(), SignedOpWireError> {
+    pub fn absorb(
+        &mut self,
+        store: &Store<L>,
+        lifted: &[EntryHash],
+    ) -> Result<(), SignedOpWireError> {
         let mut changed = false;
         for hash in lifted {
             if self.records.contains_key(hash) {
                 continue;
             }
             let Some((signed, predecessors)) = store.repair_record(hash) else {
-                debug_assert!(false, "store reported lifting {} but has no record", hash.to_hex());
+                debug_assert!(
+                    false,
+                    "store reported lifting {} but has no record",
+                    hash.to_hex()
+                );
                 continue;
             };
             let bytes = signed.to_wire_bytes_in::<L>()?;
@@ -1150,15 +1157,15 @@ mod tests {
         left: &mut RoomStore,
         right: &mut RoomStore,
         limits: SyncLimits,
-    ) -> (Result<SyncOutcome, SyncError>, Result<SyncOutcome, SyncError>) {
+    ) -> (
+        Result<SyncOutcome, SyncError>,
+        Result<SyncOutcome, SyncError>,
+    ) {
         let (a, mut b) = loopback_pair();
         futures::executor::block_on(async {
             // The dial side opens a stream; the accept side sees LaneRequested.
             let initiator_stream = a
-                .open_lane(
-                    a.remote_id(),
-                    LaneProtocol::Repair(RoomLane::Music),
-                )
+                .open_lane(a.remote_id(), LaneProtocol::Repair(RoomLane::Music))
                 .await
                 .unwrap();
             // Dispatch on event type exactly as the real room loop does: the
@@ -1171,10 +1178,20 @@ mod tests {
                 }
             };
 
-            let initiator =
-                drive_initiator::<WalkieLane, _, _, _>(initiator_stream, &NoTimeout, left, TOPIC, limits);
-            let responder =
-                drive_responder::<WalkieLane, _, _, _>(responder_stream, &NoTimeout, right, TOPIC, limits);
+            let initiator = drive_initiator::<WalkieLane, _, _, _>(
+                initiator_stream,
+                &NoTimeout,
+                left,
+                TOPIC,
+                limits,
+            );
+            let responder = drive_responder::<WalkieLane, _, _, _>(
+                responder_stream,
+                &NoTimeout,
+                right,
+                TOPIC,
+                limits,
+            );
             futures::future::join(initiator, responder).await
         })
     }
@@ -1194,7 +1211,11 @@ mod tests {
             right.entry_hashes(),
             "entry-hash identity sets must match after sync"
         );
-        assert_eq!(left.view(), right.view(), "read models must match after sync");
+        assert_eq!(
+            left.view(),
+            right.view(),
+            "read models must match after sync"
+        );
         assert_eq!(left.pending_len(), 0, "left must fully drain");
         assert_eq!(right.pending_len(), 0, "right must fully drain");
         assert_eq!(
@@ -1394,7 +1415,8 @@ mod tests {
 
     impl SyncStream for &mut ScriptedPeer {
         async fn send_frame(&mut self, frame: &[u8]) -> Result<(), TransportError> {
-            self.sent.push(SyncMessage::decode(frame).expect("driver emits valid frames"));
+            self.sent
+                .push(SyncMessage::decode(frame).expect("driver emits valid frames"));
             Ok(())
         }
 
@@ -1497,10 +1519,8 @@ mod tests {
     #[test]
     fn an_elapsed_deadline_does_not_discard_buffered_frames() {
         let mut store = RoomStore::new();
-        let mut peer = ScriptedPeer::hanging_up(vec![
-            SyncMessage::Ack(0),
-            SyncMessage::Done { root: None },
-        ]);
+        let mut peer =
+            ScriptedPeer::hanging_up(vec![SyncMessage::Ack(0), SyncMessage::Done { root: None }]);
         let outcome = futures::executor::block_on(drive_initiator::<WalkieLane, _, _, _>(
             &mut peer,
             &Expired,
@@ -1588,7 +1608,9 @@ mod tests {
 
         let mut lying = ScriptedPeer::hanging_up(vec![
             SyncMessage::Ack(0),
-            SyncMessage::Done { root: Some([9; 32]) },
+            SyncMessage::Done {
+                root: Some([9; 32]),
+            },
         ]);
         let mismatched = futures::executor::block_on(drive_initiator::<WalkieLane, _, _, _>(
             &mut lying,
@@ -1606,7 +1628,10 @@ mod tests {
             !mismatched.incomplete,
             "a divergent run still finished; it must close, not hang or error"
         );
-        assert!(lying.closed, "the stream must be closed on the divergent path");
+        assert!(
+            lying.closed,
+            "the stream must be closed on the divergent path"
+        );
     }
 
     #[test]
@@ -1664,8 +1689,7 @@ mod tests {
 
         // Garbage is refused: not admitted, so the kernel may re-ask.
         let garbage = vec![(bogus_hash(0xAA), vec![0xFF; 16])];
-        let report =
-            ingest_pairs(&mut store, TOPIC, garbage.iter().map(IncomingOp::from)).unwrap();
+        let report = ingest_pairs(&mut store, TOPIC, garbage.iter().map(IncomingOp::from)).unwrap();
         assert!(report.admitted.is_empty(), "garbage must never be admitted");
         assert!(report.lifted.is_empty());
 
@@ -1715,7 +1739,10 @@ mod tests {
         add_degrees(&mut store, &[15; 32], &[0], 1);
         let first = salt_of_first_hello(&mut store);
         let second = salt_of_first_hello(&mut store);
-        assert_ne!(first, second, "a reused salt is a permanent collision oracle");
+        assert_ne!(
+            first, second,
+            "a reused salt is a permanent collision oracle"
+        );
         assert_ne!(first, [0; 16]);
     }
 
@@ -2026,8 +2053,12 @@ mod tests {
             .map(|(hash, (bytes, _))| (*hash, bytes.clone()))
             .collect();
         let mut foreign = Store::<ExtensionLang>::new();
-        let report =
-            ingest_pairs(&mut foreign, TOPIC, music_pairs.iter().map(IncomingOp::from)).unwrap();
+        let report = ingest_pairs(
+            &mut foreign,
+            TOPIC,
+            music_pairs.iter().map(IncomingOp::from),
+        )
+        .unwrap();
         assert!(report.admitted.is_empty(), "nothing admits cross-lane");
         assert!(report.lifted.is_empty(), "nothing lifts cross-lane");
         assert!(foreign.is_empty());
@@ -2083,7 +2114,9 @@ mod tests {
         let id_a = verify_signed_op_in::<L>(&signed_a).unwrap().id();
         let id_b = verify_signed_op_in::<L>(&signed_b).unwrap().id();
         let hash_a = donor.lifted_entry(id_a).expect("op_a lifts in the donor");
-        let hash_b = donor.lifted_entry(id_b).expect("op_b lifts in the donor (observes op_a)");
+        let hash_b = donor
+            .lifted_entry(id_b)
+            .expect("op_b lifts in the donor (observes op_a)");
         let wire_a = signed_a.to_wire_bytes_in::<L>().unwrap();
         let wire_b = signed_b.to_wire_bytes_in::<L>().unwrap();
 
@@ -2151,7 +2184,11 @@ mod tests {
             }],
         )
         .unwrap();
-        assert_eq!(report.admitted, vec![hash_b], "parked is kept under the claim");
+        assert_eq!(
+            report.admitted,
+            vec![hash_b],
+            "parked is kept under the claim"
+        );
         assert!(report.lifted.is_empty(), "parked is not lifted");
         assert_eq!(fresh.pending_len(), 1);
 
@@ -2196,7 +2233,10 @@ mod tests {
             }],
         )
         .unwrap();
-        assert!(report.admitted.is_empty(), "cross-lane wire is never admitted");
+        assert!(
+            report.admitted.is_empty(),
+            "cross-lane wire is never admitted"
+        );
         assert!(cross_lane.is_empty());
 
         // persistence-refusal: verified fine, but the sink refuses to persist.

@@ -5,7 +5,7 @@
 
 mod support;
 
-use support::{random_op, Policy, Rng, SimNet};
+use support::{Policy, Rng, SimNet, random_op};
 
 /// W7 — late joiner catch-up. C is isolated while A and B commit ~50 ops; C joins
 /// and reconciles to an identical view / entry-hash set in a small round count.
@@ -30,13 +30,20 @@ fn w7_late_joiner_catch_up() {
     net.step_until_quiescent();
 
     net.assert_converged();
-    assert_eq!(net.store("C").view(), net.view("A"), "C's view matches A after catch-up");
+    assert_eq!(
+        net.store("C").view(),
+        net.view("A"),
+        "C's view matches A after catch-up"
+    );
     assert_eq!(
         net.store("C").entry_hashes(),
         net.store("A").entry_hashes(),
         "C's entry-hash set matches A",
     );
-    assert!(rounds < 60, "RBSR catch-up round count stays small (got {rounds})");
+    assert!(
+        rounds < 60,
+        "RBSR catch-up round count stays small (got {rounds})"
+    );
 }
 
 /// W12 — offline peer full catch-up. C is offline for 100 ops (A/B commit and

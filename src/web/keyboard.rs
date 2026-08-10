@@ -795,7 +795,8 @@ fn setup_piece_sync(state: Arc<AppState>, keyboard_el: web_sys::HtmlElement) {
                     raf_pending.set(true);
                     if let Some(win) = web_sys::window() {
                         if let Some(cb) = raf_cb.borrow().as_ref() {
-                            win.request_animation_frame(cb.as_ref().unchecked_ref()).ok();
+                            win.request_animation_frame(cb.as_ref().unchecked_ref())
+                                .ok();
                         }
                     }
                 }
