@@ -12,7 +12,7 @@ publish = false
 # needed here, the music lane would not be joinable by an independent device
 # (an ESP32), and the two-lane design would be broken.
 [dependencies]
-tutti-core = { git = "https://github.com/polyphonotopes/tutti.git", rev = "8596940" }
-tutti-music = { git = "https://github.com/polyphonotopes/tutti.git", rev = "8596940" }
-hhhs-sync = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "3253082", features = ["wire"] }
+tutti-core = { git = "https://github.com/polyphonotopes/tutti.git", rev = "7c45571" }
+tutti-music = { git = "https://github.com/polyphonotopes/tutti.git", rev = "7c45571" }
+hhhs-sync = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "82b9ddb", features = ["wire"] }
 futures = "0.3"

@@ -2830,7 +2830,7 @@ dependencies = [
 [[package]]
 name = "hhhs"
 version = "0.3.0"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?rev=3253082#3253082d648edf7db8aa9e6474e1d3d13e75ac86"
+source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?rev=82b9ddb#82b9ddbbf980fd0307434b606ea8c7bd60e4edfc"
 dependencies = [
  "hhhs-dag",
 ]
@@ -2838,7 +2838,7 @@ dependencies = [
 [[package]]
 name = "hhhs-dag"
 version = "0.3.0"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?rev=3253082#3253082d648edf7db8aa9e6474e1d3d13e75ac86"
+source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?rev=82b9ddb#82b9ddbbf980fd0307434b606ea8c7bd60e4edfc"
 dependencies = [
  "blake3",
  "serde",
@@ -2847,7 +2847,7 @@ dependencies = [
 [[package]]
 name = "hhhs-reactive"
 version = "0.3.0"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?rev=3253082#3253082d648edf7db8aa9e6474e1d3d13e75ac86"
+source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?rev=82b9ddb#82b9ddbbf980fd0307434b606ea8c7bd60e4edfc"
 dependencies = [
  "futures",
  "futures-signals",
@@ -2857,7 +2857,7 @@ dependencies = [
 [[package]]
 name = "hhhs-sync"
 version = "0.3.0"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?rev=3253082#3253082d648edf7db8aa9e6474e1d3d13e75ac86"
+source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?rev=82b9ddb#82b9ddbbf980fd0307434b606ea8c7bd60e4edfc"
 dependencies = [
  "hhhs-dag",
  "postcard",
@@ -7641,7 +7641,7 @@ dependencies = [
 [[package]]
 name = "tutti-core"
 version = "0.1.0"
-source = "git+https://github.com/polyphonotopes/tutti.git?rev=8596940#85969406a5caf48ab5dc285324279d5f10e8a0cd"
+source = "git+https://github.com/polyphonotopes/tutti.git?rev=7c45571#7c4557111eb6d2e532e429f4aa9c2d1c30094218"
 dependencies = [
  "blake3",
  "getrandom 0.2.16",
@@ -7656,7 +7656,7 @@ dependencies = [
 [[package]]
 name = "tutti-midi"
 version = "0.1.0"
-source = "git+https://github.com/polyphonotopes/tutti.git?rev=8596940#85969406a5caf48ab5dc285324279d5f10e8a0cd"
+source = "git+https://github.com/polyphonotopes/tutti.git?rev=7c45571#7c4557111eb6d2e532e429f4aa9c2d1c30094218"
 dependencies = [
  "thiserror 2.0.19",
  "tutti-music",
@@ -7665,7 +7665,7 @@ dependencies = [
 [[package]]
 name = "tutti-music"
 version = "0.1.0"
-source = "git+https://github.com/polyphonotopes/tutti.git?rev=8596940#85969406a5caf48ab5dc285324279d5f10e8a0cd"
+source = "git+https://github.com/polyphonotopes/tutti.git?rev=7c45571#7c4557111eb6d2e532e429f4aa9c2d1c30094218"
 dependencies = [
  "blake3",
  "serde",

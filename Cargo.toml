@@ -156,24 +156,24 @@ yrs = "0.21"
 # machinery, the `Store<L>`/`FoldCtx`/`OpLanguage` fold seam, and the generic
 # `ops_root` Merkle layer. `src/room/` re-exports it so `WalkieLang` is the sole
 # instantiation and no external call site moves. Wasm-safe (no tokio/iroh).
-tutti-core = { git = "https://github.com/polyphonotopes/tutti.git", rev = "8596940" }
+tutti-core = { git = "https://github.com/polyphonotopes/tutti.git", rev = "7c45571" }
 
 # The music protocol (tutti Phase II): tuning identity (`crate::tuning` re-exports
 # it), the MusicOp/MusicLang reference wire, the fold combinators `walkie_fold`
 # drives, and the render seam. Wasm-safe.
-tutti-music = { git = "https://github.com/polyphonotopes/tutti.git", rev = "8596940" }
+tutti-music = { git = "https://github.com/polyphonotopes/tutti.git", rev = "7c45571" }
 
 # The reactive MIDI bridge: walkie's source-balanced ledger + input tracker
 # (promoted; `src/midi` re-exports them) and the reconcile-on-reconnect core.
-tutti-midi = { git = "https://github.com/polyphonotopes/tutti.git", rev = "8596940" }
+tutti-midi = { git = "https://github.com/polyphonotopes/tutti.git", rev = "7c45571" }
 
 # P2P rewrite: signed operation log (p2panda-core) + HHHS causal read model.
 # p2panda-core and HHHS are wasm-safe (no tokio/iroh); the native networking
 # stack (p2panda-net) and browser iroh transport are added target-gated below.
 p2panda-core = "0.7"
-hhhs = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "3253082" }
-hhhs-sync = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "3253082", features = ["wire"] }
-hhhs-reactive = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "3253082" }
+hhhs = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "82b9ddb" }
+hhhs-sync = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "82b9ddb", features = ["wire"] }
+hhhs-reactive = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "82b9ddb" }
 # futures-signals drives the HHHS reactive read model (room::mirror) on ALL targets
 # (native plugin + wasm UI); dominator (wasm-only, below) consumes the same signals.
 futures-signals = "0.3"
@@ -191,12 +191,12 @@ walkie-songie = { path = ".", default-features = false, features = ["test-suppor
 # `Store::dag`, the kernel-`ReachIndex` `CausalPast` backend) for the in-crate
 # `reach_equiv` equivalence tests. As a dev-dependency it is unified into the
 # `cargo test` build only, so a plain `cargo build` keeps tutti-core lean.
-tutti-core = { git = "https://github.com/polyphonotopes/tutti.git", rev = "8596940", features = ["test-support"] }
+tutti-core = { git = "https://github.com/polyphonotopes/tutti.git", rev = "7c45571", features = ["test-support"] }
 # Named directly by `tests/music_lane_interop.rs`, whose bare-peer half must be
 # spelled purely in tutti crates (an ESP32 knows nothing of walkie). Same pin as
 # the regular dependency, so the types unify.
-tutti-music = { git = "https://github.com/polyphonotopes/tutti.git", rev = "8596940" }
-hhhs-sync = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "3253082" }
+tutti-music = { git = "https://github.com/polyphonotopes/tutti.git", rev = "7c45571" }
+hhhs-sync = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "82b9ddb" }
 # The walkie-free music peer for the lane-isolation gate
 # (`tests/native_music_lane_e2e.rs`). Its OWN manifest must never name
 # walkie-songie — that absence is what the gate proves.
