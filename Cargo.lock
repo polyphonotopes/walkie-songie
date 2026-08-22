@@ -978,7 +978,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 2.0.111",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -2041,24 +2041,24 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hhhs"
-version = "0.4.0"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.0#c97c4399f8ac8ca65ba751bb38ca28d013fa299a"
+version = "0.4.1"
+source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.1#c55def92732ebe5dd1c00dcfb5d45027cb3e1f2c"
 dependencies = [
  "hhhs-dag",
 ]
 
 [[package]]
 name = "hhhs-cap"
-version = "0.4.0"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.0#c97c4399f8ac8ca65ba751bb38ca28d013fa299a"
+version = "0.4.1"
+source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.1#c55def92732ebe5dd1c00dcfb5d45027cb3e1f2c"
 dependencies = [
  "hhhs",
 ]
 
 [[package]]
 name = "hhhs-dag"
-version = "0.4.0"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.0#c97c4399f8ac8ca65ba751bb38ca28d013fa299a"
+version = "0.4.1"
+source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.1#c55def92732ebe5dd1c00dcfb5d45027cb3e1f2c"
 dependencies = [
  "blake3",
  "serde",
@@ -2066,8 +2066,8 @@ dependencies = [
 
 [[package]]
 name = "hhhs-proof"
-version = "0.4.0"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.0#c97c4399f8ac8ca65ba751bb38ca28d013fa299a"
+version = "0.4.1"
+source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.1#c55def92732ebe5dd1c00dcfb5d45027cb3e1f2c"
 dependencies = [
  "ed25519-dalek",
  "hhhs",
@@ -2076,8 +2076,8 @@ dependencies = [
 
 [[package]]
 name = "hhhs-replica"
-version = "0.4.0"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.0#c97c4399f8ac8ca65ba751bb38ca28d013fa299a"
+version = "0.4.1"
+source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.1#c55def92732ebe5dd1c00dcfb5d45027cb3e1f2c"
 dependencies = [
  "hhhs",
  "hhhs-cap",
@@ -2088,16 +2088,16 @@ dependencies = [
 
 [[package]]
 name = "hhhs-store"
-version = "0.4.0"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.0#c97c4399f8ac8ca65ba751bb38ca28d013fa299a"
+version = "0.4.1"
+source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.1#c55def92732ebe5dd1c00dcfb5d45027cb3e1f2c"
 dependencies = [
  "hhhs",
 ]
 
 [[package]]
 name = "hhhs-sync"
-version = "0.4.0"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.0#c97c4399f8ac8ca65ba751bb38ca28d013fa299a"
+version = "0.4.1"
+source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.1#c55def92732ebe5dd1c00dcfb5d45027cb3e1f2c"
 dependencies = [
  "blake3",
  "futures",
@@ -5284,6 +5284,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b64191b275b66ffe2469e8af2c1cfe3bafa67b529ead792a6d0160888b4237"
 dependencies = [
  "proc-macro2",
+ "quote",
  "unicode-ident",
 ]
 
@@ -6170,7 +6171,7 @@ dependencies = [
 [[package]]
 name = "tutti-midi"
 version = "0.1.0"
-source = "git+https://github.com/polyphonotopes/tutti.git?tag=v0.4.0#163a5ff0022f401725be8dc1954669d0fd90d335"
+source = "git+https://github.com/polyphonotopes/tutti.git?tag=v0.4.2#ac39dff62c85ba3643c500f4ffb0af96e5420dd5"
 dependencies = [
  "thiserror 2.0.19",
  "tutti-music",
@@ -6179,7 +6180,7 @@ dependencies = [
 [[package]]
 name = "tutti-music"
 version = "0.1.0"
-source = "git+https://github.com/polyphonotopes/tutti.git?tag=v0.4.0#163a5ff0022f401725be8dc1954669d0fd90d335"
+source = "git+https://github.com/polyphonotopes/tutti.git?tag=v0.4.2#ac39dff62c85ba3643c500f4ffb0af96e5420dd5"
 dependencies = [
  "blake3",
  "serde",
@@ -6188,8 +6189,8 @@ dependencies = [
 
 [[package]]
 name = "tutti-music-hhhs"
-version = "0.4.0"
-source = "git+https://github.com/polyphonotopes/tutti.git?tag=v0.4.0#163a5ff0022f401725be8dc1954669d0fd90d335"
+version = "0.4.1"
+source = "git+https://github.com/polyphonotopes/tutti.git?tag=v0.4.2#ac39dff62c85ba3643c500f4ffb0af96e5420dd5"
 dependencies = [
  "hhhs",
  "hhhs-cap",
