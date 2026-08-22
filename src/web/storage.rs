@@ -143,8 +143,8 @@ pub async fn get_or_create_peer_id() -> String {
 }
 
 /// Key holding the 32-byte Ed25519 identity seed for the in-browser iroh
-/// transport. One seed derives BOTH the p2panda signing key and the iroh
-/// endpoint secret (see `net::identity`), so `author_id == endpoint_id`.
+/// transport. One seed derives both the HHHS presentation key and the iroh
+/// endpoint secret (see `net::identity`).
 #[cfg(feature = "browser-net")]
 const IDENTITY_SEED_KEY: &str = "identity_seed";
 
@@ -231,75 +231,8 @@ pub async fn get_or_create_identity_seed() -> [u8; 32] {
     seed
 }
 
-/// Get the stored room state for a given room name.
-pub async fn get_room_state(room_name: &str) -> Option<Vec<u8>> {
-    let db = open_db().await.ok()?;
-
-    let transaction = db.transaction_with_str(STORE_NAME).ok()?;
-    let store: IdbObjectStore = transaction.object_store(STORE_NAME).ok()?;
-
-    let key = format!("room:{}", room_name);
-    let request = store.get(&JsValue::from_str(&key)).ok()?;
-
-    let (tx, rx) = futures::channel::oneshot::channel();
-    let tx = std::cell::RefCell::new(Some(tx));
-
-    let onsuccess = Closure::once(Box::new(move |event: web_sys::Event| {
-        let target = event.target().unwrap();
-        let request: IdbRequest = target.unchecked_into();
-        let result = request.result().ok();
-        // Convert Uint8Array to Vec<u8>
-        let bytes = result.and_then(|v| {
-            if v.is_undefined() || v.is_null() {
-                return None;
-            }
-            let arr = js_sys::Uint8Array::new(&v);
-            Some(arr.to_vec())
-        });
-        if let Some(tx) = tx.borrow_mut().take() {
-            let _ = tx.send(bytes);
-        }
-    }) as Box<dyn FnOnce(_)>);
-    request.set_onsuccess(Some(onsuccess.as_ref().unchecked_ref()));
-    onsuccess.forget();
-
-    rx.await.ok().flatten()
-}
-
-/// Store the room state for a given room name.
-pub async fn set_room_state(room_name: &str, state: &[u8]) -> Result<(), String> {
-    let db = open_db().await?;
-
-    let transaction = db
-        .transaction_with_str_and_mode(STORE_NAME, web_sys::IdbTransactionMode::Readwrite)
-        .map_err(|_| "Failed to create transaction")?;
-    let store: IdbObjectStore = transaction
-        .object_store(STORE_NAME)
-        .map_err(|_| "Failed to get store")?;
-
-    let key = format!("room:{}", room_name);
-    let arr = js_sys::Uint8Array::from(state);
-
-    let request = store
-        .put_with_key(&arr, &JsValue::from_str(&key))
-        .map_err(|_| "Failed to put")?;
-
-    let (tx, rx) = futures::channel::oneshot::channel();
-    let tx = std::cell::RefCell::new(Some(tx));
-
-    let onsuccess = Closure::once(Box::new(move |_event: web_sys::Event| {
-        if let Some(tx) = tx.borrow_mut().take() {
-            let _ = tx.send(Ok(()));
-        }
-    }) as Box<dyn FnOnce(_)>);
-    request.set_onsuccess(Some(onsuccess.as_ref().unchecked_ref()));
-    onsuccess.forget();
-
-    rx.await.map_err(|_| "Channel closed")?
-}
-
 // ---------------------------------------------------------------------------
-// Room-v4 lane journal. The v3 untagged key/codec is intentionally absent.
+// Capability-native Room-v5 Replica transaction logs.
 // ---------------------------------------------------------------------------
 
 /// Load a byte blob from the settings store. Absence is distinct from an
@@ -413,33 +346,69 @@ async fn set_bytes(key: &str, bytes: &[u8]) -> Result<(), String> {
     result
 }
 
-/// Load room-v4 lane-tagged records from the disjoint v4 key. Invalid or
-/// foreign-generation blobs fail loudly; silently replacing durable history
-/// with an empty room would hide corruption. There is no v3 fallback.
+/// Async durable owner for one Room-v5 HHHS replica log.
+///
+/// This is deliberately not a `ReplicaStorage` implementation: IndexedDB is
+/// asynchronous and browser handles are single-task values. The room host
+/// serializes one writer per lane, persists a prepared transaction here, then
+/// finalizes that same transaction through `RoomReplicas::commit_prepared`.
 #[cfg(feature = "browser-net")]
-pub async fn get_op_journal_v4(
-    topic_hex: &str,
-) -> Result<Vec<crate::room::v4::LaneRecord>, String> {
-    use crate::room::lane_journal::{decode_idb_op_journal_v4, idb_op_journal_key_v4};
+pub struct IndexedDbReplicaLogV5 {
+    key: String,
+    bytes: Vec<u8>,
+}
 
-    match get_bytes(&idb_op_journal_key_v4(topic_hex)).await? {
-        Some(blob) => decode_idb_op_journal_v4(&blob).map_err(|error| error.to_string()),
-        None => Ok(Vec::new()),
+#[cfg(feature = "browser-net")]
+impl IndexedDbReplicaLogV5 {
+    pub async fn open(
+        room: &crate::room::v5::RoomIdentity,
+        lane: crate::room::v5::RoomLane,
+    ) -> Result<Self, String> {
+        let key = replica_log_key_v5(room, lane);
+        let bytes = get_bytes(&key)
+            .await?
+            .unwrap_or_else(hhhs_store::empty_storage_transaction_log);
+        hhhs_store::decode_storage_transaction_log(&bytes)
+            .map_err(|error| format!("invalid Room-v5 replica log: {error}"))?;
+        Ok(Self { key, bytes })
+    }
+
+    /// Decode the complete validated log for replay into a fresh memory store.
+    pub fn transactions(&self) -> Result<Vec<hhhs_store::StorageTransaction>, String> {
+        hhhs_store::decode_storage_transaction_log(&self.bytes)
+            .map_err(|error| format!("invalid Room-v5 replica log: {error}"))
+    }
+
+    /// Atomically replace the durable blob with one additional transaction.
+    /// The caller must not publish the prepared admission until this resolves.
+    pub async fn persist(
+        &mut self,
+        transaction: &hhhs_store::StorageTransaction,
+    ) -> Result<(), String> {
+        let next = hhhs_store::append_storage_transaction_log(&self.bytes, transaction)
+            .map_err(|error| format!("could not extend Room-v5 replica log: {error}"))?;
+        set_bytes(&self.key, &next).await?;
+        self.bytes = next;
+        Ok(())
     }
 }
 
-/// Persist the room-v4 marker plus lane-tagged verbatim wire records under
-/// `opjournal:v4:{topic}`.
 #[cfg(feature = "browser-net")]
-pub async fn set_op_journal_v4(
-    topic_hex: &str,
-    records: &[crate::room::v4::LaneRecord],
-) -> Result<(), String> {
-    use crate::room::lane_journal::{encode_idb_op_journal_v4, idb_op_journal_key_v4};
+impl hhhs_replica::AsyncTransactionSink for IndexedDbReplicaLogV5 {
+    type Error = String;
 
-    set_bytes(
-        &idb_op_journal_key_v4(topic_hex),
-        &encode_idb_op_journal_v4(records).map_err(|error| error.to_string())?,
-    )
-    .await
+    async fn persist(
+        &mut self,
+        transaction: &hhhs_store::StorageTransaction,
+    ) -> Result<(), Self::Error> {
+        IndexedDbReplicaLogV5::persist(self, transaction).await
+    }
+}
+
+#[cfg(feature = "browser-net")]
+fn replica_log_key_v5(
+    room: &crate::room::v5::RoomIdentity,
+    lane: crate::room::v5::RoomLane,
+) -> String {
+    format!("replica:v5:{}:{:02x}", room.object.to_hex(), lane.tag())
 }

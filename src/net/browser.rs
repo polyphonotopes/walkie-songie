@@ -28,16 +28,21 @@ use iroh_gossip::{
     net::{GOSSIP_ALPN, Gossip},
 };
 
+use super::SyncTimer;
 use super::iroh_common::{
     EVENT_QUEUE_DEPTH, MAX_GOSSIP_MESSAGE_BYTES, NativeNetError, NativeNetworkEvent,
-    NativeRoomNetworkConfig, NativeRoomTicketV4, PeerTransportPath, REPAIR_ACCEPT_TIMEOUT,
-    REPAIR_QUEUE_DEPTH, ROOM_V4_ALPNS, RoomTopic, classify_peer_path, peer_of,
+    NativeRoomTicketV5, PeerTransportPath, REPAIR_ACCEPT_TIMEOUT, REPAIR_QUEUE_DEPTH, RelayPolicy,
+    ReplicaRoomNetworkConfig, RoomTopic, classify_peer_path,
 };
 use super::repair::IrohSyncStream;
-use super::sync::SyncTimer;
-use super::{LaneProtocol, PeerId, Transport, TransportError, TransportEvent, TransportMode};
-use crate::client::{DiscoverySource, PeerPath};
-use crate::room::v4::{LaneSet, RoomLane};
+use crate::client::DiscoverySource;
+
+#[derive(Debug, Clone)]
+struct ReplicaTicketMetadata {
+    room: crate::room::v5::RoomIdentity,
+    owner: crate::room::v5::ActorId,
+    support: crate::room::v5::ProtocolSupport,
+}
 
 /// The browser runtime's clock for [`SyncTimer`]: `n0-future`'s wasm sleep
 /// (a `setTimeout` under the hood).
@@ -83,6 +88,7 @@ pub struct BrowserNetHandle {
     /// to the rendezvous loop via [`Self::rendezvous_peering`], which pumps the
     /// SDP/ICE handshake over the existing signaling channel.
     webrtc: super::webrtc_transport::WebRtcSignalPort,
+    replica_ticket: Option<ReplicaTicketMetadata>,
 }
 
 impl BrowserNetHandle {
@@ -98,25 +104,35 @@ impl BrowserNetHandle {
         self.endpoint.id()
     }
 
-    /// Current ticket. The relay address appears once iroh has a home relay —
-    /// and in a browser the relay address is the only address there will be.
-    pub fn ticket(&self) -> NativeRoomTicketV4 {
-        NativeRoomTicketV4::new(self.topic, LaneSet::WALKIE, self.endpoint.addr())
+    pub fn ticket(&self) -> NativeRoomTicketV5 {
+        let metadata = self
+            .replica_ticket
+            .as_ref()
+            .expect("Room-v5 endpoint always carries ticket metadata");
+        NativeRoomTicketV5::new(
+            &metadata.room,
+            metadata.owner,
+            metadata.support,
+            self.endpoint.addr(),
+        )
     }
 
-    /// Wait briefly for relay readiness so a shared ticket carries the relay
-    /// address. In a browser an offline ticket is useless, but a bounded wait
-    /// keeps room entry responsive when the relay is unreachable.
-    pub async fn settle_ticket(&self, timeout: Duration) -> NativeRoomTicketV4 {
+    pub async fn settle_ticket(&self, timeout: Duration) -> NativeRoomTicketV5 {
         let _ = n0_future::time::timeout(timeout, self.endpoint.online()).await;
         self.ticket()
     }
 
-    /// Add or refresh ticket addressing, then ask gossip to join that peer.
-    pub async fn join_ticket(&self, ticket: &NativeRoomTicketV4) -> Result<(), NativeNetError> {
-        if ticket.topic() != self.topic {
+    pub async fn join_ticket(&self, ticket: &NativeRoomTicketV5) -> Result<(), NativeNetError> {
+        let metadata = self
+            .replica_ticket
+            .as_ref()
+            .expect("Room-v5 endpoint always carries ticket metadata");
+        if ticket.topic() != self.topic
+            || ticket.room_identity() != metadata.room
+            || ticket.owner() != metadata.owner
+        {
             return Err(NativeNetError::Gossip(
-                "ticket belongs to a different room topic".into(),
+                "ticket belongs to a different Room-v5 object or owner".into(),
             ));
         }
         self.memory_lookup
@@ -140,19 +156,19 @@ impl BrowserNetHandle {
             .map_err(|error| NativeNetError::Gossip(error.to_string()))
     }
 
-    /// Open one authenticated lane-scoped repair or courier connection.
-    pub async fn begin_lane(
+    pub async fn begin_replica(
         &self,
         endpoint_id: EndpointId,
-        protocol: LaneProtocol,
+        lane: crate::room::v5::RoomLane,
     ) -> Result<Connection, NativeNetError> {
+        let alpn = lane.repair_alpn();
         self.endpoint
-            .connect(endpoint_id, protocol.alpn())
+            .connect(endpoint_id, alpn)
             .await
             .map_err(|error| {
                 NativeNetError::Gossip(format!(
                     "{} connection failed: {error}",
-                    String::from_utf8_lossy(protocol.alpn())
+                    String::from_utf8_lossy(alpn)
                 ))
             })
     }
@@ -189,11 +205,49 @@ impl BrowserRoomNetwork {
     /// `presets::N0` builder compiles the IP transport out on wasm by itself.
     pub async fn bind(
         secret_key: iroh::SecretKey,
-        config: NativeRoomNetworkConfig,
+        config: ReplicaRoomNetworkConfig,
     ) -> Result<Self, NativeNetError> {
-        let relay_mode = config.relay.to_iroh()?;
+        let topic = config.topic();
+        let mut alpns = vec![GOSSIP_ALPN];
+        let mut repair_alpns = Vec::new();
+        for lane in [
+            crate::room::v5::RoomLane::Music,
+            crate::room::v5::RoomLane::Extension,
+        ] {
+            if config.support.supports(lane) {
+                alpns.push(lane.repair_alpn());
+                repair_alpns.push(lane.repair_alpn());
+            }
+        }
+        let metadata = ReplicaTicketMetadata {
+            room: config.room,
+            owner: config.owner,
+            support: config.support,
+        };
+        Self::bind_inner(
+            secret_key,
+            topic,
+            config.relay,
+            config.bootstrap,
+            alpns,
+            repair_alpns,
+            Some(metadata),
+        )
+        .await
+    }
+
+    async fn bind_inner(
+        secret_key: iroh::SecretKey,
+        topic: RoomTopic,
+        relay: RelayPolicy,
+        bootstrap_address: Option<iroh::EndpointAddr>,
+        alpns: Vec<&'static [u8]>,
+        repair_alpns: Vec<&'static [u8]>,
+        replica_ticket: Option<ReplicaTicketMetadata>,
+    ) -> Result<Self, NativeNetError> {
+        let relay_mode = relay.to_iroh()?;
         let memory = MemoryLookup::new();
-        if let Some(bootstrap) = config.bootstrap.clone() {
+        if let Some(bootstrap) = bootstrap_address.clone() {
             memory.add_endpoint_info(bootstrap);
         }
         let (mut events_tx, events) = mpsc::channel(EVENT_QUEUE_DEPTH);
@@ -212,7 +266,7 @@ impl BrowserRoomNetwork {
 
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(secret_key)
-            .alpns(ROOM_V4_ALPNS.iter().map(|alpn| alpn.to_vec()).collect())
+            .alpns(alpns.into_iter().map(<[u8]>::to_vec).collect())
             .relay_mode(relay_mode)
             .add_custom_transport(Arc::new(webrtc_transport))
             .clear_address_lookup()
@@ -235,49 +289,28 @@ impl BrowserRoomNetwork {
         let gossip = Gossip::builder()
             .max_message_size(MAX_GOSSIP_MESSAGE_BYTES)
             .spawn(endpoint.clone());
-        let router = Router::builder(endpoint.clone())
-            .accept(GOSSIP_ALPN, gossip.clone())
-            .accept(
-                LaneProtocol::Repair(RoomLane::Music).alpn(),
+        let mut router = Router::builder(endpoint.clone()).accept(GOSSIP_ALPN, gossip.clone());
+        for alpn in repair_alpns {
+            router = router.accept(
+                alpn,
                 BrowserRepairProtocol {
                     repairs: repairs_tx.clone(),
-                    alpn: LaneProtocol::Repair(RoomLane::Music).alpn(),
+                    alpn,
                 },
-            )
-            .accept(
-                LaneProtocol::Repair(RoomLane::Extension).alpn(),
-                BrowserRepairProtocol {
-                    repairs: repairs_tx.clone(),
-                    alpn: LaneProtocol::Repair(RoomLane::Extension).alpn(),
-                },
-            )
-            .accept(
-                LaneProtocol::Courier(RoomLane::Music).alpn(),
-                BrowserRepairProtocol {
-                    repairs: repairs_tx.clone(),
-                    alpn: LaneProtocol::Courier(RoomLane::Music).alpn(),
-                },
-            )
-            .accept(
-                LaneProtocol::Courier(RoomLane::Extension).alpn(),
-                BrowserRepairProtocol {
-                    repairs: repairs_tx,
-                    alpn: LaneProtocol::Courier(RoomLane::Extension).alpn(),
-                },
-            )
-            .spawn();
+            );
+        }
+        let router = router.spawn();
 
-        let bootstrap = config
-            .bootstrap
+        let bootstrap = bootstrap_address
             .as_ref()
             .map(|address| vec![address.id])
             .unwrap_or_default();
         let bootstrap_ids: Vec<EndpointId> = bootstrap.clone();
-        let topic = gossip
-            .subscribe(config.topic.gossip_topic(), bootstrap)
+        let gossip_topic = gossip
+            .subscribe(topic.gossip_topic(), bootstrap)
             .await
             .map_err(|error| NativeNetError::Gossip(error.to_string()))?;
-        let (gossip_sender, mut gossip_events) = topic.split();
+        let (gossip_sender, mut gossip_events) = gossip_topic.split();
 
         // No mDNS branch in a browser, so the event task is a single stream
         // pump: gossip events in, `NativeNetworkEvent`s out. Bootstrap peers
@@ -346,11 +379,12 @@ impl BrowserRoomNetwork {
 
         Ok(Self {
             handle: BrowserNetHandle {
-                topic: config.topic,
+                topic,
                 endpoint,
                 gossip_sender,
                 memory_lookup: memory,
                 webrtc: webrtc_port,
+                replica_ticket,
             },
             router,
             events,
@@ -443,118 +477,5 @@ impl ProtocolHandler for BrowserRepairProtocol {
                 Ok(())
             }
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The pluggable transport seam.
-// ---------------------------------------------------------------------------
-
-/// The browser iroh backend behind the transport-neutral seam. Same event
-/// mapping as the native impl, minus the mDNS diagnostics that cannot occur.
-impl Transport for BrowserRoomNetwork {
-    type Stream = IrohSyncStream;
-
-    fn mode(&self) -> TransportMode {
-        TransportMode::Iroh
-    }
-
-    fn max_broadcast_bytes(&self) -> usize {
-        MAX_GOSSIP_MESSAGE_BYTES
-    }
-
-    async fn broadcast(&self, frame: Vec<u8>) -> Result<(), TransportError> {
-        let length = frame.len();
-        self.handle
-            .broadcast(frame)
-            .await
-            .map_err(|error| match error {
-                NativeNetError::Gossip(_) if length > MAX_GOSSIP_MESSAGE_BYTES => {
-                    TransportError::FrameTooLarge {
-                        actual: length,
-                        limit: MAX_GOSSIP_MESSAGE_BYTES,
-                    }
-                }
-                other => TransportError::Backend(other.to_string()),
-            })
-    }
-
-    async fn next_event(&mut self) -> Option<TransportEvent<Self::Stream>> {
-        let event = match self.next_inbound().await? {
-            BrowserRoomInbound::Repair(repair) => {
-                let Some(protocol) = LaneProtocol::from_alpn(repair.alpn) else {
-                    repair
-                        .connection
-                        .close(4u32.into(), b"unsupported lane protocol");
-                    return Some(TransportEvent::Diagnostic(format!(
-                        "accepted legacy ALPN {} outside the room-v4 lane seam",
-                        String::from_utf8_lossy(repair.alpn)
-                    )));
-                };
-                return Some(TransportEvent::LaneRequested {
-                    peer: peer_of(repair.endpoint_id),
-                    protocol,
-                    stream: repair.stream.owning(repair.connection),
-                });
-            }
-            BrowserRoomInbound::Event(event) => event,
-        };
-        Some(match event {
-            NativeNetworkEvent::NeighborUp {
-                endpoint_id,
-                discovery,
-            } => TransportEvent::PeerUp {
-                peer: peer_of(endpoint_id),
-                discovery,
-            },
-            NativeNetworkEvent::NeighborDown { endpoint_id } => TransportEvent::PeerDown {
-                peer: peer_of(endpoint_id),
-            },
-            NativeNetworkEvent::Message {
-                delivered_from,
-                bytes,
-            } => TransportEvent::Message {
-                from: peer_of(delivered_from),
-                bytes,
-            },
-            NativeNetworkEvent::Lagged => TransportEvent::Lagged,
-            NativeNetworkEvent::Closed => TransportEvent::Closed,
-            NativeNetworkEvent::Diagnostic(message) => TransportEvent::Diagnostic(message),
-            NativeNetworkEvent::MdnsDiscovered { endpoint_id } => {
-                TransportEvent::Diagnostic(format!("mdns discovered {endpoint_id}"))
-            }
-            NativeNetworkEvent::MdnsExpired { endpoint_id } => {
-                TransportEvent::Diagnostic(format!("mdns expired {endpoint_id}"))
-            }
-        })
-    }
-
-    async fn open_lane(
-        &self,
-        peer: PeerId,
-        protocol: LaneProtocol,
-    ) -> Result<Self::Stream, TransportError> {
-        let endpoint_id = EndpointId::from_bytes(peer.as_bytes())
-            .map_err(|_| TransportError::Unreachable(peer.to_hex()))?;
-        let connection = self
-            .handle
-            .endpoint
-            .connect(endpoint_id, protocol.alpn())
-            .await
-            .map_err(|error| TransportError::Backend(error.to_string()))?;
-        Ok(IrohSyncStream::open(&connection).await?.owning(connection))
-    }
-
-    async fn peer_path(&self, peer: PeerId) -> PeerPath {
-        let Ok(endpoint_id) = EndpointId::from_bytes(peer.as_bytes()) else {
-            return PeerPath::Disconnected;
-        };
-        self.handle.peer_path(endpoint_id).await.into()
-    }
-
-    async fn shutdown(self) -> Result<(), TransportError> {
-        BrowserRoomNetwork::shutdown(self)
-            .await
-            .map_err(|error| TransportError::Backend(error.to_string()))
     }
 }

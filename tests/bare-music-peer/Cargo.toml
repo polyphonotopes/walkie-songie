@@ -5,14 +5,13 @@ edition = "2024"
 rust-version = "1.97.1"
 publish = false
 
-# THE point of this crate is its dependency list: a peer that joins a room's
-# MUSIC lane speaks tutti-core (the signed-op substrate), tutti-music (the
-# music protocol + its lane network identities), and hhhs-sync (the real RBSR
-# session kernel) — and NOTHING of walkie-songie. If a walkie type were ever
-# needed here, the music lane would not be joinable by an independent device
-# (an ESP32), and the two-lane design would be broken.
+# THE point of this crate is its dependency list: the shared music protocol,
+# HHHS Replica/repair seams, and NOTHING from walkie-songie.
 [dependencies]
-tutti-core = { git = "https://github.com/polyphonotopes/tutti.git", rev = "7c45571" }
-tutti-music = { git = "https://github.com/polyphonotopes/tutti.git", rev = "7c45571" }
-hhhs-sync = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "82b9ddb", features = ["wire"] }
-futures = "0.3"
+tutti-music = { version = "0.1.0", git = "https://github.com/polyphonotopes/tutti.git", tag = "v0.4.0" }
+tutti-music-hhhs = { version = "0.4.0", git = "https://github.com/polyphonotopes/tutti.git", tag = "v0.4.0" }
+hhhs = { version = "0.4.0", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.0" }
+hhhs-proof = { version = "0.4.0", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.0" }
+hhhs-replica = { version = "0.4.0", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.0" }
+hhhs-store = { version = "0.4.0", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.0" }
+hhhs-sync = { version = "0.4.0", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.0", features = ["driver"] }

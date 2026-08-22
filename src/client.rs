@@ -5,10 +5,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::room::ops::{AuthorId, OpId};
+use crate::room::v5::{ActorId, PieceId};
 use crate::tuning::{TunedDegree, TunedPeriodicPitch, TuningDefinition, TuningId};
 
-pub const CLIENT_PROTOCOL_VERSION: u16 = 1;
+pub const CLIENT_PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
@@ -57,11 +57,11 @@ pub enum ClientCommand {
         pitch: TunedPeriodicPitch,
     },
     MovePiece {
-        piece: OpId,
+        piece: PieceId,
         pitch: TunedPeriodicPitch,
     },
     RemovePiece {
-        piece: OpId,
+        piece: PieceId,
     },
     SetRoomConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -103,7 +103,7 @@ pub enum DiscoverySource {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerSnapshot {
-    pub author: AuthorId,
+    pub author: ActorId,
     pub endpoint_id: String,
     pub path: PeerPath,
     pub discovery: DiscoverySource,
@@ -113,15 +113,15 @@ pub struct PeerSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PieceSnapshot {
-    pub id: OpId,
-    pub owner: AuthorId,
+    pub id: PieceId,
+    pub owner: ActorId,
     pub emoji: String,
     pub pitch: TunedPeriodicPitch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoiceSnapshot {
-    pub author: AuthorId,
+    pub author: ActorId,
     pub session: u64,
     pub sequence: u64,
     pub pitch: Option<TunedPeriodicPitch>,
@@ -178,7 +178,7 @@ impl AppSnapshot {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AppEvent {
     Snapshot {
-        snapshot: AppSnapshot,
+        snapshot: Box<AppSnapshot>,
     },
     RoomChanged {
         room_name: Option<String>,
@@ -190,7 +190,7 @@ pub enum AppEvent {
     },
     DegreeAdded {
         pitch: TunedDegree,
-        authors: Vec<AuthorId>,
+        authors: Vec<ActorId>,
     },
     DegreeRemoved {
         pitch: TunedDegree,
@@ -199,7 +199,7 @@ pub enum AppEvent {
         piece: PieceSnapshot,
     },
     PieceRemoved {
-        piece: OpId,
+        piece: PieceId,
     },
     RoomConfigChanged {
         pieces_locked: bool,
@@ -209,14 +209,14 @@ pub enum AppEvent {
         voice: VoiceSnapshot,
     },
     VoiceExpired {
-        author: AuthorId,
+        author: ActorId,
         session: u64,
     },
     PeerUpdated {
         peer: PeerSnapshot,
     },
     PeerRemoved {
-        author: AuthorId,
+        author: ActorId,
     },
     MidiPortsChanged {
         inputs: Vec<MidiPortSnapshot>,
@@ -304,7 +304,7 @@ mod tests {
         let envelope = AppEventEnvelope {
             sequence: 7,
             event: AppEvent::Snapshot {
-                snapshot: AppSnapshot::empty(Capabilities::tauri_desktop()),
+                snapshot: Box::new(AppSnapshot::empty(Capabilities::tauri_desktop())),
             },
         };
         let bytes = serde_json::to_vec(&envelope).unwrap();

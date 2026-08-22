@@ -1,20 +1,17 @@
 //! Iroh transport adapter for the HHHS anti-entropy driver.
 //!
 //! Length-prefixed framing over one QUIC bidirectional stream, plus the
-//! [`SyncStream`] impl that lets [`crate::net::sync`] drive a session over it.
+//! [`SyncStream`] impl that lets the application drive an HHHS session over it.
 //!
-//! The session's `EntrySource`/`Index` pair and its budgets live in
-//! [`crate::net::sync`] — they are transport-neutral, and keeping them there is
-//! what stops a caller from pairing a fresh index with a stale snapshot.
+//! Replica snapshots and budgets remain in the upstream sans-I/O driver.
 
 use std::time::Duration;
 
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use thiserror::Error;
 
-use super::sync::MAX_SYNC_FRAME_BYTES;
 #[cfg(not(target_arch = "wasm32"))]
-use super::sync::SyncTimer;
+use super::SyncTimer;
 use super::{SyncStream, TransportError};
 
 /// The native runtime's clock for [`SyncTimer`].
@@ -36,7 +33,7 @@ impl SyncTimer for TokioTimer {
 /// Wire cap for one framed `SyncMessage`. Deliberately the *same* constant the
 /// session budget uses, so the framing cap and the session cap cannot drift into
 /// a state where a legal message is unsendable.
-pub const MAX_REPAIR_FRAME_BYTES: usize = MAX_SYNC_FRAME_BYTES;
+pub const MAX_REPAIR_FRAME_BYTES: usize = hhhs_sync::driver::DEFAULT_MAX_FRAME_BYTES;
 
 /// Upper bound for waiting until the peer acknowledges every byte queued before
 /// our stream FIN. `finish()` alone only schedules the FIN; dropping the owning
@@ -207,7 +204,10 @@ mod tests {
     #[test]
     fn frame_cap_matches_the_session_cap() {
         // A drift here would make a session-legal message unsendable.
-        assert_eq!(MAX_REPAIR_FRAME_BYTES, MAX_SYNC_FRAME_BYTES);
+        assert_eq!(
+            MAX_REPAIR_FRAME_BYTES,
+            hhhs_sync::driver::DEFAULT_MAX_FRAME_BYTES
+        );
     }
 
     #[test]

@@ -6,14 +6,14 @@
 //! over the y-webrtc signaling server at [`SIGNALING_SERVER_URL`], implementing
 //! `docs/research/peer-discovery-design.md` §3 Option 1.
 //!
-//! Both tabs (or a browser and a desktop) that enter the same v4 room derive the
+//! Both tabs (or a browser and a desktop) that enter the same v5 room derive the
 //! same [`RoomTopic`], subscribe to the same opaque channel
-//! `walkie-rdv-v4-<topic-hex>` (never the human room name), and publish a
-//! [`HelloV4`] carrying their endpoint id, lane capabilities, and home relay
+//! `walkie-rdv-v5-<topic-hex>` (never the human room name), and publish a
+//! [`HelloV5`] carrying their endpoint id, protocol support, and home relay
 //! URL. On hearing a peer's hello we seed iroh's [`MemoryLookup`] with
 //! `{id → relay}`, ask gossip to [`join_peers`](GossipSender::join_peers), and
 //! reply with our own hello so late joiners learn us with zero server-side
-//! state. The v1 channel and hello remain only for legacy fixtures.
+//! state.
 //!
 //! The wasm backend is a raw [`web_sys::WebSocket`]; the native backend is
 //! `tokio-tungstenite`. Both sit behind [`SignalStream`] so the session loop
@@ -28,16 +28,12 @@ use iroh_gossip::api::GossipSender;
 use serde::{Deserialize, Serialize};
 
 use super::iroh_common::{RoomTopic, SIGNALING_SERVER_URL};
-use crate::room::v4::LaneSet;
+use crate::room::v5::ProtocolSupport;
 
-/// Channel-name prefix. Bumped only on a wire-incompatible protocol change.
-const RENDEZVOUS_CHANNEL_PREFIX: &str = "walkie-rdv-v1-";
 /// Hello discriminator; ignores (and is ignored by) any non-walkie publisher.
 const HELLO_KIND: &str = "walkie-hello";
-/// Hello payload version.
-const HELLO_VERSION: u32 = 1;
-const RENDEZVOUS_CHANNEL_PREFIX_V4: &str = "walkie-rdv-v4-";
-pub const HELLO_VERSION_V4: u32 = 4;
+const RENDEZVOUS_CHANNEL_PREFIX_V5: &str = "walkie-rdv-v5-";
+pub const HELLO_VERSION_V5: u32 = 5;
 /// Discriminator for a WebRTC signaling envelope (SDP offer/answer + ICE) riding
 /// the same channel as hellos. Non-`walkie-rtc` publishers are ignored; a peer that
 /// does not understand it never sees one (it is addressed by endpoint id).
@@ -60,15 +56,8 @@ const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
 /// only costs one failed dial — this cap bounds how many at once.
 const MAX_RENDEZVOUS_PEERS: usize = 64;
 
-/// The opaque rendezvous channel for a room. Derived from the topic hash only,
-/// never the human room name.
-fn rendezvous_channel(topic: RoomTopic) -> String {
-    format!("{RENDEZVOUS_CHANNEL_PREFIX}{}", topic.to_hex())
-}
-
-/// The disjoint room-v4 rendezvous channel.
-pub fn rendezvous_channel_v4(topic: RoomTopic) -> String {
-    format!("{RENDEZVOUS_CHANNEL_PREFIX_V4}{}", topic.to_hex())
+pub fn rendezvous_channel_v5(topic: RoomTopic) -> String {
+    format!("{RENDEZVOUS_CHANNEL_PREFIX_V5}{}", topic.to_hex())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -144,30 +133,13 @@ enum ServerMessage {
     Other,
 }
 
-/// Our rendezvous announcement. Rides in the y-webrtc `data` field.
-#[derive(Serialize, Deserialize)]
-struct Hello {
-    kind: String,
-    v: u32,
-    /// Endpoint id, 64-char lowercase hex ([`EndpointId`]'s `Display`).
-    id: String,
-    /// Home relay url, present once the relay handshake completes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    relay: Option<String>,
-    /// Whether this peer can answer a WebRTC offer (M4 direct peering). Absent means
-    /// "no" — unknown fields are ignored, so this is schema-compatible with older
-    /// peers, which simply never get offered to.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    rtc: Option<bool>,
-}
-
-/// A room-v4 discovery hello. `lanes` is intentionally required in JSON;
-/// validation additionally rejects zero and unknown capability bits.
+/// Room-v5 discovery metadata. `support` is required but non-authoritative: it
+/// avoids futile ALPN attempts and never enters capability evaluation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HelloV4 {
+pub struct HelloV5 {
     pub kind: String,
     pub v: u32,
-    pub lanes: u8,
+    pub support: u8,
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<String>,
@@ -175,37 +147,40 @@ pub struct HelloV4 {
     pub rtc: Option<bool>,
 }
 
-impl HelloV4 {
-    pub fn new(lanes: LaneSet, id: String, relay: Option<String>, rtc: Option<bool>) -> Self {
+impl HelloV5 {
+    pub fn new(
+        support: ProtocolSupport,
+        id: String,
+        relay: Option<String>,
+        rtc: Option<bool>,
+    ) -> Self {
         Self {
             kind: HELLO_KIND.to_owned(),
-            v: HELLO_VERSION_V4,
-            lanes: lanes.bits(),
+            v: HELLO_VERSION_V5,
+            support: support.bits(),
             id,
             relay,
             rtc,
         }
     }
 
-    pub fn validate(&self) -> Option<LaneSet> {
-        if self.kind != HELLO_KIND || self.v != HELLO_VERSION_V4 {
+    pub fn validate(&self) -> Option<ProtocolSupport> {
+        if self.kind != HELLO_KIND || self.v != HELLO_VERSION_V5 {
             return None;
         }
-        LaneSet::from_bits(self.lanes)
+        ProtocolSupport::from_bits(self.support)
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 enum RendezvousGeneration {
-    V1,
-    V4 { local_lanes: LaneSet },
+    V5 { local_support: ProtocolSupport },
 }
 
 impl RendezvousGeneration {
     fn channel(self, topic: RoomTopic) -> String {
         match self {
-            Self::V1 => rendezvous_channel(topic),
-            Self::V4 { .. } => rendezvous_channel_v4(topic),
+            Self::V5 { .. } => rendezvous_channel_v5(topic),
         }
     }
 }
@@ -293,21 +268,13 @@ async fn send_hello<S: SignalStream>(
     #[cfg(not(all(target_arch = "wasm32", feature = "browser-net")))]
     let rtc = None;
     let relay_string = relay.as_ref().map(|url| url.as_str().to_owned());
-    let data = match generation {
-        RendezvousGeneration::V1 => serde_json::to_value(Hello {
-            kind: HELLO_KIND.to_owned(),
-            v: HELLO_VERSION,
-            id: our_id.to_string(),
-            relay: relay_string,
-            rtc,
-        })?,
-        RendezvousGeneration::V4 { local_lanes } => serde_json::to_value(HelloV4::new(
-            local_lanes,
-            our_id.to_string(),
-            relay_string,
-            rtc,
-        ))?,
-    };
+    let RendezvousGeneration::V5 { local_support } = generation;
+    let data = serde_json::to_value(HelloV5::new(
+        local_support,
+        our_id.to_string(),
+        relay_string,
+        rtc,
+    ))?;
     let message = ClientMessage::Publish {
         topic: channel.to_owned(),
         data,
@@ -338,7 +305,7 @@ async fn run_rendezvous<S: SignalStream>(
     channel: &str,
     peering: &RendezvousPeering,
     generation: RendezvousGeneration,
-    on_discovered: &impl Fn(EndpointId, Option<LaneSet>),
+    on_discovered: &impl Fn(EndpointId, Option<u8>),
     joined: &mut HashSet<EndpointId>,
 ) -> Result<(), RendezvousError> {
     let our_id = peering.endpoint.id();
@@ -442,26 +409,14 @@ async fn run_rendezvous<S: SignalStream>(
                             route_rtc_envelope(peering, our_id, data);
                             continue;
                         }
-                        let (id_text, relay_text, rtc, lanes) = match generation {
-                            RendezvousGeneration::V1 => {
-                                let Ok(hello) = serde_json::from_value::<Hello>(data) else {
-                                    continue;
-                                };
-                                if hello.kind != HELLO_KIND || hello.v != HELLO_VERSION {
-                                    continue;
-                                }
-                                (hello.id, hello.relay, hello.rtc, None)
-                            }
-                            RendezvousGeneration::V4 { .. } => {
-                                let Ok(hello) = serde_json::from_value::<HelloV4>(data) else {
-                                    continue;
-                                };
-                                let Some(lanes) = hello.validate() else {
-                                    continue;
-                                };
-                                (hello.id, hello.relay, hello.rtc, Some(lanes))
-                            }
+                        let Ok(hello) = serde_json::from_value::<HelloV5>(data) else {
+                            continue;
                         };
+                        let Some(support) = hello.validate() else {
+                            continue;
+                        };
+                        let (id_text, relay_text, rtc, support_bits) =
+                            (hello.id, hello.relay, hello.rtc, Some(support.bits()));
                         #[cfg(not(all(target_arch = "wasm32", feature = "browser-net")))]
                         let _ = rtc;
                         let Ok(id) = id_text.parse::<EndpointId>() else {
@@ -504,7 +459,7 @@ async fn run_rendezvous<S: SignalStream>(
                                     "join_peers for {id} failed: {error}"
                                 );
                             }
-                            on_discovered(id, lanes);
+                            on_discovered(id, support_bits);
                             // Kick the WebRTC handshake for a newly discovered
                             // rtc-capable peer (browser only). The driver picks the
                             // role: lower endpoint id offers, the other answers.
@@ -625,7 +580,7 @@ async fn rendezvous_main(
     peering: RendezvousPeering,
     topic: RoomTopic,
     generation: RendezvousGeneration,
-    on_discovered: impl Fn(EndpointId, Option<LaneSet>),
+    on_discovered: impl Fn(EndpointId, Option<u8>),
 ) {
     let channel = generation.channel(topic);
     let mut joined: HashSet<EndpointId> = HashSet::new();
@@ -681,85 +636,44 @@ impl Drop for RendezvousHandle {
     }
 }
 
-/// Start the retired v1 rendezvous for legacy fixtures. Live runtimes call
-/// [`spawn_rendezvous_v4`]. `on_discovered` fires once per genuinely new peer.
-///
-/// [`DiscoverySource::AddressLookup`]: crate::client::DiscoverySource::AddressLookup
-/// [`PeerPath::Connecting`]: crate::client::PeerPath::Connecting
+/// Start capability-native Room-v5 rendezvous. Support is connectivity
+/// metadata only and remains distinct from receiver-bound grants.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn spawn_rendezvous(
+pub fn spawn_rendezvous_v5(
     peering: RendezvousPeering,
     topic: RoomTopic,
-    // `Sync` too: `run_rendezvous` holds `&on_discovered` across awaits, and a
-    // `&F` is `Send` only when `F: Sync`.
-    on_discovered: impl Fn(EndpointId) + Send + Sync + 'static,
+    local_support: ProtocolSupport,
+    on_discovered: impl Fn(EndpointId, ProtocolSupport) + Send + Sync + 'static,
 ) -> RendezvousHandle {
     RendezvousHandle {
         task: tokio::spawn(rendezvous_main(
             peering,
             topic,
-            RendezvousGeneration::V1,
-            move |id, _| on_discovered(id),
-        )),
-    }
-}
-
-/// Start room-v4 rendezvous and surface each peer's required lane capability.
-#[cfg(not(target_arch = "wasm32"))]
-pub fn spawn_rendezvous_v4(
-    peering: RendezvousPeering,
-    topic: RoomTopic,
-    local_lanes: LaneSet,
-    on_discovered: impl Fn(EndpointId, LaneSet) + Send + Sync + 'static,
-) -> RendezvousHandle {
-    RendezvousHandle {
-        task: tokio::spawn(rendezvous_main(
-            peering,
-            topic,
-            RendezvousGeneration::V4 { local_lanes },
-            move |id, lanes| {
-                if let Some(lanes) = lanes {
-                    on_discovered(id, lanes);
+            RendezvousGeneration::V5 { local_support },
+            move |id, support| {
+                if let Some(support) = support.and_then(ProtocolSupport::from_bits) {
+                    on_discovered(id, support);
                 }
             },
         )),
     }
 }
 
-/// Start the retired v1 rendezvous for wasm legacy fixtures. Live runtimes call
-/// [`spawn_rendezvous_v4`]; the loop and JS handles are `!Send`.
 #[cfg(target_arch = "wasm32")]
-pub fn spawn_rendezvous(
+pub fn spawn_rendezvous_v5(
     peering: RendezvousPeering,
     topic: RoomTopic,
-    on_discovered: impl Fn(EndpointId) + 'static,
+    local_support: ProtocolSupport,
+    on_discovered: impl Fn(EndpointId, ProtocolSupport) + 'static,
 ) -> RendezvousHandle {
     RendezvousHandle {
         task: n0_future::task::spawn(rendezvous_main(
             peering,
             topic,
-            RendezvousGeneration::V1,
-            move |id, _| on_discovered(id),
-        )),
-    }
-}
-
-/// Start room-v4 rendezvous in the browser and surface peer lane capabilities.
-#[cfg(target_arch = "wasm32")]
-pub fn spawn_rendezvous_v4(
-    peering: RendezvousPeering,
-    topic: RoomTopic,
-    local_lanes: LaneSet,
-    on_discovered: impl Fn(EndpointId, LaneSet) + 'static,
-) -> RendezvousHandle {
-    RendezvousHandle {
-        task: n0_future::task::spawn(rendezvous_main(
-            peering,
-            topic,
-            RendezvousGeneration::V4 { local_lanes },
-            move |id, lanes| {
-                if let Some(lanes) = lanes {
-                    on_discovered(id, lanes);
+            RendezvousGeneration::V5 { local_support },
+            move |id, support| {
+                if let Some(support) = support.and_then(ProtocolSupport::from_bits) {
+                    on_discovered(id, support);
                 }
             },
         )),
@@ -964,126 +878,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn channel_is_topic_scoped_and_leaks_no_room_name() {
-        let topic = RoomTopic::from_room_name("groovy-field-garden");
-        let channel = rendezvous_channel(topic);
-        assert!(channel.starts_with(RENDEZVOUS_CHANNEL_PREFIX));
+    fn room_v5_channel_and_support_are_strict() {
+        let room = crate::room::v5::RoomIdentity::from_name("quiet-cactus-song");
+        let topic = RoomTopic::from_room_identity(&room);
+        let channel = rendezvous_channel_v5(topic);
+        assert!(channel.starts_with(RENDEZVOUS_CHANNEL_PREFIX_V5));
         assert!(channel.ends_with(&topic.to_hex()));
-        assert!(!channel.contains("groovy"));
-        assert_eq!(channel, rendezvous_channel(topic));
-        assert_ne!(
-            channel,
-            rendezvous_channel(RoomTopic::from_room_name("groovy-field-drum"))
-        );
-    }
-
-    #[test]
-    fn hello_round_trips_through_the_ywebrtc_data_field() {
-        let hello = Hello {
-            kind: HELLO_KIND.to_owned(),
-            v: HELLO_VERSION,
-            id: "aa".repeat(32),
-            relay: Some("https://relay.wondering.xyz/".to_owned()),
-            rtc: Some(true),
-        };
-        let message = ClientMessage::Publish {
-            topic: rendezvous_channel(RoomTopic::from_room_name("quiet-cactus-song")),
-            data: serde_json::to_value(&hello).unwrap(),
-        };
-        let json = serde_json::to_string(&message).unwrap();
-        assert!(json.contains("\"type\":\"publish\""));
-        assert!(json.contains("\"kind\":\"walkie-hello\""));
-        assert!(json.contains("\"rtc\":true"));
-
-        // The server echoes `data` verbatim; we must decode our own publish.
-        let echoed: ServerMessage = serde_json::from_str(&json).unwrap();
-        let ServerMessage::Publish { data, .. } = echoed else {
-            panic!("expected a publish");
-        };
-        // Dispatch key the loop reads before choosing hello vs webrtc.
-        assert_eq!(data.get("kind").and_then(|k| k.as_str()), Some(HELLO_KIND));
-        let decoded: Hello = serde_json::from_value(data).unwrap();
-        assert_eq!(decoded.id, "aa".repeat(32));
-        assert_eq!(
-            decoded.relay.as_deref(),
-            Some("https://relay.wondering.xyz/")
-        );
-        assert_eq!(decoded.rtc, Some(true));
-    }
-
-    #[test]
-    fn hello_without_rtc_flag_omits_the_field_and_defaults_to_none() {
-        let hello = Hello {
-            kind: HELLO_KIND.to_owned(),
-            v: HELLO_VERSION,
-            id: "bb".repeat(32),
-            relay: None,
-            rtc: None,
-        };
-        let json = serde_json::to_string(&hello).unwrap();
-        assert!(!json.contains("rtc"));
-        let decoded: Hello = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.rtc, None);
-    }
-
-    #[test]
-    fn room_v4_channel_and_hello_bytes_are_exact() {
-        let topic = RoomTopic::from_room_name_v4("quiet-cactus-song");
-        assert_eq!(
-            rendezvous_channel_v4(topic),
-            format!("walkie-rdv-v4-{}", topic.to_hex())
-        );
-        assert_ne!(rendezvous_channel_v4(topic), rendezvous_channel(topic));
-
-        let hello = HelloV4::new(
-            LaneSet::WALKIE,
+        let hello = HelloV5::new(
+            ProtocolSupport::WALKIE,
             "aa".repeat(32),
             Some("https://relay.wondering.xyz/".to_owned()),
             Some(true),
         );
         let json = serde_json::to_string(&hello).unwrap();
+        assert!(json.contains("\"support\":3"));
+        assert!(!json.contains("\"lanes\""));
         assert_eq!(
-            json,
-            format!(
-                "{{\"kind\":\"walkie-hello\",\"v\":4,\"lanes\":3,\"id\":\"{}\",\"relay\":\"https://relay.wondering.xyz/\",\"rtc\":true}}",
-                "aa".repeat(32)
-            )
+            serde_json::from_str::<HelloV5>(&json).unwrap().validate(),
+            Some(ProtocolSupport::WALKIE)
         );
-        assert_eq!(
-            serde_json::from_str::<HelloV4>(&json).unwrap().validate(),
-            Some(LaneSet::WALKIE)
-        );
-    }
-
-    #[test]
-    fn room_v4_hello_requires_and_validates_lanes_and_generation() {
-        let missing_lanes = format!(
-            "{{\"kind\":\"walkie-hello\",\"v\":4,\"id\":\"{}\",\"rtc\":true}}",
-            "bb".repeat(32)
-        );
-        assert!(serde_json::from_str::<HelloV4>(&missing_lanes).is_err());
-
-        for lanes in [0x00, 0x04, 0x80, 0xff] {
-            let hello = HelloV4 {
-                lanes,
-                ..HelloV4::new(LaneSet::MUSIC, "bb".repeat(32), None, Some(true))
-            };
-            assert_eq!(hello.validate(), None);
+        for support in [0x00, 0x04, 0x80, 0xff] {
+            assert_eq!(
+                HelloV5 {
+                    support,
+                    ..hello.clone()
+                }
+                .validate(),
+                None
+            );
         }
-        let wrong_version = HelloV4 {
-            v: HELLO_VERSION,
-            ..HelloV4::new(LaneSet::MUSIC, "bb".repeat(32), None, Some(true))
-        };
-        assert_eq!(wrong_version.validate(), None);
-
-        let v1 = Hello {
-            kind: HELLO_KIND.to_owned(),
-            v: HELLO_VERSION,
-            id: "bb".repeat(32),
-            relay: None,
-            rtc: Some(true),
-        };
-        assert!(serde_json::from_value::<HelloV4>(serde_json::to_value(v1).unwrap()).is_err());
     }
 
     #[test]

@@ -1,13 +1,11 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    marker::PhantomData,
+    collections::BTreeMap,
     path::PathBuf,
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 
-use hhhs::EntryHash;
-use iroh::endpoint::Connection;
+use hhhs_store::JournalStorage;
 use tauri::{Manager, ipc::Channel};
 use tokio::sync::{mpsc, oneshot};
 use walkie_songie::{
@@ -21,27 +19,20 @@ use walkie_songie::{
         MidiSource, NativeMidiService, PhysicalMidiKey,
     },
     net::{
-        CourierFrame, CourierResponder, ExtensionLane, FileSeedStore, IncomingOp, IrohSyncStream,
-        LaneIngest, LaneProtocol, LaneSpec, LaneStoreAccess, LaneSyncSource, MusicLane,
-        NativeNetworkEvent, NativeRoomNetwork, NativeRoomNetworkConfig, NativeRoomTicketV4, PeerId,
-        PeerTransportPath, RelayPolicy, RoomInbound, RoomTopic, SyncApply, SyncError, SyncLimits,
-        SyncOutcome, SyncStream, TokioTimer, TrackedDiscardHistory, WalkieIdentity,
-        drive_initiator, drive_responder, ingest_pairs, spawn_rendezvous_v4,
+        FileSeedStore, IrohSyncStream, NativeNetworkEvent, NativeRoomNetwork, NativeRoomTicketV5,
+        PeerTransportPath, RelayPolicy, ReplicaProtocol, ReplicaRepairHint,
+        ReplicaRoomNetworkConfig, RoomInbound, TokioTimer, WalkieIdentity, drive_replica_initiator,
+        drive_replica_responder, spawn_rendezvous_v5,
     },
-    room::{
-        lane_journal::FileLaneJournal,
-        ops::{AuthorId, OpLanguage, SigningKey, VerifiedOpG, WindowIngest},
-        presence::{PresenceBody, SignedPresenceV4},
-        store::{RoomView, Store},
-        v4::{
-            ExtensionLang, ExtensionOp, LaneSet, LocalRoomOp, MusicLang, MusicOp, Room, RoomLane,
-        },
+    room::v5::{
+        ActorId, ExtensionCommand, MemberCapabilities, MusicOp, ProtocolSupport, RoomCommand,
+        RoomLane, RoomReplicas, RoomView,
     },
 };
 
 enum RoomControl {
     Commit {
-        op: LocalRoomOp,
+        command: RoomCommand,
         response: oneshot::Sender<Result<CommandAck, AppError>>,
     },
     Presence {
@@ -60,7 +51,7 @@ struct ActiveRoom {
 struct RuntimeState {
     sequence: u64,
     snapshot: AppSnapshot,
-    pitch_authors: BTreeMap<walkie_songie::TunedDegree, Vec<AuthorId>>,
+    pitch_authors: BTreeMap<walkie_songie::TunedDegree, Vec<ActorId>>,
     subscribers: Vec<Channel<AppEventEnvelope>>,
     active_room: Option<ActiveRoom>,
 }
@@ -72,9 +63,8 @@ struct MidiRuntime {
 }
 
 struct DurableRoom {
-    room: Room,
-    journal: FileLaneJournal,
-    courier: BTreeMap<(PeerId, RoomLane), TrackedDiscardHistory>,
+    room: RoomReplicas<JournalStorage, JournalStorage>,
+    capabilities: MemberCapabilities,
 }
 
 type SharedDurableRoom = Arc<tokio::sync::Mutex<DurableRoom>>;
@@ -133,7 +123,7 @@ impl AppRuntime {
         let envelope = AppEventEnvelope {
             sequence: state.sequence,
             event: AppEvent::Snapshot {
-                snapshot: state.snapshot.clone(),
+                snapshot: Box::new(state.snapshot.clone()),
             },
         };
         subscriber.send(envelope).map_err(|error| {
@@ -148,8 +138,8 @@ impl AppRuntime {
 
     async fn dispatch(&self, command: ClientCommand) -> Result<CommandAck, AppError> {
         match command {
-            ClientCommand::EnterRoom { room_name } => self.enter_room(room_name).await,
-            ClientCommand::JoinTicket { ticket } => self.join_ticket(ticket).await,
+            ClientCommand::EnterRoom { room_name } => self.enter_room_v5(room_name).await,
+            ClientCommand::JoinTicket { ticket } => self.join_ticket_v5(ticket).await,
             ClientCommand::LeaveRoom => self.leave_room().await,
             ClientCommand::SetTuning { definition } => {
                 definition.validate("room tuning").map_err(|error| {
@@ -171,16 +161,16 @@ impl AppRuntime {
             }
             ClientCommand::PutPiece { emoji, pitch } => {
                 self.validate_periodic_pitch(pitch)?;
-                self.submit_durable(ExtensionOp::PutPiece { emoji, pitch }.into())
+                self.submit_durable(ExtensionCommand::PutPiece { emoji, pitch }.into())
                     .await
             }
             ClientCommand::MovePiece { piece, pitch } => {
                 self.validate_periodic_pitch(pitch)?;
-                self.submit_durable(ExtensionOp::MovePiece { piece, pitch }.into())
+                self.submit_durable(ExtensionCommand::MovePiece { piece, pitch }.into())
                     .await
             }
             ClientCommand::RemovePiece { piece } => {
-                self.submit_durable(ExtensionOp::RemovePiece { piece }.into())
+                self.submit_durable(ExtensionCommand::RemovePiece { piece }.into())
                     .await
             }
             ClientCommand::SetRoomConfig {
@@ -188,7 +178,7 @@ impl AppRuntime {
                 available_emojis,
             } => {
                 self.submit_durable(
-                    ExtensionOp::SetConfig {
+                    ExtensionCommand::SetConfig {
                         pieces_locked,
                         available_emojis,
                     }
@@ -212,91 +202,74 @@ impl AppRuntime {
         }
     }
 
-    async fn enter_room(&self, room_name: String) -> Result<CommandAck, AppError> {
+    async fn enter_room_v5(&self, room_name: String) -> Result<CommandAck, AppError> {
         if !is_valid_room_name(&room_name) {
             return Err(AppError::new(
                 AppErrorCode::InvalidRoom,
                 "room names use the form adjective-noun-noun",
             ));
         }
-        let topic = RoomTopic::from_room_name_v4(&room_name);
-        let config = NativeRoomNetworkConfig {
-            topic,
-            relay: relay_policy_from_environment()?,
-            bootstrap: None,
-            bootstrap_lanes: None,
-        };
-        self.start_room(Some(room_name), config, DiscoverySource::Mdns)
+        let mut config =
+            ReplicaRoomNetworkConfig::create(&room_name, self.identity.capability_actor_id());
+        config.relay = relay_policy_from_environment()?;
+        self.start_room_v5(Some(room_name), config, DiscoverySource::Mdns)
             .await
     }
 
-    async fn join_ticket(&self, encoded: String) -> Result<CommandAck, AppError> {
-        let ticket = encoded.parse::<NativeRoomTicketV4>().map_err(|error| {
-            AppError::new(AppErrorCode::InvalidTicket, "invalid room ticket")
+    async fn join_ticket_v5(&self, encoded: String) -> Result<CommandAck, AppError> {
+        let ticket = encoded.parse::<NativeRoomTicketV5>().map_err(|error| {
+            AppError::new(AppErrorCode::InvalidTicket, "invalid Room-v5 ticket")
                 .with_detail(error.to_string())
         })?;
-        let config = NativeRoomNetworkConfig {
-            topic: ticket.topic(),
-            relay: relay_policy_from_environment()?,
-            bootstrap: Some(ticket.endpoint_addr().clone()),
-            bootstrap_lanes: Some(ticket.lanes()),
-        };
-        self.start_room(None, config, DiscoverySource::Ticket).await
+        let mut config = ReplicaRoomNetworkConfig::join(&ticket);
+        config.relay = relay_policy_from_environment()?;
+        self.start_room_v5(None, config, DiscoverySource::Ticket)
+            .await
     }
 
-    async fn start_room(
+    async fn start_room_v5(
         &self,
         room_name: Option<String>,
-        config: NativeRoomNetworkConfig,
+        config: ReplicaRoomNetworkConfig,
         bootstrap_source: DiscoverySource,
     ) -> Result<CommandAck, AppError> {
         self.stop_active_room().await;
 
-        let topic_string = config.topic.to_string();
-        let journal_path = self
-            .data_dir
-            .join("rooms")
-            .join(format!("{topic_string}.v4.ops"));
-        let (journal, recovered) =
-            FileLaneJournal::open(journal_path).map_err(persistence_error)?;
-        let room = Room::recover(&topic_string, &recovered).map_err(|error| {
-            persistence_error(format!("stored operation failed recovery: {error}"))
-        })?;
-        let pending = room.music().pending_len() + room.extension().pending_len();
-        if pending != 0 {
-            return Err(persistence_error(format!(
-                "{} stored operations are missing causal predecessors",
-                pending
-            )));
-        }
+        let topic = config.topic();
+        let topic_string = topic.to_string();
+        let room_directory = self.data_dir.join("rooms");
+        std::fs::create_dir_all(&room_directory).map_err(persistence_error)?;
+        let music =
+            JournalStorage::open(room_directory.join(format!("{topic_string}.music.v5.hhhs")))
+                .map_err(persistence_error)?;
+        let extension =
+            JournalStorage::open(room_directory.join(format!("{topic_string}.extension.v5.hhhs")))
+                .map_err(persistence_error)?;
+        let local_actor = self.identity.capability_actor_id();
+        let room = RoomReplicas::initialize(config.room.clone(), config.owner, music, extension)
+            .map_err(persistence_error)?;
         let recovered_view = room.view();
         let durable = Arc::new(tokio::sync::Mutex::new(DurableRoom {
+            capabilities: room.capabilities_for(local_actor),
             room,
-            journal,
-            courier: BTreeMap::new(),
         }));
 
         let bootstrap = config.bootstrap.as_ref().map(|address| address.id);
-        let bootstrap_lanes = config.bootstrap_lanes;
+        let bootstrap_support = config.bootstrap_support;
         let mut network = NativeRoomNetwork::bind(self.identity.iroh_secret(), config.clone())
             .await
             .map_err(network_error)?;
         let ticket = network.settle_ticket(Duration::from_millis(750)).await;
         let ticket_string = ticket.to_string();
 
-        // ---- topic rendezvous: auto-peer everyone in this room by code ----
-        // Room-NAME path only (no bootstrap ticket); additive to the ticket
-        // flow. This also gives native cross-network peering — mDNS is LAN-only.
-        // Discovered ids flow to the room loop below, which seeds the peer map
-        // (the rendezvous task itself already fed MemoryLookup + gossip).
         let (rendezvous_guard, mut rendezvous_rx) = if bootstrap.is_none() {
-            let (rdv_tx, rdv_rx) = mpsc::channel::<(iroh::EndpointId, LaneSet)>(64);
-            let handle = spawn_rendezvous_v4(
+            let (rdv_tx, rdv_rx) = mpsc::channel::<(iroh::EndpointId, ProtocolSupport)>(64);
+            let handle = spawn_rendezvous_v5(
                 network.rendezvous_peering(),
-                config.topic,
-                LaneSet::WALKIE,
-                move |endpoint_id, lanes| {
-                    let _ = rdv_tx.try_send((endpoint_id, lanes));
+                topic,
+                ProtocolSupport::WALKIE,
+                move |endpoint_id, support| {
+                    let _ = rdv_tx.try_send((endpoint_id, support));
                 },
             );
             (Some(handle), Some(rdv_rx))
@@ -306,185 +279,95 @@ impl AppRuntime {
 
         let (control, mut control_rx) = mpsc::channel(64);
         let runtime = self.clone();
-        let signing_key = self.identity.signing_key();
-        let signed_topic = topic_string.clone();
-        let presence_topic = *config.topic.as_bytes();
+        let signing_key = self.identity.capability_signing_key();
+        let endpoint = network.endpoint().clone();
+        let own_endpoint = network.endpoint_id();
         let midi_events = self.lock_midi()?.service.input_events();
-        let network_handle = NativeRoomNetworkHandle {
-            endpoint: network.endpoint().clone(),
-        };
-        let sync_progress = Arc::new(tokio::sync::Mutex::new(PeerSyncProgress::default()));
         let task = tauri::async_runtime::spawn(async move {
-            // Own the rendezvous task for the room's lifetime; dropping it when
-            // this task ends (below) aborts the signaling connection.
             let _rendezvous_guard = rendezvous_guard;
             let mut local_presence_session = 0_u64;
             let mut local_presence_sequence = 0_u64;
-            // author -> (session, sequence, issued_at_ms, local_expires_at_ms)
-            let mut presence_order: BTreeMap<AuthorId, (u64, u64, u64, u64)> = BTreeMap::new();
-            let mut peers: BTreeMap<iroh::EndpointId, (DiscoverySource, PeerPath)> =
-                BTreeMap::new();
-            let mut peer_lanes: BTreeMap<iroh::EndpointId, LaneSet> = BTreeMap::new();
+            let mut peers: BTreeMap<
+                iroh::EndpointId,
+                (DiscoverySource, PeerPath, ProtocolSupport),
+            > = BTreeMap::new();
             if let Some(endpoint_id) = bootstrap {
-                peers.insert(endpoint_id, (bootstrap_source, PeerPath::Connecting));
-                if let Some(lanes) = bootstrap_lanes {
-                    peer_lanes.insert(endpoint_id, lanes);
-                }
+                peers.insert(
+                    endpoint_id,
+                    (
+                        bootstrap_source,
+                        PeerPath::Connecting,
+                        bootstrap_support.unwrap_or(ProtocolSupport::WALKIE),
+                    ),
+                );
                 runtime.update_peer(endpoint_id, bootstrap_source, PeerPath::Connecting, false);
             }
 
             let mut path_refresh = tokio::time::interval(Duration::from_secs(1));
             path_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut presence_refresh = tokio::time::interval(Duration::from_millis(250));
-            presence_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut midi_refresh = tokio::time::interval(Duration::from_secs(2));
             midi_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // Gossip is intentionally lossy. Give every room a stable, slightly
-            // jittered anti-entropy cadence so a missed operation converges even
-            // when membership never changes and no Lagged event is surfaced.
             let repair_period =
-                Duration::from_secs(25 + u64::from(network.endpoint_id().as_bytes()[0] % 11));
+                Duration::from_secs(25 + u64::from(own_endpoint.as_bytes()[0] % 11));
             let mut repair_refresh = tokio::time::interval_at(
                 tokio::time::Instant::now() + repair_period,
                 repair_period,
             );
             repair_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
             loop {
                 tokio::select! {
-                    control = control_rx.recv() => {
-                        match control {
-                            Some(RoomControl::Commit { op, response }) => {
-                                let result = commit_room_op(
-                                    &durable,
-                                    &signing_key,
-                                    &signed_topic,
-                                    op,
-                                    &network,
-                                    &runtime,
-                                )
-                                .await;
-                                let _ = response.send(result.map(|accepted_sequence| {
-                                    CommandAck { accepted_sequence }
-                                }));
+                    control = control_rx.recv() => match control {
+                        Some(RoomControl::Commit { command, response }) => {
+                            let result = commit_replica_command(
+                                &durable,
+                                &signing_key,
+                                command,
+                                &network,
+                                &runtime,
+                            ).await;
+                            let _ = response.send(result.map(|accepted_sequence| CommandAck {
+                                accepted_sequence,
+                            }));
+                        }
+                        Some(RoomControl::Presence { session, pitch, response }) => {
+                            if session == local_presence_session {
+                                local_presence_sequence = local_presence_sequence.saturating_add(1);
+                            } else {
+                                local_presence_session = session;
+                                local_presence_sequence = 0;
                             }
-                            Some(RoomControl::Presence {
+                            let result = broadcast_presence(
+                                &durable,
+                                &signing_key,
                                 session,
+                                local_presence_sequence,
                                 pitch,
-                                response,
-                            }) => {
-                                if session == local_presence_session {
-                                    local_presence_sequence =
-                                        local_presence_sequence.saturating_add(1);
-                                } else {
-                                    local_presence_session = session;
-                                    local_presence_sequence = 0;
-                                }
-                                let now = unix_time_millis();
-                                match SignedPresenceV4::sign(
-                                    &signing_key,
-                                    PresenceBody::new_v4(
-                                        presence_topic,
-                                        session,
-                                        local_presence_sequence,
-                                        now,
-                                        pitch,
-                                    ),
-                                ) {
-                                    Ok(signed) => {
-                                        let body = signed
-                                            .verify(presence_topic)
-                                            .expect("just-signed presence verifies")
-                                            .body;
-                                        let expires = now.saturating_add(u64::from(body.lease_ms));
-                                        let author = AuthorId(
-                                            *signing_key.verifying_key().as_bytes()
-                                        );
-                                        presence_order.insert(
-                                            author,
-                                            (
-                                                body.session,
-                                                body.sequence,
-                                                body.issued_at_ms,
-                                                expires,
-                                            ),
-                                        );
-                                        let accepted_sequence = runtime.apply_presence(
-                                            author,
-                                            body,
-                                            expires,
-                                        );
-                                        if let Ok(bytes) = signed.to_wire_bytes()
-                                            && let Err(error) = network.broadcast(bytes).await
-                                        {
-                                            runtime.emit_diagnostic(
-                                                "presence_broadcast",
-                                                &error.to_string(),
-                                            );
-                                        }
-                                        let _ = response.send(Ok(CommandAck {
-                                            accepted_sequence,
-                                        }));
-                                    }
-                                    Err(error) => {
-                                        let _ = response.send(Err(
-                                            AppError::new(
-                                                AppErrorCode::InvalidCommand,
-                                                "could not sign voice presence",
-                                            )
-                                            .with_detail(error.to_string()),
-                                        ));
-                                    }
-                                }
-                            }
-                            Some(RoomControl::Shutdown) | None => break,
+                                &network,
+                                &runtime,
+                            ).await;
+                            let _ = response.send(result.map(|accepted_sequence| CommandAck {
+                                accepted_sequence,
+                            }));
                         }
-                    }
-                    _ = presence_refresh.tick() => {
-                        let now = unix_time_millis();
-                        let expired: Vec<_> = presence_order
-                            .iter()
-                            .filter(|(_, (_, _, _, expires))| *expires <= now)
-                            .map(|(author, _)| *author)
-                            .collect();
-                        for author in expired {
-                            if let Some((session, _, _, _)) =
-                                presence_order.remove(&author)
-                            {
-                                runtime.expire_presence(author, session);
-                            }
-                        }
-                    }
+                        Some(RoomControl::Shutdown) | None => break,
+                    },
                     _ = midi_refresh.tick() => {
                         match runtime.refresh_midi_devices() {
-                            Ok(actions) => {
-                                for action in actions {
-                                    let op = match action {
-                                        HeldInputAction::DegreeActivated(pitch) =>
-                                            MusicOp::AddDegree { degree: pitch }.into(),
-                                        HeldInputAction::DegreeReleased(pitch) =>
-                                            MusicOp::RemoveDegree { degree: pitch }.into(),
-                                    };
-                                    if let Err(error) = commit_room_op(
-                                        &durable,
-                                        &signing_key,
-                                        &signed_topic,
-                                        op,
-                                        &network,
-                                        &runtime,
-                                    )
-                                    .await
-                                    {
-                                        runtime.emit_diagnostic(
-                                            "midi_persistence",
-                                            &error.message,
-                                        );
-                                    }
+                            Ok(actions) => for action in actions {
+                                let command = match action {
+                                    HeldInputAction::DegreeActivated(pitch) =>
+                                        MusicOp::AddDegree { degree: pitch }.into(),
+                                    HeldInputAction::DegreeReleased(pitch) =>
+                                        MusicOp::RemoveDegree { degree: pitch }.into(),
+                                };
+                                if let Err(error) = commit_replica_command(
+                                    &durable, &signing_key, command, &network, &runtime,
+                                ).await {
+                                    runtime.emit_diagnostic("midi_persistence", &error.message);
                                 }
-                            }
-                            Err(error) => runtime.emit_diagnostic(
-                                "midi_refresh",
-                                &error.message,
-                            ),
+                            },
+                            Err(error) => runtime.emit_diagnostic("midi_refresh", &error.message),
                         }
                     }
                     input = midi_events.recv() => {
@@ -496,102 +379,66 @@ impl AppRuntime {
                             continue;
                         };
                         for action in runtime.apply_midi_input(input) {
-                            let op = match action {
+                            let command = match action {
                                 HeldInputAction::DegreeActivated(pitch) =>
                                     MusicOp::AddDegree { degree: pitch }.into(),
                                 HeldInputAction::DegreeReleased(pitch) =>
                                     MusicOp::RemoveDegree { degree: pitch }.into(),
                             };
-                            if let Err(error) = commit_room_op(
-                                &durable,
-                                &signing_key,
-                                &signed_topic,
-                                op,
-                                &network,
-                                &runtime,
-                            )
-                            .await
-                            {
-                                runtime.emit_diagnostic(
-                                    "midi_persistence",
-                                    &error.message,
-                                );
+                            if let Err(error) = commit_replica_command(
+                                &durable, &signing_key, command, &network, &runtime,
+                            ).await {
+                                runtime.emit_diagnostic("midi_persistence", &error.message);
                             }
                         }
                     }
                     _ = path_refresh.tick() => {
                         for endpoint_id in peers.keys().copied().collect::<Vec<_>>() {
                             let path = map_peer_path(network.peer_path(endpoint_id).await);
-                            let Some((source, previous)) = peers.get_mut(&endpoint_id) else {
+                            let Some((source, previous, _)) = peers.get_mut(&endpoint_id) else {
                                 continue;
                             };
                             if *previous != path {
                                 *previous = path;
-                                runtime.update_peer(
-                                    endpoint_id,
-                                    *source,
-                                    path,
-                                    false,
-                                );
+                                runtime.update_peer(endpoint_id, *source, path, false);
                             }
                         }
                     }
                     _ = repair_refresh.tick() => {
-                        for endpoint_id in peers
-                            .iter()
-                            .filter(|(_, (_, path))| *path != PeerPath::Disconnected)
-                            .map(|(endpoint_id, _)| *endpoint_id)
-                            .collect::<Vec<_>>()
-                        {
-                            if network.endpoint_id().as_bytes() < endpoint_id.as_bytes() {
-                                spawn_repair_round(
-                                    runtime.clone(),
-                                    durable.clone(),
-                                    sync_progress.clone(),
-                                    peer_lanes.get(&endpoint_id).copied(),
-                                    signed_topic.clone(),
-                                    endpoint_id,
-                                    network_handle.clone(),
-                                );
+                        for (peer, (_, path, support)) in &peers {
+                            if *path == PeerPath::Disconnected || own_endpoint.as_bytes() >= peer.as_bytes() {
+                                continue;
                             }
-                        }
-                    }
-                    // Topic-rendezvous discovery. Seed the peer map like an mDNS
-                    // discovery; the rendezvous task already fed MemoryLookup +
-                    // gossip join_peers. The `pending` branch is inert when this
-                    // is a ticket join (no rendezvous); latching the receiver to
-                    // `None` on close keeps a drained channel from spinning.
-                    discovered = async {
-                        match rendezvous_rx.as_mut() {
-                            Some(rx) => rx.recv().await,
-                            None => std::future::pending::<Option<(iroh::EndpointId, LaneSet)>>().await,
-                        }
-                    } => {
-                        match discovered {
-                            Some((endpoint_id, lanes)) => {
-                                peer_lanes.insert(endpoint_id, lanes);
-                                let inserted = !peers.contains_key(&endpoint_id);
-                                peers.entry(endpoint_id).or_insert((
-                                    DiscoverySource::AddressLookup,
-                                    PeerPath::Connecting,
-                                ));
-                                if inserted {
-                                    runtime.update_peer(
-                                        endpoint_id,
-                                        DiscoverySource::AddressLookup,
-                                        PeerPath::Connecting,
-                                        false,
+                            for lane in [RoomLane::Music, RoomLane::Extension] {
+                                if support.supports(lane) {
+                                    spawn_replica_initiator(
+                                        runtime.clone(), durable.clone(), endpoint.clone(), *peer, lane,
                                     );
                                 }
                             }
-                            None => rendezvous_rx = None,
                         }
                     }
-                    // Repair arrives on its OWN bounded queue inside
-                    // `next_inbound`, so a peer opening repair sessions can never
-                    // head-of-line block op delivery, and each session is spawned
-                    // rather than driven here — the room loop must keep serving
-                    // commits and gossip while anti-entropy runs.
+                    discovered = async {
+                        match rendezvous_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending::<Option<(iroh::EndpointId, ProtocolSupport)>>().await,
+                        }
+                    } => match discovered {
+                        Some((endpoint_id, support)) => {
+                            peers.entry(endpoint_id).or_insert((
+                                DiscoverySource::AddressLookup,
+                                PeerPath::Connecting,
+                                support,
+                            ));
+                            runtime.update_peer(
+                                endpoint_id,
+                                DiscoverySource::AddressLookup,
+                                PeerPath::Connecting,
+                                false,
+                            );
+                        }
+                        None => rendezvous_rx = None,
+                    },
                     inbound = network.next_inbound() => {
                         let Some(inbound) = inbound else {
                             runtime.emit_diagnostic(
@@ -600,277 +447,134 @@ impl AppRuntime {
                             );
                             break;
                         };
-                        let event = match inbound {
+                        match inbound {
                             RoomInbound::Repair(repair) => {
-                                let expected = peer_lanes
-                                    .get(&repair.endpoint_id)
-                                    .copied()
-                                    .unwrap_or(LaneSet::WALKIE);
-                                match LaneProtocol::from_alpn(repair.alpn) {
-                                    Some(LaneProtocol::Repair(RoomLane::Music)) => {
-                                        spawn_repair::<MusicLane>(
-                                            runtime.clone(),
-                                            durable.clone(),
-                                            sync_progress.clone(),
-                                            expected,
-                                            signed_topic.clone(),
-                                            repair.endpoint_id,
-                                            repair.connection,
-                                            repair.stream,
-                                        );
-                                    }
-                                    Some(LaneProtocol::Repair(RoomLane::Extension)) => {
-                                        spawn_repair::<ExtensionLane>(
-                                            runtime.clone(),
-                                            durable.clone(),
-                                            sync_progress.clone(),
-                                            expected,
-                                            signed_topic.clone(),
-                                            repair.endpoint_id,
-                                            repair.connection,
-                                            repair.stream,
-                                        );
-                                    }
-                                    Some(LaneProtocol::Courier(RoomLane::Music)) => {
-                                        spawn_courier::<MusicLane>(
-                                            runtime.clone(),
-                                            durable.clone(),
-                                            repair.endpoint_id,
-                                            repair.connection,
-                                            repair.stream,
-                                        );
-                                    }
-                                    Some(LaneProtocol::Courier(RoomLane::Extension)) => {
-                                        spawn_courier::<ExtensionLane>(
-                                            runtime.clone(),
-                                            durable.clone(),
-                                            repair.endpoint_id,
-                                            repair.connection,
-                                            repair.stream,
-                                        );
-                                    }
-                                    None => repair
-                                        .connection
-                                        .close(4u32.into(), b"unsupported lane protocol"),
-                                }
-                                continue;
-                            }
-                            RoomInbound::Event(event) => event,
-                        };
-                        match event {
-                            NativeNetworkEvent::MdnsDiscovered { endpoint_id } => {
-                                peers
-                                    .entry(endpoint_id)
-                                    .and_modify(|peer| peer.0 = DiscoverySource::Mdns)
-                                    .or_insert((DiscoverySource::Mdns, PeerPath::Connecting));
-                                runtime.update_peer(
-                                    endpoint_id,
-                                    DiscoverySource::Mdns,
-                                    PeerPath::Connecting,
-                                    false,
+                                let Some(ReplicaProtocol::Repair(lane)) =
+                                    ReplicaProtocol::from_alpn(repair.alpn)
+                                else {
+                                    repair.connection.close(4u32.into(), b"unsupported Room-v5 ALPN");
+                                    continue;
+                                };
+                                spawn_replica_responder(
+                                    runtime.clone(),
+                                    durable.clone(),
+                                    repair.endpoint_id,
+                                    lane,
+                                    repair.stream.owning(repair.connection),
                                 );
                             }
-                            NativeNetworkEvent::MdnsExpired { endpoint_id } => {
-                                // Expiry removes LAN discovery, not necessarily an
-                                // already-active gossip/relay connection.
-                                if peers.get(&endpoint_id).is_some_and(|peer| {
-                                    peer.0 == DiscoverySource::Mdns
-                                        && peer.1 == PeerPath::Disconnected
-                                }) {
-                                    peers.remove(&endpoint_id);
-                                    runtime.remove_peer(endpoint_id);
-                                }
-                            }
-                            NativeNetworkEvent::NeighborUp {
-                                endpoint_id,
-                                discovery,
-                            } => {
-                                let source = peers
-                                    .get(&endpoint_id)
-                                    .map(|peer| peer.0)
-                                    .unwrap_or(discovery);
-                                let path = map_peer_path(network.peer_path(endpoint_id).await);
-                                peers.insert(endpoint_id, (source, path));
-                                runtime.update_peer(endpoint_id, source, path, false);
-                                if network.endpoint_id().as_bytes()
-                                    < endpoint_id.as_bytes()
-                                {
-                                    let advertised = peer_lanes.get(&endpoint_id).copied();
-                                    spawn_repair_round(
-                                        runtime.clone(),
-                                        durable.clone(),
-                                        sync_progress.clone(),
-                                        advertised,
-                                        signed_topic.clone(),
-                                        endpoint_id,
-                                        network_handle.clone(),
-                                    );
-                                }
-                            }
-                            NativeNetworkEvent::NeighborDown { endpoint_id } => {
-                                sync_progress.lock().await.clear(endpoint_id);
-                                if let Some((source, path)) = peers.get_mut(&endpoint_id) {
-                                    *path = PeerPath::Disconnected;
+                            RoomInbound::Event(event) => match event {
+                                NativeNetworkEvent::MdnsDiscovered { endpoint_id } => {
+                                    peers.entry(endpoint_id).or_insert((
+                                        DiscoverySource::Mdns,
+                                        PeerPath::Connecting,
+                                        ProtocolSupport::WALKIE,
+                                    ));
                                     runtime.update_peer(
                                         endpoint_id,
-                                        *source,
-                                        PeerPath::Disconnected,
+                                        DiscoverySource::Mdns,
+                                        PeerPath::Connecting,
                                         false,
                                     );
                                 }
-                            }
-                            NativeNetworkEvent::Message {
-                                delivered_from,
-                                bytes,
-                            } => {
-                                if bytes.starts_with(MusicLang::WIRE_MAGIC) {
-                                    let mut access = DurableLaneAccess::<MusicLane>::new(
-                                        durable.clone(),
-                                        runtime.clone(),
-                                    );
-                                    if let Err(error) = access
-                                        .apply_gossip(&signed_topic, &bytes)
-                                        .await
-                                    {
-                                        runtime.emit_diagnostic(
-                                            "gossip_rejected",
-                                            &format!(
-                                                "music frame from {delivered_from} was refused: {error}"
-                                            ),
-                                        );
+                                NativeNetworkEvent::MdnsExpired { endpoint_id } => {
+                                    if peers.get(&endpoint_id).is_some_and(|(_, path, _)| {
+                                        *path == PeerPath::Disconnected
+                                    }) {
+                                        peers.remove(&endpoint_id);
+                                        runtime.remove_peer(endpoint_id);
                                     }
-                                } else if bytes.starts_with(ExtensionLang::WIRE_MAGIC) {
-                                    let mut access = DurableLaneAccess::<ExtensionLane>::new(
-                                        durable.clone(),
-                                        runtime.clone(),
-                                    );
-                                    if let Err(error) = access
-                                        .apply_gossip(&signed_topic, &bytes)
-                                        .await
-                                    {
-                                        runtime.emit_diagnostic(
-                                            "gossip_rejected",
-                                            &format!(
-                                                "extension frame from {delivered_from} was refused: {error}"
-                                            ),
-                                        );
+                                }
+                                NativeNetworkEvent::NeighborUp { endpoint_id, discovery } => {
+                                    let support = peers.get(&endpoint_id)
+                                        .map(|(_, _, support)| *support)
+                                        .unwrap_or(ProtocolSupport::WALKIE);
+                                    let source = peers.get(&endpoint_id)
+                                        .map(|(source, _, _)| *source)
+                                        .unwrap_or(discovery);
+                                    let path = map_peer_path(network.peer_path(endpoint_id).await);
+                                    peers.insert(endpoint_id, (source, path, support));
+                                    runtime.update_peer(endpoint_id, source, path, false);
+                                    if let Err(error) = maybe_grant_peer(
+                                        &durable,
+                                        &signing_key,
+                                        local_actor,
+                                        ActorId(*endpoint_id.as_bytes()),
+                                        &network,
+                                    ).await {
+                                        runtime.emit_diagnostic("capability_grant", &error.message);
                                     }
-                                } else if let Ok(signed) =
-                                    SignedPresenceV4::from_wire_bytes(&bytes)
-                                {
-                                    match signed.verify(presence_topic) {
-                                        Ok(verified) => {
-                                            let body = verified.body;
-                                            let now = unix_time_millis();
-                                            let future_limit =
-                                                now.saturating_add(30_000);
-                                            let order = presence_order
-                                                .get(&verified.author)
-                                                .copied();
-                                            let is_newer = match order {
-                                                None => true,
-                                                Some((session, sequence, _issued, _))
-                                                    if session == body.session =>
-                                                {
-                                                    body.sequence > sequence
-                                                }
-                                                Some((_, _, issued, _)) => {
-                                                    body.issued_at_ms > issued
-                                                }
-                                            };
-                                            if body.issued_at_ms <= future_limit
-                                                && is_newer
-                                                && runtime.presence_pitch_is_valid(
-                                                    body.pitch,
-                                                )
-                                            {
-                                                let expires = now.saturating_add(
-                                                    u64::from(body.lease_ms),
-                                                );
-                                                presence_order.insert(
-                                                    verified.author,
-                                                    (
-                                                        body.session,
-                                                        body.sequence,
-                                                        body.issued_at_ms,
-                                                        expires,
-                                                    ),
-                                                );
-                                                runtime.apply_presence(
-                                                    verified.author,
-                                                    body,
-                                                    expires,
+                                    if own_endpoint.as_bytes() < endpoint_id.as_bytes() {
+                                        for lane in [RoomLane::Music, RoomLane::Extension] {
+                                            if support.supports(lane) {
+                                                spawn_replica_initiator(
+                                                    runtime.clone(), durable.clone(), endpoint.clone(), endpoint_id, lane,
                                                 );
                                             }
                                         }
-                                        Err(error) => runtime.emit_diagnostic(
-                                            "presence_rejected",
-                                            &error.to_string(),
-                                        ),
                                     }
-                                } else {
-                                    runtime.emit_diagnostic(
-                                        "gossip_rejected",
-                                        "unknown or malformed room message",
-                                    );
                                 }
-                            }
-                            NativeNetworkEvent::Lagged => {
-                                runtime.emit_diagnostic(
-                                    "gossip_lagged",
-                                    "the gossip event consumer lagged; scheduling anti-entropy repair",
-                                );
-                                for endpoint_id in peers
-                                    .iter()
-                                    .filter(|(_, (_, path))| *path != PeerPath::Disconnected)
-                                    .map(|(endpoint_id, _)| *endpoint_id)
-                                    .collect::<Vec<_>>()
-                                {
-                                    if network.endpoint_id().as_bytes() < endpoint_id.as_bytes() {
-                                        spawn_repair_round(
-                                            runtime.clone(),
-                                            durable.clone(),
-                                            sync_progress.clone(),
-                                            peer_lanes.get(&endpoint_id).copied(),
-                                            signed_topic.clone(),
+                                NativeNetworkEvent::NeighborDown { endpoint_id } => {
+                                    if let Some((source, path, _)) = peers.get_mut(&endpoint_id) {
+                                        *path = PeerPath::Disconnected;
+                                        runtime.update_peer(
                                             endpoint_id,
-                                            network_handle.clone(),
+                                            *source,
+                                            PeerPath::Disconnected,
+                                            false,
                                         );
                                     }
                                 }
-                            }
-                            NativeNetworkEvent::Closed => break,
-                            NativeNetworkEvent::Diagnostic(message) => runtime.emit_diagnostic(
-                                "native_network",
-                                &message,
-                            ),
+                                NativeNetworkEvent::Message { bytes, .. } => {
+                                    if let Some(hint) = ReplicaRepairHint::decode(&bytes)
+                                        && hint.source != walkie_songie::net::PeerId(*own_endpoint.as_bytes())
+                                        && let Ok(source) = iroh::EndpointId::from_bytes(hint.source.as_bytes())
+                                    {
+                                        spawn_replica_initiator(
+                                            runtime.clone(), durable.clone(), endpoint.clone(), source, hint.lane,
+                                        );
+                                    } else if let Ok(presence) =
+                                        durable.lock().await.room.verify_presence(&bytes)
+                                    {
+                                        runtime.apply_presence_v5(
+                                            presence.actor,
+                                            presence.session,
+                                            presence.sequence,
+                                            presence.pitch,
+                                            unix_time_millis().saturating_add(1_500),
+                                        );
+                                    }
+                                }
+                                NativeNetworkEvent::Lagged => {
+                                    for (peer, (_, path, support)) in &peers {
+                                        if *path == PeerPath::Disconnected { continue; }
+                                        for lane in [RoomLane::Music, RoomLane::Extension] {
+                                            if support.supports(lane) {
+                                                spawn_replica_initiator(
+                                                    runtime.clone(), durable.clone(), endpoint.clone(), *peer, lane,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                NativeNetworkEvent::Diagnostic(message) =>
+                                    runtime.emit_diagnostic("native_network", &message),
+                                NativeNetworkEvent::Closed => break,
+                            },
                         }
                     }
                 }
             }
-            if let Err(error) = network.shutdown().await {
-                runtime.emit_diagnostic("native_network_shutdown", &error.to_string());
-            }
+            let _ = network.shutdown().await;
         });
 
         let mut state = self.lock()?;
+        state.active_room = Some(ActiveRoom { control, task });
         state.snapshot.room_name = room_name.clone();
         state.snapshot.room_topic = Some(topic_string.clone());
         state.snapshot.room_ticket = Some(ticket_string.clone());
-        state.snapshot.active_degrees.clear();
-        state.pitch_authors.clear();
-        state.snapshot.pieces.clear();
-        state.snapshot.pieces_locked = false;
-        state.snapshot.available_emojis = None;
-        state.snapshot.voices.clear();
         state.snapshot.peers.clear();
-        state.snapshot.tuning = Some(walkie_songie::TuningDefinition::twelve_tet());
-        state.snapshot.tuning_id = state
-            .snapshot
-            .tuning
-            .as_ref()
-            .map(|definition| definition.id);
-        state.active_room = Some(ActiveRoom { control, task });
+        state.snapshot.voices.clear();
         emit_locked(
             &mut state,
             AppEvent::RoomChanged {
@@ -931,7 +635,7 @@ impl AppRuntime {
         self.stop_active_room().await;
     }
 
-    async fn submit_durable(&self, op: LocalRoomOp) -> Result<CommandAck, AppError> {
+    async fn submit_durable(&self, command: RoomCommand) -> Result<CommandAck, AppError> {
         let control = self
             .lock()?
             .active_room
@@ -945,7 +649,7 @@ impl AppRuntime {
             })?;
         let (response, receive) = oneshot::channel();
         control
-            .send(RoomControl::Commit { op, response })
+            .send(RoomControl::Commit { command, response })
             .await
             .map_err(|_| {
                 AppError::new(
@@ -1263,29 +967,31 @@ impl AppRuntime {
         };
         let mut events = Vec::new();
 
-        if state.snapshot.tuning != view.tuning {
-            state.snapshot.tuning = view.tuning.clone();
-            state.snapshot.tuning_id = view.tuning.as_ref().map(|definition| definition.id);
-            if let Some(definition) = view.tuning.clone() {
-                events.push(AppEvent::TuningChanged { definition });
-            }
+        if state.snapshot.tuning.as_ref() != Some(&view.music.tuning) {
+            state.snapshot.tuning = Some(view.music.tuning.clone());
+            state.snapshot.tuning_id = Some(view.music.tuning.id);
+            events.push(AppEvent::TuningChanged {
+                definition: view.music.tuning.clone(),
+            });
         }
 
         let old_degrees = state.snapshot.active_degrees.clone();
-        let new_degrees: Vec<_> = view.pitches.iter().copied().collect();
+        let new_degrees: Vec<_> = view.music.live.iter().copied().collect();
         for pitch in &old_degrees {
-            if !view.pitches.contains(pitch) {
+            if !view.music.live.contains(pitch) {
                 events.push(AppEvent::DegreeRemoved { pitch: *pitch });
             }
         }
         let new_authors: BTreeMap<_, Vec<_>> = view
-            .pitch_authors
+            .music
+            .holders
             .iter()
             .map(|(pitch, authors)| (*pitch, authors.iter().copied().collect()))
             .collect();
         for pitch in &new_degrees {
             let authors: Vec<_> = view
-                .pitch_authors
+                .music
+                .holders
                 .get(pitch)
                 .into_iter()
                 .flatten()
@@ -1303,9 +1009,9 @@ impl AppRuntime {
 
         let new_pieces: Vec<_> = view
             .pieces
-            .values()
-            .map(|piece| walkie_songie::client::PieceSnapshot {
-                id: piece.id,
+            .iter()
+            .map(|(id, piece)| walkie_songie::client::PieceSnapshot {
+                id: *id,
                 owner: piece.owner,
                 emoji: piece.emoji.clone(),
                 pitch: piece.pitch,
@@ -1344,76 +1050,39 @@ impl AppRuntime {
         self.lock().map(|state| state.sequence).unwrap_or(0)
     }
 
-    fn presence_pitch_is_valid(&self, pitch: Option<walkie_songie::TunedPeriodicPitch>) -> bool {
-        let Ok(state) = self.lock() else {
-            return false;
-        };
-        let Ok(tuning) = current_tuning(&state) else {
-            return false;
-        };
-        pitch.is_none_or(|pitch| pitch.validate(&tuning).is_ok())
-    }
-
-    fn apply_presence(&self, author: AuthorId, body: PresenceBody, expires_at_ms: u64) -> u64 {
+    fn apply_presence_v5(
+        &self,
+        author: ActorId,
+        session: u64,
+        sequence: u64,
+        pitch: Option<walkie_songie::TunedPeriodicPitch>,
+        expires_at_ms: u64,
+    ) -> u64 {
         let Ok(mut state) = self.lock() else {
             return 0;
         };
-        match body.pitch {
-            Some(pitch) => {
-                let voice = walkie_songie::client::VoiceSnapshot {
-                    author,
-                    session: body.session,
-                    sequence: body.sequence,
-                    pitch: Some(pitch),
-                    expires_at_ms,
-                };
-                if let Some(existing) = state
-                    .snapshot
-                    .voices
-                    .iter_mut()
-                    .find(|voice| voice.author == author)
-                {
-                    *existing = voice.clone();
-                } else {
-                    state.snapshot.voices.push(voice.clone());
-                    state.snapshot.voices.sort_by_key(|voice| voice.author);
-                }
-                emit_locked(&mut state, AppEvent::VoiceUpdated { voice });
-            }
-            None => {
-                state.snapshot.voices.retain(|voice| voice.author != author);
-                emit_locked(
-                    &mut state,
-                    AppEvent::VoiceExpired {
-                        author,
-                        session: body.session,
-                    },
-                );
-            }
-        }
-        drop(state);
-        self.sync_midi_from_snapshot();
-        self.lock().map(|state| state.sequence).unwrap_or(0)
-    }
-
-    fn expire_presence(&self, author: AuthorId, session: u64) {
-        let Ok(mut state) = self.lock() else {
-            return;
+        let voice = walkie_songie::client::VoiceSnapshot {
+            author,
+            session,
+            sequence,
+            pitch,
+            expires_at_ms,
         };
-        let was_present = state
+        if let Some(existing) = state
             .snapshot
             .voices
-            .iter()
-            .any(|voice| voice.author == author && voice.session == session);
-        state
-            .snapshot
-            .voices
-            .retain(|voice| voice.author != author || voice.session != session);
-        if was_present {
-            emit_locked(&mut state, AppEvent::VoiceExpired { author, session });
+            .iter_mut()
+            .find(|existing| existing.author == author && existing.session == session)
+        {
+            if sequence <= existing.sequence {
+                return state.sequence;
+            }
+            *existing = voice.clone();
+        } else {
+            state.snapshot.voices.push(voice.clone());
         }
-        drop(state);
-        self.sync_midi_from_snapshot();
+        emit_locked(&mut state, AppEvent::VoiceUpdated { voice });
+        state.sequence
     }
 
     fn update_peer(
@@ -1426,7 +1095,7 @@ impl AppRuntime {
         let Ok(mut state) = self.lock() else {
             return;
         };
-        let author = AuthorId(*endpoint_id.as_bytes());
+        let author = ActorId(*endpoint_id.as_bytes());
         let mut peer = PeerSnapshot {
             author,
             endpoint_id: endpoint_id.to_string(),
@@ -1453,29 +1122,11 @@ impl AppRuntime {
         emit_locked(&mut state, AppEvent::PeerUpdated { peer });
     }
 
-    fn update_peer_rtt(&self, endpoint_id: iroh::EndpointId, rtt: Duration) {
-        let Ok(mut state) = self.lock() else {
-            return;
-        };
-        let author = AuthorId(*endpoint_id.as_bytes());
-        let Some(peer) = state
-            .snapshot
-            .peers
-            .iter_mut()
-            .find(|peer| peer.author == author)
-        else {
-            return;
-        };
-        peer.round_trip_ms = Some(u32::try_from(rtt.as_millis()).unwrap_or(u32::MAX));
-        let event = peer.clone();
-        emit_locked(&mut state, AppEvent::PeerUpdated { peer: event });
-    }
-
     fn remove_peer(&self, endpoint_id: iroh::EndpointId) {
         let Ok(mut state) = self.lock() else {
             return;
         };
-        let author = AuthorId(*endpoint_id.as_bytes());
+        let author = ActorId(*endpoint_id.as_bytes());
         state.snapshot.peers.retain(|peer| peer.author != author);
         emit_locked(&mut state, AppEvent::PeerRemoved { author });
     }
@@ -1484,7 +1135,7 @@ impl AppRuntime {
         let Ok(mut state) = self.lock() else {
             return;
         };
-        let author = AuthorId(*endpoint_id.as_bytes());
+        let author = ActorId(*endpoint_id.as_bytes());
         let Some(peer) = state
             .snapshot
             .peers
@@ -1515,485 +1166,231 @@ impl AppRuntime {
     }
 }
 
-trait AppLane: LaneSpec {
-    const LANE: RoomLane;
-
-    fn store(room: &Room) -> &Store<Self::Lang>;
-    fn ingest(room: &mut Room, op: VerifiedOpG<Self::Lang>) -> WindowIngest;
-}
-
-impl AppLane for MusicLane {
-    const LANE: RoomLane = RoomLane::Music;
-
-    fn store(room: &Room) -> &Store<MusicLang> {
-        room.music()
-    }
-
-    fn ingest(room: &mut Room, op: VerifiedOpG<MusicLang>) -> WindowIngest {
-        WindowIngest {
-            lifted: room.ingest_music(op),
-            courier: Vec::new(),
-        }
-    }
-}
-
-impl AppLane for ExtensionLane {
-    const LANE: RoomLane = RoomLane::Extension;
-
-    fn store(room: &Room) -> &Store<ExtensionLang> {
-        room.extension()
-    }
-
-    fn ingest(room: &mut Room, op: VerifiedOpG<ExtensionLang>) -> WindowIngest {
-        WindowIngest {
-            lifted: room.ingest_extension(op),
-            courier: Vec::new(),
-        }
-    }
-}
-
-struct DurableLaneSink<'a, P: AppLane> {
-    durable: &'a mut DurableRoom,
-    lane: PhantomData<P>,
-}
-
-impl<P: AppLane> LaneIngest<P::Lang> for DurableLaneSink<'_, P> {
-    fn lifted_entry(&self, id: walkie_songie::room::ops::OpId) -> Option<EntryHash> {
-        P::store(&self.durable.room).lifted_entry(id)
-    }
-
-    fn knows_op(&self, id: walkie_songie::room::ops::OpId) -> bool {
-        P::store(&self.durable.room).knows_op(id)
-    }
-
-    fn ingest_lane(
-        &mut self,
-        wire: &[u8],
-        op: VerifiedOpG<P::Lang>,
-    ) -> Result<WindowIngest, SyncError> {
-        self.durable
-            .journal
-            .append(P::LANE, wire)
-            .map_err(|error| SyncError::Persistence(error.to_string()))?;
-        Ok(P::ingest(&mut self.durable.room, op))
-    }
-}
-
-/// Lane-generic durable access. The room lock is held only while capturing or
-/// applying one batch, never across a network round trip.
-struct DurableLaneAccess<P: AppLane> {
-    durable: SharedDurableRoom,
-    runtime: AppRuntime,
-    lane: PhantomData<P>,
-}
-
-impl<P: AppLane> DurableLaneAccess<P> {
-    fn new(durable: SharedDurableRoom, runtime: AppRuntime) -> Self {
-        Self {
-            durable,
-            runtime,
-            lane: PhantomData,
-        }
-    }
-
-    async fn apply_gossip(&mut self, topic: &str, wire: &[u8]) -> Result<usize, SyncError> {
-        let (report, view) = {
-            let mut durable = self.durable.lock().await;
-            let mut sink = DurableLaneSink::<P> {
-                durable: &mut durable,
-                lane: PhantomData,
-            };
-            let report = ingest_pairs::<P::Lang, _>(
-                &mut sink,
-                topic,
-                [IncomingOp {
-                    claimed_entry: None,
-                    wire,
-                }],
-            )?;
-            let view = durable.room.view();
-            (report, view)
-        };
-        if !report.lifted.is_empty() {
-            self.runtime.apply_room_view(view);
-        }
-        Ok(report.lifted.len())
-    }
-}
-
-impl<P: AppLane> LaneStoreAccess<P::Lang> for DurableLaneAccess<P> {
-    async fn capture(&mut self, salt: [u8; 16]) -> Result<LaneSyncSource<P::Lang>, SyncError> {
-        let durable = self.durable.lock().await;
-        Ok(LaneSyncSource::capture(P::store(&durable.room), salt)?)
-    }
-
-    async fn apply(
-        &mut self,
-        topic: &str,
-        pairs: &[(EntryHash, Vec<u8>)],
-        source: &mut LaneSyncSource<P::Lang>,
-    ) -> Result<SyncApply, SyncError> {
-        let (report, view) = {
-            let mut durable = self.durable.lock().await;
-            let report = {
-                let mut sink = DurableLaneSink::<P> {
-                    durable: &mut durable,
-                    lane: PhantomData,
-                };
-                ingest_pairs::<P::Lang, _>(&mut sink, topic, pairs.iter().map(IncomingOp::from))?
-            };
-            source.absorb(P::store(&durable.room), &report.lifted)?;
-            let view = durable.room.view();
-            (report, view)
-        };
-        if !report.lifted.is_empty() {
-            self.runtime.apply_room_view(view);
-        }
-        Ok(SyncApply {
-            admitted: report.admitted,
-            lifted: report.lifted.len(),
-            courier: report.courier,
-        })
-    }
-}
-
-#[derive(Default)]
-struct PeerSyncProgress {
-    completed: BTreeMap<iroh::EndpointId, u8>,
-    outbound_in_flight: BTreeSet<iroh::EndpointId>,
-}
-
-impl PeerSyncProgress {
-    fn record(&mut self, peer: iroh::EndpointId, lane: RoomLane, expected: LaneSet) -> bool {
-        let completed = self.completed.entry(peer).or_default();
-        *completed |= lane.tag();
-        *completed & expected.bits() == expected.bits()
-    }
-
-    fn clear(&mut self, peer: iroh::EndpointId) {
-        self.completed.remove(&peer);
-    }
-
-    fn begin_outbound(&mut self, peer: iroh::EndpointId) -> bool {
-        self.outbound_in_flight.insert(peer)
-    }
-
-    fn finish_outbound(&mut self, peer: iroh::EndpointId) {
-        self.outbound_in_flight.remove(&peer);
-    }
-}
-
-type SharedSyncProgress = Arc<tokio::sync::Mutex<PeerSyncProgress>>;
-
-async fn finish_repair<P: AppLane>(
-    result: Result<SyncOutcome, String>,
-    runtime: &AppRuntime,
-    progress: &SharedSyncProgress,
-    expected: LaneSet,
-    endpoint_id: iroh::EndpointId,
-    telemetry: &Connection,
-) {
-    match result {
-        Ok(outcome) if !outcome.root_mismatch && !outcome.incomplete => {
-            if let Some(rtt) = telemetry.rtt(iroh::endpoint::PathId::ZERO) {
-                runtime.update_peer_rtt(endpoint_id, rtt);
-            }
-            if progress.lock().await.record(endpoint_id, P::LANE, expected) {
-                runtime.mark_peer_synchronized(endpoint_id);
-            }
-            runtime.emit_diagnostic(
-                "repair_complete",
-                &format!(
-                    "{} repair with {endpoint_id} completed; ingested {} operations",
-                    String::from_utf8_lossy(P::ALPN),
-                    outcome.ingested,
-                ),
-            );
-        }
-        Ok(outcome) => runtime.emit_diagnostic(
-            "repair_incomplete",
-            &format!(
-                "{} repair with {endpoint_id} ended without convergence (root_mismatch={}, incomplete={})",
-                String::from_utf8_lossy(P::ALPN),
-                outcome.root_mismatch,
-                outcome.incomplete,
-            ),
-        ),
-        Err(error) => runtime.emit_diagnostic(
-            "repair_failed",
-            &format!(
-                "{} repair with {endpoint_id} failed: {error}",
-                String::from_utf8_lossy(P::ALPN)
-            ),
-        ),
-    }
-}
-
-fn spawn_repair<P: AppLane>(
-    runtime: AppRuntime,
-    durable: SharedDurableRoom,
-    progress: SharedSyncProgress,
-    expected: LaneSet,
-    signed_topic: String,
-    endpoint_id: iroh::EndpointId,
-    connection: Connection,
-    stream: IrohSyncStream,
-) {
-    tauri::async_runtime::spawn(async move {
-        let telemetry = connection.clone();
-        let result = run_repair_session::<P>(
-            stream.owning(connection),
-            false,
-            durable,
-            signed_topic,
-            runtime.clone(),
-        )
-        .await;
-        finish_repair::<P>(
-            result,
-            &runtime,
-            &progress,
-            expected,
-            endpoint_id,
-            &telemetry,
-        )
-        .await;
-    });
-}
-
-fn spawn_repair_round(
-    runtime: AppRuntime,
-    durable: SharedDurableRoom,
-    progress: SharedSyncProgress,
-    advertised: Option<LaneSet>,
-    signed_topic: String,
-    endpoint_id: iroh::EndpointId,
-    network: NativeRoomNetworkHandle,
-) {
-    tauri::async_runtime::spawn(async move {
-        if !progress.lock().await.begin_outbound(endpoint_id) {
-            return;
-        }
-        let attempted = advertised.unwrap_or(LaneSet::WALKIE);
-        let music_network = network.clone();
-        let music_durable = durable.clone();
-        let music_topic = signed_topic.clone();
-        let music_runtime = runtime.clone();
-        let music = async move {
-            if attempted.contains(RoomLane::Music) {
-                dial_and_run::<MusicLane>(
-                    &music_network,
-                    endpoint_id,
-                    music_durable,
-                    music_topic,
-                    music_runtime,
-                )
-                .await
-            } else {
-                None
-            }
-        };
-        let extension_network = network;
-        let extension_runtime = runtime.clone();
-        let extension = async move {
-            if attempted.contains(RoomLane::Extension) {
-                dial_and_run::<ExtensionLane>(
-                    &extension_network,
-                    endpoint_id,
-                    durable,
-                    signed_topic,
-                    extension_runtime,
-                )
-                .await
-            } else {
-                None
-            }
-        };
-        let (music, extension) = tokio::join!(music, extension);
-        let negotiated_bits = u8::from(music.is_some()) * RoomLane::Music.tag()
-            | u8::from(extension.is_some()) * RoomLane::Extension.tag();
-        if let Some(expected) = advertised.or_else(|| LaneSet::from_bits(negotiated_bits)) {
-            if let Some((telemetry, result)) = music {
-                finish_repair::<MusicLane>(
-                    result,
-                    &runtime,
-                    &progress,
-                    expected,
-                    endpoint_id,
-                    &telemetry,
-                )
-                .await;
-            }
-            if let Some((telemetry, result)) = extension {
-                finish_repair::<ExtensionLane>(
-                    result,
-                    &runtime,
-                    &progress,
-                    expected,
-                    endpoint_id,
-                    &telemetry,
-                )
-                .await;
-            }
-        }
-        progress.lock().await.finish_outbound(endpoint_id);
-    });
-}
-
-/// A cloneable subset of the native network used by concurrent repair dials.
-#[derive(Clone)]
-struct NativeRoomNetworkHandle {
-    endpoint: iroh::Endpoint,
-}
-
-impl NativeRoomNetworkHandle {
-    async fn dial(
-        &self,
-        endpoint_id: iroh::EndpointId,
-        protocol: LaneProtocol,
-    ) -> Result<(Connection, IrohSyncStream), String> {
-        let connection = self
-            .endpoint
-            .connect(endpoint_id, protocol.alpn())
-            .await
-            .map_err(|error| error.to_string())?;
-        let stream = IrohSyncStream::open(&connection)
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok((connection.clone(), stream.owning(connection)))
-    }
-}
-
-async fn dial_and_run<P: AppLane>(
-    network: &NativeRoomNetworkHandle,
-    endpoint_id: iroh::EndpointId,
-    durable: SharedDurableRoom,
-    signed_topic: String,
-    runtime: AppRuntime,
-) -> Option<(Connection, Result<SyncOutcome, String>)> {
-    let (connection, stream) = match network
-        .dial(endpoint_id, LaneProtocol::Repair(P::LANE))
-        .await
-    {
-        Ok(opened) => opened,
-        Err(error) => {
-            runtime.emit_diagnostic(
-                "repair_connect",
-                &format!(
-                    "{} repair connection to {endpoint_id} failed: {error}",
-                    String::from_utf8_lossy(P::ALPN)
-                ),
-            );
-            return None;
-        }
-    };
-    let result = run_repair_session::<P>(stream, true, durable, signed_topic, runtime).await;
-    Some((connection, result))
-}
-
-async fn run_repair_session<P: AppLane>(
-    stream: IrohSyncStream,
-    initiator: bool,
-    durable: SharedDurableRoom,
-    signed_topic: String,
-    runtime: AppRuntime,
-) -> Result<SyncOutcome, String> {
-    let mut access = DurableLaneAccess::<P>::new(durable, runtime);
-    let limits = SyncLimits::default();
-    if initiator {
-        drive_initiator::<P, _, _, _>(stream, &TokioTimer, &mut access, &signed_topic, limits).await
-    } else {
-        drive_responder::<P, _, _, _>(stream, &TokioTimer, &mut access, &signed_topic, limits).await
-    }
-    .map_err(|error| error.to_string())
-}
-
-fn spawn_courier<P: AppLane>(
-    runtime: AppRuntime,
-    durable: SharedDurableRoom,
-    endpoint_id: iroh::EndpointId,
-    connection: Connection,
-    mut stream: IrohSyncStream,
-) {
-    tauri::async_runtime::spawn(async move {
-        let result: Result<(), String> = async {
-            let Some(frame) = stream
-                .recv_frame()
-                .await
-                .map_err(|error| error.to_string())?
-            else {
-                return Ok(());
-            };
-            let request = match CourierFrame::decode(&frame).map_err(|error| error.to_string())? {
-                CourierFrame::Request(request) => request,
-                CourierFrame::Response(_) => return Err("courier opener was a response".into()),
-            };
-            let response = {
-                let durable = durable.lock().await;
-                let empty = TrackedDiscardHistory::new();
-                let peer = PeerId(*endpoint_id.as_bytes());
-                let history = durable.courier.get(&(peer, P::LANE)).unwrap_or(&empty);
-                CourierResponder {
-                    history,
-                    full: P::store(&durable.room),
-                }
-                .answer(&request)
-            };
-            let bytes = CourierFrame::Response(response)
-                .encode()
-                .map_err(|error| error.to_string())?;
-            stream
-                .send_frame(&bytes)
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok(())
-        }
-        .await;
-        stream.close().await;
-        drop(connection);
-        if let Err(error) = result {
-            runtime.emit_diagnostic(
-                "courier_failed",
-                &format!(
-                    "{} courier with {endpoint_id} failed: {error}",
-                    String::from_utf8_lossy(P::COURIER_ALPN)
-                ),
-            );
-        }
-    });
-}
-
-async fn commit_room_op(
+async fn broadcast_presence(
     durable: &SharedDurableRoom,
-    signing_key: &SigningKey,
-    signed_topic: &str,
-    op: LocalRoomOp,
+    signing_key: &hhhs_proof::SigningKey,
+    session: u64,
+    sequence: u64,
+    pitch: Option<walkie_songie::TunedPeriodicPitch>,
     network: &NativeRoomNetwork,
     runtime: &AppRuntime,
 ) -> Result<u64, AppError> {
-    let (wire, view) = {
+    let actor = ActorId::from_signing_key(signing_key);
+    let wire = {
         let mut durable = durable.lock().await;
-        let prepared = durable
-            .room
-            .prepare(signing_key, signed_topic, unix_time_micros(), op);
-        let wire = prepared.to_wire_bytes().map_err(persistence_error)?;
-        durable
-            .journal
-            .append(prepared.lane(), &wire)
-            .map_err(persistence_error)?;
+        durable.capabilities = durable.room.capabilities_for(actor);
         durable
             .room
-            .ingest_prepared(signed_topic, &prepared)
-            .expect("a just-signed, topic-scoped lane operation verifies");
-        (wire, durable.room.view())
+            .sign_presence(signing_key, &durable.capabilities, session, sequence, pitch)
+            .map_err(persistence_error)?
     };
+    let accepted_sequence = runtime.apply_presence_v5(
+        actor,
+        session,
+        sequence,
+        pitch,
+        unix_time_millis().saturating_add(1_500),
+    );
     if let Err(error) = network.broadcast(wire).await {
         runtime.emit_diagnostic(
-            "gossip_broadcast",
-            &format!("operation committed locally but broadcast failed: {error}"),
+            "presence_broadcast",
+            &format!("local presence applied; broadcast failed: {error}"),
+        );
+    }
+    Ok(accepted_sequence)
+}
+
+async fn commit_replica_command(
+    durable: &SharedDurableRoom,
+    signing_key: &hhhs_proof::SigningKey,
+    command: RoomCommand,
+    network: &NativeRoomNetwork,
+    runtime: &AppRuntime,
+) -> Result<u64, AppError> {
+    let (receipt, view) = {
+        let mut durable = durable.lock().await;
+        let actor = ActorId::from_signing_key(signing_key);
+        durable.capabilities = durable.room.capabilities_for(actor);
+        if durable.capabilities.for_lane(command.lane()).is_empty() {
+            return Err(AppError::new(
+                AppErrorCode::UnsupportedCapability,
+                "this actor has not received a live Room-v5 capability for that Replica",
+            ));
+        }
+        let receipt = durable
+            .room
+            .author(signing_key, &durable.capabilities, command)
+            .map_err(persistence_error)?;
+        (receipt, durable.room.view())
+    };
+    let hint = ReplicaRepairHint {
+        lane: receipt.lane,
+        source: walkie_songie::net::PeerId(*network.endpoint_id().as_bytes()),
+        entry: receipt.entry,
+    };
+    if let Err(error) = network.broadcast(hint.encode()).await {
+        runtime.emit_diagnostic(
+            "repair_hint_broadcast",
+            &format!("command is durable; repair hint failed: {error}"),
         );
     }
     Ok(runtime.apply_room_view(view))
+}
+
+async fn maybe_grant_peer(
+    durable: &SharedDurableRoom,
+    signing_key: &hhhs_proof::SigningKey,
+    local_actor: ActorId,
+    peer: ActorId,
+    network: &NativeRoomNetwork,
+) -> Result<(), AppError> {
+    let invitation = {
+        let durable = durable.lock().await;
+        if durable.room.owner() != local_actor || peer == local_actor {
+            return Ok(());
+        }
+        let existing = durable.room.capabilities_for(peer);
+        if !existing.music.is_empty() && !existing.extension.is_empty() {
+            return Ok(());
+        }
+        durable
+            .room
+            .grant_member(signing_key, peer)
+            .map_err(persistence_error)?
+    };
+    for (lane, entries) in [
+        (RoomLane::Music, invitation.capabilities.music),
+        (RoomLane::Extension, invitation.capabilities.extension),
+    ] {
+        for entry in entries {
+            network
+                .broadcast(
+                    ReplicaRepairHint {
+                        lane,
+                        source: walkie_songie::net::PeerId(*network.endpoint_id().as_bytes()),
+                        entry,
+                    }
+                    .encode(),
+                )
+                .await
+                .map_err(network_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn spawn_replica_initiator(
+    runtime: AppRuntime,
+    durable: SharedDurableRoom,
+    endpoint: iroh::Endpoint,
+    peer: iroh::EndpointId,
+    lane: RoomLane,
+) {
+    tauri::async_runtime::spawn(async move {
+        let connection = match endpoint.connect(peer, lane.repair_alpn()).await {
+            Ok(connection) => connection,
+            Err(error) => {
+                runtime.emit_diagnostic(
+                    "replica_repair_dial",
+                    &format!(
+                        "{} with {peer} failed: {error}",
+                        String::from_utf8_lossy(lane.repair_alpn())
+                    ),
+                );
+                return;
+            }
+        };
+        let stream = match IrohSyncStream::open(&connection).await {
+            Ok(stream) => stream.owning(connection),
+            Err(error) => {
+                runtime.emit_diagnostic("replica_repair_stream", &error.to_string());
+                return;
+            }
+        };
+        let mut host = {
+            let durable = durable.lock().await;
+            match lane {
+                RoomLane::Music => durable.room.music_repair_host(),
+                RoomLane::Extension => durable.room.extension_repair_host(),
+            }
+        };
+        match drive_replica_initiator(
+            stream,
+            &TokioTimer,
+            &mut host,
+            lane,
+            hhhs_sync::SessionLimits::default(),
+        )
+        .await
+        {
+            Ok(outcome) if !outcome.incomplete && !outcome.root_mismatch => {
+                let view = {
+                    let mut durable = durable.lock().await;
+                    durable.capabilities = durable
+                        .room
+                        .capabilities_for(runtime.identity.capability_actor_id());
+                    durable.room.view()
+                };
+                runtime.apply_room_view(view);
+                runtime.mark_peer_synchronized(peer);
+            }
+            Ok(outcome) => runtime.emit_diagnostic(
+                "replica_repair_incomplete",
+                &format!("{lane:?} repair with {peer} ended incomplete: {outcome:?}"),
+            ),
+            Err(error) => runtime.emit_diagnostic(
+                "replica_repair",
+                &format!("{lane:?} repair with {peer} failed: {error}"),
+            ),
+        }
+    });
+}
+
+fn spawn_replica_responder(
+    runtime: AppRuntime,
+    durable: SharedDurableRoom,
+    peer: iroh::EndpointId,
+    lane: RoomLane,
+    stream: IrohSyncStream,
+) {
+    tauri::async_runtime::spawn(async move {
+        let mut host = {
+            let durable = durable.lock().await;
+            match lane {
+                RoomLane::Music => durable.room.music_repair_host(),
+                RoomLane::Extension => durable.room.extension_repair_host(),
+            }
+        };
+        match drive_replica_responder(
+            stream,
+            &TokioTimer,
+            &mut host,
+            lane,
+            hhhs_sync::SessionLimits::default(),
+        )
+        .await
+        {
+            Ok(outcome) if !outcome.incomplete && !outcome.root_mismatch => {
+                let view = {
+                    let mut durable = durable.lock().await;
+                    durable.capabilities = durable
+                        .room
+                        .capabilities_for(runtime.identity.capability_actor_id());
+                    durable.room.view()
+                };
+                runtime.apply_room_view(view);
+                runtime.mark_peer_synchronized(peer);
+            }
+            Ok(outcome) => runtime.emit_diagnostic(
+                "replica_repair_incomplete",
+                &format!("{lane:?} repair from {peer} ended incomplete: {outcome:?}"),
+            ),
+            Err(error) => runtime.emit_diagnostic(
+                "replica_repair",
+                &format!("{lane:?} repair from {peer} failed: {error}"),
+            ),
+        }
+    });
 }
 
 fn midi_output_config(tuning: &walkie_songie::Tuning) -> MidiOutputConfig {
@@ -2060,13 +1457,6 @@ fn network_error(error: impl std::fmt::Display) -> AppError {
         "could not start native Iroh room",
     )
     .with_detail(error.to_string())
-}
-
-fn unix_time_micros() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| u64::try_from(duration.as_micros()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
 }
 
 fn unix_time_millis() -> u64 {
@@ -2143,32 +1533,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn peer_sync_requires_every_advertised_lane() {
-        let peer = iroh::SecretKey::from_bytes(&[51; 32]).public();
-        let mut progress = PeerSyncProgress::default();
-        assert!(!progress.record(peer, RoomLane::Music, LaneSet::WALKIE));
-        assert!(progress.record(peer, RoomLane::Extension, LaneSet::WALKIE));
-        progress.clear(peer);
-        assert!(
-            !progress.record(peer, RoomLane::Extension, LaneSet::WALKIE),
-            "a reconnect cannot reuse a lane completed by the previous connection"
-        );
-
-        let music_only = iroh::SecretKey::from_bytes(&[52; 32]).public();
-        assert!(progress.record(music_only, RoomLane::Music, LaneSet::MUSIC));
-    }
-
-    #[test]
-    fn app_lane_protocols_are_disjoint_and_pinned() {
-        assert_eq!(MusicLane::LANE, RoomLane::Music);
-        assert_eq!(ExtensionLane::LANE, RoomLane::Extension);
-        assert_eq!(
-            LaneProtocol::Repair(MusicLane::LANE).alpn(),
-            MusicLane::ALPN
-        );
-        assert_eq!(
-            LaneProtocol::Courier(ExtensionLane::LANE).alpn(),
-            ExtensionLane::COURIER_ALPN
-        );
+    fn production_host_exposes_only_room_v5_replica_protocols() {
+        for lane in [RoomLane::Music, RoomLane::Extension] {
+            let protocol = ReplicaProtocol::Repair(lane);
+            assert_eq!(ReplicaProtocol::from_alpn(protocol.alpn()), Some(protocol));
+        }
+        assert_eq!(ReplicaProtocol::from_alpn(b"tutti/music/courier/1"), None);
     }
 }

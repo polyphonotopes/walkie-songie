@@ -793,7 +793,7 @@ struct NoteDisplayInfo {
 
 /// Compute info panel data from room state
 fn compute_info_panel_data(
-    room: &crate::room::RoomState,
+    room: &crate::room::RoomProjection,
     tuning: &crate::tuning::Tuning,
 ) -> InfoPanelData {
     use super::graph::find_matching_scale_names;

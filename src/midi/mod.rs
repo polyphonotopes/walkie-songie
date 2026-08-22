@@ -20,7 +20,7 @@ pub use native::{
     MidiDeviceDirection, MidiInputEvent, NativeMidiError, NativeMidiService, NativePort,
 };
 
-use crate::room::ops::{AuthorId, OpId};
+use crate::room::v5::{ActorId, PieceId};
 use crate::tuning::TunedDegree;
 
 /// One independent reason a MIDI note is sounding, walkie's vocabulary:
@@ -29,14 +29,11 @@ use crate::tuning::TunedDegree;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MidiSource {
     /// A durable shared degree, held per author (authorship-as-channel).
-    DurableDegree {
-        author: AuthorId,
-        pitch: TunedDegree,
-    },
+    DurableDegree { author: ActorId, pitch: TunedDegree },
     /// An emoji piece, keyed by its creating op.
-    Piece { id: OpId },
+    Piece { id: PieceId },
     /// A peer's live voice preview (presence-leased, never durable).
-    Voice { author: AuthorId, session: u64 },
+    Voice { author: ActorId, session: u64 },
     /// A locally held physical key.
     LocalInput {
         port_id: String,

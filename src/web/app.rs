@@ -19,7 +19,7 @@ use crate::client::{
     PeerPath,
 };
 use crate::pitch::{PitchDetectorConfig, PitchEvent, SwiftF0Detector};
-use crate::room::{Piece, RoomEvent, RoomState};
+use crate::room::{Piece, RoomEvent, RoomProjection};
 use crate::tuning::{PitchClass, TunedDegree, TunedPeriodicPitch, Tuning, TuningDefinition};
 
 use crate::words::generate_room_name;
@@ -50,7 +50,7 @@ const STABILITY_DURATION_MS: u64 = 100;
 /// Application state.
 /// Uses Rc for wasm (single-threaded), Arc would work too but Rc is simpler.
 pub struct AppState {
-    /// True when a signed-RoomStore host is authoritative — either the Tauri
+    /// True when a capability-native Replica host is authoritative — either the Tauri
     /// runtime or the in-page browser iroh host. In these modes the Yrs state
     /// below is only a rendering adapter.
     pub native_backend: bool,
@@ -73,7 +73,7 @@ pub struct AppState {
     /// Last preview sent to Tauri, used to coalesce detector-rate updates while
     /// still refreshing the 1.5-second signed lease.
     last_native_voice: Rc<RefCell<Option<(Instant, TunedPeriodicPitch)>>>,
-    /// Room state with CRDT synchronization (manual/clicked pitches).
+    /// Ephemeral UI/MIDI projection of the admitted Replica view.
     ///
     /// PRIVATE: the projection (`project_native_snapshot`) is the sole
     /// effective writer. Sibling UI modules (`keyboard`, `components`, …) see
@@ -81,7 +81,7 @@ pub struct AppState {
     /// offline writers below reach it via [`AppState::room_mut`], which never
     /// escapes this module. This makes the single-writer invariant a compile
     /// error to violate, not a convention.
-    room: Mutable<RoomState>,
+    room: Mutable<RoomProjection>,
     /// Current tuning system.
     pub tuning: Mutable<Tuning>,
     /// Whether voice input is active.
@@ -151,7 +151,7 @@ pub struct AppState {
 impl AppState {
     /// Create a new application state.
     pub fn new(peer_id: String) -> Arc<Self> {
-        let room = RoomState::new(peer_id);
+        let room = RoomProjection::new(peer_id);
         let tuning = Tuning::twelve_tet();
         let config = PitchDetectorConfig::default();
         let swiftf0 = SwiftF0Detector::new(config.sample_rate);
@@ -159,8 +159,7 @@ impl AppState {
         let voice_session = (js_sys::Date::now() as u64).max(1);
 
         let tauri = super::native_bridge::is_available();
-        // Without Tauri, the browser-net build hosts the signed room in-page;
-        // otherwise the tab is the offline legacy Yrs fallback.
+        // Without Tauri, the browser-net build hosts the signed room in-page.
         let browser_host = !tauri && cfg!(feature = "browser-net");
 
         Arc::new(Self {
@@ -228,14 +227,14 @@ impl AppState {
     /// state. `ReadOnlyMutable` exposes `lock_ref`/`signal_cloned`/`get_cloned`
     /// but no `lock_mut`, so a component structurally cannot write unbacked
     /// state — the projection is the sole writer, enforced by the type system.
-    pub fn room(&self) -> ReadOnlyMutable<RoomState> {
+    pub fn room(&self) -> ReadOnlyMutable<RoomProjection> {
         self.room.read_only()
     }
 
     /// Private mutable access to the render adapter. Module-scoped so only the
     /// projection and the vestigial offline writers below can lock it for
     /// mutation; no write handle escapes to sibling UI modules.
-    fn room_mut(&self) -> MutableLockMut<'_, RoomState> {
+    fn room_mut(&self) -> MutableLockMut<'_, RoomProjection> {
         self.room.lock_mut()
     }
 
@@ -306,7 +305,7 @@ impl AppState {
         };
         #[cfg(feature = "browser-net")]
         if self.browser_host {
-            super::browser_host::dispatch(command, on_error);
+            super::replica_host::dispatch(command, on_error);
             return;
         }
         super::native_bridge::dispatch(command, on_error);
@@ -357,7 +356,7 @@ impl AppState {
     }
 
     pub fn move_native_piece(&self, piece_id: &str, absolute_pitch: i32) {
-        let Some(piece) = parse_op_id(piece_id) else {
+        let Some(piece) = parse_piece_id(piece_id) else {
             return;
         };
         if let Some(pitch) = self.native_periodic_pitch(absolute_pitch) {
@@ -366,7 +365,7 @@ impl AppState {
     }
 
     pub fn remove_native_piece(&self, piece_id: &str) {
-        if let Some(piece) = parse_op_id(piece_id) {
+        if let Some(piece) = parse_piece_id(piece_id) {
             self.dispatch_native(ClientCommand::RemovePiece { piece });
         }
     }
@@ -428,7 +427,7 @@ impl AppState {
         {
             let mut current = self.native_snapshot.lock_mut();
             match envelope.event {
-                AppEvent::Snapshot { snapshot } => *current = Some(snapshot),
+                AppEvent::Snapshot { snapshot } => *current = Some(*snapshot),
                 event => {
                     let Some(snapshot) = current.as_mut() else {
                         web_sys::console::warn_1(
@@ -544,7 +543,7 @@ impl AppState {
         drop(tuning);
 
         self.pieces_locked.set(snapshot.pieces_locked);
-        self.room.lock_mut().replace_native_projection(
+        self.room.lock_mut().replace_replica_projection(
             &pitches,
             &pieces,
             &voices,
@@ -1155,7 +1154,7 @@ fn apply_native_delta(snapshot: &mut AppSnapshot, event: AppEvent) {
     match event {
         AppEvent::Snapshot {
             snapshot: replacement,
-        } => *snapshot = replacement,
+        } => *snapshot = *replacement,
         AppEvent::RoomChanged {
             room_name,
             room_topic,
@@ -1299,7 +1298,7 @@ fn native_status(snapshot: &AppSnapshot) -> String {
     }
 }
 
-fn parse_op_id(value: &str) -> Option<crate::room::ops::OpId> {
+fn parse_piece_id(value: &str) -> Option<crate::room::v5::PieceId> {
     if value.len() != 64 {
         return None;
     }
@@ -1307,7 +1306,7 @@ fn parse_op_id(value: &str) -> Option<crate::room::ops::OpId> {
     for (index, byte) in bytes.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
     }
-    Some(crate::room::ops::OpId(bytes))
+    Some(crate::room::v5::PieceId(bytes))
 }
 
 /// Render the main application.
@@ -1489,15 +1488,15 @@ fn active_pitches_list(state: Arc<AppState>) -> Dom {
 /// Compute active pitches data for display.
 /// Returns Vec of (name, is_voice, is_piece, sort_key).
 fn compute_active_pitches_data(
-    room: &RoomState,
+    room: &RoomProjection,
     tuning: &Tuning,
 ) -> Vec<(String, bool, bool, i32)> {
     let pc_count = tuning.pitch_class_count() as i32;
 
-    // Get combined pitches from ALL peers via CRDT
+    // Get combined pitches from the current Replica projection.
     let room_result = room.compute_room_result();
 
-    // Get local voice pitch from CRDT (shows as green)
+    // Get the local projected voice pitch (shows as green).
     let (_, local_voice_pc) = room.local_voice();
 
     // Build list of active pitches: (name, is_voice, is_piece, sort_key)
@@ -1642,7 +1641,7 @@ async fn init_app() {
         #[cfg(feature = "browser-net")]
         if state.browser_host {
             let event_state = state.clone();
-            if let Err(error) = super::browser_host::init(move |event| {
+            if let Err(error) = super::replica_host::init(move |event| {
                 event_state.apply_native_event(event);
             })
             .await
@@ -1667,19 +1666,6 @@ async fn init_app() {
         .unwrap_or(&room_topic)
         .to_string();
     state.set_room_name(room_name.clone());
-
-    // Native operation history is recovered from the app-data journal. IndexedDB
-    // remains only for the standalone browser fallback.
-    if !state.native_backend {
-        if let Some(saved_state) = super::storage::get_room_state(&room_name).await {
-            web_sys::console::log_1(
-                &format!("Loading saved room state ({} bytes)", saved_state.len()).into(),
-            );
-            if let Err(e) = state.room.lock_mut().load_state(&saved_state) {
-                web_sys::console::warn_1(&format!("Failed to load saved state: {}", e).into());
-            }
-        }
-    }
 
     let _room_topic = room_topic;
 
@@ -1736,7 +1722,7 @@ fn update_graph_highlights(_state: &Arc<AppState>) {
     // Graph visualization is disabled - info panel handles scale display reactively
 }
 
-/// Handle a room event - update UI, MIDI, and persist state.
+/// Handle a projected room event and update UI/MIDI consumers.
 fn handle_room_event(state: &Arc<AppState>, event: &RoomEvent) {
     // Log event for debugging
     web_sys::console::log_1(&format!("[RoomEvent] {:?}", event).into());
@@ -1768,17 +1754,4 @@ fn handle_room_event(state: &Arc<AppState>, event: &RoomEvent) {
         state.sync_midi_voice_output();
         update_graph_highlights(state);
     }
-
-    if state.native_backend {
-        return;
-    }
-
-    // Persist standalone-browser state to IndexedDB on any change.
-    let state_bytes = state.room.lock_ref().encode_state_as_update();
-    let room_name = state.room_name.get_cloned();
-    spawn_local(async move {
-        if let Err(e) = super::storage::set_room_state(&room_name, &state_bytes).await {
-            web_sys::console::warn_1(&format!("Failed to save room state: {}", e).into());
-        }
-    });
 }

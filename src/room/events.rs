@@ -57,7 +57,7 @@ pub enum RoomEvent {
     EmojisChanged { emojis: Vec<String> },
 
     // === Peer Lifecycle ===
-    /// A peer joined the room (detected via CRDT state)
+    /// A peer appeared in the application projection.
     PeerJoined { peer_id: String },
     /// A peer left the room
     PeerLeft { peer_id: String },

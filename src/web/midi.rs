@@ -1,7 +1,7 @@
 //! Web MIDI input/output handling for walkie-songie.
 //!
 //! Two-channel MIDI model:
-//! - Channel 1 (0): Toggle set (collaborative CRDT, pitch classes as notes)
+//! - Channel 1 (0): Replica-projected toggle set (pitch classes as notes)
 //! - Channel 2 (1): Voice pitches (per-peer, full MIDI notes with octave)
 //!
 //! Input from MIDI controllers routes to the toggle set.

@@ -7,45 +7,9 @@ rust-version = "1.97.1"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-[[bin]]
-name = "walkie-songie-plugin"
-path = "src/plugin_main.rs"
-required-features = ["plugin"]
-
-[[bin]]
-name = "room-v4-native-probe"
-path = "tests/support/room_v4_native_probe.rs"
-required-features = ["native-net"]
-
-# Performance benchmark suite (docs/research/performance-benchmark-suite.md).
-# All native, feature-free, exercising the embeddable core (fold + ops + RBSR).
-[[bench]]
-name = "fold"
-harness = false
-
-[[bench]]
-name = "ops"
-harness = false
-
-[[bench]]
-name = "rbsr"
-harness = false
-
-# dhat heap-profiling harness for the Θ(N²) ReachIndex closure + view() RAM.
-# Its own `fn main()` installs `dhat::Alloc` as the global allocator, so it must
-# stay a separate binary from the criterion benches.
-[[bench]]
-name = "reach_mem"
-harness = false
-
 [features]
-default = ["merkle"]
+default = []
 core = []
-# Additive Merkle commitment/proof layer (M2): `ops_root` + `state_root` over the
-# radix_immutable trie, BESIDE RBSR (never replacing it). Pulls in the wasm-safe
-# `radix_immutable` crate with its `merkle` feature (blake3-256). Enabled by the
-# normal build (`default`); a `--no-default-features` leaf profile drops it.
-merkle = ["dep:radix_immutable", "tutti-core/merkle"]
 web-ui = [
     "dep:wasm-bindgen",
     "dep:wasm-bindgen-futures",
@@ -58,9 +22,7 @@ web-ui = [
     "browser-net",
 ]
 # Browser (wasm) iroh transport: relay fallback + WebRTC custom direct carrier,
-# iroh-gossip, and Router.
-# The browser host speaks the same room-v4 two-lane protocol as native, with a
-# lane-tagged IndexedDB journal and the exact v4 repair/courier ALPN surface.
+# iroh-gossip, and Router. The browser host carries Room-v5 Replica repair only.
 # Enabled by `web-ui` so the plain-browser build (no Tauri) stands up a
 # peer-to-peer room. The iroh crates are declared under the wasm target table
 # below; native uses `native-net`.
@@ -104,11 +66,6 @@ native-net = [
 native-midi = ["dep:midir", "dep:wmidi"]
 client-adapter = ["native-net"]
 tauri-app = ["native-net", "native-midi"]
-plugin = ["dep:nih_plug", "dep:nih_plug_egui", "dep:crossbeam-channel", "dep:egui_extras", "dep:image"]
-# Exposes `room::test_support` (Peer, oracle, entryhash_set) to the out-of-crate
-# integration suite under `tests/`, which cannot see `#[cfg(test)]` items. The L0
-# harness enables this: `cargo test --no-default-features --features test-support`.
-test-support = []
 
 [workspace]
 members = [
@@ -143,70 +100,40 @@ qrcode = "0.14"
 unicode-segmentation = "1.11"
 blake3 = "=1.8.5"
 
-# Merkle commitment/proof layer (feature `merkle`, M2): the canonical blake3-256
-# radix trie for ops_root / prove_op. Same git pin tutti-core uses, so their
-# `Proof` types unify into one.
-radix_immutable = { git = "https://github.com/micahscopes/radix_immutable.git", rev = "a039226abccdd0375a48687ec54aea5f2a20e1fc", features = ["merkle"], optional = true }
-
-# CRDT (legacy — being replaced by p2panda signed op-log + HHHS)
-yrs = "0.21"
-
-# The domain-agnostic reconciling signed-op substrate (tutti extraction Track-D
-# step 3): the signed envelope + verification, the DAG lift/deferral/heads
-# machinery, the `Store<L>`/`FoldCtx`/`OpLanguage` fold seam, and the generic
-# `ops_root` Merkle layer. `src/room/` re-exports it so `WalkieLang` is the sole
-# instantiation and no external call site moves. Wasm-safe (no tokio/iroh).
-tutti-core = { git = "https://github.com/polyphonotopes/tutti.git", rev = "7c45571" }
-
 # The music protocol (tutti Phase II): tuning identity (`crate::tuning` re-exports
 # it), the MusicOp/MusicLang reference wire, the fold combinators `walkie_fold`
 # drives, and the render seam. Wasm-safe.
-tutti-music = { git = "https://github.com/polyphonotopes/tutti.git", rev = "7c45571" }
+tutti-music = { version = "0.1.0", git = "https://github.com/polyphonotopes/tutti.git", tag = "v0.4.0" }
+# Capability-native canonical-history adapter shared with independent music
+# peers. It owns no Walkie extension or network runtime.
+tutti-music-hhhs = { version = "0.4.0", git = "https://github.com/polyphonotopes/tutti.git", tag = "v0.4.0" }
 
 # The reactive MIDI bridge: walkie's source-balanced ledger + input tracker
 # (promoted; `src/midi` re-exports them) and the reconcile-on-reconnect core.
-tutti-midi = { git = "https://github.com/polyphonotopes/tutti.git", rev = "7c45571" }
+tutti-midi = { version = "0.1.0", git = "https://github.com/polyphonotopes/tutti.git", tag = "v0.4.0" }
 
-# P2P rewrite: signed operation log (p2panda-core) + HHHS causal read model.
-# p2panda-core and HHHS are wasm-safe (no tokio/iroh); the native networking
-# stack (p2panda-net) and browser iroh transport are added target-gated below.
-p2panda-core = "0.7"
-hhhs = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "82b9ddb" }
-hhhs-sync = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "82b9ddb", features = ["wire"] }
-hhhs-reactive = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "82b9ddb" }
+# HHHS 0.4 release tag. The Replica owns admission,
+# persistence, materialization and repair-host state; walkie continues to own
+# iroh/WebRTC/loopback carriers and execution.
+hhhs = { version = "0.4.0", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.0" }
+hhhs-sync = { version = "0.4.0", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.0", features = ["driver"] }
+hhhs-cap = { version = "0.4.0", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.0" }
+hhhs-proof = { version = "0.4.0", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.0" }
+hhhs-store = { version = "0.4.0", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.0" }
+hhhs-replica = { version = "0.4.0", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.0" }
 # futures-signals drives the HHHS reactive read model (room::mirror) on ALL targets
 # (native plugin + wasm UI); dominator (wasm-only, below) consumes the same signals.
 futures-signals = "0.3"
-
 # Pitch detection: SwiftF0 ML model via onnxruntime-web JS bridge (no Rust ML deps needed)
 
 # No build dependencies - palette.css is copied directly
 
-# L0 integration-test harness (tests/). The self dev-dep forces the `test-support`
-# feature on for the out-of-crate test crates (which cannot see `#[cfg(test)]`), and
-# `hhhs-sync` lets the reconcile driver name the RBSR reconciliation types directly.
 [dev-dependencies]
-walkie-songie = { path = ".", default-features = false, features = ["test-support"] }
-# Enables tutti-core's reference-oracle surface (`Store::view_reference`,
-# `Store::dag`, the kernel-`ReachIndex` `CausalPast` backend) for the in-crate
-# `reach_equiv` equivalence tests. As a dev-dependency it is unified into the
-# `cargo test` build only, so a plain `cargo build` keeps tutti-core lean.
-tutti-core = { git = "https://github.com/polyphonotopes/tutti.git", rev = "7c45571", features = ["test-support"] }
-# Named directly by `tests/music_lane_interop.rs`, whose bare-peer half must be
-# spelled purely in tutti crates (an ESP32 knows nothing of walkie). Same pin as
-# the regular dependency, so the types unify.
-tutti-music = { git = "https://github.com/polyphonotopes/tutti.git", rev = "7c45571" }
-hhhs-sync = { git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "82b9ddb" }
 # The walkie-free music peer for the lane-isolation gate
 # (`tests/native_music_lane_e2e.rs`). Its OWN manifest must never name
 # walkie-songie — that absence is what the gate proves.
 bare-music-peer = { path = "tests/bare-music-peer" }
-# Benchmark suite (M0). criterion: native micro-benchmarks; dhat: heap profiling
-# for the reach/view RAM harness; postcard: the real RBSR wire codec, for
-# byte-accurate reconciliation-size reporting.
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
-dhat = "0.3"
-postcard = { version = "1", features = ["alloc"] }
+tempfile = "3"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.32", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "io-util"] }
@@ -231,13 +158,6 @@ tokio-tungstenite = { version = "0.27", features = [
 # Native MIDI backend. Platform access stays behind `native-midi`.
 midir = { version = "=0.11.0", optional = true }
 wmidi = { version = "=4.0.11", optional = true }
-
-# Plugin dependencies (native only, feature-gated)
-nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }
-nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }
-crossbeam-channel = { version = "0.5", optional = true }
-egui_extras = { version = "0.30", optional = true, features = ["image"] }
-image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokio = { version = "1.32", default-features = false, features = ["time", "sync", "macros", "io-util"] }

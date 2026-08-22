@@ -504,12 +504,6 @@ pub fn room_name_to_topic_id(name: &str) -> [u8; 32] {
     )
 }
 
-/// Room-v4 topic identity. Delegates to the one shared core derivation used by
-/// the transport layer.
-pub fn room_name_to_topic_id_v4(name: &str) -> [u8; 32] {
-    crate::room::v4::room_topic_v4(name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,14 +576,6 @@ mod tests {
         assert_ne!(
             id1, id2,
             "Different names should produce different topic IDs"
-        );
-    }
-
-    #[test]
-    fn room_v4_topic_helper_delegates_to_the_shared_derivation() {
-        assert_eq!(
-            room_name_to_topic_id_v4("Sunny-Garden-Melody"),
-            crate::room::v4::room_topic_v4("sunny-garden-melody"),
         );
     }
 }

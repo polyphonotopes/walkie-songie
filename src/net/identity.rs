@@ -1,30 +1,25 @@
-//! One Ed25519 seed → both identities (transport-design §2.1, task 5.1).
+//! One persisted Ed25519 seed, used across explicit protocol roles.
 //!
 //! A participant has a single 32-byte seed. That same seed feeds:
-//!   * the p2panda author key ([`ops::signing_key_from_seed`]) — signs op headers, and
-//!   * the iroh endpoint key ([`iroh::SecretKey::from_bytes`]) — authenticates the QUIC
-//!     TLS handshake and *is* the endpoint id.
+//!   * the HHHS proof key used to present room capabilities, and
+//!   * the iroh endpoint key used to authenticate a connection.
 //!
-//! Because both key types derive their public key from the seed via the same
-//! `ed25519-dalek` `SigningKey::from_bytes(seed)` construction, the p2panda
-//! [`AuthorId`] bytes and the iroh `EndpointId` bytes are **identical** — the "one key"
-//! invariant, asserted by [`tests::author_id_equals_iroh_endpoint_id_bytes`]. This is
-//! potluck's P12 "one key = NodeId + author" precedent.
+//! Sharing key material makes identity hand-off ergonomic; it does not collapse
+//! protocol roles. An authenticated iroh connection grants no room authority.
+//! Every durable command and signed presence update still presents a live,
+//! object-scoped capability path.
 //!
 //! Persistence is intentionally out of scope here: [`SeedStore`] captures the tiny
 //! load/save surface, and only the in-memory [`MemorySeedStore`] ships now. The real
 //! backends (browser IndexedDB via `src/web/storage.rs`, native seed file, 0600) land
 //! with the transport wiring.
 
-use crate::room::ops::{self, AuthorId, SigningKey};
-
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-net"))]
 use std::path::{Path, PathBuf};
 
 /// A participant identity derived from a persisted 32-byte Ed25519 seed.
 ///
-/// Yields both the p2panda [`SigningKey`] and the [`iroh::SecretKey`] from the one
-/// seed; see the module docs for the "one key" invariant.
+/// Derives proof and transport keys from one durable seed.
 #[derive(Clone)]
 pub struct WalkieIdentity {
     seed: [u8; 32],
@@ -56,22 +51,21 @@ impl WalkieIdentity {
         &self.seed
     }
 
-    /// The p2panda signing key. Signs op headers at commit time.
-    pub fn signing_key(&self) -> SigningKey {
-        ops::signing_key_from_seed(&self.seed)
+    /// HHHS 0.4 capability-presentation key. It is derived from the same seed
+    /// as the transport key, but connection authentication alone never grants
+    /// authority: Room v5 still requires an explicit live capability path.
+    pub fn capability_signing_key(&self) -> hhhs_proof::SigningKey {
+        hhhs_proof::SigningKey::from_bytes(&self.seed)
     }
 
-    /// The iroh endpoint secret key. Same curve, same seed ⇒ same public-key bytes as
-    /// [`Self::author_id`].
+    pub fn capability_actor_id(&self) -> crate::room::v5::ActorId {
+        crate::room::v5::ActorId::from_signing_key(&self.capability_signing_key())
+    }
+
+    /// The iroh endpoint secret key.
     #[cfg(any(feature = "native-net", feature = "browser-net"))]
     pub fn iroh_secret(&self) -> iroh::SecretKey {
         iroh::SecretKey::from_bytes(&self.seed)
-    }
-
-    /// This participant's stable [`AuthorId`] — the Ed25519 verifying-key bytes, which
-    /// are byte-for-byte the iroh `EndpointId` (`iroh::PublicKey`) as well.
-    pub fn author_id(&self) -> AuthorId {
-        AuthorId(*self.signing_key().verifying_key().as_bytes())
     }
 }
 
@@ -256,23 +250,34 @@ mod tests {
 
     const SEED: [u8; 32] = [42u8; 32];
 
-    /// The "one key" invariant: the p2panda `AuthorId` bytes equal the iroh
-    /// public-key / `EndpointId` bytes, because both come from the same seed.
+    #[test]
+    fn capability_receiver_uses_the_persisted_identity_key() {
+        let identity = WalkieIdentity::from_seed(SEED);
+        assert_eq!(
+            identity.capability_actor_id().0,
+            *identity.capability_signing_key().verifying_key().as_bytes()
+        );
+        assert_eq!(
+            identity.capability_actor_id().0,
+            *identity.capability_signing_key().verifying_key().as_bytes()
+        );
+    }
+
+    /// Capability receiver and transport endpoint are stable derivations of the
+    /// persisted identity seed, while remaining distinct protocol roles.
     #[cfg(feature = "native-net")]
     #[test]
-    fn author_id_equals_iroh_endpoint_id_bytes() {
+    fn capability_receiver_equals_iroh_endpoint_id_bytes() {
         let id = WalkieIdentity::from_seed(SEED);
 
-        let author = id.author_id();
+        let receiver = id.capability_actor_id();
         let iroh_public: iroh::PublicKey = id.iroh_secret().public(); // EndpointId == PublicKey
 
         assert_eq!(
-            &author.0,
+            &receiver.0,
             iroh_public.as_bytes(),
-            "AuthorId bytes must equal the iroh EndpointId bytes (one key)"
+            "both roles must be stable derivations of the persisted seed"
         );
-        // And both agree with the p2panda signing key's own verifying key.
-        assert_eq!(&author.0, id.signing_key().verifying_key().as_bytes());
     }
 
     /// `load_or_create` mints a seed on first run, persists it, and reloads the *same*
@@ -284,7 +289,7 @@ mod tests {
         let second = WalkieIdentity::load_or_create(&store).expect("infallible store");
 
         assert_eq!(first.seed(), second.seed());
-        assert_eq!(first.author_id(), second.author_id());
+        assert_eq!(first.capability_actor_id(), second.capability_actor_id());
     }
 
     /// A pre-seeded store yields a deterministic author id.
@@ -292,7 +297,10 @@ mod tests {
     fn preseeded_store_is_deterministic() {
         let store = MemorySeedStore::with_seed(SEED);
         let id = WalkieIdentity::load_or_create(&store).expect("infallible store");
-        assert_eq!(id.author_id(), WalkieIdentity::from_seed(SEED).author_id());
+        assert_eq!(
+            id.capability_actor_id(),
+            WalkieIdentity::from_seed(SEED).capability_actor_id()
+        );
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "native-net"))]

@@ -1,41 +1,10 @@
-//! Room state management using CRDTs.
-//!
-//! The CRDT is the single source of truth for room state:
-//! - Shared pitch class set (toggleable keyboard)
-//! - Emoji pieces with positions
-//! - Per-peer voice state
-//! - Room tuning (SCL content)
-//! - Combination method for computing room result
+//! Capability-native Room-v5 protocol and application projections.
 
 pub mod events;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod journal;
-/// v4 lane-tagged journal codecs (native file + browser IndexedDB blob),
-/// additive beside the v3 [`journal`] this module does not touch. Unconditional
-/// (like [`presence`]) because the browser codec must compile under
-/// `--features web-ui`; only its native [`lane_journal::FileLaneJournal`] is
-/// gated non-wasm internally.
-pub mod lane_journal;
-/// Additive Merkle commitment/proof layer (`ops_root` + `state_root`), beside RBSR.
-#[cfg(feature = "merkle")]
-pub mod merkle;
-pub mod ops;
-pub mod presence;
-pub mod store;
+pub mod projection;
 pub mod streams;
-#[cfg(any(test, feature = "test-support"))]
-pub mod test_support;
-/// Room v4: the two-lane room (music lane + walkie extension lane) a bare
-/// tutti-music peer can join. Both native and browser hosts use this generation;
-/// the v3 store remains only for golden, refusal, and semantic-equivalence tests.
-pub mod v4;
-pub mod yrs_state;
-
-// `view.rs` (per-author-union hand fold) and `mirror.rs` (opaque-entry HHHS mirror)
-// were removed: the data design consolidated onto HHHS-native materialization
-// (content-keyed add-wins pitches, op-id-keyed pieces, causal-maxima registers). The
-// replacement lands in `store.rs` (RoomStore: verbatim-bytes lift + cover/register
-// views). `ops.rs` (WalkieOp v2) is the shared op alphabet.
+/// Room v5: capability-native HHHS Replicas with application-owned carriers.
+pub mod v5;
 
 pub use events::RoomEvent;
 pub use streams::{
@@ -50,12 +19,12 @@ pub use streams::{
 };
 
 // State signals (for UI) - only available in wasm32
+pub use projection::{Piece, RoomProjection};
 #[cfg(target_arch = "wasm32")]
 pub use streams::{
     available_emojis_signal, pieces_locked_signal, pieces_signal, shared_pitches_signal,
     unified_pitch_classes_signal,
 };
-pub use yrs_state::{Piece, RoomState};
 
 use std::collections::{HashMap, HashSet};
 
@@ -73,16 +42,19 @@ pub enum CombinationMethod {
     Custom(String),
 }
 
-impl CombinationMethod {
-    /// Parse a combination method from a string identifier.
-    pub fn from_str(s: &str) -> Self {
+impl std::str::FromStr for CombinationMethod {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "union" => Self::Union,
-            "intersection" => Self::Intersection,
-            _ => Self::Custom(s.to_string()),
+            "union" => Ok(Self::Union),
+            "intersection" => Ok(Self::Intersection),
+            _ => Ok(Self::Custom(s.to_string())),
         }
     }
+}
 
+impl CombinationMethod {
     /// Convert to string identifier.
     pub fn as_str(&self) -> &str {
         match self {

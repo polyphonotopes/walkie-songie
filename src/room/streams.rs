@@ -15,10 +15,10 @@ use std::sync::{Arc, RwLock};
 use futures::{Stream, StreamExt, future::ready};
 
 use super::events::RoomEvent;
-use super::yrs_state::RoomState;
+use super::projection::RoomProjection;
 
 #[cfg(target_arch = "wasm32")]
-use super::yrs_state::Piece;
+use super::projection::Piece;
 #[cfg(target_arch = "wasm32")]
 use crate::tuning::PitchClass;
 #[cfg(target_arch = "wasm32")]
@@ -102,7 +102,7 @@ impl ActivePitchesSnapshot {
 }
 
 /// Compute current snapshot from room state.
-pub fn snapshot_active_pitches(room: &RoomState) -> ActivePitchesSnapshot {
+pub fn snapshot_active_pitches(room: &RoomProjection) -> ActivePitchesSnapshot {
     ActivePitchesSnapshot {
         toggle_pitch_classes: room.shared_pitches().iter().map(|pc| pc.index()).collect(),
         piece_pitches: room.all_pieces().iter().map(|p| p.pitch).collect(),
@@ -121,9 +121,9 @@ pub fn snapshot_active_pitches(room: &RoomState) -> ActivePitchesSnapshot {
 /// The first emitted delta represents the initial state (empty → current).
 /// Consumers should use this for the main MIDI output.
 ///
-/// Takes Arc<RwLock<RoomState>> so it can query authoritative state on each event.
+/// Takes the application projection so it can query current state on each event.
 pub fn unified_pitch_class_deltas(
-    room: Arc<RwLock<RoomState>>,
+    room: Arc<RwLock<RoomProjection>>,
 ) -> impl Stream<Item = PitchClassDelta> {
     // Get initial state and event stream (read lock, release immediately)
     let (initial_unified, events) = {
@@ -169,7 +169,7 @@ pub fn unified_pitch_class_deltas(
 /// For routing pieces to a separate MIDI channel with octave info.
 ///
 /// The first emitted delta represents the initial state (empty → current).
-pub fn piece_pitch_deltas(room: Arc<RwLock<RoomState>>) -> impl Stream<Item = PitchDelta> {
+pub fn piece_pitch_deltas(room: Arc<RwLock<RoomProjection>>) -> impl Stream<Item = PitchDelta> {
     // Get initial state and event stream (read lock, release immediately)
     let (initial, events) = {
         let room_guard = room.read().unwrap();
@@ -220,7 +220,7 @@ pub fn piece_pitch_deltas(room: Arc<RwLock<RoomState>>) -> impl Stream<Item = Pi
 /// For routing voice to a separate MIDI channel.
 ///
 /// The first emitted delta represents the initial state (empty → current).
-pub fn voice_pitch_deltas(room: Arc<RwLock<RoomState>>) -> impl Stream<Item = PitchDelta> {
+pub fn voice_pitch_deltas(room: Arc<RwLock<RoomProjection>>) -> impl Stream<Item = PitchDelta> {
     // Get initial state and event stream (read lock, release immediately)
     let (initial, events) = {
         let room_guard = room.read().unwrap();
@@ -274,7 +274,7 @@ pub fn voice_pitch_deltas(room: Arc<RwLock<RoomState>>) -> impl Stream<Item = Pi
 /// Use this for keyboard highlighting, etc.
 #[cfg(target_arch = "wasm32")]
 pub fn unified_pitch_classes_signal(
-    room: Arc<RwLock<RoomState>>,
+    room: Arc<RwLock<RoomProjection>>,
 ) -> impl Signal<Item = HashSet<u16>> {
     // Get initial state and events
     let (initial, events) = {
@@ -301,7 +301,7 @@ pub fn unified_pitch_classes_signal(
 /// Use this for showing which keys are "locked on" via manual toggle.
 #[cfg(target_arch = "wasm32")]
 pub fn shared_pitches_signal(
-    room: Arc<RwLock<RoomState>>,
+    room: Arc<RwLock<RoomProjection>>,
 ) -> impl Signal<Item = HashSet<PitchClass>> {
     let (initial, events) = {
         let room_guard = room.read().unwrap();
@@ -328,7 +328,7 @@ pub fn shared_pitches_signal(
 /// Signal of all pieces.
 /// Emits the current piece list whenever pieces change.
 #[cfg(target_arch = "wasm32")]
-pub fn pieces_signal(room: Arc<RwLock<RoomState>>) -> impl Signal<Item = Vec<Piece>> {
+pub fn pieces_signal(room: Arc<RwLock<RoomProjection>>) -> impl Signal<Item = Vec<Piece>> {
     let (initial, events) = {
         let room_guard = room.read().unwrap();
         (room_guard.all_pieces(), room_guard.events())
@@ -345,7 +345,7 @@ pub fn pieces_signal(room: Arc<RwLock<RoomState>>) -> impl Signal<Item = Vec<Pie
 
 /// Signal of pieces lock state.
 #[cfg(target_arch = "wasm32")]
-pub fn pieces_locked_signal(room: Arc<RwLock<RoomState>>) -> impl Signal<Item = bool> {
+pub fn pieces_locked_signal(room: Arc<RwLock<RoomProjection>>) -> impl Signal<Item = bool> {
     let (initial, events) = {
         let room_guard = room.read().unwrap();
         (room_guard.pieces_locked(), room_guard.events())
@@ -367,7 +367,9 @@ pub fn pieces_locked_signal(room: Arc<RwLock<RoomState>>) -> impl Signal<Item = 
 
 /// Signal of available emojis for the picker.
 #[cfg(target_arch = "wasm32")]
-pub fn available_emojis_signal(room: Arc<RwLock<RoomState>>) -> impl Signal<Item = Vec<String>> {
+pub fn available_emojis_signal(
+    room: Arc<RwLock<RoomProjection>>,
+) -> impl Signal<Item = Vec<String>> {
     let (initial, events) = {
         let room_guard = room.read().unwrap();
         (room_guard.available_emojis(), room_guard.events())
