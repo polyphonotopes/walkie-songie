@@ -37,7 +37,8 @@ peer set, mesh, and carrier in the application.
 - Affected code: `src/room/**`, `src/net/**`, `src/web/browser_host.rs`,
   `src/web/storage.rs`, `src-tauri/src/lib.rs`, `tests/bare-music-peer/**`, and
   Room v5 integration tests.
-- Dependencies: immutable HHHS `v0.4.1` and Tutti `v0.4.2` release tags;
+- Dependencies: immutable HHHS `v0.4.2` and the coordinated Tutti follow-up
+  release tag;
   `p2panda-core` and the old HHHS facade have left walkie's live state path.
 
 ## Approval
@@ -47,6 +48,12 @@ direction, independent per-lane replicas, application-owned iroh/WebRTC/IPC
 carriers, a comprehensive HHHS 0.4 migration, and functional rather than byte
 compatibility. It also explicitly rejected preserving old abstractions through
 conservative compatibility layers. This proposal records that approved scope.
+
+The same thread approved the HHHS 0.4.2 durable-host consolidation: each
+browser lane holds one `DurableReplicaHost`, and local commands plus inbound
+repair use that host's single persist-before-publish boundary. Walkie retains
+peer/path/repair-role policy but no longer owns a parallel IndexedDB log-lending
+protocol.
 
 The `openspec` CLI is not installed in this environment. These files are checked
 manually against `openspec/AGENTS.md` and must be CLI-validated when available.

@@ -21,8 +21,7 @@ use hhhs_proof::{
 };
 use hhhs_replica::{
     AdmissionOutcome, AdmissionPolicy, AdmissionRequest, AdmittedAuthority, AsyncTransactionSink,
-    DurableReplicaRepairHost, PreparedAdmission, Replica, ReplicaError, ReplicaRecord,
-    ReplicaRepairHost,
+    DurableReplicaHost, PreparedAdmission, Replica, ReplicaError, ReplicaRecord, ReplicaRepairHost,
 };
 use hhhs_store::{
     Materializer, MemoryStorage, ProjectionCheckpoint, ProjectionKey, ReplicaStorage, SecretKey,
@@ -1174,6 +1173,11 @@ impl PreparedMemberGrant {
     pub fn replica_record(&self) -> ReplicaRecord {
         self.prepared.replica_record()
     }
+
+    /// Hand the validated admission to the lane's asynchronous durable host.
+    pub fn into_prepared(self) -> PreparedAdmission {
+        self.prepared
+    }
 }
 
 impl PreparedRoomCommand {
@@ -1193,6 +1197,11 @@ impl PreparedRoomCommand {
     /// It contains no storage sequence, endpoint, route, or local secret.
     pub fn replica_record(&self) -> ReplicaRecord {
         self.prepared.replica_record()
+    }
+
+    /// Hand the validated admission to the lane's asynchronous durable host.
+    pub fn into_prepared(self) -> PreparedAdmission {
+        self.prepared
     }
 }
 
@@ -1786,24 +1795,24 @@ where
         ReplicaRepairHost::new(self.extension.clone())
     }
 
-    pub fn music_durable_repair_host<D>(
+    pub fn music_durable_host<D>(
         &self,
         durability: D,
-    ) -> DurableReplicaRepairHost<MS, RoomAdmissionPolicy, D>
+    ) -> DurableReplicaHost<MS, RoomAdmissionPolicy, D>
     where
         D: AsyncTransactionSink,
     {
-        DurableReplicaRepairHost::new(self.music.clone(), durability)
+        DurableReplicaHost::new(self.music.clone(), durability)
     }
 
-    pub fn extension_durable_repair_host<D>(
+    pub fn extension_durable_host<D>(
         &self,
         durability: D,
-    ) -> DurableReplicaRepairHost<ES, RoomAdmissionPolicy, D>
+    ) -> DurableReplicaHost<ES, RoomAdmissionPolicy, D>
     where
         D: AsyncTransactionSink,
     {
-        DurableReplicaRepairHost::new(self.extension.clone(), durability)
+        DurableReplicaHost::new(self.extension.clone(), durability)
     }
 
     fn replica(&self, lane: RoomLane) -> ReplicaRef<'_, MS, ES> {

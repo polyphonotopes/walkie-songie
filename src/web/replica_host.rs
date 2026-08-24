@@ -16,6 +16,7 @@ use futures::{
     channel::{mpsc, oneshot},
     lock::Mutex,
 };
+use hhhs_replica::DurableReplicaHost;
 use hhhs_store::MemoryStorage;
 use wasm_bindgen_futures::spawn_local;
 
@@ -33,7 +34,7 @@ use crate::{
         drive_replica_responder, is_routine_repair_initiator, spawn_rendezvous_v5,
     },
     room::v5::{
-        ActorId, ExtensionCommand, MemberCapabilities, MusicOp, ProtocolSupport, RoomCommand,
+        ActorId, ExtensionCommand, MusicOp, ProtocolSupport, RoomAdmissionPolicy, RoomCommand,
         RoomLane, RoomReplicas, RoomView, open_room_authority,
     },
     tuning::{TunedDegree, TunedPeriodicPitch},
@@ -54,70 +55,29 @@ enum RoomControl {
     Shutdown,
 }
 
+type BrowserDurableLane =
+    DurableReplicaHost<MemoryStorage, RoomAdmissionPolicy, IndexedDbReplicaLogV5>;
+
 struct DurableRoom {
     room: RoomReplicas<MemoryStorage, MemoryStorage>,
-    capabilities: MemberCapabilities,
-    music_log: Option<IndexedDbReplicaLogV5>,
-    extension_log: Option<IndexedDbReplicaLogV5>,
-    music_repair_active: bool,
-    extension_repair_active: bool,
-    music_available: async_broadcast::Sender<()>,
-    extension_available: async_broadcast::Sender<()>,
+    music: Rc<Mutex<BrowserDurableLane>>,
+    extension: Rc<Mutex<BrowserDurableLane>>,
 }
 
 impl DurableRoom {
-    fn log_mut(&mut self, lane: RoomLane) -> Option<&mut IndexedDbReplicaLogV5> {
+    fn lane(&self, lane: RoomLane) -> Rc<Mutex<BrowserDurableLane>> {
         match lane {
-            RoomLane::Music => self.music_log.as_mut(),
-            RoomLane::Extension => self.extension_log.as_mut(),
-        }
-    }
-
-    fn take_log(&mut self, lane: RoomLane) -> Option<IndexedDbReplicaLogV5> {
-        match lane {
-            RoomLane::Music => self.music_log.take(),
-            RoomLane::Extension => self.extension_log.take(),
-        }
-    }
-
-    fn restore_log(&mut self, lane: RoomLane, log: IndexedDbReplicaLogV5) {
-        match lane {
-            RoomLane::Music => self.music_log = Some(log),
-            RoomLane::Extension => self.extension_log = Some(log),
-        }
-    }
-
-    const fn repair_active(&self, lane: RoomLane) -> bool {
-        match lane {
-            RoomLane::Music => self.music_repair_active,
-            RoomLane::Extension => self.extension_repair_active,
-        }
-    }
-
-    fn set_repair_active(&mut self, lane: RoomLane, active: bool) {
-        match lane {
-            RoomLane::Music => self.music_repair_active = active,
-            RoomLane::Extension => self.extension_repair_active = active,
-        }
-    }
-
-    fn lane_available(&mut self, lane: RoomLane) -> bool {
-        !self.repair_active(lane) && self.log_mut(lane).is_some()
-    }
-
-    const fn availability(&self, lane: RoomLane) -> &async_broadcast::Sender<()> {
-        match lane {
-            RoomLane::Music => &self.music_available,
-            RoomLane::Extension => &self.extension_available,
+            RoomLane::Music => Rc::clone(&self.music),
+            RoomLane::Extension => Rc::clone(&self.extension),
         }
     }
 }
 
-type SharedDurableRoom = Rc<Mutex<DurableRoom>>;
+type SharedDurableRoom = Rc<DurableRoom>;
 
 async fn persist_initial_member_grant(
     room: &RoomReplicas<MemoryStorage, MemoryStorage>,
-    log: &mut IndexedDbReplicaLogV5,
+    host: &mut BrowserDurableLane,
     lane: RoomLane,
     authority: &hhhs_proof::SigningKey,
     member: ActorId,
@@ -128,55 +88,10 @@ async fn persist_initial_member_grant(
     let prepared = room
         .prepare_member_grant(lane, authority, member)
         .map_err(persistence_error)?;
-    log.persist(prepared.transaction())
+    host.commit_prepared(prepared.into_prepared())
         .await
         .map_err(persistence_error)?;
-    room.commit_prepared_member_grant(prepared)
-        .map_err(persistence_error)?;
     Ok(())
-}
-
-/// Wait for the browser's single async durability owner for `lane`.
-///
-/// A repair session temporarily owns the IndexedDB log so its
-/// prepare -> persist -> finalize sequence cannot race a local commit. User
-/// commands and grants wait on an explicit availability event at that boundary;
-/// rejecting them made ordinary clicks appear to be randomly ignored while
-/// synchronization was active.
-async fn lock_available_lane(
-    durable: &SharedDurableRoom,
-    lane: RoomLane,
-) -> futures::lock::MutexGuard<'_, DurableRoom> {
-    loop {
-        let mut available = {
-            let mut room = durable.lock().await;
-            if room.lane_available(lane) {
-                return room;
-            }
-            // Subscribe while holding the state lock so a repair cannot finish
-            // between the availability check and listener registration.
-            room.availability(lane).new_receiver()
-        };
-        let _ = available.recv().await;
-    }
-}
-
-async fn try_begin_repair(durable: &SharedDurableRoom, lane: RoomLane) -> bool {
-    let mut room = durable.lock().await;
-    if !room.lane_available(lane) {
-        return false;
-    }
-    room.set_repair_active(lane, true);
-    true
-}
-
-async fn finish_repair(durable: &SharedDurableRoom, lane: RoomLane) {
-    let available = {
-        let mut room = durable.lock().await;
-        room.set_repair_active(lane, false);
-        room.availability(lane).clone()
-    };
-    let _ = available.try_broadcast(());
 }
 
 struct ActiveRoom {
@@ -429,11 +344,10 @@ impl BrowserHost {
     ) -> Result<CommandAck, AppError> {
         self.stop_active_room().await;
         let local_actor = self.identity.capability_actor_id();
-        let mut music_log =
-            IndexedDbReplicaLogV5::open(&config.room, config.owner, RoomLane::Music)
-                .await
-                .map_err(persistence_error)?;
-        let mut extension_log =
+        let music_log = IndexedDbReplicaLogV5::open(&config.room, config.owner, RoomLane::Music)
+            .await
+            .map_err(persistence_error)?;
+        let extension_log =
             IndexedDbReplicaLogV5::open(&config.room, config.owner, RoomLane::Extension)
                 .await
                 .map_err(persistence_error)?;
@@ -444,6 +358,8 @@ impl BrowserHost {
             extension_log.transactions().map_err(persistence_error)?,
         )
         .map_err(persistence_error)?;
+        let mut music = room.music_durable_host(music_log);
+        let mut extension = room.extension_durable_host(extension_log);
         if let Some(authority) = room_authority.as_ref() {
             if ActorId::from_signing_key(authority) != config.owner {
                 return Err(AppError::new(
@@ -453,7 +369,7 @@ impl BrowserHost {
             }
             persist_initial_member_grant(
                 &room,
-                &mut music_log,
+                &mut music,
                 RoomLane::Music,
                 authority,
                 local_actor,
@@ -461,7 +377,7 @@ impl BrowserHost {
             .await?;
             persist_initial_member_grant(
                 &room,
-                &mut extension_log,
+                &mut extension,
                 RoomLane::Extension,
                 authority,
                 local_actor,
@@ -469,18 +385,11 @@ impl BrowserHost {
             .await?;
         }
         let recovered_view = room.view();
-        let (music_available, _) = async_broadcast::broadcast(1);
-        let (extension_available, _) = async_broadcast::broadcast(1);
-        let durable = Rc::new(Mutex::new(DurableRoom {
-            capabilities: room.capabilities_for(local_actor),
+        let durable = Rc::new(DurableRoom {
             room,
-            music_log: Some(music_log),
-            extension_log: Some(extension_log),
-            music_repair_active: false,
-            extension_repair_active: false,
-            music_available,
-            extension_available,
-        }));
+            music: Rc::new(Mutex::new(music)),
+            extension: Rc::new(Mutex::new(extension)),
+        });
 
         let topic = config.topic();
         let topic_string = topic.to_string();
@@ -887,11 +796,10 @@ fn spawn_room_loop(
                                 presence_sequence = 0;
                             }
                             let wire = {
-                                let mut durable = durable.lock().await;
-                                durable.capabilities = durable.room.capabilities_for(local_actor);
+                                let capabilities = durable.room.capabilities_for(local_actor);
                                 durable.room.sign_presence(
                                     &signing_key,
-                                    &durable.capabilities,
+                                    &capabilities,
                                     session,
                                     presence_sequence,
                                     pitch,
@@ -1046,9 +954,7 @@ fn spawn_room_loop(
                                         source,
                                         hint.lane,
                                     );
-                                } else if let Ok(presence) =
-                                    durable.lock().await.room.verify_presence(&bytes)
-                                {
+                                } else if let Ok(presence) = durable.room.verify_presence(&bytes) {
                                     host.apply_presence(
                                         presence.actor,
                                         presence.session,
@@ -1152,10 +1058,11 @@ async fn commit_command(
 ) -> Result<u64, AppError> {
     let lane = command.lane();
     let (entry, record, view) = {
-        let mut durable = lock_available_lane(durable, lane).await;
+        let lane_host = durable.lane(lane);
+        let mut writer = lane_host.lock().await;
         let actor = ActorId::from_signing_key(signing_key);
-        durable.capabilities = durable.room.capabilities_for(actor);
-        if durable.capabilities.for_lane(lane).is_empty() {
+        let capabilities = durable.room.capabilities_for(actor);
+        if capabilities.for_lane(lane).is_empty() {
             return Err(AppError::new(
                 AppErrorCode::UnsupportedCapability,
                 "this actor has not received a live Room-v5 capability for that Replica",
@@ -1163,19 +1070,14 @@ async fn commit_command(
         }
         let prepared = durable
             .room
-            .prepare_author(signing_key, &durable.capabilities, command)
+            .prepare_author(signing_key, &capabilities, command)
             .map_err(persistence_error)?;
-        let entry = prepared.entry();
-        let record = prepared.replica_record();
-        let transaction = prepared.transaction().clone();
-        let log = durable
-            .log_mut(lane)
-            .expect("available lane was checked while holding its lock");
-        log.persist(&transaction).await.map_err(persistence_error)?;
-        durable
-            .room
-            .commit_prepared(prepared)
+        let committed = writer
+            .commit_prepared(prepared.into_prepared())
+            .await
             .map_err(persistence_error)?;
+        let entry = committed.outcome().entry;
+        let record = committed.replica_record().clone();
         (entry, record, durable.room.view())
     };
     let accepted_sequence = host.apply_room_view(view);
@@ -1220,13 +1122,12 @@ async fn grant_peer(
     handle: &BrowserNetHandle,
 ) -> Result<(), AppError> {
     let mut hints = Vec::new();
-    if peer == local_actor
-        || durable.lock().await.room.owner() != ActorId::from_signing_key(signing_key)
-    {
+    if peer == local_actor || durable.room.owner() != ActorId::from_signing_key(signing_key) {
         return Ok(());
     }
     for lane in [RoomLane::Music, RoomLane::Extension] {
-        let mut durable = lock_available_lane(durable, lane).await;
+        let lane_host = durable.lane(lane);
+        let mut writer = lane_host.lock().await;
         let existing = durable.room.capabilities_for(peer);
         if !existing.for_lane(lane).is_empty() {
             continue;
@@ -1235,16 +1136,11 @@ async fn grant_peer(
             .room
             .prepare_member_grant(lane, signing_key, peer)
             .map_err(persistence_error)?;
-        let transaction = prepared.transaction().clone();
-        let log = durable
-            .log_mut(lane)
-            .expect("available lane was checked while holding its lock");
-        log.persist(&transaction).await.map_err(persistence_error)?;
-        let entry = durable
-            .room
-            .commit_prepared_member_grant(prepared)
+        let committed = writer
+            .commit_prepared(prepared.into_prepared())
+            .await
             .map_err(persistence_error)?;
-        hints.push((lane, entry));
+        hints.push((lane, committed.outcome().entry));
     }
     for (lane, entry) in hints {
         handle
@@ -1270,14 +1166,14 @@ fn spawn_repair_initiator(
     lane: RoomLane,
 ) {
     spawn_local(async move {
-        if !try_begin_repair(&durable, lane).await {
+        let lane_host = durable.lane(lane);
+        let Some(mut repair_host) = lane_host.try_lock() else {
             return;
-        }
+        };
         let connection = match handle.begin_replica(peer, lane).await {
             Ok(connection) => connection,
             Err(error) => {
                 host.emit_diagnostic("replica_repair_dial", &error.to_string());
-                finish_repair(&durable, lane).await;
                 return;
             }
         };
@@ -1285,11 +1181,10 @@ fn spawn_repair_initiator(
             Ok(stream) => stream.owning(connection),
             Err(error) => {
                 host.emit_diagnostic("replica_repair_stream", &error.to_string());
-                finish_repair(&durable, lane).await;
                 return;
             }
         };
-        run_repair(host, durable, peer, lane, stream, true).await;
+        run_repair(host, durable, peer, lane, &mut repair_host, stream, true).await;
     });
 }
 
@@ -1301,9 +1196,11 @@ fn spawn_repair_responder(
     stream: IrohSyncStream,
 ) {
     spawn_local(async move {
-        if try_begin_repair(&durable, lane).await {
-            run_repair(host, durable, peer, lane, stream, false).await;
-        }
+        let lane_host = durable.lane(lane);
+        let Some(mut repair_host) = lane_host.try_lock() else {
+            return;
+        };
+        run_repair(host, durable, peer, lane, &mut repair_host, stream, false).await;
     });
 }
 
@@ -1315,27 +1212,11 @@ async fn apply_live_record(
     let lane = live.lane;
     let entry = live.record.entry_hash();
     let bytes = live.record.encode();
-    let mut repair_host = {
-        let mut durable = lock_available_lane(durable, lane).await;
-        let log = durable
-            .take_log(lane)
-            .expect("available lane was checked while holding its lock");
-        match lane {
-            RoomLane::Music => durable.room.music_durable_repair_host(log),
-            RoomLane::Extension => durable.room.extension_durable_repair_host(log),
-        }
-    };
-    let result = hhhs_sync::RepairHost::apply(&mut repair_host, &[(entry, bytes)]).await;
-    let (_, log) = repair_host.into_parts();
-    let view = {
-        let mut durable = durable.lock().await;
-        durable.restore_log(lane, log);
-        let _ = durable.availability(lane).try_broadcast(());
-        durable.capabilities = durable
-            .room
-            .capabilities_for(host.identity.capability_actor_id());
-        durable.room.view()
-    };
+    let lane_host = durable.lane(lane);
+    let mut writer = lane_host.lock().await;
+    let result = hhhs_sync::RepairHost::apply(&mut *writer, &[(entry, bytes)]).await;
+    let view = durable.room.view();
+    drop(writer);
     let report = result.map_err(persistence_error)?;
     host.apply_room_view(view);
     Ok(report.refused.is_empty() && report.admitted.contains(&entry))
@@ -1382,26 +1263,15 @@ async fn run_repair(
     durable: SharedDurableRoom,
     peer: iroh::EndpointId,
     lane: RoomLane,
+    repair_host: &mut BrowserDurableLane,
     stream: IrohSyncStream,
     initiator: bool,
 ) {
-    let mut repair_host = {
-        let mut durable = durable.lock().await;
-        let log = durable.take_log(lane);
-        let Some(log) = log else {
-            durable.set_repair_active(lane, false);
-            return;
-        };
-        match lane {
-            RoomLane::Music => durable.room.music_durable_repair_host(log),
-            RoomLane::Extension => durable.room.extension_durable_repair_host(log),
-        }
-    };
     let result = if initiator {
         drive_replica_initiator(
             stream,
             &BrowserTimer,
-            &mut repair_host,
+            repair_host,
             lane,
             hhhs_sync::SessionLimits::default(),
         )
@@ -1410,23 +1280,13 @@ async fn run_repair(
         drive_replica_responder(
             stream,
             &BrowserTimer,
-            &mut repair_host,
+            repair_host,
             lane,
             hhhs_sync::SessionLimits::default(),
         )
         .await
     };
-    let (_, log) = repair_host.into_parts();
-    let view = {
-        let mut durable = durable.lock().await;
-        durable.restore_log(lane, log);
-        durable.set_repair_active(lane, false);
-        let _ = durable.availability(lane).try_broadcast(());
-        durable.capabilities = durable
-            .room
-            .capabilities_for(host.identity.capability_actor_id());
-        durable.room.view()
-    };
+    let view = durable.room.view();
     match result {
         Ok(outcome) if !outcome.incomplete && !outcome.root_mismatch => {
             host.apply_room_view(view);
