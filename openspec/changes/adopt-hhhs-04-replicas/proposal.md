@@ -37,8 +37,7 @@ peer set, mesh, and carrier in the application.
 - Affected code: `src/room/**`, `src/net/**`, `src/web/browser_host.rs`,
   `src/web/storage.rs`, `src-tauri/src/lib.rs`, `tests/bare-music-peer/**`, and
   Room v5 integration tests.
-- Dependencies: immutable HHHS `v0.4.2` and the coordinated Tutti follow-up
-  release tag;
+- Dependencies: immutable HHHS `v0.4.2` and Tutti `v0.4.3` release tags;
   `p2panda-core` and the old HHHS facade have left walkie's live state path.
 
 ## Approval

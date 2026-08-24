@@ -2042,7 +2042,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 [[package]]
 name = "hhhs"
 version = "0.4.2"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?rev=eba76d3#eba76d3f8aa5d6478b402bc973692b575616c7a1"
+source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.2#476a4c6a800fed215dade5089ac2c241ca79fcf8"
 dependencies = [
  "hhhs-dag",
 ]
@@ -2050,7 +2050,7 @@ dependencies = [
 [[package]]
 name = "hhhs-cap"
 version = "0.4.2"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?rev=eba76d3#eba76d3f8aa5d6478b402bc973692b575616c7a1"
+source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.2#476a4c6a800fed215dade5089ac2c241ca79fcf8"
 dependencies = [
  "hhhs",
 ]
@@ -2058,7 +2058,7 @@ dependencies = [
 [[package]]
 name = "hhhs-dag"
 version = "0.4.2"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?rev=eba76d3#eba76d3f8aa5d6478b402bc973692b575616c7a1"
+source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.2#476a4c6a800fed215dade5089ac2c241ca79fcf8"
 dependencies = [
  "blake3",
  "serde",
@@ -2067,7 +2067,7 @@ dependencies = [
 [[package]]
 name = "hhhs-proof"
 version = "0.4.2"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?rev=eba76d3#eba76d3f8aa5d6478b402bc973692b575616c7a1"
+source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.2#476a4c6a800fed215dade5089ac2c241ca79fcf8"
 dependencies = [
  "ed25519-dalek",
  "hhhs",
@@ -2077,7 +2077,7 @@ dependencies = [
 [[package]]
 name = "hhhs-replica"
 version = "0.4.2"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?rev=eba76d3#eba76d3f8aa5d6478b402bc973692b575616c7a1"
+source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.2#476a4c6a800fed215dade5089ac2c241ca79fcf8"
 dependencies = [
  "hhhs",
  "hhhs-cap",
@@ -2089,7 +2089,7 @@ dependencies = [
 [[package]]
 name = "hhhs-store"
 version = "0.4.2"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?rev=eba76d3#eba76d3f8aa5d6478b402bc973692b575616c7a1"
+source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.2#476a4c6a800fed215dade5089ac2c241ca79fcf8"
 dependencies = [
  "hhhs",
 ]
@@ -2097,7 +2097,7 @@ dependencies = [
 [[package]]
 name = "hhhs-sync"
 version = "0.4.2"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?rev=eba76d3#eba76d3f8aa5d6478b402bc973692b575616c7a1"
+source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.2#476a4c6a800fed215dade5089ac2c241ca79fcf8"
 dependencies = [
  "blake3",
  "futures",
@@ -6171,7 +6171,7 @@ dependencies = [
 [[package]]
 name = "tutti-midi"
 version = "0.1.0"
-source = "git+https://github.com/polyphonotopes/tutti.git?rev=9cc1437#9cc1437a42412cfc6ad1732a39942e42c0a00082"
+source = "git+https://github.com/polyphonotopes/tutti.git?tag=v0.4.3#617734a66ec2cd1190afc2570f16e32d6c4b5928"
 dependencies = [
  "thiserror 2.0.19",
  "tutti-music",
@@ -6180,7 +6180,7 @@ dependencies = [
 [[package]]
 name = "tutti-music"
 version = "0.1.0"
-source = "git+https://github.com/polyphonotopes/tutti.git?rev=9cc1437#9cc1437a42412cfc6ad1732a39942e42c0a00082"
+source = "git+https://github.com/polyphonotopes/tutti.git?tag=v0.4.3#617734a66ec2cd1190afc2570f16e32d6c4b5928"
 dependencies = [
  "blake3",
  "serde",
@@ -6190,7 +6190,7 @@ dependencies = [
 [[package]]
 name = "tutti-music-hhhs"
 version = "0.4.2"
-source = "git+https://github.com/polyphonotopes/tutti.git?rev=9cc1437#9cc1437a42412cfc6ad1732a39942e42c0a00082"
+source = "git+https://github.com/polyphonotopes/tutti.git?tag=v0.4.3#617734a66ec2cd1190afc2570f16e32d6c4b5928"
 dependencies = [
  "hhhs",
  "hhhs-cap",
