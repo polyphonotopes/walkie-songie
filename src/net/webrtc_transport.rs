@@ -62,6 +62,7 @@ use std::{
     rc::Rc,
     sync::Arc,
     task::{Context, Poll, Waker},
+    time::Duration,
 };
 
 use futures::{StreamExt, channel::mpsc};
@@ -170,7 +171,7 @@ pub enum Command {
 ///
 /// `Clone` (the `outbound` receiver is wrapped so the whole `RendezvousPeering`
 /// stays `Clone`); the receiver is `take`n once by the loop that owns it.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WebRtcSignalPort {
     /// Our own endpoint id — used to fill the `from` field and to drop self-echoes.
     pub local_id: [u8; 32],
@@ -178,6 +179,54 @@ pub struct WebRtcSignalPort {
     pub commands: mpsc::UnboundedSender<Command>,
     /// Driver → rendezvous: signaling to publish. `take`n once by the loop.
     pub outbound: Rc<RefCell<Option<mpsc::UnboundedReceiver<SignalOut>>>>,
+    shared: SharedRef,
+    ready: async_broadcast::Sender<[u8; 32]>,
+}
+
+impl fmt::Debug for WebRtcSignalPort {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WebRtcSignalPort")
+            .finish_non_exhaustive()
+    }
+}
+
+impl WebRtcSignalPort {
+    pub fn is_connected(&self, peer: &[u8; 32]) -> bool {
+        self.shared
+            .try_borrow()
+            .ok()
+            .and_then(|shared| {
+                shared
+                    .links
+                    .get(peer)
+                    .and_then(|link| link.channel.as_ref().cloned())
+            })
+            .is_some_and(|channel| channel.ready_state() == RtcDataChannelState::Open)
+    }
+
+    /// Event-driven direct-path readiness used by rendezvous before it asks
+    /// gossip to establish a long-lived neighbor connection.
+    pub async fn wait_connected(&self, peer: [u8; 32], timeout: Duration) -> bool {
+        if self.is_connected(&peer) {
+            return true;
+        }
+        let mut ready = self.ready.new_receiver();
+        if self.is_connected(&peer) {
+            return true;
+        }
+        n0_future::time::timeout(timeout, async {
+            loop {
+                match ready.recv().await {
+                    Ok(connected) if connected == peer => return,
+                    Ok(_) | Err(async_broadcast::RecvError::Overflowed(_)) => {}
+                    Err(async_broadcast::RecvError::Closed) => return,
+                }
+            }
+        })
+        .await
+        .is_ok()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +250,8 @@ struct Shared {
     dialing: HashSet<[u8; 32]>,
     /// `poll_send` uses this to kick a lazy dial.
     cmd_tx: mpsc::UnboundedSender<Command>,
+    /// Data-channel readiness notifications for direct-first rendezvous.
+    ready: async_broadcast::Sender<[u8; 32]>,
 }
 
 /// One peer's WebRTC connection state.
@@ -259,6 +310,8 @@ impl WebRtcTransport {
     pub fn new(local_id: [u8; 32]) -> (Self, WebRtcSignalPort) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded::<Command>();
         let (signal_tx, signal_rx) = mpsc::unbounded::<SignalOut>();
+        let (mut ready, _ready_rx) = async_broadcast::broadcast(64);
+        ready.set_overflow(true);
 
         let shared: SharedRef = Rc::new(RefCell::new(Shared {
             local_id,
@@ -267,17 +320,20 @@ impl WebRtcTransport {
             links: HashMap::new(),
             dialing: HashSet::new(),
             cmd_tx: cmd_tx.clone(),
+            ready: ready.clone(),
         }));
 
         spawn_local(run_driver(shared.clone(), cmd_rx, signal_tx));
 
         let transport = Self {
-            shared: SendWrapper::new(shared),
+            shared: SendWrapper::new(shared.clone()),
         };
         let port = WebRtcSignalPort {
             local_id,
             commands: cmd_tx,
             outbound: Rc::new(RefCell::new(Some(signal_rx))),
+            shared,
+            ready,
         };
         (transport, port)
     }
@@ -488,6 +544,7 @@ fn configuration() -> RtcConfiguration {
 /// borrowed elsewhere.
 fn wire_channel(
     shared: &SharedRef,
+    ready: async_broadcast::Sender<[u8; 32]>,
     peer: [u8; 32],
     channel: &RtcDataChannel,
     closures: &mut Vec<AnyClosure>,
@@ -510,7 +567,9 @@ fn wire_channel(
             }
         }
         s.recv_queue.push_back((remote_addr.clone(), bytes));
-        if let Some(waker) = s.recv_waker.take() {
+        let waker = s.recv_waker.take();
+        drop(s);
+        if let Some(waker) = waker {
             waker.wake();
         }
     }) as Box<dyn FnMut(MessageEvent)>);
@@ -522,6 +581,7 @@ fn wire_channel(
             "data channel OPEN to {} — direct path is live",
             short(&peer)
         );
+        let _ = ready.try_broadcast(peer);
     }) as Box<dyn FnMut()>);
     channel.set_onopen(Some(onopen.as_ref().unchecked_ref()));
 
@@ -530,9 +590,14 @@ fn wire_channel(
 }
 
 /// Store an inbound (answerer-side) data channel into its link and wire it.
-fn attach_incoming_channel(shared: &SharedRef, peer: [u8; 32], channel: RtcDataChannel) {
+fn attach_incoming_channel(
+    shared: &SharedRef,
+    ready: async_broadcast::Sender<[u8; 32]>,
+    peer: [u8; 32],
+    channel: RtcDataChannel,
+) {
     let mut closures = Vec::new();
-    wire_channel(shared, peer, &channel, &mut closures);
+    wire_channel(shared, ready, peer, &channel, &mut closures);
     let mut s = shared.borrow_mut();
     if let Some(link) = s.links.get_mut(&peer) {
         link.channel = Some(channel);
@@ -571,6 +636,7 @@ fn ensure_link(
     };
 
     let mut closures: Vec<AnyClosure> = Vec::new();
+    let ready = s.ready.clone();
 
     // Trickle ICE: forward each local candidate to the peer over signaling.
     let ice_tx = signal_tx.clone();
@@ -610,13 +676,14 @@ fn ensure_link(
         init.set_ordered(false);
         init.set_max_retransmits(0);
         let dc = pc.create_data_channel_with_data_channel_dict(DATA_CHANNEL_LABEL, &init);
-        wire_channel(shared, peer, &dc, &mut closures);
+        wire_channel(shared, ready.clone(), peer, &dc, &mut closures);
         channel = Some(dc);
     } else {
         // The answerer receives the channel via `ondatachannel`.
         let shared_for_dc = shared.clone();
+        let ready_for_dc = ready;
         let ondatachannel = Closure::wrap(Box::new(move |event: RtcDataChannelEvent| {
-            attach_incoming_channel(&shared_for_dc, peer, event.channel());
+            attach_incoming_channel(&shared_for_dc, ready_for_dc.clone(), peer, event.channel());
         }) as Box<dyn FnMut(RtcDataChannelEvent)>);
         pc.set_ondatachannel(Some(ondatachannel.as_ref().unchecked_ref()));
         closures.push(AnyClosure::Chan(ondatachannel));

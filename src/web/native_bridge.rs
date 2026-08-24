@@ -9,13 +9,22 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 use crate::client::{AppEventEnvelope, ClientCommand};
 
 #[wasm_bindgen(inline_js = r#"
+let walkieCommandQueue = Promise.resolve();
+
 export function walkieTauriAvailable() {
   return Boolean(window.__TAURI__?.core?.invoke && window.__TAURI__?.core?.Channel);
 }
 
 export function walkieDispatchJson(json) {
   const command = JSON.parse(json);
-  return window.__TAURI__.core.invoke("dispatch", { command }).catch((error) => {
+  const request = walkieCommandQueue.then(() =>
+    window.__TAURI__.core.invoke("dispatch", { command })
+  );
+  // Keep the ingress alive after an individual rejection while returning the
+  // original request to its caller. This preserves UI command order across the
+  // async IPC boundary (notably EnterRoom followed immediately by a note).
+  walkieCommandQueue = request.catch(() => {});
+  return request.catch((error) => {
     const message = typeof error === "string" ? error : JSON.stringify(error);
     return Promise.reject(message);
   });

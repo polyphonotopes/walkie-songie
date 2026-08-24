@@ -20,13 +20,13 @@ use walkie_songie::{
     },
     net::{
         FileSeedStore, IrohSyncStream, NativeNetworkEvent, NativeRoomNetwork, NativeRoomTicketV5,
-        PeerTransportPath, RelayPolicy, ReplicaProtocol, ReplicaRepairHint,
+        PeerTransportPath, RelayPolicy, ReplicaLiveRecord, ReplicaProtocol, ReplicaRepairHint,
         ReplicaRoomNetworkConfig, RoomInbound, TokioTimer, WalkieIdentity, drive_replica_initiator,
-        drive_replica_responder, spawn_rendezvous_v5,
+        drive_replica_responder, is_routine_repair_initiator, spawn_rendezvous_v5,
     },
     room::v5::{
         ActorId, ExtensionCommand, MemberCapabilities, MusicOp, ProtocolSupport, RoomCommand,
-        RoomLane, RoomReplicas, RoomView,
+        RoomLane, RoomReplicas, RoomView, open_room_authority,
     },
 };
 
@@ -209,11 +209,17 @@ impl AppRuntime {
                 "room names use the form adjective-noun-noun",
             ));
         }
-        let mut config =
-            ReplicaRoomNetworkConfig::create(&room_name, self.identity.capability_actor_id());
+        let authority = open_room_authority(&room_name);
+        let owner = ActorId::from_signing_key(&authority);
+        let mut config = ReplicaRoomNetworkConfig::create(&room_name, owner);
         config.relay = relay_policy_from_environment()?;
-        self.start_room_v5(Some(room_name), config, DiscoverySource::Mdns)
-            .await
+        self.start_room_v5(
+            Some(room_name),
+            config,
+            DiscoverySource::Mdns,
+            Some(authority),
+        )
+        .await
     }
 
     async fn join_ticket_v5(&self, encoded: String) -> Result<CommandAck, AppError> {
@@ -223,7 +229,7 @@ impl AppRuntime {
         })?;
         let mut config = ReplicaRoomNetworkConfig::join(&ticket);
         config.relay = relay_policy_from_environment()?;
-        self.start_room_v5(None, config, DiscoverySource::Ticket)
+        self.start_room_v5(None, config, DiscoverySource::Ticket, None)
             .await
     }
 
@@ -232,22 +238,39 @@ impl AppRuntime {
         room_name: Option<String>,
         config: ReplicaRoomNetworkConfig,
         bootstrap_source: DiscoverySource,
+        room_authority: Option<hhhs_proof::SigningKey>,
     ) -> Result<CommandAck, AppError> {
         self.stop_active_room().await;
 
         let topic = config.topic();
         let topic_string = topic.to_string();
+        let owner_string = walkie_songie::net::PeerId(config.owner.0).to_hex();
         let room_directory = self.data_dir.join("rooms");
         std::fs::create_dir_all(&room_directory).map_err(persistence_error)?;
-        let music =
-            JournalStorage::open(room_directory.join(format!("{topic_string}.music.v5.hhhs")))
-                .map_err(persistence_error)?;
-        let extension =
-            JournalStorage::open(room_directory.join(format!("{topic_string}.extension.v5.hhhs")))
-                .map_err(persistence_error)?;
+        let music = JournalStorage::open(
+            room_directory.join(format!("{topic_string}.{owner_string}.music.v5.hhhs")),
+        )
+        .map_err(persistence_error)?;
+        let extension = JournalStorage::open(
+            room_directory.join(format!("{topic_string}.{owner_string}.extension.v5.hhhs")),
+        )
+        .map_err(persistence_error)?;
         let local_actor = self.identity.capability_actor_id();
         let room = RoomReplicas::initialize(config.room.clone(), config.owner, music, extension)
             .map_err(persistence_error)?;
+        if let Some(authority) = room_authority.as_ref() {
+            if ActorId::from_signing_key(authority) != config.owner {
+                return Err(AppError::new(
+                    AppErrorCode::InvalidRoom,
+                    "open-room authority does not match the room owner",
+                ));
+            }
+            let capabilities = room.capabilities_for(local_actor);
+            if capabilities.music.is_empty() || capabilities.extension.is_empty() {
+                room.grant_member(authority, local_actor)
+                    .map_err(persistence_error)?;
+            }
+        }
         let recovered_view = room.view();
         let durable = Arc::new(tokio::sync::Mutex::new(DurableRoom {
             capabilities: room.capabilities_for(local_actor),
@@ -406,7 +429,12 @@ impl AppRuntime {
                     }
                     _ = repair_refresh.tick() => {
                         for (peer, (_, path, support)) in &peers {
-                            if *path == PeerPath::Disconnected || own_endpoint.as_bytes() >= peer.as_bytes() {
+                            if *path == PeerPath::Disconnected
+                                || !is_routine_repair_initiator(
+                                    walkie_songie::net::PeerId(*own_endpoint.as_bytes()),
+                                    walkie_songie::net::PeerId(*peer.as_bytes()),
+                                )
+                            {
                                 continue;
                             }
                             for lane in [RoomLane::Music, RoomLane::Extension] {
@@ -497,14 +525,17 @@ impl AppRuntime {
                                     runtime.update_peer(endpoint_id, source, path, false);
                                     if let Err(error) = maybe_grant_peer(
                                         &durable,
-                                        &signing_key,
+                                        room_authority.as_ref().unwrap_or(&signing_key),
                                         local_actor,
                                         ActorId(*endpoint_id.as_bytes()),
                                         &network,
                                     ).await {
                                         runtime.emit_diagnostic("capability_grant", &error.message);
                                     }
-                                    if own_endpoint.as_bytes() < endpoint_id.as_bytes() {
+                                    if is_routine_repair_initiator(
+                                        walkie_songie::net::PeerId(*own_endpoint.as_bytes()),
+                                        walkie_songie::net::PeerId(*endpoint_id.as_bytes()),
+                                    ) {
                                         for lane in [RoomLane::Music, RoomLane::Extension] {
                                             if support.supports(lane) {
                                                 spawn_replica_initiator(
@@ -526,8 +557,64 @@ impl AppRuntime {
                                     }
                                 }
                                 NativeNetworkEvent::Message { bytes, .. } => {
-                                    if let Some(hint) = ReplicaRepairHint::decode(&bytes)
-                                        && hint.source != walkie_songie::net::PeerId(*own_endpoint.as_bytes())
+                                    if let Some(live) = ReplicaLiveRecord::decode(&bytes) {
+                                        let local = walkie_songie::net::PeerId(*own_endpoint.as_bytes());
+                                        if live.source != local {
+                                            let source = live.source;
+                                            let lane = live.lane;
+                                            let entry = live.record.entry_hash();
+                                            let accepted = match apply_native_live_record(
+                                                &durable,
+                                                live,
+                                                &runtime,
+                                                local_actor,
+                                            ).await {
+                                                Ok(accepted) => accepted,
+                                                Err(error) => {
+                                                    runtime.emit_diagnostic(
+                                                        "live_record_admission",
+                                                        &error.message,
+                                                    );
+                                                    false
+                                                }
+                                            };
+                                            if !accepted
+                                                && let Ok(source_endpoint) =
+                                                    iroh::EndpointId::from_bytes(source.as_bytes())
+                                            {
+                                                if is_routine_repair_initiator(local, source) {
+                                                    spawn_replica_initiator(
+                                                        runtime.clone(),
+                                                        durable.clone(),
+                                                        endpoint.clone(),
+                                                        source_endpoint,
+                                                        lane,
+                                                    );
+                                                } else if let Err(error) = network
+                                                    .broadcast(
+                                                        ReplicaRepairHint {
+                                                            lane,
+                                                            source: local,
+                                                            entry,
+                                                        }
+                                                        .encode(),
+                                                    )
+                                                    .await
+                                                {
+                                                    runtime.emit_diagnostic(
+                                                        "repair_hint_broadcast",
+                                                        &format!(
+                                                            "live delivery needs repair; hint failed: {error}"
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    } else if let Some(hint) = ReplicaRepairHint::decode(&bytes)
+                                        && is_routine_repair_initiator(
+                                            walkie_songie::net::PeerId(*own_endpoint.as_bytes()),
+                                            hint.source,
+                                        )
                                         && let Ok(source) = iroh::EndpointId::from_bytes(hint.source.as_bytes())
                                     {
                                         spawn_replica_initiator(
@@ -547,7 +634,14 @@ impl AppRuntime {
                                 }
                                 NativeNetworkEvent::Lagged => {
                                     for (peer, (_, path, support)) in &peers {
-                                        if *path == PeerPath::Disconnected { continue; }
+                                        if *path == PeerPath::Disconnected
+                                            || !is_routine_repair_initiator(
+                                                walkie_songie::net::PeerId(*own_endpoint.as_bytes()),
+                                                walkie_songie::net::PeerId(*peer.as_bytes()),
+                                            )
+                                        {
+                                            continue;
+                                        }
                                         for lane in [RoomLane::Music, RoomLane::Extension] {
                                             if support.supports(lane) {
                                                 spawn_replica_initiator(
@@ -1207,7 +1301,7 @@ async fn commit_replica_command(
     network: &NativeRoomNetwork,
     runtime: &AppRuntime,
 ) -> Result<u64, AppError> {
-    let (receipt, view) = {
+    let (receipt, record, view) = {
         let mut durable = durable.lock().await;
         let actor = ActorId::from_signing_key(signing_key);
         durable.capabilities = durable.room.capabilities_for(actor);
@@ -1217,24 +1311,69 @@ async fn commit_replica_command(
                 "this actor has not received a live Room-v5 capability for that Replica",
             ));
         }
+        let prepared = durable
+            .room
+            .prepare_author(signing_key, &durable.capabilities, command)
+            .map_err(persistence_error)?;
+        let record = prepared.replica_record();
         let receipt = durable
             .room
-            .author(signing_key, &durable.capabilities, command)
+            .commit_prepared(prepared)
             .map_err(persistence_error)?;
-        (receipt, durable.room.view())
+        (receipt, record, durable.room.view())
     };
-    let hint = ReplicaRepairHint {
+    let accepted_sequence = runtime.apply_room_view(view);
+    let live = ReplicaLiveRecord {
         lane: receipt.lane,
         source: walkie_songie::net::PeerId(*network.endpoint_id().as_bytes()),
-        entry: receipt.entry,
+        record,
     };
-    if let Err(error) = network.broadcast(hint.encode()).await {
+    if let Err(error) = network.broadcast(live.encode()).await {
         runtime.emit_diagnostic(
-            "repair_hint_broadcast",
-            &format!("command is durable; repair hint failed: {error}"),
+            "live_record_broadcast",
+            &format!("command is durable; fast delivery failed: {error}"),
         );
+        let hint = ReplicaRepairHint {
+            lane: receipt.lane,
+            source: walkie_songie::net::PeerId(*network.endpoint_id().as_bytes()),
+            entry: receipt.entry,
+        };
+        if let Err(error) = network.broadcast(hint.encode()).await {
+            runtime.emit_diagnostic(
+                "repair_hint_broadcast",
+                &format!("command is durable; repair hint failed: {error}"),
+            );
+        }
     }
-    Ok(runtime.apply_room_view(view))
+    Ok(accepted_sequence)
+}
+
+async fn apply_native_live_record(
+    durable: &SharedDurableRoom,
+    live: ReplicaLiveRecord,
+    runtime: &AppRuntime,
+    local_actor: ActorId,
+) -> Result<bool, AppError> {
+    let lane = live.lane;
+    let entry = live.record.entry_hash();
+    let bytes = live.record.encode();
+    let mut repair_host = {
+        let durable = durable.lock().await;
+        match lane {
+            RoomLane::Music => durable.room.music_repair_host(),
+            RoomLane::Extension => durable.room.extension_repair_host(),
+        }
+    };
+    let report = hhhs_sync::RepairHost::apply(&mut repair_host, &[(entry, bytes)])
+        .await
+        .map_err(persistence_error)?;
+    let view = {
+        let mut durable = durable.lock().await;
+        durable.capabilities = durable.room.capabilities_for(local_actor);
+        durable.room.view()
+    };
+    runtime.apply_room_view(view);
+    Ok(report.refused.is_empty() && report.admitted.contains(&entry))
 }
 
 async fn maybe_grant_peer(
@@ -1246,7 +1385,7 @@ async fn maybe_grant_peer(
 ) -> Result<(), AppError> {
     let invitation = {
         let durable = durable.lock().await;
-        if durable.room.owner() != local_actor || peer == local_actor {
+        if durable.room.owner() != ActorId::from_signing_key(signing_key) || peer == local_actor {
             return Ok(());
         }
         let existing = durable.room.capabilities_for(peer);

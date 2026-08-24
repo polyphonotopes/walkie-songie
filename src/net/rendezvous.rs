@@ -47,6 +47,11 @@ const RE_HELLO_INTERVAL: Duration = Duration::from_secs(30);
 /// Faster re-hello while the home relay handshake is still settling, so the
 /// first hello that actually carries a relay url goes out promptly.
 const RETRY_HELLO_INTERVAL: Duration = Duration::from_secs(3);
+/// Give browser peers a bounded chance to establish WebRTC before gossip
+/// chooses its long-lived neighbor path; relay remains the deterministic
+/// fallback.
+#[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+const DIRECT_FIRST_TIMEOUT: Duration = Duration::from_millis(1_500);
 /// Backoff before reconnecting after the signaling socket drops.
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
 /// Cap on distinct peers we will ever `join_peers`/seed per rendezvous session.
@@ -452,24 +457,86 @@ async fn run_rendezvous<S: SignalStream>(
                             peering.memory_lookup.add_endpoint_info(endpoint_addr);
                         } else if joined.len() < MAX_RENDEZVOUS_PEERS {
                             joined.insert(id);
-                            peering.memory_lookup.add_endpoint_info(endpoint_addr);
-                            if let Err(error) = peering.gossip_sender.join_peers(vec![id]).await {
-                                tracing::debug!(
-                                    target: "walkie::rendezvous",
-                                    "join_peers for {id} failed: {error}"
+                            #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+                            let direct_first = rtc == Some(true) && peering.webrtc.is_some();
+                            #[cfg(not(all(target_arch = "wasm32", feature = "browser-net")))]
+                            let direct_first = false;
+                            if direct_first {
+                                #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+                                peering.memory_lookup.add_endpoint_info(
+                                    EndpointAddr::new(id).with_addrs([
+                                        iroh::TransportAddr::Custom(
+                                            super::webrtc_transport::webrtc_custom_addr(
+                                                id.as_bytes(),
+                                            ),
+                                        ),
+                                    ]),
                                 );
+                            } else {
+                                peering
+                                    .memory_lookup
+                                    .add_endpoint_info(endpoint_addr.clone());
                             }
                             on_discovered(id, support_bits);
                             // Kick the WebRTC handshake for a newly discovered
                             // rtc-capable peer (browser only). The driver picks the
-                            // role: lower endpoint id offers, the other answers.
+                            // role: lower endpoint id offers, the other answers. A
+                            // detached waiter joins gossip as soon as direct is
+                            // ready, or after a bounded relay-fallback timeout;
+                            // the signaling loop must remain free to pump SDP/ICE.
                             #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
-                            if rtc == Some(true) {
+                            let deferred_join = if rtc == Some(true) {
                                 if let Some(port) = peering.webrtc.as_ref() {
                                     let _ = port.commands.unbounded_send(
                                         super::webrtc_transport::Command::Dial(*id.as_bytes()),
                                     );
+                                    let port = port.clone();
+                                    let gossip = peering.gossip_sender.clone();
+                                    let lookup = peering.memory_lookup.clone();
+                                    let fallback_addr = endpoint_addr.clone();
+                                    wasm_bindgen_futures::spawn_local(async move {
+                                        let direct = port
+                                            .wait_connected(*id.as_bytes(), DIRECT_FIRST_TIMEOUT)
+                                            .await;
+                                        if !direct {
+                                            lookup.add_endpoint_info(fallback_addr.clone());
+                                        }
+                                        tracing::debug!(
+                                            target: "walkie::rendezvous",
+                                            peer = %id,
+                                            direct,
+                                            "joining gossip after browser path selection"
+                                        );
+                                        if let Err(error) = gossip.join_peers(vec![id]).await {
+                                            tracing::debug!(
+                                                target: "walkie::rendezvous",
+                                                "join_peers for {id} failed: {error}"
+                                            );
+                                        }
+                                        if direct {
+                                            // Let the custom path start QUIC before
+                                            // restoring relay as a migration/failure
+                                            // candidate for this long-lived peer.
+                                            rdv_sleep(Duration::from_secs(2)).await;
+                                            lookup.add_endpoint_info(fallback_addr);
+                                        }
+                                    });
+                                    true
+                                } else {
+                                    false
                                 }
+                            } else {
+                                false
+                            };
+                            #[cfg(not(all(target_arch = "wasm32", feature = "browser-net")))]
+                            let deferred_join = false;
+                            if !deferred_join
+                                && let Err(error) = peering.gossip_sender.join_peers(vec![id]).await
+                            {
+                                tracing::debug!(
+                                    target: "walkie::rendezvous",
+                                    "join_peers for {id} failed: {error}"
+                                );
                             }
                             // Reply so a newcomer learns us with zero server
                             // state. Only on first sight, else the ping-pong.

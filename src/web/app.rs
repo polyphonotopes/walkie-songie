@@ -61,6 +61,9 @@ pub struct AppState {
     pub native_snapshot: Mutable<Option<AppSnapshot>>,
     /// Highest accepted native event sequence.
     pub native_sequence: Mutable<u64>,
+    /// UI-only intent overlay while a durable degree command is in flight.
+    /// Authoritative snapshots always win once their matching event arrives.
+    pending_degrees: Rc<RefCell<HashMap<TunedDegree, bool>>>,
     /// Native MIDI ports rendered by the existing settings component.
     pub native_midi_inputs: Mutable<Vec<MidiPortSnapshot>>,
     pub native_midi_outputs: Mutable<Vec<MidiPortSnapshot>>,
@@ -75,12 +78,12 @@ pub struct AppState {
     last_native_voice: Rc<RefCell<Option<(Instant, TunedPeriodicPitch)>>>,
     /// Ephemeral UI/MIDI projection of the admitted Replica view.
     ///
-    /// PRIVATE: the projection (`project_native_snapshot`) is the sole
-    /// effective writer. Sibling UI modules (`keyboard`, `components`, …) see
-    /// it only through the read-only handle [`AppState::room`]; the vestigial
-    /// offline writers below reach it via [`AppState::room_mut`], which never
-    /// escapes this module. This makes the single-writer invariant a compile
-    /// error to violate, not a convention.
+    /// PRIVATE: the authoritative projection and its explicit pending-intent
+    /// overlay are the only effective writers. Sibling UI modules (`keyboard`,
+    /// `components`, …) see it only through the read-only handle
+    /// [`AppState::room`]; the offline writers below reach it via
+    /// [`AppState::room_mut`], which never escapes this module. This makes the
+    /// write boundary a compile error to violate, not a convention.
     room: Mutable<RoomProjection>,
     /// Current tuning system.
     pub tuning: Mutable<Tuning>,
@@ -167,6 +170,7 @@ impl AppState {
             browser_host,
             native_snapshot: Mutable::new(None),
             native_sequence: Mutable::new(0),
+            pending_degrees: Rc::new(RefCell::new(HashMap::new())),
             native_midi_inputs: Mutable::new(Vec::new()),
             native_midi_outputs: Mutable::new(Vec::new()),
             native_status: Mutable::new(
@@ -324,15 +328,40 @@ impl AppState {
         TunedPeriodicPitch::new(&tuning, degree, period).ok()
     }
 
-    pub fn set_native_degree(&self, pitch_class: PitchClass, active: bool) {
+    pub fn set_native_degree(self: &Arc<Self>, pitch_class: PitchClass, active: bool) {
         let Some(pitch) = self.current_native_pitch(pitch_class) else {
             return;
         };
-        self.dispatch_native(if active {
+        self.pending_degrees.borrow_mut().insert(pitch, active);
+        {
+            let mut room = self.room_mut();
+            if active {
+                room.add_pitch(pitch_class);
+            } else {
+                room.remove_pitch(pitch_class);
+            }
+        }
+        sync_active_pitches(self);
+
+        let command = if active {
             ClientCommand::AddDegree { pitch }
         } else {
             ClientCommand::RemoveDegree { pitch }
-        });
+        };
+        let state = self.clone();
+        let on_error = move |error: String| {
+            if state.pending_degrees.borrow().get(&pitch) == Some(&active) {
+                state.pending_degrees.borrow_mut().remove(&pitch);
+            }
+            state.native_status.set(format!("⚠ {error}"));
+            state.project_native_snapshot();
+        };
+        #[cfg(feature = "browser-net")]
+        if self.browser_host {
+            super::replica_host::dispatch(command, on_error);
+            return;
+        }
+        super::native_bridge::dispatch(command, on_error);
     }
 
     /// Presence of a pitch class in the projected (authoritative) snapshot —
@@ -343,6 +372,9 @@ impl AppState {
         let Some(pitch) = self.current_native_pitch(pitch_class) else {
             return false;
         };
+        if let Some(active) = self.pending_degrees.borrow().get(&pitch) {
+            return *active;
+        }
         self.native_snapshot
             .lock_ref()
             .as_ref()
@@ -424,6 +456,20 @@ impl AppState {
         }
         self.native_sequence.set(envelope.sequence);
 
+        match &envelope.event {
+            AppEvent::DegreeAdded { pitch, .. }
+                if self.pending_degrees.borrow().get(pitch) == Some(&true) =>
+            {
+                self.pending_degrees.borrow_mut().remove(pitch);
+            }
+            AppEvent::DegreeRemoved { pitch }
+                if self.pending_degrees.borrow().get(pitch) == Some(&false) =>
+            {
+                self.pending_degrees.borrow_mut().remove(pitch);
+            }
+            _ => {}
+        }
+
         {
             let mut current = self.native_snapshot.lock_mut();
             match envelope.event {
@@ -499,12 +545,23 @@ impl AppState {
 
         let tuning = self.tuning.lock_ref();
         let degree_count = i64::try_from(tuning.pitch_class_count()).unwrap_or(1);
-        let pitches: Vec<_> = snapshot
+        let mut pitches: Vec<_> = snapshot
             .active_degrees
             .iter()
             .filter(|pitch| pitch.tuning_id == tuning.id())
             .map(|pitch| PitchClass::from(pitch.degree))
             .collect();
+        for (pitch, active) in self.pending_degrees.borrow().iter() {
+            if pitch.tuning_id != tuning.id() {
+                continue;
+            }
+            let pitch_class = PitchClass::from(pitch.degree);
+            if *active && !pitches.contains(&pitch_class) {
+                pitches.push(pitch_class);
+            } else if !*active {
+                pitches.retain(|current| *current != pitch_class);
+            }
+        }
         let pieces: Vec<_> = snapshot
             .pieces
             .iter()
@@ -921,30 +978,16 @@ impl AppState {
     pub fn enter_room_or_ticket(&self, input: String) {
         if let Some(room_name) = crate::words::parse_room_input(&input) {
             self.set_room_name(room_name);
-        } else if self.native_backend && !input.trim().is_empty() {
-            self.room_input.set(input.clone());
-            self.dispatch_native(ClientCommand::JoinTicket {
-                ticket: input.trim().to_owned(),
-            });
+        } else if self.native_backend
+            && let Some(ticket) = invite_ticket_from_input(&input)
+        {
+            self.room_input.set(ticket.clone());
+            self.dispatch_native(ClientCommand::JoinTicket { ticket });
         }
     }
 
-    /// Poll MIDI input and route note events to toggle set.
-    pub fn poll_midi_input(self: &Arc<Self>) {
-        // Tauri owns MIDI natively; the browser (offline OR in-page host) polls
-        // Web MIDI here.
-        if self.tauri_backend() {
-            return;
-        }
-        while let Some(event) = MidiManager::poll_input() {
-            self.route_midi_event(event);
-        }
-    }
-
-    /// Route one decoded Web MIDI input event into the store/room. Shared by the
-    /// synchronous drain ([`Self::poll_midi_input`]) and the event-driven consumer
-    /// that awaits the MIDI channel (the browser MIDI task in `run`), so the UI
-    /// never polls on a timer for MIDI.
+    /// Route one decoded Web MIDI input event from the event-driven browser
+    /// channel into the store/room.
     fn route_midi_event(self: &Arc<Self>, event: MidiInputEvent) {
         // MIDI input is 12-TET frequency data, even when the active room tuning is
         // not. Quantize the frequency; never reduce modulo the room's degree count.
@@ -1528,42 +1571,61 @@ fn compute_active_pitches_data(
     active
 }
 
-/// Get room topic from URL hash or query param, or generate a new one.
-/// Returns the full topic string which may include @peer-id for bootstrapping.
-fn get_or_generate_room_name() -> String {
+enum InitialRoom {
+    Create(String),
+    Join(String),
+}
+
+fn invite_ticket_from_input(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    let candidate = trimmed
+        .split_once("#ticket=")
+        .map(|(_, ticket)| ticket)
+        .or_else(|| trimmed.strip_prefix("ticket="))
+        .unwrap_or(trimmed);
+    candidate
+        .starts_with("walkieroom5")
+        .then(|| candidate.to_owned())
+}
+
+/// Resolve an invite ticket or a new-room label from the URL.
+fn initial_room() -> InitialRoom {
     if let Some(window) = web_sys::window() {
-        // First, try hash: #room-name or #room-name@peer-id
         if let Ok(hash) = window.location().hash() {
             let full = hash.trim_start_matches('#');
-            if !full.is_empty() {
-                // Split on @ to separate room name from optional peer ID
-                let room_part = full.split('@').next().unwrap_or(full);
-                if crate::words::is_valid_room_name(room_part) {
-                    // Return the FULL string including @peer-id if present
-                    return full.to_string();
-                }
+            if let Some(ticket) = invite_ticket_from_input(full) {
+                return InitialRoom::Join(ticket);
+            }
+            if crate::words::is_valid_room_name(full) {
+                return InitialRoom::Create(full.to_owned());
             }
         }
 
-        // Fallback: try query param ?room=name
         if let Ok(search) = window.location().search() {
+            if let Some(ticket) = search
+                .trim_start_matches('?')
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("ticket="))
+                .and_then(invite_ticket_from_input)
+            {
+                return InitialRoom::Join(ticket);
+            }
             if search.starts_with("?room=") {
                 let name = search.trim_start_matches("?room=");
                 if crate::words::is_valid_room_name(name) {
-                    return name.to_string();
+                    return InitialRoom::Create(name.to_owned());
                 }
             }
             if let Some(pos) = search.find("room=") {
                 let rest = &search[pos + 5..];
                 let name = rest.split('&').next().unwrap_or("");
                 if crate::words::is_valid_room_name(name) {
-                    return name.to_string();
+                    return InitialRoom::Create(name.to_owned());
                 }
             }
         }
     }
-    // Generate a new room name
-    generate_room_name()
+    InitialRoom::Create(generate_room_name())
 }
 
 /// Update the URL hash to reflect the current room.
@@ -1656,18 +1718,13 @@ async fn init_app() {
         }
     }
 
-    // Initialize room name (from URL or generate new) and sync to hash
-    // room_topic may include @peer-id for bootstrapping
-    let room_topic = get_or_generate_room_name();
-    // Extract just the room name for display/state (strip @peer-id if present)
-    let room_name = room_topic
-        .split('@')
-        .next()
-        .unwrap_or(&room_topic)
-        .to_string();
-    state.set_room_name(room_name.clone());
-
-    let _room_topic = room_topic;
+    match initial_room() {
+        InitialRoom::Create(room_name) => state.set_room_name(room_name),
+        InitialRoom::Join(ticket) => {
+            state.room_input.set(ticket.clone());
+            state.dispatch_native(ClientCommand::JoinTicket { ticket });
+        }
+    }
 
     // Initialize SwiftF0 ML model in background
     let state_for_init = state.clone();

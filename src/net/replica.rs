@@ -17,6 +17,8 @@ use crate::room::v5::{LANE_STRATEGY_VERSION, ROOM_PROTOCOL_GENERATION, RoomLane}
 
 const REPAIR_HINT_DOMAIN: &[u8] = b"walkie replica repair hint v5\0";
 const REPAIR_HINT_BYTES: usize = REPAIR_HINT_DOMAIN.len() + 4 + 1 + 32 + 32;
+const LIVE_RECORD_DOMAIN: &[u8] = b"walkie replica live record v5\0";
+const LIVE_RECORD_HEADER_BYTES: usize = LIVE_RECORD_DOMAIN.len() + 4 + 1 + 32;
 
 /// The complete Room-v5 application protocol surface accepted by a Replica
 /// carrier. Courier and source-log exchanges are intentionally absent.
@@ -55,6 +57,28 @@ pub struct ReplicaRepairHint {
     pub entry: EntryHash,
 }
 
+/// Low-latency delivery of one opaque, public HHHS admission record.
+///
+/// This is a carrier optimization, never an admission shortcut: the receiver
+/// decodes the `ReplicaRecord` and submits it to the same durable Replica path
+/// used by repair. Missing causal closure falls back to ordinary repair.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ReplicaLiveRecord {
+    pub lane: RoomLane,
+    pub source: PeerId,
+    pub record: hhhs_replica::ReplicaRecord,
+}
+
+/// Choose exactly one endpoint to initiate repair when both sides observe the
+/// same symmetric trigger (neighbor-up, lag recovery, or a periodic sweep).
+///
+/// Repair itself is bidirectional, so the ordering has no authority meaning;
+/// it only prevents the two hosts from opening competing sessions while each
+/// lane's durable log is exclusively borrowed by one session.
+pub fn is_routine_repair_initiator(local: PeerId, remote: PeerId) -> bool {
+    local < remote
+}
+
 impl ReplicaRepairHint {
     pub fn encode(self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(REPAIR_HINT_BYTES);
@@ -89,6 +113,45 @@ impl ReplicaRepairHint {
             lane,
             source,
             entry,
+        })
+    }
+}
+
+impl ReplicaLiveRecord {
+    pub fn encode(&self) -> Vec<u8> {
+        let record = self.record.encode();
+        let mut bytes = Vec::with_capacity(LIVE_RECORD_HEADER_BYTES + record.len());
+        bytes.extend_from_slice(LIVE_RECORD_DOMAIN);
+        bytes.extend_from_slice(&ROOM_PROTOCOL_GENERATION.to_le_bytes());
+        bytes.push(self.lane.tag());
+        bytes.extend_from_slice(self.source.as_bytes());
+        bytes.extend_from_slice(&record);
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() <= LIVE_RECORD_HEADER_BYTES || !bytes.starts_with(LIVE_RECORD_DOMAIN) {
+            return None;
+        }
+        let mut cursor = LIVE_RECORD_DOMAIN.len();
+        let generation = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().ok()?);
+        cursor += 4;
+        if generation != ROOM_PROTOCOL_GENERATION {
+            return None;
+        }
+        let lane = match bytes[cursor] {
+            tag if tag == RoomLane::Music.tag() => RoomLane::Music,
+            tag if tag == RoomLane::Extension.tag() => RoomLane::Extension,
+            _ => return None,
+        };
+        cursor += 1;
+        let source = PeerId(bytes[cursor..cursor + 32].try_into().ok()?);
+        cursor += 32;
+        let record = hhhs_replica::ReplicaRecord::decode(&bytes[cursor..]).ok()?;
+        Some(Self {
+            lane,
+            source,
+            record,
         })
     }
 }
@@ -207,6 +270,68 @@ mod tests {
         let mut trailing = hint.encode();
         trailing.push(0);
         assert_eq!(ReplicaRepairHint::decode(&trailing), None);
+    }
+
+    #[test]
+    fn routine_repair_has_exactly_one_initiator() {
+        let lower = PeerId([1; 32]);
+        let higher = PeerId([2; 32]);
+
+        assert!(is_routine_repair_initiator(lower, higher));
+        assert!(!is_routine_repair_initiator(higher, lower));
+        assert!(!is_routine_repair_initiator(lower, lower));
+    }
+
+    #[test]
+    fn live_record_round_trips_as_opaque_admission_material() {
+        let owner_key = SigningKey::from_bytes(&[3; 32]);
+        let owner = ActorId::from_signing_key(&owner_key);
+        let room = RoomReplicas::memory("bright-river-song", owner).unwrap();
+        let degree = TunedDegree::new(&Tuning::twelve_tet(), 2).unwrap();
+        let prepared = room
+            .prepare_author(
+                &owner_key,
+                &room.owner_capabilities(),
+                MusicOp::AddDegree { degree }.into(),
+            )
+            .unwrap();
+        let live = ReplicaLiveRecord {
+            lane: RoomLane::Music,
+            source: PeerId([9; 32]),
+            record: prepared.replica_record(),
+        };
+
+        assert_eq!(ReplicaLiveRecord::decode(&live.encode()), Some(live));
+    }
+
+    #[test]
+    fn live_record_uses_the_same_capability_admission_as_repair() {
+        futures::executor::block_on(async {
+            let owner_key = SigningKey::from_bytes(&[4; 32]);
+            let owner = ActorId::from_signing_key(&owner_key);
+            let source = RoomReplicas::memory("bright-river-song", owner).unwrap();
+            let target = RoomReplicas::memory("bright-river-song", owner).unwrap();
+            let degree = TunedDegree::new(&Tuning::twelve_tet(), 5).unwrap();
+            let prepared = source
+                .prepare_author(
+                    &owner_key,
+                    &source.owner_capabilities(),
+                    MusicOp::AddDegree { degree }.into(),
+                )
+                .unwrap();
+            let record = prepared.replica_record();
+            let entry = record.entry_hash();
+            source.commit_prepared(prepared).unwrap();
+
+            let mut target_host = target.music_repair_host();
+            let report = RepairHost::apply(&mut target_host, &[(entry, record.encode())])
+                .await
+                .unwrap();
+
+            assert_eq!(report.admitted, vec![entry]);
+            assert!(report.refused.is_empty());
+            assert!(target.view().music.live.contains(&degree));
+        });
     }
 
     struct TestStream {

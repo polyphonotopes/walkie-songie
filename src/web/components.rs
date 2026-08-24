@@ -331,16 +331,16 @@ pub fn room_overlay(state: Arc<AppState>) -> Dom {
                         .children(&mut [
                             html!("button", {
                                 .class("room-action-btn")
-                                .text_signal(state.room_ticket.signal_cloned().map(|ticket| {
-                                    if ticket.is_some() { "📋 Copy Ticket" } else { "📋 Copy Link" }
-                                }))
+                                .text("📋 Copy Link")
                                 .event(clone!(state => move |_: events::Click| {
                                     let room = state.room_name.get_cloned();
                                     if let Some(window) = web_sys::window() {
-                                        let link = state.room_ticket.get_cloned().unwrap_or_else(|| {
-                                            let base = "https://polyphonotopes.github.io/walkie-songie";
-                                            format!("{}#{}", base, room)
-                                        });
+                                        let base = window.location().origin()
+                                            .ok()
+                                            .filter(|origin| origin != "null")
+                                            .unwrap_or_else(|| "https://polyphonotopes.github.io".to_owned());
+                                        let path = window.location().pathname().unwrap_or_else(|_| "/walkie-songie/".to_owned());
+                                        let link = format!("{base}{path}#{room}");
                                         let clipboard = window.navigator().clipboard();
                                         let _ = clipboard.write_text(&link);
                                     }
@@ -374,7 +374,6 @@ pub fn room_overlay(state: Arc<AppState>) -> Dom {
                     html!("div", {
                         .class("qr-container")
                         .child_signal(state.room_name.signal_cloned().map(|room_name| {
-                            // Use full base URL with hash for room name
                             let base = "https://polyphonotopes.github.io/walkie-songie";
                             let svg = generate_room_qr_svg(&room_name, base);
                             Some(html!("div", {
