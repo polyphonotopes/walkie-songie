@@ -103,24 +103,24 @@ blake3 = "=1.8.5"
 # The music protocol (tutti Phase II): tuning identity (`crate::tuning` re-exports
 # it), the MusicOp/MusicLang reference wire, the fold combinators `walkie_fold`
 # drives, and the render seam. Wasm-safe.
-tutti-music = { version = "0.1.0", git = "https://github.com/polyphonotopes/tutti.git", tag = "v0.4.2" }
+tutti-music = { version = "0.1.0", git = "https://github.com/polyphonotopes/tutti.git", rev = "9cc1437" }
 # Capability-native canonical-history adapter shared with independent music
 # peers. It owns no Walkie extension or network runtime.
-tutti-music-hhhs = { version = "0.4.1", git = "https://github.com/polyphonotopes/tutti.git", tag = "v0.4.2" }
+tutti-music-hhhs = { version = "0.4.2", git = "https://github.com/polyphonotopes/tutti.git", rev = "9cc1437" }
 
 # The reactive MIDI bridge: walkie's source-balanced ledger + input tracker
 # (promoted; `src/midi` re-exports them) and the reconcile-on-reconnect core.
-tutti-midi = { version = "0.1.0", git = "https://github.com/polyphonotopes/tutti.git", tag = "v0.4.2" }
+tutti-midi = { version = "0.1.0", git = "https://github.com/polyphonotopes/tutti.git", rev = "9cc1437" }
 
-# HHHS 0.4.1 release tag. The Replica owns admission,
+# HHHS 0.4.2 candidate. The Replica owns admission,
 # persistence, materialization and repair-host state; walkie continues to own
 # iroh/WebRTC/loopback carriers and execution.
-hhhs = { version = "0.4.1", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.1" }
-hhhs-sync = { version = "0.4.1", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.1", features = ["driver"] }
-hhhs-cap = { version = "0.4.1", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.1" }
-hhhs-proof = { version = "0.4.1", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.1" }
-hhhs-store = { version = "0.4.1", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.1" }
-hhhs-replica = { version = "0.4.1", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.1" }
+hhhs = { version = "0.4.2", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "eba76d3" }
+hhhs-sync = { version = "0.4.2", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "eba76d3", features = ["driver"] }
+hhhs-cap = { version = "0.4.2", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "eba76d3" }
+hhhs-proof = { version = "0.4.2", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "eba76d3" }
+hhhs-store = { version = "0.4.2", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "eba76d3" }
+hhhs-replica = { version = "0.4.2", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "eba76d3" }
 # futures-signals drives the HHHS reactive read model (room::mirror) on ALL targets
 # (native plugin + wasm UI); dominator (wasm-only, below) consumes the same signals.
 futures-signals = "0.3"

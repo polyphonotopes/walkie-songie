@@ -238,10 +238,8 @@ pub async fn get_or_create_identity_seed() -> [u8; 32] {
 /// Load a byte blob from the settings store. Absence is distinct from an
 /// IndexedDB failure so room recovery can refuse unavailable durable history.
 #[cfg(feature = "browser-net")]
-async fn get_bytes(key: &str) -> Result<Option<Vec<u8>>, String> {
+async fn get_bytes(db: &IdbDatabase, key: &str) -> Result<Option<Vec<u8>>, String> {
     use std::{cell::RefCell, rc::Rc};
-
-    let db = open_db().await?;
 
     let transaction = db
         .transaction_with_str(STORE_NAME)
@@ -289,14 +287,18 @@ async fn get_bytes(key: &str) -> Result<Option<Vec<u8>>, String> {
     result
 }
 
-/// Write a byte blob and wait for the transaction's `complete` event. Request
-/// success alone is not the durability boundary: the transaction can still
-/// abort afterward.
+/// Append one encoded transaction and advance its manifest in the same
+/// IndexedDB transaction. Request success alone is not the durability boundary:
+/// the transaction can still abort afterward.
 #[cfg(feature = "browser-net")]
-async fn set_bytes(key: &str, bytes: &[u8]) -> Result<(), String> {
+async fn append_replica_transaction(
+    db: &IdbDatabase,
+    record_key: &str,
+    record: &[u8],
+    count_key: &str,
+    next_count: u64,
+) -> Result<(), String> {
     use std::{cell::RefCell, rc::Rc};
-
-    let db = open_db().await?;
 
     let transaction = db
         .transaction_with_str_and_mode(STORE_NAME, web_sys::IdbTransactionMode::Readwrite)
@@ -305,10 +307,14 @@ async fn set_bytes(key: &str, bytes: &[u8]) -> Result<(), String> {
         .object_store(STORE_NAME)
         .map_err(|_| "Failed to get store")?;
 
-    let arr = js_sys::Uint8Array::from(bytes);
+    let arr = js_sys::Uint8Array::from(record);
     store
-        .put_with_key(&arr, &JsValue::from_str(key))
-        .map_err(|_| "Failed to put")?;
+        .put_with_key(&arr, &JsValue::from_str(record_key))
+        .map_err(|_| "Failed to append replica transaction")?;
+    let count = js_sys::Uint8Array::from(next_count.to_le_bytes().as_slice());
+    store
+        .put_with_key(&count, &JsValue::from_str(count_key))
+        .map_err(|_| "Failed to advance replica manifest")?;
 
     let (tx, rx) = futures::channel::oneshot::channel();
     let tx = Rc::new(RefCell::new(Some(tx)));
@@ -352,43 +358,86 @@ async fn set_bytes(key: &str, bytes: &[u8]) -> Result<(), String> {
 /// asynchronous and browser handles are single-task values. The room host
 /// serializes one writer per lane, persists a prepared transaction here, then
 /// finalizes that same transaction through `RoomReplicas::commit_prepared`.
+/// Each HHHS transaction is a separate IndexedDB value; steady-state commits
+/// never rewrite earlier room history.
 #[cfg(feature = "browser-net")]
 pub struct IndexedDbReplicaLogV5 {
-    key: String,
-    bytes: Vec<u8>,
+    db: IdbDatabase,
+    prefix: String,
+    transactions: Vec<hhhs_store::StorageTransaction>,
 }
 
 #[cfg(feature = "browser-net")]
 impl IndexedDbReplicaLogV5 {
     pub async fn open(
         room: &crate::room::v5::RoomIdentity,
+        owner: crate::room::v5::ActorId,
         lane: crate::room::v5::RoomLane,
     ) -> Result<Self, String> {
-        let key = replica_log_key_v5(room, lane);
-        let bytes = get_bytes(&key)
-            .await?
-            .unwrap_or_else(hhhs_store::empty_storage_transaction_log);
-        hhhs_store::decode_storage_transaction_log(&bytes)
-            .map_err(|error| format!("invalid Room-v5 replica log: {error}"))?;
-        Ok(Self { key, bytes })
+        let db = open_db().await?;
+        let prefix = replica_log_prefix_v5(room, owner, lane);
+        let count = match get_bytes(&db, &replica_count_key(&prefix)).await? {
+            None => 0,
+            Some(bytes) => {
+                let bytes: [u8; 8] = bytes
+                    .try_into()
+                    .map_err(|_| "invalid Room-v5 replica manifest length")?;
+                usize::try_from(u64::from_le_bytes(bytes))
+                    .map_err(|_| "Room-v5 replica manifest exceeds this browser's limits")?
+            }
+        };
+        let mut transactions = Vec::with_capacity(count);
+        // Bound the number of simultaneous IndexedDB requests while avoiding
+        // one event-loop round trip per historical transaction during replay.
+        const LOAD_BATCH: usize = 64;
+        for start in (0..count).step_by(LOAD_BATCH) {
+            let end = count.min(start + LOAD_BATCH);
+            let keys: Vec<_> = (start..end)
+                .map(|sequence| replica_record_key(&prefix, sequence))
+                .collect();
+            let records =
+                futures::future::try_join_all(keys.iter().map(|key| get_bytes(&db, key))).await?;
+            for (offset, record) in records.into_iter().enumerate() {
+                let sequence = start + offset;
+                let record = record
+                    .ok_or_else(|| format!("Room-v5 replica transaction {sequence} is missing"))?;
+                transactions.push(hhhs_store::decode_storage_transaction(&record).map_err(
+                    |error| format!("invalid Room-v5 replica transaction {sequence}: {error}"),
+                )?);
+            }
+        }
+        Ok(Self {
+            db,
+            prefix,
+            transactions,
+        })
     }
 
     /// Decode the complete validated log for replay into a fresh memory store.
     pub fn transactions(&self) -> Result<Vec<hhhs_store::StorageTransaction>, String> {
-        hhhs_store::decode_storage_transaction_log(&self.bytes)
-            .map_err(|error| format!("invalid Room-v5 replica log: {error}"))
+        Ok(self.transactions.clone())
     }
 
-    /// Atomically replace the durable blob with one additional transaction.
-    /// The caller must not publish the prepared admission until this resolves.
+    /// Atomically append one transaction and advance the replay manifest. The
+    /// caller must not publish the prepared admission until this resolves.
     pub async fn persist(
         &mut self,
         transaction: &hhhs_store::StorageTransaction,
     ) -> Result<(), String> {
-        let next = hhhs_store::append_storage_transaction_log(&self.bytes, transaction)
-            .map_err(|error| format!("could not extend Room-v5 replica log: {error}"))?;
-        set_bytes(&self.key, &next).await?;
-        self.bytes = next;
+        let sequence = self.transactions.len();
+        let next_count = u64::try_from(sequence)
+            .ok()
+            .and_then(|sequence| sequence.checked_add(1))
+            .ok_or_else(|| "Room-v5 replica manifest overflow".to_owned())?;
+        append_replica_transaction(
+            &self.db,
+            &replica_record_key(&self.prefix, sequence),
+            &hhhs_store::encode_storage_transaction(transaction),
+            &replica_count_key(&self.prefix),
+            next_count,
+        )
+        .await?;
+        self.transactions.push(transaction.clone());
         Ok(())
     }
 }
@@ -406,9 +455,25 @@ impl hhhs_replica::AsyncTransactionSink for IndexedDbReplicaLogV5 {
 }
 
 #[cfg(feature = "browser-net")]
-fn replica_log_key_v5(
+fn replica_log_prefix_v5(
     room: &crate::room::v5::RoomIdentity,
+    owner: crate::room::v5::ActorId,
     lane: crate::room::v5::RoomLane,
 ) -> String {
-    format!("replica:v5:{}:{:02x}", room.object.to_hex(), lane.tag())
+    format!(
+        "replica-records:v5:{}:{}:{:02x}",
+        room.object.to_hex(),
+        crate::net::PeerId(owner.0).to_hex(),
+        lane.tag()
+    )
+}
+
+#[cfg(feature = "browser-net")]
+fn replica_count_key(prefix: &str) -> String {
+    format!("{prefix}:count")
+}
+
+#[cfg(feature = "browser-net")]
+fn replica_record_key(prefix: &str, sequence: usize) -> String {
+    format!("{prefix}:transaction:{sequence:020}")
 }

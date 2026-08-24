@@ -21,7 +21,7 @@ use hhhs_proof::{
 };
 use hhhs_replica::{
     AdmissionOutcome, AdmissionPolicy, AdmissionRequest, AdmittedAuthority, AsyncTransactionSink,
-    DurableReplicaRepairHost, PreparedAdmission, Replica, ReplicaError, ReplicaRepairHost,
+    DurableReplicaHost, PreparedAdmission, Replica, ReplicaError, ReplicaRecord, ReplicaRepairHost,
 };
 use hhhs_store::{
     Materializer, MemoryStorage, ProjectionCheckpoint, ProjectionKey, ReplicaStorage, SecretKey,
@@ -44,6 +44,7 @@ pub const MUSIC_STRATEGY_NAME: &str = tutti_music_hhhs::STRATEGY_NAME;
 pub const EXTENSION_STRATEGY_NAME: &str = "walkie-extension-hhhs-entry";
 
 const ROOM_OBJECT_DOMAIN: &[u8] = b"walkie room object v5";
+const OPEN_ROOM_AUTHORITY_DOMAIN: &[u8] = b"walkie open room authority v5";
 const LANE_NAMESPACE_DOMAIN: &[u8] = b"walkie room lane namespace v5";
 const EXTENSION_COMMAND_DOMAIN: &[u8] = b"walkie extension command v5\0";
 const PRESENCE_DOMAIN: &[u8] = b"walkie capability presence v5\0";
@@ -178,6 +179,21 @@ impl RoomIdentity {
             RoomLane::Extension => self.extension,
         }
     }
+}
+
+/// Derive the bearer authority for a human-named open room.
+///
+/// This deliberately preserves the original three-word-code experience: the
+/// normalized room phrase is sufficient to join and author in an open jam.
+/// It is not a private-room secret; anyone who knows or guesses the phrase has
+/// the same authority. Private or delegated rooms use receiver-bound tickets
+/// instead.
+pub fn open_room_authority(room_name: &str) -> SigningKey {
+    let mut encoder = Encoder::new();
+    encoder
+        .bytes(OPEN_ROOM_AUTHORITY_DOMAIN)
+        .str(&room_name.to_ascii_lowercase());
+    SigningKey::from_bytes(encoder.digest_finish().as_bytes())
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -1150,6 +1166,18 @@ impl PreparedMemberGrant {
     pub const fn entry(&self) -> EntryHash {
         self.prepared.entry()
     }
+
+    /// Public, secret-free admission material for a low-latency carrier path.
+    /// Receivers still run this through ordinary Replica admission; repair is
+    /// the eventual-completeness fallback when causal closure is missing.
+    pub fn replica_record(&self) -> ReplicaRecord {
+        self.prepared.replica_record()
+    }
+
+    /// Hand the validated admission to the lane's asynchronous durable host.
+    pub fn into_prepared(self) -> PreparedAdmission {
+        self.prepared
+    }
 }
 
 impl PreparedRoomCommand {
@@ -1163,6 +1191,17 @@ impl PreparedRoomCommand {
 
     pub const fn entry(&self) -> EntryHash {
         self.prepared.entry()
+    }
+
+    /// Public, secret-free admission material for a low-latency carrier path.
+    /// It contains no storage sequence, endpoint, route, or local secret.
+    pub fn replica_record(&self) -> ReplicaRecord {
+        self.prepared.replica_record()
+    }
+
+    /// Hand the validated admission to the lane's asynchronous durable host.
+    pub fn into_prepared(self) -> PreparedAdmission {
+        self.prepared
     }
 }
 
@@ -1756,24 +1795,24 @@ where
         ReplicaRepairHost::new(self.extension.clone())
     }
 
-    pub fn music_durable_repair_host<D>(
+    pub fn music_durable_host<D>(
         &self,
         durability: D,
-    ) -> DurableReplicaRepairHost<MS, RoomAdmissionPolicy, D>
+    ) -> DurableReplicaHost<MS, RoomAdmissionPolicy, D>
     where
         D: AsyncTransactionSink,
     {
-        DurableReplicaRepairHost::new(self.music.clone(), durability)
+        DurableReplicaHost::new(self.music.clone(), durability)
     }
 
-    pub fn extension_durable_repair_host<D>(
+    pub fn extension_durable_host<D>(
         &self,
         durability: D,
-    ) -> DurableReplicaRepairHost<ES, RoomAdmissionPolicy, D>
+    ) -> DurableReplicaHost<ES, RoomAdmissionPolicy, D>
     where
         D: AsyncTransactionSink,
     {
-        DurableReplicaRepairHost::new(self.extension.clone(), durability)
+        DurableReplicaHost::new(self.extension.clone(), durability)
     }
 
     fn replica(&self, lane: RoomLane) -> ReplicaRef<'_, MS, ES> {
@@ -1989,6 +2028,16 @@ mod tests {
             decode_envelope::<MusicOp>(RoomLane::Music, &spaced),
             Err(CommandCodecError::NonCanonical)
         ));
+    }
+
+    #[test]
+    fn open_room_phrase_is_a_normalized_bearer_authority() {
+        let lower = open_room_authority("bright-river-song");
+        let mixed = open_room_authority("Bright-River-Song");
+        let other = open_room_authority("bright-river-dawn");
+
+        assert_eq!(lower.verifying_key(), mixed.verifying_key());
+        assert_ne!(lower.verifying_key(), other.verifying_key());
     }
 
     #[test]

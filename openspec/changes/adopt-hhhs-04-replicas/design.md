@@ -58,20 +58,23 @@ list is an authority oracle.
 
 The native host opens one `JournalStorage` per lane. IndexedDB is asynchronous
 and its handles are browser-task-local, so the browser does not pretend it can
-implement the synchronous, `Send + Sync` `ReplicaStorage` contract. It owns one
-validated portable transaction log per lane and serializes prepare → IndexedDB
-persist → Replica finalize. The transaction still spans canonical entries,
-local evidence, local secrets, and projection checkpoints. Nothing becomes
-visible before IndexedDB's transaction-complete event. The browser host is the
-exclusive writer for each lane, so a successfully persisted preparation cannot
-be made stale by a concurrent in-memory commit.
+implement the synchronous, `Send + Sync` `ReplicaStorage` contract. Each lane
+owns one HHHS `DurableReplicaHost` around its validated portable transaction
+log. The host serializes local preparations and inbound repair through the same
+prepare → IndexedDB persist → Replica finalize boundary. The transaction still
+spans canonical entries, local evidence, local secrets, and projection
+checkpoints. Nothing becomes visible or announceable before IndexedDB's
+transaction-complete event.
 
-Inbound repair crosses the same durability boundary. Its async `RepairHost`
-apply step validates incoming Replica records, persists the resulting prepared
-transactions, and only then reports them admitted to the sync session. Browser
-startup strictly decodes and replays the per-lane logs after reconstructing the
-deterministic trusted roots; checksum failure, truncation, sequence mismatch,
-or a causal hole refuses room entry rather than silently resetting history.
+Inbound repair crosses that durable host's `RepairHost` implementation. Its
+async apply step validates incoming Replica records, persists the resulting
+prepared transactions, and only then reports them admitted to the sync session.
+Local clicks await the lane host instead of being rejected while repair owns
+it; redundant routine repair attempts use a non-blocking acquisition and leave
+the active writer alone. Browser startup strictly decodes and replays the
+per-lane logs after reconstructing the deterministic trusted roots; checksum
+failure, truncation, sequence mismatch, or a causal hole refuses room entry
+rather than silently resetting history.
 
 Music and extension materializers fold immutable snapshots into versioned
 checkpoints. Checkpoints are validated against their exact history root and can
@@ -80,7 +83,9 @@ state and not a cross-lane canonical fact.
 
 ### Networking and repair
 
-`ReplicaRepairHost` adapts a lane Replica to `hhhs_sync::RepairHost`.
+`ReplicaRepairHost` adapts a synchronous lane Replica to
+`hhhs_sync::RepairHost`; the browser uses `DurableReplicaHost` for the same
+carrier boundary with asynchronous persistence.
 `hhhs_sync::{drive_initiator, drive_responder}` drives any walkie-provided
 `FrameStream`; iroh QUIC, browser WebRTC custom transport, loopback, threads,
 pipes, and IPC are carrier choices below that boundary. Broadcast delivery is

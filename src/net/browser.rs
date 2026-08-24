@@ -8,8 +8,8 @@
 //!   bootstrap (`MemoryLookup`) or gossip.
 //! * No native IP carrier: iroh's wasm build tunnels QUIC over the relay's
 //!   WebSocket, while [`super::webrtc_transport`] supplies an optional custom
-//!   direct carrier. The current [`PeerTransportPath`] classifier reports the
-//!   built-in path as `Relayed` (or `Connecting`/`Disconnected`).
+//!   direct carrier. [`BrowserNetHandle::peer_path`] combines WebRTC readiness
+//!   with Iroh's active-address report instead of making the UI infer either.
 //! * `n0-future` supplies spawn/sleep/timeout where native uses tokio, and the
 //!   queues are `futures` channels — everything here is single-threaded and
 //!   `!Send` by construction.
@@ -174,6 +174,9 @@ impl BrowserNetHandle {
     }
 
     pub async fn peer_path(&self, endpoint_id: EndpointId) -> PeerTransportPath {
+        if self.webrtc.is_connected(endpoint_id.as_bytes()) {
+            return PeerTransportPath::Direct;
+        }
         classify_peer_path(&self.endpoint, endpoint_id).await
     }
 

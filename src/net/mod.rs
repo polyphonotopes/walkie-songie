@@ -53,8 +53,8 @@ pub mod webrtc_transport;
 pub use identity::FileSeedStore;
 pub use identity::{MemorySeedStore, SeedStore, WalkieIdentity};
 pub use replica::{
-    ReplicaFrameStream, ReplicaProtocol, ReplicaRepairHint, ReplicaTimer, drive_replica_initiator,
-    drive_replica_responder, repair_lane,
+    ReplicaFrameStream, ReplicaLiveRecord, ReplicaProtocol, ReplicaRepairHint, ReplicaTimer,
+    drive_replica_initiator, drive_replica_responder, is_routine_repair_initiator, repair_lane,
 };
 
 #[cfg(any(

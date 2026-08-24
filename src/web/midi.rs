@@ -633,12 +633,6 @@ impl MidiManager {
         let (_, receiver) = get_midi_input_channel();
         receiver
     }
-
-    /// Poll for MIDI input events (non-blocking).
-    pub fn poll_input() -> Option<MidiInputEvent> {
-        let receiver = Self::input_receiver();
-        receiver.try_recv().ok()
-    }
 }
 
 impl Default for MidiManager {
