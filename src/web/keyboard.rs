@@ -1,9 +1,9 @@
 //! Bindings and wrapper for the all-around-keyboard web component.
 //!
-//! Declarative API:
-//! - State in via attributes: `pressed-notes`, `lit-notes`
+//! Projection API:
+//! - State in via one atomic `updateState` patch
 //! - Indicator children: `data-pitch`, `data-key`, `data-radius`
-//! - Events out: `keyclick`, `keyhover`, `keyunhover`
+//! - Intent out via typed `keyboardintent` events
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -14,7 +14,7 @@ use futures_signals::signal::SignalExt as _;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlElement;
-use web_sys::js_sys::Reflect;
+use web_sys::js_sys::{Array, Object, Reflect};
 
 use crate::tuning::{PitchClass, Tuning};
 
@@ -126,14 +126,46 @@ fn notes_to_json(notes: &[u8]) -> String {
     )
 }
 
-/// Set which notes are pressed (active pitches).
-pub fn set_pressed_notes(notes: &[u8]) {
-    set_keyboard_attr("pressed-notes", &notes_to_json(notes));
-}
+/// Project the complete key-state facet through all-around-keyboard's atomic
+/// update boundary. Admission, persistence, carrier work, and room projection
+/// never wait for the component's animation-frame render.
+fn update_keyboard_state(pressed_notes: &[u8], lit_notes: &[u8]) {
+    let Some(keyboard) = get_keyboard() else {
+        return;
+    };
+    let Ok(update_state) = Reflect::get(&keyboard, &JsValue::from_str("updateState")) else {
+        return;
+    };
+    let Ok(update_state) = update_state.dyn_into::<js_sys::Function>() else {
+        // Retain a bounded fallback for an element that has not upgraded yet.
+        // The production browser gate requires the v1.9 API, so this cannot
+        // silently make an old release candidate pass.
+        let _ = keyboard.set_attribute("pressed-notes", &notes_to_json(pressed_notes));
+        let _ = keyboard.set_attribute("lit-notes", &notes_to_json(lit_notes));
+        return;
+    };
 
-/// Set which notes are lit (detected pitch during singing).
-pub fn set_lit_notes(notes: &[u8]) {
-    set_keyboard_attr("lit-notes", &notes_to_json(notes));
+    let numbers = |notes: &[u8]| {
+        let values = Array::new_with_length(notes.len() as u32);
+        for (index, note) in notes.iter().copied().enumerate() {
+            values.set(index as u32, JsValue::from_f64(f64::from(note)));
+        }
+        values
+    };
+    let patch = Object::new();
+    let _ = Reflect::set(
+        &patch,
+        &JsValue::from_str("pressedNotes"),
+        numbers(pressed_notes).as_ref(),
+    );
+    let _ = Reflect::set(
+        &patch,
+        &JsValue::from_str("litNotes"),
+        numbers(lit_notes).as_ref(),
+    );
+    if let Err(error) = update_state.call1(&keyboard, &patch) {
+        web_sys::console::error_2(&"all-around-keyboard updateState failed".into(), &error);
+    }
 }
 
 /// Update keyboard to match tuning.
@@ -200,9 +232,6 @@ pub fn sync_active_pitches(state: &Arc<AppState>) {
     // Update piece overlays (piece-dots pattern for key highlight)
     sync_piece_overlays(&piece_notes);
 
-    // Clear pressed notes (pieces are shown as emoji indicators)
-    set_pressed_notes(&[]);
-
     // Voice pitch classes from all peers (wavy overlay with shout emoji)
     let voice_notes: Vec<u8> = room
         .all_voice_pitch_classes()
@@ -229,8 +258,10 @@ pub fn sync_active_pitches(state: &Arc<AppState>) {
     // Update bass/treble clef indicators
     sync_clef_indicators(&all_pitches, pc_count);
 
-    // Clear lit notes (we use overlays now)
-    set_lit_notes(&[]);
+    // Textured overlays carry the semantic facets above. Clear the component's
+    // plain pressed/lit state together so it performs at most one render for
+    // this projection revision.
+    update_keyboard_state(&[], &[]);
 }
 
 /// Sync bass and treble clef indicators on the keyboard.
@@ -1408,8 +1439,9 @@ fn setup_keyboard_events(state: Arc<AppState>) {
     setup_emoji_drag_handlers(state.clone());
 
     if let Some(kb) = get_keyboard() {
-        // Listen for keyclick events (actual user clicks, not hover)
-        // Clicks toggle pitch classes AND clear voices at that pitch class
+        // A `press` is the immediate musical-intent boundary for pointer and
+        // keyboard input. Release/activate/focus/hover events remain purely
+        // presentational and cannot author room state.
         let state_click = state.clone();
         let on_click = Closure::<dyn Fn(web_sys::Event)>::new(move |event: web_sys::Event| {
             // Skip if voice input is active
@@ -1424,6 +1456,14 @@ fn setup_keyboard_events(state: Arc<AppState>) {
 
             // Get note from event detail
             if let Ok(detail) = Reflect::get(&event, &JsValue::from_str("detail")) {
+                if Reflect::get(&detail, &JsValue::from_str("type"))
+                    .ok()
+                    .and_then(|value| value.as_string())
+                    .as_deref()
+                    != Some("press")
+                {
+                    return;
+                }
                 if let Ok(note_val) = Reflect::get(&detail, &JsValue::from_str("note")) {
                     if let Some(note) = note_val.as_f64() {
                         let tuning = state_click.tuning.lock_ref();
@@ -1469,7 +1509,8 @@ fn setup_keyboard_events(state: Arc<AppState>) {
             }
         });
 
-        let _ = kb.add_event_listener_with_callback("keyclick", on_click.as_ref().unchecked_ref());
+        let _ = kb
+            .add_event_listener_with_callback("keyboardintent", on_click.as_ref().unchecked_ref());
         on_click.forget();
     }
 }

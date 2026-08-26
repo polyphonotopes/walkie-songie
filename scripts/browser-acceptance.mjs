@@ -1,7 +1,15 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
-import { createReadStream, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  createReadStream,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer } from "node:http";
 import { dirname, extname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,10 +25,17 @@ const reportPath = resolve(
 const timeoutMs = Number(process.env.WALKIE_ACCEPTANCE_TIMEOUT_MS ?? 90_000);
 const headed = process.env.WALKIE_HEADED === "1";
 const targetKey = 36;
+const keyboardVersion = "1.9.0";
+const keyboardSha256 = "bdf2cf76fd1605f5d3923c0ac3b6758f22dbf1d6ead4d5c9f2fdc9aafbcf4a59";
 
-for (const required of ["index.html", "sw.js"]) {
+for (const required of ["index.html", "sw.js", "all-around-keyboard.esm.min.js"]) {
   assert.ok(existsSync(join(dist, required)), `missing release artifact: ${join(dist, required)}`);
 }
+const keyboardArtifact = join(dist, "all-around-keyboard.esm.min.js");
+const actualKeyboardSha256 = createHash("sha256")
+  .update(readFileSync(keyboardArtifact))
+  .digest("hex");
+assert.equal(actualKeyboardSha256, keyboardSha256, "unexpected all-around-keyboard artifact");
 
 const mimeTypes = new Map([
   [".css", "text/css; charset=utf-8"],
@@ -123,6 +138,23 @@ async function openPeer(context, label, url, diagnostics) {
   attachDiagnostics(page, label, diagnostics);
   await page.goto(url, { waitUntil: "domcontentloaded" });
   await page.waitForSelector("all-around-keyboard", { state: "attached", timeout: timeoutMs });
+  await page.waitForFunction(
+    (expectedVersion) => customElements.get("all-around-keyboard")?.version === expectedVersion,
+    keyboardVersion,
+    { timeout: timeoutMs },
+  );
+  const keyboardContract = await page.locator("all-around-keyboard").evaluate((keyboard) => ({
+    version: keyboard.constructor.version,
+    updateState: typeof keyboard.updateState,
+    setOverlay: typeof keyboard.setOverlay,
+    setIndicator: typeof keyboard.setIndicator,
+  }));
+  assert.deepEqual(keyboardContract, {
+    version: keyboardVersion,
+    updateState: "function",
+    setOverlay: "function",
+    setIndicator: "function",
+  });
   return page;
 }
 
@@ -143,6 +175,13 @@ async function installOverlayObserver(page) {
     if (!keyboard) throw new Error("keyboard was not mounted");
     window.__walkieAcceptanceObserver?.disconnect();
     window.__walkieAcceptanceEvents = [];
+    window.__walkieKeyboardRenders = [];
+    keyboard.onRenderStats = (stats) => {
+      window.__walkieKeyboardRenders.push({
+        ...stats,
+        at: performance.timeOrigin + performance.now(),
+      });
+    };
     window.__walkieAcceptanceObserver = new MutationObserver((records) => {
       for (const record of records) {
         for (const node of record.addedNodes) {
@@ -150,7 +189,7 @@ async function installOverlayObserver(page) {
             window.__walkieAcceptanceEvents.push({
               action: "add",
               key: Number(node.getAttribute("data-key-overlay")),
-              at: Date.now(),
+              at: performance.timeOrigin + performance.now(),
             });
           }
         }
@@ -159,7 +198,7 @@ async function installOverlayObserver(page) {
             window.__walkieAcceptanceEvents.push({
               action: "remove",
               key: Number(node.getAttribute("data-key-overlay")),
-              at: Date.now(),
+              at: performance.timeOrigin + performance.now(),
             });
           }
         }
@@ -172,6 +211,7 @@ async function installOverlayObserver(page) {
 async function resetOverlayEvents(page) {
   await page.evaluate(() => {
     window.__walkieAcceptanceEvents = [];
+    window.__walkieKeyboardRenders = [];
   });
 }
 
@@ -190,20 +230,32 @@ async function waitForOverlay(page, key, present) {
   );
 }
 
+async function waitForOverlayRender(page) {
+  await page.waitForFunction(
+    () => (window.__walkieKeyboardRenders ?? []).some((stats) => stats.dirtyOverlays > 0),
+    undefined,
+    { timeout: timeoutMs },
+  );
+}
+
 async function dispatchPitch(page, note) {
-  return page.evaluate((pitch) => {
+  const started = page.evaluate((pitch) => {
     const keyboard = document.querySelector("all-around-keyboard");
     if (!keyboard) throw new Error("keyboard was not mounted");
-    const started = Date.now();
-    keyboard.dispatchEvent(
-      new CustomEvent("keyclick", {
-        bubbles: true,
-        composed: true,
-        detail: { index: 36 + pitch, note: pitch },
-      }),
-    );
-    return started;
+    return new Promise((resolvePromise) => {
+      const onIntent = (event) => {
+        if (event.detail?.type !== "press" || event.detail?.note !== pitch) return;
+        keyboard.removeEventListener("keyboardintent", onIntent, true);
+        resolvePromise(performance.timeOrigin + event.detail.timeStamp);
+      };
+      keyboard.addEventListener("keyboardintent", onIntent, true);
+    });
   }, note);
+  await page
+    .locator("all-around-keyboard")
+    .locator(`[data-key-index="${targetKey + note}"]`)
+    .click();
+  return started;
 }
 
 async function assertSingleMutation(page, label, action, key) {
@@ -219,24 +271,46 @@ async function assertSingleMutation(page, label, action, key) {
     1,
     `${label} expected one ${action} mutation for key ${key}, got ${JSON.stringify(events)}`,
   );
+  return events[0];
 }
 
-async function operate({ source, sourceLabel, peer, peerLabel, note, present, latencies }) {
+async function assertSingleOverlayRender(page, label) {
+  const renders = await page.evaluate(() =>
+    (window.__walkieKeyboardRenders ?? []).filter((stats) => stats.dirtyOverlays > 0),
+  );
+  assert.equal(
+    renders.length,
+    1,
+    `${label} expected one keyboard overlay render, got ${JSON.stringify(renders)}`,
+  );
+  return renders[0];
+}
+
+async function operate({ source, sourceLabel, peer, peerLabel, note, present, timings }) {
   const key = 36 + note;
   await Promise.all([resetOverlayEvents(source), resetOverlayEvents(peer)]);
   const started = await dispatchPitch(source, note);
   await Promise.all([waitForOverlay(source, key, present), waitForOverlay(peer, key, present)]);
-  const reachedPeer = await peer.evaluate(() => Date.now());
-  latencies.push(reachedPeer - started);
+  await Promise.all([waitForOverlayRender(source), waitForOverlayRender(peer)]);
 
   // The peer-visible mutation proves durable admission. Leave a short quiet
   // window to catch a redundant local confirmation repaint if one regresses.
   await source.waitForTimeout(250);
   const action = present ? "add" : "remove";
-  await Promise.all([
+  const [sourceMutation, peerMutation, sourceRender, peerRender] = await Promise.all([
     assertSingleMutation(source, sourceLabel, action, key),
     assertSingleMutation(peer, peerLabel, action, key),
+    assertSingleOverlayRender(source, sourceLabel),
+    assertSingleOverlayRender(peer, peerLabel),
   ]);
+  timings.localProjection.push(sourceMutation.at - started);
+  timings.peerProjection.push(peerMutation.at - started);
+  timings.localVisible.push(sourceRender.at - started);
+  timings.peerVisible.push(peerRender.at - started);
+  timings.localProjectionToVisible.push(sourceRender.at - sourceMutation.at);
+  timings.peerProjectionToVisible.push(peerRender.at - peerMutation.at);
+  timings.localRenderDuration.push(sourceRender.durationMs);
+  timings.peerRenderDuration.push(peerRender.durationMs);
   assert.equal(await overlayCount(source, key), present ? 1 : 0);
   assert.equal(await overlayCount(peer, key), present ? 1 : 0);
 }
@@ -257,7 +331,16 @@ function assertNoRepairFailures(diagnostics) {
 }
 
 const diagnostics = [];
-const latencies = [];
+const timings = {
+  localProjection: [],
+  peerProjection: [],
+  localVisible: [],
+  peerVisible: [],
+  localProjectionToVisible: [],
+  peerProjectionToVisible: [],
+  localRenderDuration: [],
+  peerRenderDuration: [],
+};
 const room = `audit-${alphabetic(Date.now())}-${alphabetic(process.pid)}`;
 const { server, origin } = await serveRelease();
 let browser;
@@ -277,14 +360,14 @@ try {
   await Promise.all([waitForSynchronized(left), waitForSynchronized(right)]);
   await Promise.all([installOverlayObserver(left), installOverlayObserver(right)]);
 
-  for (const [index, note] of [0, 2, 4, 5].entries()) {
+  for (const [index, note] of [0, 1, 2, 3, 4, 5, 6, 8, 9, 10].entries()) {
     const sourceIsLeft = index % 2 === 0;
     const source = sourceIsLeft ? left : right;
     const peer = sourceIsLeft ? right : left;
     const sourceLabel = sourceIsLeft ? "left" : "right";
     const peerLabel = sourceIsLeft ? "right" : "left";
-    await operate({ source, sourceLabel, peer, peerLabel, note, present: true, latencies });
-    await operate({ source, sourceLabel, peer, peerLabel, note, present: false, latencies });
+    await operate({ source, sourceLabel, peer, peerLabel, note, present: true, timings });
+    await operate({ source, sourceLabel, peer, peerLabel, note, present: false, timings });
   }
 
   // Leave one durable fact present, remove its peer, and prove that the
@@ -296,7 +379,7 @@ try {
     peerLabel: "right",
     note: 7,
     present: true,
-    latencies,
+    timings,
   });
   await left.close();
   await right.reload({ waitUntil: "domcontentloaded" });
@@ -318,7 +401,7 @@ try {
     peerLabel: "left-reopened",
     note: 7,
     present: false,
-    latencies,
+    timings,
   });
 
   assertNoRepairFailures(diagnostics);
@@ -327,12 +410,51 @@ try {
     capturedAt: new Date().toISOString(),
     room,
     releaseDist: relative(repository, dist),
-    sampleCount: latencies.length,
+    allAroundKeyboard: {
+      version: keyboardVersion,
+      sha256: keyboardSha256,
+    },
+    sampleCount: timings.peerVisible.length,
+    localProjectionLatencyMs: {
+      samples: timings.localProjection,
+      p50: percentile(timings.localProjection, 0.5),
+      p95: percentile(timings.localProjection, 0.95),
+    },
+    localVisibleLatencyMs: {
+      samples: timings.localVisible,
+      p50: percentile(timings.localVisible, 0.5),
+      p95: percentile(timings.localVisible, 0.95),
+    },
+    localProjectionToVisibleMs: {
+      samples: timings.localProjectionToVisible,
+      p50: percentile(timings.localProjectionToVisible, 0.5),
+      p95: percentile(timings.localProjectionToVisible, 0.95),
+    },
+    localKeyboardRenderDurationMs: {
+      samples: timings.localRenderDuration,
+      p50: percentile(timings.localRenderDuration, 0.5),
+      p95: percentile(timings.localRenderDuration, 0.95),
+    },
+    peerProjectionLatencyMs: {
+      samples: timings.peerProjection,
+      p50: percentile(timings.peerProjection, 0.5),
+      p95: percentile(timings.peerProjection, 0.95),
+    },
     peerVisibleLatencyMs: {
-      samples: latencies,
-      p50: percentile(latencies, 0.5),
-      p95: percentile(latencies, 0.95),
+      samples: timings.peerVisible,
+      p50: percentile(timings.peerVisible, 0.5),
+      p95: percentile(timings.peerVisible, 0.95),
       hardBudgetApplied: false,
+    },
+    peerProjectionToVisibleMs: {
+      samples: timings.peerProjectionToVisible,
+      p50: percentile(timings.peerProjectionToVisible, 0.5),
+      p95: percentile(timings.peerProjectionToVisible, 0.95),
+    },
+    peerKeyboardRenderDurationMs: {
+      samples: timings.peerRenderDuration,
+      p50: percentile(timings.peerRenderDuration, 0.5),
+      p95: percentile(timings.peerRenderDuration, 0.95),
     },
     reconnectMs,
   };
