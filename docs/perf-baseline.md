@@ -1,9 +1,11 @@
-# Performance regression baseline
+# Performance evidence
 
-Regenerate: `nix develop --command cargo bench` (criterion micro-benchmarks +
-the `reach_mem` dhat RAM harness). Criterion stores its own baseline under
-`target/criterion/` and prints `change:` deltas on each run; this file is the
-committed human-readable reference so shifts are visible, not silent.
+This file contains two different kinds of evidence. The Room-v4 native section
+is a historical measurement which motivated the HHHS migration; its custom
+store and benchmarks were deleted with Room v4 and it cannot be regenerated
+against Room v5. The browser section measures the current v0.4.3 path. Do not
+use the historical table as a current regression gate or revive the retired
+store merely to keep an old benchmark name alive.
 
 **Captured:** 2026-08-08, commit `bc05368` (M3.0 bounded-window store), native
 (release bench profile, per-crate crypto `opt-level=3`).
@@ -49,3 +51,99 @@ committed human-readable reference so shifts are visible, not silent.
   pairwise `is_ancestor` over surviving adds; a candidate for a future combinator
   optimization.
 - **RBSR scales ~linearly** in room size — healthy for the sync layer.
+
+## Browser release path (v0.4.3)
+
+### Initial release-path baseline
+
+**Captured:** 2026-08-24 from a fresh `trunk build --release`, with two
+independent Chromium profiles in one room on the same machine. The peers had an
+open direct WebRTC data channel. The sample alternated one pitch on and off ten
+times after connection and startup work had settled.
+
+| Boundary | Median | Observed range |
+|---|---:|---:|
+| click → local pending state visible | 10.5 ms | 7.0–27.3 ms |
+| click → durable record handed to networking | 84.9 ms | 55.5–111.6 ms |
+| network handoff → peer receive | 24.5 ms | 7–140 ms |
+| peer receive → verified, persisted, materialized, applied | 29.5 ms | 18–85 ms |
+| applied peer state → peer DOM change | 26.0 ms | 12.1–62.6 ms |
+| click → peer-visible state | **177.3 ms** | **104.2–357.6 ms** |
+
+The sender's measured durable phases had medians of 2.0 ms for lane-specific
+capability discovery, 5.3 ms for preparation/signing, 37.0 ms for commit (35.1
+ms waiting at the IndexedDB transaction boundary), and 6.2 ms for
+materialization plus application. Receiver admission had a 14.5 ms median (5.6
+ms at the IndexedDB boundary), followed by 10.3 ms of
+materialization/application. “IndexedDB boundary” includes browser transaction
+scheduling and delivery of its completion callback; it is not serialization
+time or a claim that the storage engine spent the entire interval writing
+bytes. Per-phase medians do not sum exactly to the end-to-end median because
+each median can come from a different sample.
+
+This establishes two separate product paths. Local pending intent provides
+gesture feedback near one frame, but the durable peer path crosses serial
+persist-before-publish boundaries at both peers and is not a sub-15-ms music
+lane. A future bounded session-capability protocol may carry authenticated
+provisional intent and reconcile it against the durable Replica; v0.4.3 does
+not add that second protocol.
+
+Periodic health checking now sends a fixed-domain causal-frontier probe and
+opens full HHHS repair only when frontiers differ. In the same browser run,
+waiting beyond the 27-second repair interval produced no new long task; the old
+unconditional repair produced 50–134 ms tasks even for synchronized peers.
+
+### Storage-boundary refinement
+
+Temporary instrumentation then separated encoding from browser transaction
+completion. A normal music transaction was about 1.33 KiB: roughly 706–709
+bytes of command entry payload, one 32-byte predecessor, 400 bytes of public
+authority evidence, a 79-byte evidence-kind identifier, and about 111 bytes of
+canonical framing/count/sequence/domain data. It contained no secret mutations
+or checkpoints. HHHS encoding took 0.0–0.1 ms in the release WASM build, so the
+large interval was not serialization.
+
+Idle synthetic measurements for the same two-put transaction were about 2.4 ms
+median. A 1.34 KiB sample using Walkie's actual `settings` object store was
+about 4.85 ms median (2.4–18.3 ms observed). The live adapter's completion
+callback was much more variable because its event was delivered into the same
+busy browser event loop as UI, crypto, transport, and application work.
+
+Walkie now calls `IDBTransaction.commit()` immediately after queuing the atomic
+record-plus-count writes and still waits for the transaction `complete` event
+before publishing the Replica record. This does not weaken atomicity or the
+persist-before-publish boundary. In the controlled A/B run, receiver completion
+fell from roughly 29 ms median to 7–8 ms; the ten-operation end-to-end median
+improved from 177.3 ms to 136.4 ms (97.6–306 ms observed), about a 23% reduction.
+Local pending visibility in that run was 13.9 ms median.
+
+### UI projection cleanup
+
+The final v0.4.3 code also removes redundant presentation work:
+
+- pending intent and durable confirmation flow through one RoomProjection event
+  path;
+- equal Replica projections do not notify subscribers;
+- `FullStateSync` projects into the keyboard once instead of once per pitch,
+  voice, and full-sync branch;
+- toggle overlays compare pitch classes and `data-key-overlay` values in one
+  absolute-key coordinate system, so durable confirmation no longer removes and
+  recreates unchanged overlays;
+- unconditional RoomEvent logging and a leaked per-piece debug MutationObserver
+  are gone.
+
+A fresh release build verified direct WebRTC convergence across ten alternating
+operations and observed exactly one local plus one remote overlay mutation per
+logical operation. The machine was heavily saturated during that final
+diagnostic run (about 2–3% CPU idle, with unrelated VM/build/scanning work), so
+its wall-clock distribution is intentionally not recorded as a replacement
+baseline. Re-capture p50/p95/p99 on a quiet host after the keyboard renderer is
+upgraded; retain the one-mutation and convergence assertions regardless of host
+speed.
+
+The remaining durable path still performs serial sender and receiver durability
+and is not the proposed sub-15-ms musical lane. A browser worker can isolate
+Replica/IndexedDB callbacks from presentation contention, but does not eliminate
+those two durability boundaries. The post-v0.4 session-capability lane remains
+the design for immediate symmetrically authenticated peer feedback followed by
+durable confirmation or correction.
