@@ -3,6 +3,14 @@
 /node_modules
 **/target
 
+# Local browser acceptance evidence and scratch profiles. The reproducible
+# harness lives under scripts/; its generated reports, CLI logs, and traces do
+# not belong in source control.
+/output/
+/.playwright-cli/
+/Trace-*.json.gz
+/tutti-amy/
+
 # Local dev secrets — the relay auth token is injected at build time and must
 # never be committed (it ships in the wasm anyway, but keep it out of the repo).
 /dev-serve.sh

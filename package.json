@@ -6,9 +6,12 @@
   "scripts": {
     "tauri": "tauri",
     "desktop:dev": "tauri dev",
-    "desktop:build": "tauri build"
+    "desktop:build": "tauri build",
+    "browser:acceptance": "node scripts/browser-acceptance.mjs",
+    "check:release-candidate": "bash scripts/check-release-candidate.sh"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "2.11.4"
+    "@tauri-apps/cli": "2.11.4",
+    "playwright": "1.62.1"
   }
 }

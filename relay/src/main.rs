@@ -210,7 +210,10 @@ mod tests {
     #[test]
     fn host_of_parses_forms() {
         assert_eq!(host_of("http://localhost:8888"), Some("localhost"));
-        assert_eq!(host_of("https://micahscopes.github.io"), Some("micahscopes.github.io"));
+        assert_eq!(
+            host_of("https://micahscopes.github.io"),
+            Some("micahscopes.github.io")
+        );
         assert_eq!(host_of("http://[::1]:8888"), Some("::1"));
         assert_eq!(host_of("not-an-origin"), None);
     }

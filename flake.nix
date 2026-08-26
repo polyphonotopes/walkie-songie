@@ -30,6 +30,7 @@
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             rust
+            chromium
             trunk
             nodejs_24
             pnpm

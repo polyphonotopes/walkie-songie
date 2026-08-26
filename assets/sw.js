@@ -5,13 +5,17 @@ const CACHE_NAME = 'walkie-songie-v8';
 const PRECACHE_ASSETS = [
   './',
   './index.html',
-  './style.css',
   './all-around-keyboard.esm.min.js',
   './onnx-bridge.js',
   './swiftf0.onnx',
   './manifest.webmanifest',
   './icon.svg'
 ];
+
+// Trunk fingerprints CSS (for example `style-<hash>.css`) and injects the
+// resulting URL into index.html. The network-first fetch handler below caches
+// that exact generated asset when the page loads; a hard-coded `style.css`
+// entry would only create a guaranteed 404 during service-worker installation.
 
 // Install event - cache core assets
 self.addEventListener('install', event => {
