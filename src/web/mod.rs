@@ -20,6 +20,8 @@ mod native_bridge;
 pub mod onnx_bridge;
 #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
 mod replica_host;
+#[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+mod replica_worker;
 #[cfg(target_arch = "wasm32")]
 mod solfege;
 #[cfg(target_arch = "wasm32")]

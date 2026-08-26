@@ -103,13 +103,35 @@ function percentile(samples, fraction) {
   return sorted[Math.ceil(fraction * sorted.length) - 1];
 }
 
+function latencySummary(samples) {
+  return {
+    samples,
+    p50: percentile(samples, 0.5),
+    p95: percentile(samples, 0.95),
+  };
+}
+
+function workerReadyCount(diagnostics, label) {
+  return diagnostics.filter(
+    (entry) =>
+      entry.label === label &&
+      entry.type === "info" &&
+      /^\[replica_worker\] ready generation \d+$/.test(entry.text),
+  ).length;
+}
+
 function attachDiagnostics(page, label, diagnostics) {
   page.on("console", (message) => {
     const entry = { label, type: message.type(), text: message.text() };
     diagnostics.push(entry);
   });
   page.on("pageerror", (error) => {
-    diagnostics.push({ label, type: "pageerror", text: String(error) });
+    diagnostics.push({
+      label,
+      type: "pageerror",
+      text: String(error),
+      stack: error.stack ?? null,
+    });
   });
   page.on("response", (response) => {
     const url = new URL(response.url());
@@ -167,6 +189,20 @@ async function waitForSynchronized(page) {
     undefined,
     { timeout: timeoutMs },
   );
+}
+
+function assertReplicaWorkersReady(diagnostics, labels) {
+  for (const label of labels) {
+    assert.ok(
+      diagnostics.some(
+        (entry) =>
+          entry.label === label &&
+          entry.type === "info" &&
+          /^\[replica_worker\] ready generation \d+$/.test(entry.text),
+      ),
+      `${label} never reported a ready dedicated Replica worker`,
+    );
+  }
 }
 
 async function installOverlayObserver(page) {
@@ -358,6 +394,7 @@ try {
   let left = await openPeer(leftContext, "left", url, diagnostics);
   let right = await openPeer(rightContext, "right", url, diagnostics);
   await Promise.all([waitForSynchronized(left), waitForSynchronized(right)]);
+  assertReplicaWorkersReady(diagnostics, ["left", "right"]);
   await Promise.all([installOverlayObserver(left), installOverlayObserver(right)]);
 
   for (const [index, note] of [0, 1, 2, 3, 4, 5, 6, 8, 9, 10].entries()) {
@@ -382,9 +419,14 @@ try {
     timings,
   });
   await left.close();
+  const rightWorkerGenerationsBeforeReload = workerReadyCount(diagnostics, "right");
   await right.reload({ waitUntil: "domcontentloaded" });
   await right.waitForSelector("all-around-keyboard", { state: "attached", timeout: timeoutMs });
   await waitForOverlay(right, targetKey + 7, true);
+  assert.ok(
+    workerReadyCount(diagnostics, "right") > rightWorkerGenerationsBeforeReload,
+    "right did not open a fresh Replica worker and recover after reload",
+  );
 
   // Reopen the other independent profile, prove its own durable reconstruction,
   // then wait for the normal carrier to report direct synchronized repair.
@@ -392,6 +434,7 @@ try {
   left = await openPeer(leftContext, "left-reopened", url, diagnostics);
   await waitForOverlay(left, targetKey + 7, true);
   await Promise.all([waitForSynchronized(left), waitForSynchronized(right)]);
+  assertReplicaWorkersReady(diagnostics, ["left-reopened"]);
   const reconnectMs = Date.now() - reconnectStarted;
   await Promise.all([installOverlayObserver(left), installOverlayObserver(right)]);
   await operate({
@@ -405,6 +448,16 @@ try {
   });
 
   assertNoRepairFailures(diagnostics);
+  // The first two operations from each source include first-write allocation,
+  // JIT, and cold carrier scheduling. Preserve them in the primary samples,
+  // but also report the musical steady-state budget independently.
+  const warmupSamplesExcluded = 4;
+  const steady = Object.fromEntries(
+    Object.entries(timings).map(([name, samples]) => [
+      name,
+      latencySummary(samples.slice(warmupSamplesExcluded)),
+    ]),
+  );
   const report = {
     schema: 1,
     capturedAt: new Date().toISOString(),
@@ -415,6 +468,8 @@ try {
       sha256: keyboardSha256,
     },
     sampleCount: timings.peerVisible.length,
+    warmupSamplesExcluded,
+    steadyStateLatencyMs: steady,
     localProjectionLatencyMs: {
       samples: timings.localProjection,
       p50: percentile(timings.localProjection, 0.5),
@@ -463,6 +518,18 @@ try {
   console.log(JSON.stringify(report, null, 2));
 
   await Promise.all([leftContext.close(), rightContext.close()]);
+} catch (error) {
+  console.error(
+    JSON.stringify(
+      {
+        failure: String(error),
+        diagnostics,
+      },
+      null,
+      2,
+    ),
+  );
+  throw error;
 } finally {
   if (browser) await browser.close();
   await new Promise((resolvePromise) => server.close(resolvePromise));

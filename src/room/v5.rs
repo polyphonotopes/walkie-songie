@@ -58,7 +58,7 @@ const MAX_EMOJI_PALETTE_BYTES: usize = 4096;
 
 /// A Room v5 causal lane. The numeric tag is stable protocol identity.
 #[repr(u8)]
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub enum RoomLane {
     Music = 0x01,
     Extension = 0x02,
@@ -222,7 +222,7 @@ pub enum ExtensionCommand {
     },
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum RoomCommand {
     Music(MusicOp),
     Extension(ExtensionCommand),
@@ -770,7 +770,7 @@ pub struct ExtensionView {
     pub available_emojis: Option<String>,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct RoomView {
     pub music: MusicView,
     pub pieces: BTreeMap<PieceId, Piece>,
@@ -781,7 +781,7 @@ pub struct RoomView {
 /// UI-facing consequences between two materialized snapshots. These are
 /// derived acceleration data: callers may always discard them and compare or
 /// rebuild full views again.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub struct RoomViewDelta {
     pub pitches_added: BTreeSet<TunedDegree>,
     pub pitches_retracted: BTreeSet<TunedDegree>,

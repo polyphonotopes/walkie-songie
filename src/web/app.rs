@@ -1638,6 +1638,14 @@ fn set_url_hash(room_name: &str) {
 /// Run the web application.
 #[wasm_bindgen(start)]
 pub fn run_app() {
+    // The production module is also imported by the dedicated Replica worker.
+    // Wasm initialization invokes this start function in both realms; only a
+    // Window may install the application and DOM/audio adapters. The worker
+    // module calls `startWalkieReplicaWorker` immediately after initialization.
+    if web_sys::window().is_none() {
+        return;
+    }
+
     // Set up panic hook for better error messages
     console_error_panic_hook::set_once();
 

@@ -13,11 +13,18 @@ const PEER_ID_KEY: &str = "peer_id";
 async fn open_db() -> Result<IdbDatabase, String> {
     use std::{cell::RefCell, rc::Rc};
 
-    let window = web_sys::window().ok_or("No window")?;
-    let idb_factory = window
-        .indexed_db()
-        .map_err(|_| "IndexedDB not available")?
-        .ok_or("IndexedDB not available")?;
+    // `indexedDB` is exposed on both Window and WorkerGlobalScope. Resolve the
+    // global mixin directly so the exact Room-v5 log can move into a dedicated
+    // worker without changing databases or copying history through the window.
+    let global = js_sys::global();
+    let indexed_db = js_sys::Reflect::get(&global, &JsValue::from_str("indexedDB"))
+        .map_err(|_| "IndexedDB not available")?;
+    if indexed_db.is_null() || indexed_db.is_undefined() {
+        return Err("IndexedDB not available".into());
+    }
+    let idb_factory: web_sys::IdbFactory = indexed_db
+        .dyn_into()
+        .map_err(|_| "indexedDB global has an unexpected type")?;
 
     let request = idb_factory
         .open_with_u32(DB_NAME, DB_VERSION)

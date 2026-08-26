@@ -5,6 +5,8 @@ pub mod projection;
 pub mod streams;
 /// Room v5: capability-native HHHS Replicas with application-owned carriers.
 pub mod v5;
+#[cfg(any(test, all(target_arch = "wasm32", feature = "browser-net")))]
+pub(crate) mod worker;
 
 pub use events::RoomEvent;
 pub use streams::{

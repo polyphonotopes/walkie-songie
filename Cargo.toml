@@ -125,6 +125,11 @@ hhhs-cap = { version = "0.4.4", git = "https://gitlab.com/micahscopes/hhhs-rs.gi
 hhhs-proof = { version = "0.4.4", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.4" }
 hhhs-store = { version = "0.4.4", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.4" }
 hhhs-replica = { version = "0.4.4", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.4" }
+# Browser placement protocol and in-process parity host. The actual Worker and
+# IndexedDB handles remain wasm-only inside this crate, while its typed service
+# seam is testable on native targets.
+hhhs-web-browser = { version = "0.4.4", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.4" }
+ciborium = "0.2"
 # futures-signals drives the HHHS reactive read model (room::mirror) on ALL targets
 # (native plugin + wasm UI); dominator (wasm-only, below) consumes the same signals.
 futures-signals = "0.3"

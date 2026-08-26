@@ -1,8 +1,8 @@
 //! Capability-native in-page Room-v5 host.
 //!
-//! The browser owns IndexedDB, iroh/WebRTC, rendezvous, tasks, and UI events.
-//! HHHS owns each lane's admission, materialization, and repair state. IndexedDB
-//! remains an async durability owner; it never masquerades as `ReplicaStorage`.
+//! The window owns iroh/WebRTC, rendezvous, tasks, audio, and UI events. One
+//! dedicated worker owns both HHHS lanes, materialization, and their existing
+//! Room-v5 IndexedDB logs.
 
 use std::{
     cell::{Cell, RefCell},
@@ -14,11 +14,7 @@ use std::{
 use futures::{
     SinkExt, StreamExt,
     channel::{mpsc, oneshot},
-    lock::Mutex,
 };
-use hhhs::DagRead as _;
-use hhhs_replica::DurableReplicaHost;
-use hhhs_store::MemoryStorage;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::{
@@ -29,20 +25,23 @@ use crate::{
     },
     is_valid_room_name,
     net::{
-        BrowserNetHandle, BrowserRoomInbound, BrowserRoomNetwork, BrowserTimer, IrohSyncStream,
+        BrowserNetHandle, BrowserRoomInbound, BrowserRoomNetwork, IrohSyncStream,
         NativeNetworkEvent, NativeRoomTicketV5, ReplicaLiveRecord, ReplicaProtocol,
-        ReplicaRepairHint, ReplicaRepairProbe, ReplicaRoomNetworkConfig, WalkieIdentity,
-        drive_replica_initiator, drive_replica_responder, is_routine_repair_initiator,
-        replica_frontier_digest, spawn_rendezvous_v5,
+        ReplicaRepairHint, ReplicaRepairProbe, ReplicaRoomNetworkConfig, SyncStream,
+        WalkieIdentity, is_routine_repair_initiator, spawn_rendezvous_v5,
     },
     room::v5::{
-        ActorId, ExtensionCommand, MusicOp, ProtocolSupport, RoomAdmissionPolicy, RoomCommand,
-        RoomLane, RoomReplicas, RoomView, open_room_authority,
+        ActorId, ExtensionCommand, MusicOp, ProtocolSupport, RoomCommand, RoomLane, RoomView,
+        open_room_authority,
+    },
+    room::worker::{
+        RoomWorkerOpen, RoomWorkerRepairOutcome, RoomWorkerRepairRequest, RoomWorkerRepairStatus,
+        RoomWorkerResponse,
     },
     tuning::{TunedDegree, TunedPeriodicPitch},
 };
 
-use super::storage::IndexedDbReplicaLogV5;
+use super::replica_worker::BrowserReplicaHandle;
 
 /// End the current browser task before accepting more already-buffered work.
 ///
@@ -66,85 +65,10 @@ enum RoomControl {
         pitch: Option<TunedPeriodicPitch>,
         response: oneshot::Sender<Result<CommandAck, AppError>>,
     },
-    Shutdown,
-}
-
-type BrowserDurableLane =
-    DurableReplicaHost<MemoryStorage, RoomAdmissionPolicy, IndexedDbReplicaLogV5>;
-
-struct DurableRoom {
-    room: RoomReplicas<MemoryStorage, MemoryStorage>,
-    music: Rc<Mutex<BrowserDurableLane>>,
-    extension: Rc<Mutex<BrowserDurableLane>>,
-    music_frontier: Cell<hhhs::Digest>,
-    extension_frontier: Cell<hhhs::Digest>,
-}
-
-impl DurableRoom {
-    fn lane(&self, lane: RoomLane) -> Rc<Mutex<BrowserDurableLane>> {
-        match lane {
-            RoomLane::Music => Rc::clone(&self.music),
-            RoomLane::Extension => Rc::clone(&self.extension),
-        }
-    }
-
-    fn frontier_digest(&self, lane: RoomLane) -> hhhs::Digest {
-        match lane {
-            RoomLane::Music => self.music_frontier.get(),
-            RoomLane::Extension => self.extension_frontier.get(),
-        }
-    }
-
-    fn set_frontiers(&self, music: &hhhs::Position, extension: &hhhs::Position) {
-        self.music_frontier.set(replica_frontier_digest(music));
-        self.extension_frontier
-            .set(replica_frontier_digest(extension));
-    }
-
-    fn view_and_refresh_frontiers(&self) -> RoomView {
-        let (view, music, extension) = self.room.view_with_frontiers();
-        self.set_frontiers(&music, &extension);
-        view
-    }
-
-    /// Refresh the carrier's constant-time convergence summary after durable
-    /// growth. Periodic health checks read this cache instead of rebuilding a
-    /// history-sized snapshot while peers are already synchronized.
-    fn refresh_frontier(&self, lane: RoomLane) {
-        let digest = match lane {
-            RoomLane::Music => {
-                replica_frontier_digest(&self.room.music_snapshot().history.frontier())
-            }
-            RoomLane::Extension => {
-                replica_frontier_digest(&self.room.extension_snapshot().history.frontier())
-            }
-        };
-        match lane {
-            RoomLane::Music => self.music_frontier.set(digest),
-            RoomLane::Extension => self.extension_frontier.set(digest),
-        }
-    }
-}
-
-type SharedDurableRoom = Rc<DurableRoom>;
-
-async fn persist_initial_member_grant(
-    room: &RoomReplicas<MemoryStorage, MemoryStorage>,
-    host: &mut BrowserDurableLane,
-    lane: RoomLane,
-    authority: &hhhs_proof::SigningKey,
-    member: ActorId,
-) -> Result<(), AppError> {
-    if !room.capabilities_for_lane(member, lane).is_empty() {
-        return Ok(());
-    }
-    let prepared = room
-        .prepare_member_grant(lane, authority, member)
-        .map_err(persistence_error)?;
-    host.commit_prepared(prepared.into_prepared())
-        .await
-        .map_err(persistence_error)?;
-    Ok(())
+    OutboundRecord(Vec<u8>),
+    Shutdown {
+        response: oneshot::Sender<()>,
+    },
 }
 
 struct ActiveRoom {
@@ -398,22 +322,6 @@ impl BrowserHost {
     ) -> Result<CommandAck, AppError> {
         self.stop_active_room().await;
         let local_actor = self.identity.capability_actor_id();
-        let music_log = IndexedDbReplicaLogV5::open(&config.room, config.owner, RoomLane::Music)
-            .await
-            .map_err(persistence_error)?;
-        let extension_log =
-            IndexedDbReplicaLogV5::open(&config.room, config.owner, RoomLane::Extension)
-                .await
-                .map_err(persistence_error)?;
-        let room = RoomReplicas::from_transaction_logs(
-            config.room.clone(),
-            config.owner,
-            music_log.transactions().map_err(persistence_error)?,
-            extension_log.transactions().map_err(persistence_error)?,
-        )
-        .map_err(persistence_error)?;
-        let mut music = room.music_durable_host(music_log);
-        let mut extension = room.extension_durable_host(extension_log);
         if let Some(authority) = room_authority.as_ref() {
             if ActorId::from_signing_key(authority) != config.owner {
                 return Err(AppError::new(
@@ -421,33 +329,65 @@ impl BrowserHost {
                     "open-room authority does not match the room owner",
                 ));
             }
-            persist_initial_member_grant(
-                &room,
-                &mut music,
-                RoomLane::Music,
-                authority,
-                local_actor,
-            )
-            .await?;
-            persist_initial_member_grant(
-                &room,
-                &mut extension,
-                RoomLane::Extension,
-                authority,
-                local_actor,
-            )
-            .await?;
         }
-        let (recovered_view, music_position, extension_position) = room.view_with_frontiers();
-        let music_frontier = replica_frontier_digest(&music_position);
-        let extension_frontier = replica_frontier_digest(&extension_position);
-        let durable = Rc::new(DurableRoom {
-            room,
-            music: Rc::new(Mutex::new(music)),
-            extension: Rc::new(Mutex::new(extension)),
-            music_frontier: Cell::new(music_frontier),
-            extension_frontier: Cell::new(extension_frontier),
-        });
+
+        let (control, control_rx) = mpsc::channel(64);
+        let worker_control = Rc::new(RefCell::new(control.clone()));
+        let projection_host = self.clone();
+        let outbound_host = self.clone();
+        let outbound = Rc::clone(&worker_control);
+        let diagnostic_host = self.clone();
+        let worker_open = RoomWorkerOpen::new(
+            &config.room,
+            config.owner,
+            *self.identity.seed(),
+            room_authority
+                .as_ref()
+                .map(|authority| authority.to_bytes()),
+        );
+        let (worker, opened) = BrowserReplicaHandle::open(
+            worker_open,
+            move |projection| {
+                projection_host.apply_room_view(projection.view);
+            },
+            move |record| {
+                if outbound
+                    .borrow_mut()
+                    .try_send(RoomControl::OutboundRecord(record))
+                    .is_err()
+                {
+                    outbound_host.emit_diagnostic(
+                        "replica_worker_outbound",
+                        "worker outbound-record queue is full",
+                    );
+                }
+            },
+            move |message| {
+                diagnostic_host.emit_diagnostic("replica_worker", &message);
+            },
+        )
+        .await
+        .map_err(persistence_error)?;
+        match opened {
+            RoomWorkerResponse::Opened { actor, projection }
+                if actor == local_actor
+                    && worker
+                        .projections()
+                        .get_cloned()
+                        .is_some_and(|current| current.value == projection)
+                    && matches!(
+                        worker.lifecycle().get_cloned(),
+                        super::replica_worker::BrowserReplicaLifecycle::Ready { .. }
+                    ) => {}
+            RoomWorkerResponse::Opened { .. } => {
+                worker.terminate();
+                return Err(AppError::new(
+                    AppErrorCode::Internal,
+                    "Replica worker opened with the wrong local actor",
+                ));
+            }
+            _ => unreachable!("BrowserReplicaHandle validates its Open response"),
+        }
 
         let topic = config.topic();
         let topic_string = topic.to_string();
@@ -492,10 +432,9 @@ impl BrowserHost {
             );
             self.update_peer(peer, bootstrap_source, PeerPath::Connecting, false);
         }
-        let (control, control_rx) = mpsc::channel(64);
         spawn_room_loop(
             self.clone(),
-            durable.clone(),
+            worker.clone(),
             network,
             handle.clone(),
             control_rx,
@@ -503,9 +442,8 @@ impl BrowserHost {
             rendezvous_guard,
             peers.clone(),
             alive.clone(),
-            room_authority,
         );
-        spawn_periodic_repair(self.clone(), durable, handle, peers, alive.clone());
+        spawn_periodic_repair(self.clone(), worker, handle, peers, alive.clone());
 
         {
             let mut state = self.state.borrow_mut();
@@ -521,7 +459,6 @@ impl BrowserHost {
             room_topic: Some(topic_string),
             ticket: Some(ticket_string),
         });
-        self.apply_room_view(recovered_view);
         Ok(CommandAck {
             accepted_sequence: self.sequence(),
         })
@@ -554,7 +491,15 @@ impl BrowserHost {
         let active = self.state.borrow_mut().active_room.take();
         if let Some(mut active) = active {
             active.alive.set(false);
-            let _ = active.control.send(RoomControl::Shutdown).await;
+            let (response, closed) = oneshot::channel();
+            if active
+                .control
+                .send(RoomControl::Shutdown { response })
+                .await
+                .is_ok()
+            {
+                let _ = closed.await;
+            }
         }
     }
 
@@ -795,7 +740,7 @@ impl BrowserHost {
 #[allow(clippy::too_many_arguments)]
 fn spawn_room_loop(
     host: Rc<BrowserHost>,
-    durable: SharedDurableRoom,
+    worker: BrowserReplicaHandle,
     mut network: BrowserRoomNetwork,
     handle: BrowserNetHandle,
     mut control: mpsc::Receiver<RoomControl>,
@@ -803,14 +748,13 @@ fn spawn_room_loop(
     rendezvous_guard: Option<crate::net::RendezvousHandle>,
     peers: Rc<RefCell<BTreeMap<iroh::EndpointId, (DiscoverySource, PeerPath, ProtocolSupport)>>>,
     alive: Rc<Cell<bool>>,
-    room_authority: Option<hhhs_proof::SigningKey>,
 ) {
-    let signing_key = host.identity.capability_signing_key();
     let local_actor = host.identity.capability_actor_id();
     spawn_local(async move {
         let _rendezvous_guard = rendezvous_guard;
         let mut presence_session = 0_u64;
         let mut presence_sequence = 0_u64;
+        let mut shutdown_response = None;
         while alive.get() {
             let control_next = control.next();
             let inbound_next = network.next_inbound();
@@ -830,14 +774,14 @@ fn spawn_room_loop(
                 futures::future::Either::Left((futures::future::Either::Left((control, _)), _)) => {
                     match control {
                         Some(RoomControl::Commit { command, response }) => {
-                            let result = commit_command(
-                                &durable,
-                                &signing_key,
-                                command,
-                                &handle,
-                                host.clone(),
-                            )
-                            .await;
+                            let result = worker
+                                .commit(command)
+                                .await
+                                .map(|receipt| {
+                                    let _ = (receipt.entry, receipt.projection_revision);
+                                    host.sequence()
+                                })
+                                .map_err(persistence_error);
                             let _ = response.send(
                                 result.map(|accepted_sequence| CommandAck { accepted_sequence }),
                             );
@@ -853,16 +797,9 @@ fn spawn_room_loop(
                                 presence_session = session;
                                 presence_sequence = 0;
                             }
-                            let wire = {
-                                let capabilities = durable.room.capabilities_for(local_actor);
-                                durable.room.sign_presence(
-                                    &signing_key,
-                                    &capabilities,
-                                    session,
-                                    presence_sequence,
-                                    pitch,
-                                )
-                            };
+                            let wire = worker
+                                .sign_presence(session, presence_sequence, pitch)
+                                .await;
                             match wire {
                                 Ok(wire) => {
                                     let accepted_sequence = host.apply_presence(
@@ -886,7 +823,35 @@ fn spawn_room_loop(
                                 }
                             }
                         }
-                        Some(RoomControl::Shutdown) | None => break,
+                        Some(RoomControl::OutboundRecord(bytes)) => {
+                            let repair =
+                                ReplicaLiveRecord::decode(&bytes).map(|live| ReplicaRepairHint {
+                                    lane: live.lane,
+                                    source: live.source,
+                                    entry: live.record.entry_hash(),
+                                });
+                            if let Err(error) = handle.broadcast(bytes).await {
+                                host.emit_diagnostic(
+                                    "live_record_broadcast",
+                                    &format!("durable record broadcast failed: {error}"),
+                                );
+                                if let Some(hint) = repair
+                                    && let Err(error) = handle.broadcast(hint.encode()).await
+                                {
+                                    host.emit_diagnostic(
+                                        "repair_hint_broadcast",
+                                        &format!(
+                                            "durable record broadcast failed; repair hint also failed: {error}"
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                        Some(RoomControl::Shutdown { response }) => {
+                            shutdown_response = Some(response);
+                            break;
+                        }
+                        None => break,
                     }
                 }
                 futures::future::Either::Left((
@@ -906,7 +871,7 @@ fn spawn_room_loop(
                             };
                             spawn_repair_responder(
                                 host.clone(),
-                                durable.clone(),
+                                worker.clone(),
                                 alive.clone(),
                                 repair.endpoint_id,
                                 lane,
@@ -930,23 +895,17 @@ fn spawn_room_loop(
                                     .borrow_mut()
                                     .insert(endpoint_id, (discovery, path, support));
                                 host.update_peer(endpoint_id, discovery, path, false);
-                                if let Err(error) = grant_peer(
-                                    &durable,
-                                    room_authority.as_ref().unwrap_or(&signing_key),
-                                    local_actor,
-                                    ActorId(*endpoint_id.as_bytes()),
-                                    &handle,
-                                )
-                                .await
+                                if let Err(error) =
+                                    worker.grant_peer(ActorId(*endpoint_id.as_bytes())).await
                                 {
-                                    host.emit_diagnostic("capability_grant", &error.message);
+                                    host.emit_diagnostic("capability_grant", &error);
                                 }
                                 if is_routine_repair_initiator(local, remote) {
                                     for lane in [RoomLane::Music, RoomLane::Extension] {
                                         if support.supports(lane) {
                                             spawn_repair_initiator(
                                                 host.clone(),
-                                                durable.clone(),
+                                                worker.clone(),
                                                 handle.clone(),
                                                 alive.clone(),
                                                 endpoint_id,
@@ -978,12 +937,12 @@ fn spawn_room_loop(
                                         let lane = live.lane;
                                         let entry = live.record.entry_hash();
                                         let accepted =
-                                            match apply_live_record(&durable, live, &host).await {
+                                            match worker.inbound_record(bytes.clone()).await {
                                                 Ok(accepted) => accepted,
                                                 Err(error) => {
                                                     host.emit_diagnostic(
                                                         "live_record_admission",
-                                                        &error.message,
+                                                        &error,
                                                     );
                                                     false
                                                 }
@@ -991,7 +950,7 @@ fn spawn_room_loop(
                                         if !accepted {
                                             request_repair_after_live_failure(
                                                 host.clone(),
-                                                durable.clone(),
+                                                worker.clone(),
                                                 handle.clone(),
                                                 alive.clone(),
                                                 source,
@@ -1010,7 +969,7 @@ fn spawn_room_loop(
                                 {
                                     spawn_repair_initiator(
                                         host.clone(),
-                                        durable.clone(),
+                                        worker.clone(),
                                         handle.clone(),
                                         alive.clone(),
                                         source,
@@ -1019,22 +978,27 @@ fn spawn_room_loop(
                                 } else if let Some(probe) = ReplicaRepairProbe::decode(&bytes) {
                                     let local =
                                         crate::net::PeerId(*handle.endpoint_id().as_bytes());
+                                    let frontier =
+                                        worker.projection().map(|projection| match probe.lane {
+                                            RoomLane::Music => projection.music_frontier,
+                                            RoomLane::Extension => projection.extension_frontier,
+                                        });
                                     if probe.source != local
                                         && is_routine_repair_initiator(local, probe.source)
-                                        && durable.frontier_digest(probe.lane) != probe.frontier
+                                        && frontier != Some(*probe.frontier.as_bytes())
                                         && let Ok(source) =
                                             iroh::EndpointId::from_bytes(probe.source.as_bytes())
                                     {
                                         spawn_repair_initiator(
                                             host.clone(),
-                                            durable.clone(),
+                                            worker.clone(),
                                             handle.clone(),
                                             alive.clone(),
                                             source,
                                             probe.lane,
                                         );
                                     }
-                                } else if let Ok(presence) = durable.room.verify_presence(&bytes) {
+                                } else if let Ok(presence) = worker.verify_presence(bytes).await {
                                     host.apply_presence(
                                         presence.actor,
                                         presence.session,
@@ -1056,7 +1020,7 @@ fn spawn_room_loop(
                                         if support.supports(lane) {
                                             spawn_repair_initiator(
                                                 host.clone(),
-                                                durable.clone(),
+                                                worker.clone(),
                                                 handle.clone(),
                                                 alive.clone(),
                                                 *peer,
@@ -1096,12 +1060,18 @@ fn spawn_room_loop(
         }
         alive.set(false);
         let _ = network.shutdown().await;
+        if let Err(error) = worker.close().await {
+            host.emit_diagnostic("replica_worker_close", &error);
+        }
+        if let Some(response) = shutdown_response {
+            let _ = response.send(());
+        }
     });
 }
 
 fn spawn_periodic_repair(
     host: Rc<BrowserHost>,
-    durable: SharedDurableRoom,
+    worker: BrowserReplicaHandle,
     handle: BrowserNetHandle,
     peers: Rc<RefCell<BTreeMap<iroh::EndpointId, (DiscoverySource, PeerPath, ProtocolSupport)>>>,
     alive: Rc<Cell<bool>>,
@@ -1128,7 +1098,16 @@ fn spawn_periodic_repair(
                 if !supported {
                     continue;
                 }
-                let frontier = durable.frontier_digest(lane);
+                let Some(frontier) = worker.projection().map(|projection| match lane {
+                    RoomLane::Music => hhhs::Digest(projection.music_frontier),
+                    RoomLane::Extension => hhhs::Digest(projection.extension_frontier),
+                }) else {
+                    host.emit_diagnostic(
+                        "replica_repair_probe",
+                        "Replica worker has no current projection frontier",
+                    );
+                    continue;
+                };
                 if let Err(error) = handle
                     .broadcast(
                         ReplicaRepairProbe {
@@ -1150,120 +1129,9 @@ fn spawn_periodic_repair(
     });
 }
 
-async fn commit_command(
-    durable: &SharedDurableRoom,
-    signing_key: &hhhs_proof::SigningKey,
-    command: RoomCommand,
-    handle: &BrowserNetHandle,
-    host: Rc<BrowserHost>,
-) -> Result<u64, AppError> {
-    let lane = command.lane();
-    let (entry, record, view) = {
-        let lane_host = durable.lane(lane);
-        let mut writer = lane_host.lock().await;
-        let actor = ActorId::from_signing_key(signing_key);
-        let capabilities = durable.room.capabilities_for_lane(actor, lane);
-        if capabilities.is_empty() {
-            return Err(AppError::new(
-                AppErrorCode::UnsupportedCapability,
-                "this actor has not received a live Room-v5 capability for that Replica",
-            ));
-        }
-        let prepared = durable
-            .room
-            .prepare_author_presenting(signing_key, &capabilities, command)
-            .map_err(persistence_error)?;
-        let committed = writer
-            .commit_prepared(prepared.into_prepared())
-            .await
-            .map_err(persistence_error)?;
-        let entry = committed.outcome().entry;
-        let record = committed.replica_record().clone();
-        let view = durable.view_and_refresh_frontiers();
-        (entry, record, view)
-    };
-    let accepted_sequence = host.apply_room_view(view);
-    let live = ReplicaLiveRecord {
-        lane,
-        source: crate::net::PeerId(*handle.endpoint_id().as_bytes()),
-        record,
-    };
-    let handle = handle.clone();
-    spawn_local(async move {
-        if let Err(error) = handle.broadcast(live.encode()).await {
-            host.emit_diagnostic(
-                "live_record_broadcast",
-                &format!("command is durable; fast delivery failed: {error}"),
-            );
-            if let Err(error) = handle
-                .broadcast(
-                    ReplicaRepairHint {
-                        lane,
-                        source: crate::net::PeerId(*handle.endpoint_id().as_bytes()),
-                        entry,
-                    }
-                    .encode(),
-                )
-                .await
-            {
-                host.emit_diagnostic(
-                    "repair_hint_broadcast",
-                    &format!("command is durable; repair hint failed: {error}"),
-                );
-            }
-        }
-    });
-    Ok(accepted_sequence)
-}
-
-async fn grant_peer(
-    durable: &SharedDurableRoom,
-    signing_key: &hhhs_proof::SigningKey,
-    local_actor: ActorId,
-    peer: ActorId,
-    handle: &BrowserNetHandle,
-) -> Result<(), AppError> {
-    let mut hints = Vec::new();
-    if peer == local_actor || durable.room.owner() != ActorId::from_signing_key(signing_key) {
-        return Ok(());
-    }
-    for lane in [RoomLane::Music, RoomLane::Extension] {
-        let lane_host = durable.lane(lane);
-        let mut writer = lane_host.lock().await;
-        if !durable.room.capabilities_for_lane(peer, lane).is_empty() {
-            continue;
-        }
-        let prepared = durable
-            .room
-            .prepare_member_grant(lane, signing_key, peer)
-            .map_err(persistence_error)?;
-        let committed = writer
-            .commit_prepared(prepared.into_prepared())
-            .await
-            .map_err(persistence_error)?;
-        hints.push((lane, committed.outcome().entry));
-        drop(writer);
-        durable.refresh_frontier(lane);
-    }
-    for (lane, entry) in hints {
-        handle
-            .broadcast(
-                ReplicaRepairHint {
-                    lane,
-                    source: crate::net::PeerId(*handle.endpoint_id().as_bytes()),
-                    entry,
-                }
-                .encode(),
-            )
-            .await
-            .map_err(network_error)?;
-    }
-    Ok(())
-}
-
 fn spawn_repair_initiator(
     host: Rc<BrowserHost>,
-    durable: SharedDurableRoom,
+    worker: BrowserReplicaHandle,
     handle: BrowserNetHandle,
     alive: Rc<Cell<bool>>,
     peer: iroh::EndpointId,
@@ -1273,10 +1141,6 @@ fn spawn_repair_initiator(
         if !alive.get() {
             return;
         }
-        let lane_host = durable.lane(lane);
-        let Some(mut repair_host) = lane_host.try_lock() else {
-            return;
-        };
         let connection = match handle.begin_replica(peer, lane).await {
             Ok(connection) => connection,
             Err(error) => {
@@ -1295,23 +1159,13 @@ fn spawn_repair_initiator(
                 return;
             }
         };
-        run_repair(
-            host,
-            durable,
-            &alive,
-            peer,
-            lane,
-            &mut repair_host,
-            stream,
-            true,
-        )
-        .await;
+        run_repair(host, worker, &alive, peer, lane, stream, true).await;
     });
 }
 
 fn spawn_repair_responder(
     host: Rc<BrowserHost>,
-    durable: SharedDurableRoom,
+    worker: BrowserReplicaHandle,
     alive: Rc<Cell<bool>>,
     peer: iroh::EndpointId,
     lane: RoomLane,
@@ -1321,48 +1175,13 @@ fn spawn_repair_responder(
         if !alive.get() {
             return;
         }
-        let lane_host = durable.lane(lane);
-        let Some(mut repair_host) = lane_host.try_lock() else {
-            return;
-        };
-        run_repair(
-            host,
-            durable,
-            &alive,
-            peer,
-            lane,
-            &mut repair_host,
-            stream,
-            false,
-        )
-        .await;
+        run_repair(host, worker, &alive, peer, lane, stream, false).await;
     });
-}
-
-async fn apply_live_record(
-    durable: &SharedDurableRoom,
-    live: ReplicaLiveRecord,
-    host: &BrowserHost,
-) -> Result<bool, AppError> {
-    let lane = live.lane;
-    let entry = live.record.entry_hash();
-    let bytes = live.record.encode();
-    let lane_host = durable.lane(lane);
-    let mut writer = lane_host.lock().await;
-    let report = hhhs_sync::RepairHost::apply(&mut *writer, &[(entry, bytes)])
-        .await
-        .map_err(persistence_error)?;
-    drop(writer);
-    if report.lifted > 0 {
-        let view = durable.view_and_refresh_frontiers();
-        host.apply_room_view(view);
-    }
-    Ok(report.refused.is_empty() && report.admitted.contains(&entry))
 }
 
 fn request_repair_after_live_failure(
     host: Rc<BrowserHost>,
-    durable: SharedDurableRoom,
+    worker: BrowserReplicaHandle,
     handle: BrowserNetHandle,
     alive: Rc<Cell<bool>>,
     source: crate::net::PeerId,
@@ -1374,7 +1193,7 @@ fn request_repair_after_live_failure(
         return;
     };
     if is_routine_repair_initiator(local, source) {
-        spawn_repair_initiator(host, durable, handle, alive, source_endpoint, lane);
+        spawn_repair_initiator(host, worker, handle, alive, source_endpoint, lane);
         return;
     }
     spawn_local(async move {
@@ -1402,56 +1221,112 @@ fn request_repair_after_live_failure(
 
 async fn run_repair(
     host: Rc<BrowserHost>,
-    durable: SharedDurableRoom,
+    worker: BrowserReplicaHandle,
     alive: &Cell<bool>,
     peer: iroh::EndpointId,
     lane: RoomLane,
-    repair_host: &mut BrowserDurableLane,
     stream: IrohSyncStream,
     initiator: bool,
 ) {
-    let result = if initiator {
-        drive_replica_initiator(
-            stream,
-            &BrowserTimer,
-            repair_host,
-            lane,
-            hhhs_sync::SessionLimits::default(),
-        )
-        .await
-    } else {
-        drive_replica_responder(
-            stream,
-            &BrowserTimer,
-            repair_host,
-            lane,
-            hhhs_sync::SessionLimits::default(),
-        )
-        .await
-    };
+    let result = drive_worker_repair(stream, &worker, lane, initiator).await;
     if !alive.get() {
         return;
     }
     match result {
-        Ok(outcome) if !outcome.incomplete && !outcome.root_mismatch => {
-            if outcome.lifted > 0 {
-                host.apply_room_view(durable.view_and_refresh_frontiers());
-            }
+        Ok((RoomWorkerRepairStatus::Complete, _outcome)) => {
             host.mark_synchronized(peer);
         }
-        Ok(outcome) => {
-            if outcome.lifted > 0 {
-                durable.refresh_frontier(lane);
-            }
+        Ok((status, outcome)) => {
             host.emit_diagnostic(
                 "replica_repair_incomplete",
-                &format!("{lane:?} repair with {peer} ended incomplete: {outcome:?}"),
+                &format!("{lane:?} repair with {peer} ended {status:?}: {outcome:?}"),
             );
         }
         Err(error) => host.emit_diagnostic(
             "replica_repair",
             &format!("{lane:?} repair with {peer} failed: {error}"),
         ),
+    }
+}
+
+async fn drive_worker_repair(
+    mut stream: IrohSyncStream,
+    worker: &BrowserReplicaHandle,
+    lane: RoomLane,
+    initiator: bool,
+) -> Result<(RoomWorkerRepairStatus, RoomWorkerRepairOutcome), String> {
+    let session = worker.next_repair_session();
+    let result = drive_worker_repair_inner(&mut stream, worker, session, lane, initiator).await;
+    if result.is_err() {
+        let _ = worker
+            .repair(RoomWorkerRepairRequest::Close { session })
+            .await;
+    }
+    stream.close().await;
+    result
+}
+
+async fn drive_worker_repair_inner(
+    stream: &mut IrohSyncStream,
+    worker: &BrowserReplicaHandle,
+    session: u64,
+    lane: RoomLane,
+    initiator: bool,
+) -> Result<(RoomWorkerRepairStatus, RoomWorkerRepairOutcome), String> {
+    let mut step = if initiator {
+        worker
+            .repair(RoomWorkerRepairRequest::StartInitiator { session, lane })
+            .await?
+    } else {
+        let hello = receive_repair_frame(stream).await?;
+        worker
+            .repair(RoomWorkerRepairRequest::StartResponder {
+                session,
+                lane,
+                hello,
+            })
+            .await?
+    };
+
+    loop {
+        for frame in &step.frames {
+            stream
+                .send_frame(frame)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        if step.status != RoomWorkerRepairStatus::Exchanging {
+            return Ok((step.status, step.outcome));
+        }
+        let frame = receive_repair_frame(stream).await?;
+        step = worker
+            .repair(RoomWorkerRepairRequest::Frame { session, frame })
+            .await?;
+    }
+}
+
+async fn receive_repair_frame(stream: &mut IrohSyncStream) -> Result<Vec<u8>, String> {
+    let limits = hhhs_sync::SessionLimits::default();
+    let receive = stream.recv_frame();
+    let timeout = n0_future::time::sleep(limits.recv_timeout);
+    futures::pin_mut!(receive, timeout);
+    match futures::future::select(receive, timeout).await {
+        futures::future::Either::Left((frame, _)) => {
+            let frame = frame.map_err(|error| error.to_string())?.ok_or_else(|| {
+                "repair stream closed before the worker session finished".to_owned()
+            })?;
+            if frame.len() > limits.max_frame_bytes {
+                return Err(format!(
+                    "repair frame is {} bytes; maximum is {}",
+                    frame.len(),
+                    limits.max_frame_bytes
+                ));
+            }
+            Ok(frame)
+        }
+        futures::future::Either::Right(((), _)) => {
+            Err("repair stream timed out waiting for the next frame".into())
+        }
     }
 }
 
