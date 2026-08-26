@@ -8,10 +8,10 @@ publish = false
 # THE point of this crate is its dependency list: the shared music protocol,
 # HHHS Replica/repair seams, and NOTHING from walkie-songie.
 [dependencies]
-tutti-music = { version = "0.1.0", git = "https://github.com/polyphonotopes/tutti.git", tag = "v0.4.4" }
-tutti-music-hhhs = { version = "0.4.3", git = "https://github.com/polyphonotopes/tutti.git", tag = "v0.4.4" }
-hhhs = { version = "0.4.3", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.3" }
-hhhs-proof = { version = "0.4.3", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.3" }
-hhhs-replica = { version = "0.4.3", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.3" }
-hhhs-store = { version = "0.4.3", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.3" }
-hhhs-sync = { version = "0.4.3", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.3", features = ["driver"] }
+tutti-music = { version = "0.1.0", git = "https://github.com/polyphonotopes/tutti.git", tag = "v0.4.5" }
+tutti-music-hhhs = { version = "0.4.4", git = "https://github.com/polyphonotopes/tutti.git", tag = "v0.4.5" }
+hhhs = { version = "0.4.4", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.4" }
+hhhs-proof = { version = "0.4.4", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.4" }
+hhhs-replica = { version = "0.4.4", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.4" }
+hhhs-store = { version = "0.4.4", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.4" }
+hhhs-sync = { version = "0.4.4", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.4", features = ["driver"] }
