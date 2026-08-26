@@ -40,7 +40,7 @@ impl Piece {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct ProjectionSnapshot {
     pitches: HashSet<PitchClass>,
     pieces: HashMap<String, (i32, String)>,
@@ -117,7 +117,7 @@ impl RoomProjection {
         }
     }
 
-    fn emit_diffs(&self, before: &ProjectionSnapshot) {
+    fn emit_diffs(&self, before: &ProjectionSnapshot) -> bool {
         let after = self.snapshot();
         for pitch_class in after.pitches.difference(&before.pitches) {
             self.emit(RoomEvent::PitchAdded {
@@ -181,6 +181,7 @@ impl RoomProjection {
                 locked: after.pieces_locked,
             });
         }
+        before != &after
     }
 
     /// Replace the cache from an admitted, materialized Room-v5 view.
@@ -210,13 +211,16 @@ impl RoomProjection {
             .filter(|emojis| !emojis.is_empty())
             .map(|emojis| emojis.graphemes(true).map(str::to_owned).collect())
             .unwrap_or_else(default_emojis);
-        self.emit_diffs(&before);
-        if old_emojis != self.available_emojis {
+        let changed = self.emit_diffs(&before);
+        let emojis_changed = old_emojis != self.available_emojis;
+        if emojis_changed {
             self.emit(RoomEvent::EmojisChanged {
                 emojis: self.available_emojis.clone(),
             });
         }
-        self.notify();
+        if changed || emojis_changed {
+            self.notify();
+        }
     }
 
     pub fn emit_full_state_sync(&self) {

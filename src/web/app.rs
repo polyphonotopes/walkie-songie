@@ -341,8 +341,6 @@ impl AppState {
                 room.remove_pitch(pitch_class);
             }
         }
-        sync_active_pitches(self);
-
         let command = if active {
             ClientCommand::AddDegree { pitch }
         } else {
@@ -494,19 +492,22 @@ impl AppState {
         };
 
         if let Some(room_name) = snapshot.room_name.clone() {
-            self.room_name.set(room_name.clone());
-            self.room_input.set(room_name);
+            self.room_name.set_neq(room_name.clone());
+            self.room_input.set_neq(room_name);
         }
-        self.room_ticket.set(snapshot.room_ticket.clone());
+        self.room_ticket.set_neq(snapshot.room_ticket.clone());
 
-        if let Some(definition) = snapshot.tuning.as_ref() {
+        let current_tuning_id = self.tuning.lock_ref().id();
+        if snapshot.tuning_id != Some(current_tuning_id)
+            && let Some(definition) = snapshot.tuning.as_ref()
+        {
             match definition.validate("room tuning") {
                 Ok(tuning) => {
                     self.tuning.set(tuning.clone());
-                    self.scl_error.set(None);
+                    self.scl_error.set_neq(None);
                     super::keyboard::update_tuning(&tuning);
                 }
-                Err(error) => self.scl_error.set(Some(error.to_string())),
+                Err(error) => self.scl_error.set_neq(Some(error.to_string())),
             }
         }
 
@@ -540,8 +541,8 @@ impl AppState {
             .iter()
             .find(|peer| matches!(peer.path, PeerPath::Direct | PeerPath::Relayed));
         self.iroh_peer_id
-            .set(connected.map(|peer| peer.endpoint_id.clone()));
-        self.native_status.set(native_status(&snapshot));
+            .set_neq(connected.map(|peer| peer.endpoint_id.clone()));
+        self.native_status.set_neq(native_status(&snapshot));
 
         let tuning = self.tuning.lock_ref();
         let degree_count = i64::try_from(tuning.pitch_class_count()).unwrap_or(1);
@@ -599,7 +600,7 @@ impl AppState {
             .collect();
         drop(tuning);
 
-        self.pieces_locked.set(snapshot.pieces_locked);
+        self.pieces_locked.set_neq(snapshot.pieces_locked);
         self.room.lock_mut().replace_replica_projection(
             &pitches,
             &pieces,
@@ -607,7 +608,6 @@ impl AppState {
             snapshot.pieces_locked,
             snapshot.available_emojis.as_deref(),
         );
-        sync_active_pitches(self);
     }
 
     /// Handle pitch detection event from SwiftF0, applying conditioner modifier.
@@ -1781,34 +1781,32 @@ fn update_graph_highlights(_state: &Arc<AppState>) {
 
 /// Handle a projected room event and update UI/MIDI consumers.
 fn handle_room_event(state: &Arc<AppState>, event: &RoomEvent) {
-    // Log event for debugging
-    web_sys::console::log_1(&format!("[RoomEvent] {:?}", event).into());
+    let affects_pitches = event.affects_pitches();
+    let affects_voice = event.affects_voice();
 
-    // Handle pitch-affecting events
-    if event.affects_pitches() {
+    // Project every logical room event into the keyboard exactly once. In
+    // particular, FullStateSync affects both pitches and voices; handling each
+    // facet independently used to repaint the full keyboard three times.
+    if affects_pitches || affects_voice {
         sync_active_pitches(state);
-        state.sync_midi_toggle_output();
         update_graph_highlights(state);
     }
 
-    // Handle voice events
-    if event.affects_voice() {
-        sync_active_pitches(state);
+    if affects_pitches {
+        state.sync_midi_toggle_output();
+    }
+
+    if affects_voice {
         state.sync_midi_voice_output();
-        update_graph_highlights(state);
     }
 
     // Handle piece lock changes
     if let RoomEvent::PiecesLockChanged { locked } = event {
-        state.pieces_locked.set(*locked);
+        state.pieces_locked.set_neq(*locked);
     }
 
     // Handle full state sync (initial load or reconnect)
     if let RoomEvent::FullStateSync { pieces_locked, .. } = event {
-        state.pieces_locked.set(*pieces_locked);
-        sync_active_pitches(state);
-        state.sync_midi_toggle_output();
-        state.sync_midi_voice_output();
-        update_graph_highlights(state);
+        state.pieces_locked.set_neq(*pieces_locked);
     }
 }

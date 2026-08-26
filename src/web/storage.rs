@@ -343,6 +343,21 @@ async fn append_replica_transaction(
     }) as Box<dyn FnOnce(_)>);
     transaction.set_onabort(Some(onabort.as_ref().unchecked_ref()));
 
+    // Both writes have been queued; begin committing without waiting for their
+    // success events to make an otherwise unnecessary trip through a busy
+    // browser event loop. Atomicity and the transaction `complete` boundary are
+    // unchanged.
+    // `IDBTransaction.commit()` is standardized and supported by the browsers
+    // in Walkie's compatibility set. The pinned `web-sys` binding still marks
+    // it deprecated, so keep the allowance scoped to this one call.
+    #[allow(deprecated)]
+    if transaction.commit().is_err() {
+        transaction.set_oncomplete(None);
+        transaction.set_onerror(None);
+        transaction.set_onabort(None);
+        return Err("Failed to commit IndexedDB journal transaction".to_owned());
+    }
+
     let result = rx
         .await
         .map_err(|_| "IndexedDB transaction callback closed")?;
@@ -429,10 +444,11 @@ impl IndexedDbReplicaLogV5 {
             .ok()
             .and_then(|sequence| sequence.checked_add(1))
             .ok_or_else(|| "Room-v5 replica manifest overflow".to_owned())?;
+        let encoded = hhhs_store::encode_storage_transaction(transaction);
         append_replica_transaction(
             &self.db,
             &replica_record_key(&self.prefix, sequence),
-            &hhhs_store::encode_storage_transaction(transaction),
+            &encoded,
             &replica_count_key(&self.prefix),
             next_count,
         )

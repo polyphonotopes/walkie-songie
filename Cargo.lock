@@ -2041,24 +2041,24 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hhhs"
-version = "0.4.2"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.2#476a4c6a800fed215dade5089ac2c241ca79fcf8"
+version = "0.4.3"
+source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.3#35d2018cb5239f29a420eab26ed23f0bd3870b5b"
 dependencies = [
  "hhhs-dag",
 ]
 
 [[package]]
 name = "hhhs-cap"
-version = "0.4.2"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.2#476a4c6a800fed215dade5089ac2c241ca79fcf8"
+version = "0.4.3"
+source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.3#35d2018cb5239f29a420eab26ed23f0bd3870b5b"
 dependencies = [
  "hhhs",
 ]
 
 [[package]]
 name = "hhhs-dag"
-version = "0.4.2"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.2#476a4c6a800fed215dade5089ac2c241ca79fcf8"
+version = "0.4.3"
+source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.3#35d2018cb5239f29a420eab26ed23f0bd3870b5b"
 dependencies = [
  "blake3",
  "serde",
@@ -2066,8 +2066,8 @@ dependencies = [
 
 [[package]]
 name = "hhhs-proof"
-version = "0.4.2"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.2#476a4c6a800fed215dade5089ac2c241ca79fcf8"
+version = "0.4.3"
+source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.3#35d2018cb5239f29a420eab26ed23f0bd3870b5b"
 dependencies = [
  "ed25519-dalek",
  "hhhs",
@@ -2076,8 +2076,8 @@ dependencies = [
 
 [[package]]
 name = "hhhs-replica"
-version = "0.4.2"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.2#476a4c6a800fed215dade5089ac2c241ca79fcf8"
+version = "0.4.3"
+source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.3#35d2018cb5239f29a420eab26ed23f0bd3870b5b"
 dependencies = [
  "hhhs",
  "hhhs-cap",
@@ -2088,16 +2088,16 @@ dependencies = [
 
 [[package]]
 name = "hhhs-store"
-version = "0.4.2"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.2#476a4c6a800fed215dade5089ac2c241ca79fcf8"
+version = "0.4.3"
+source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.3#35d2018cb5239f29a420eab26ed23f0bd3870b5b"
 dependencies = [
  "hhhs",
 ]
 
 [[package]]
 name = "hhhs-sync"
-version = "0.4.2"
-source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.2#476a4c6a800fed215dade5089ac2c241ca79fcf8"
+version = "0.4.3"
+source = "git+https://gitlab.com/micahscopes/hhhs-rs.git?tag=v0.4.3#35d2018cb5239f29a420eab26ed23f0bd3870b5b"
 dependencies = [
  "blake3",
  "futures",
@@ -6171,7 +6171,7 @@ dependencies = [
 [[package]]
 name = "tutti-midi"
 version = "0.1.0"
-source = "git+https://github.com/polyphonotopes/tutti.git?tag=v0.4.3#617734a66ec2cd1190afc2570f16e32d6c4b5928"
+source = "git+https://github.com/polyphonotopes/tutti.git?tag=v0.4.4#8a051d095b45abe4741b412a172824904dff2c17"
 dependencies = [
  "thiserror 2.0.19",
  "tutti-music",
@@ -6180,7 +6180,7 @@ dependencies = [
 [[package]]
 name = "tutti-music"
 version = "0.1.0"
-source = "git+https://github.com/polyphonotopes/tutti.git?tag=v0.4.3#617734a66ec2cd1190afc2570f16e32d6c4b5928"
+source = "git+https://github.com/polyphonotopes/tutti.git?tag=v0.4.4#8a051d095b45abe4741b412a172824904dff2c17"
 dependencies = [
  "blake3",
  "serde",
@@ -6189,8 +6189,8 @@ dependencies = [
 
 [[package]]
 name = "tutti-music-hhhs"
-version = "0.4.2"
-source = "git+https://github.com/polyphonotopes/tutti.git?tag=v0.4.3#617734a66ec2cd1190afc2570f16e32d6c4b5928"
+version = "0.4.3"
+source = "git+https://github.com/polyphonotopes/tutti.git?tag=v0.4.4#8a051d095b45abe4741b412a172824904dff2c17"
 dependencies = [
  "hhhs",
  "hhhs-cap",
@@ -6400,7 +6400,6 @@ dependencies = [
 name = "walkie-songie"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-broadcast",
  "async-channel",
  "bare-music-peer",
@@ -6437,7 +6436,6 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
- "tracing-subscriber",
  "tracing-wasm",
  "tutti-midi",
  "tutti-music",
@@ -6459,8 +6457,6 @@ dependencies = [
  "hhhs-store",
  "hhhs-sync",
  "iroh",
- "rand 0.9.2",
- "serde",
  "tauri",
  "tauri-build",
  "tokio",

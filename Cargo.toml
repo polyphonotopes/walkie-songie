@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.97.1"
 
+[package.metadata.cargo-machete]
+# Feature-only dependency: enables getrandom's browser crypto backend for rand
+# and uuid even though application source does not name the crate directly.
+ignored = ["getrandom"]
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
@@ -92,7 +97,6 @@ serde_json = "1.0"
 # Utils
 uuid = { version = "1.16", features = ["v4", "rng-getrandom"] }
 web-time = "1.1"
-anyhow = "1.0"
 thiserror = "2.0"
 tracing = "0.1"
 rand = "0.9"
@@ -103,24 +107,24 @@ blake3 = "=1.8.5"
 # The music protocol (tutti Phase II): tuning identity (`crate::tuning` re-exports
 # it), the MusicOp/MusicLang reference wire, the fold combinators `walkie_fold`
 # drives, and the render seam. Wasm-safe.
-tutti-music = { version = "0.1.0", git = "https://github.com/polyphonotopes/tutti.git", tag = "v0.4.3" }
+tutti-music = { version = "0.1.0", git = "https://github.com/polyphonotopes/tutti.git", tag = "v0.4.4" }
 # Capability-native canonical-history adapter shared with independent music
 # peers. It owns no Walkie extension or network runtime.
-tutti-music-hhhs = { version = "0.4.2", git = "https://github.com/polyphonotopes/tutti.git", tag = "v0.4.3" }
+tutti-music-hhhs = { version = "0.4.3", git = "https://github.com/polyphonotopes/tutti.git", tag = "v0.4.4" }
 
 # The reactive MIDI bridge: walkie's source-balanced ledger + input tracker
 # (promoted; `src/midi` re-exports them) and the reconcile-on-reconnect core.
-tutti-midi = { version = "0.1.0", git = "https://github.com/polyphonotopes/tutti.git", tag = "v0.4.3" }
+tutti-midi = { version = "0.1.0", git = "https://github.com/polyphonotopes/tutti.git", tag = "v0.4.4" }
 
-# HHHS 0.4.2 release. The Replica owns admission,
+# HHHS 0.4.3 release. The Replica owns admission,
 # persistence, materialization and repair-host state; walkie continues to own
 # iroh/WebRTC/loopback carriers and execution.
-hhhs = { version = "0.4.2", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.2" }
-hhhs-sync = { version = "0.4.2", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.2", features = ["driver"] }
-hhhs-cap = { version = "0.4.2", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.2" }
-hhhs-proof = { version = "0.4.2", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.2" }
-hhhs-store = { version = "0.4.2", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.2" }
-hhhs-replica = { version = "0.4.2", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.2" }
+hhhs = { version = "0.4.3", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.3" }
+hhhs-sync = { version = "0.4.3", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.3", features = ["driver"] }
+hhhs-cap = { version = "0.4.3", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.3" }
+hhhs-proof = { version = "0.4.3", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.3" }
+hhhs-store = { version = "0.4.3", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.3" }
+hhhs-replica = { version = "0.4.3", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.3" }
 # futures-signals drives the HHHS reactive read model (room::mirror) on ALL targets
 # (native plugin + wasm UI); dominator (wasm-only, below) consumes the same signals.
 futures-signals = "0.3"
@@ -138,7 +142,6 @@ tempfile = "3"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.32", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "io-util"] }
 futures = "0.3"
-tracing-subscriber = "0.3"
 
 # Native transport: QUIC, relay-assisted hole punching, gossip, and room-scoped mDNS.
 iroh = { version = "=1.0.3", optional = true }
@@ -209,7 +212,6 @@ web-sys = { version = "0.3", optional = true, features = [
     "RtcIceCandidate", "RtcIceCandidateInit", "RtcSignalingState",
     "MidiAccess", "MidiInput", "MidiInputMap", "MidiOutput", "MidiOutputMap", "MidiMessageEvent", "MidiOptions",
     "KeyboardEvent", "FocusEvent", "PointerEvent", "DomRect",
-    "MutationObserver", "MutationObserverInit", "MutationRecord",
     "DragEvent", "DataTransfer",
     "IdbFactory", "IdbDatabase", "IdbObjectStore", "IdbRequest", "IdbTransaction", "IdbTransactionMode", "IdbVersionChangeEvent", "IdbOpenDbRequest"
 ] }

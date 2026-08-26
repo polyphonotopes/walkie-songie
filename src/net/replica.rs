@@ -6,7 +6,7 @@
 
 use core::future::Future;
 
-use hhhs::EntryHash;
+use hhhs::{Digest, Encoder, EntryHash, Position};
 use hhhs_sync::{
     FrameStream, Lane, RepairHost, SessionLimits, SessionOutcome, SyncError,
     SyncTimer as HhhsSyncTimer, drive_initiator, drive_responder,
@@ -17,6 +17,9 @@ use crate::room::v5::{LANE_STRATEGY_VERSION, ROOM_PROTOCOL_GENERATION, RoomLane}
 
 const REPAIR_HINT_DOMAIN: &[u8] = b"walkie replica repair hint v5\0";
 const REPAIR_HINT_BYTES: usize = REPAIR_HINT_DOMAIN.len() + 4 + 1 + 32 + 32;
+const REPAIR_PROBE_DOMAIN: &[u8] = b"walkie replica repair probe v5\0";
+const REPAIR_PROBE_BYTES: usize = REPAIR_PROBE_DOMAIN.len() + 4 + 1 + 32 + 32;
+const FRONTIER_DIGEST_DOMAIN: &[u8] = b"walkie replica frontier v5\0";
 const LIVE_RECORD_DOMAIN: &[u8] = b"walkie replica live record v5\0";
 const LIVE_RECORD_HEADER_BYTES: usize = LIVE_RECORD_DOMAIN.len() + 4 + 1 + 32;
 
@@ -55,6 +58,16 @@ pub struct ReplicaRepairHint {
     pub lane: RoomLane,
     pub source: PeerId,
     pub entry: EntryHash,
+}
+
+/// Cheap periodic convergence probe. The frontier digest is only a wake-up
+/// summary: a mismatch opens ordinary HHHS repair, while equality avoids
+/// rebuilding a full reconciliation snapshot for already-synchronized peers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ReplicaRepairProbe {
+    pub lane: RoomLane,
+    pub source: PeerId,
+    pub frontier: Digest,
 }
 
 /// Low-latency delivery of one opaque, public HHHS admission record.
@@ -113,6 +126,58 @@ impl ReplicaRepairHint {
             lane,
             source,
             entry,
+        })
+    }
+}
+
+/// Digest the causally maximal entry hashes. Since every entry hash commits to
+/// its predecessors and a valid Replica retains causal closure, equal frontier
+/// sets identify equal reachable history without encoding every repair record.
+pub fn replica_frontier_digest(frontier: &Position) -> Digest {
+    let mut encoder = Encoder::new();
+    encoder
+        .bytes(FRONTIER_DIGEST_DOMAIN)
+        .u64(frontier.0.len() as u64);
+    for entry in &frontier.0 {
+        encoder.digest(&entry.0);
+    }
+    encoder.digest_finish()
+}
+
+impl ReplicaRepairProbe {
+    pub fn encode(self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(REPAIR_PROBE_BYTES);
+        bytes.extend_from_slice(REPAIR_PROBE_DOMAIN);
+        bytes.extend_from_slice(&ROOM_PROTOCOL_GENERATION.to_le_bytes());
+        bytes.push(self.lane.tag());
+        bytes.extend_from_slice(self.source.as_bytes());
+        bytes.extend_from_slice(self.frontier.as_bytes());
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != REPAIR_PROBE_BYTES || !bytes.starts_with(REPAIR_PROBE_DOMAIN) {
+            return None;
+        }
+        let mut cursor = REPAIR_PROBE_DOMAIN.len();
+        let generation = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().ok()?);
+        cursor += 4;
+        if generation != ROOM_PROTOCOL_GENERATION {
+            return None;
+        }
+        let lane = match bytes[cursor] {
+            tag if tag == RoomLane::Music.tag() => RoomLane::Music,
+            tag if tag == RoomLane::Extension.tag() => RoomLane::Extension,
+            _ => return None,
+        };
+        cursor += 1;
+        let source = PeerId(bytes[cursor..cursor + 32].try_into().ok()?);
+        cursor += 32;
+        let frontier = Digest(bytes[cursor..cursor + 32].try_into().ok()?);
+        Some(Self {
+            lane,
+            source,
+            frontier,
         })
     }
 }
@@ -250,7 +315,7 @@ mod tests {
     use crate::room::v5::{ActorId, RoomReplicas};
 
     #[test]
-    fn replica_protocol_and_hint_are_strict_and_non_courier() {
+    fn replica_protocol_hints_and_probes_are_strict_and_non_courier() {
         for lane in [RoomLane::Music, RoomLane::Extension] {
             let protocol = ReplicaProtocol::Repair(lane);
             assert_eq!(ReplicaProtocol::from_alpn(protocol.alpn()), Some(protocol));
@@ -260,6 +325,12 @@ mod tests {
                 entry: EntryHash(hhhs::Digest([8; 32])),
             };
             assert_eq!(ReplicaRepairHint::decode(&hint.encode()), Some(hint));
+            let probe = ReplicaRepairProbe {
+                lane,
+                source: PeerId([7; 32]),
+                frontier: Digest([9; 32]),
+            };
+            assert_eq!(ReplicaRepairProbe::decode(&probe.encode()), Some(probe));
         }
         assert_eq!(ReplicaProtocol::from_alpn(b"tutti/music/courier/1"), None);
         let hint = ReplicaRepairHint {
@@ -270,6 +341,40 @@ mod tests {
         let mut trailing = hint.encode();
         trailing.push(0);
         assert_eq!(ReplicaRepairHint::decode(&trailing), None);
+        let probe = ReplicaRepairProbe {
+            lane: RoomLane::Music,
+            source: PeerId([7; 32]),
+            frontier: Digest([9; 32]),
+        };
+        let mut trailing = probe.encode();
+        trailing.push(0);
+        assert_eq!(ReplicaRepairProbe::decode(&trailing), None);
+    }
+
+    #[test]
+    fn frontier_probe_changes_exactly_when_canonical_history_changes() {
+        let owner_key = SigningKey::from_bytes(&[3; 32]);
+        let owner = ActorId::from_signing_key(&owner_key);
+        let left = RoomReplicas::memory("bright-river-song", owner).unwrap();
+        let right = RoomReplicas::memory("bright-river-song", owner).unwrap();
+
+        let initial = replica_frontier_digest(&left.music_snapshot().history.frontier());
+        assert_eq!(
+            initial,
+            replica_frontier_digest(&right.music_snapshot().history.frontier())
+        );
+
+        let degree = TunedDegree::new(&Tuning::twelve_tet(), 2).unwrap();
+        left.author(
+            &owner_key,
+            &left.owner_capabilities(),
+            MusicOp::AddDegree { degree }.into(),
+        )
+        .unwrap();
+        assert_ne!(
+            replica_frontier_digest(&left.music_snapshot().history.frontier()),
+            replica_frontier_digest(&right.music_snapshot().history.frontier())
+        );
     }
 
     #[test]

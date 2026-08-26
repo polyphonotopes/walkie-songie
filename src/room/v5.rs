@@ -10,7 +10,9 @@ use std::{
     sync::Arc,
 };
 
-use hhhs::{DagRead, DagSnapshot, Digest, Encoder, Entry, EntryHash, Position, ReachIndex};
+use hhhs::{
+    DagRead, DagSnapshot, Digest, Encoder, Entry, EntryHash, LazyReach, Position, Reach, ReachIndex,
+};
 use hhhs_cap::{
     Area, AuthorizationDecision, AuthorizationRequest, CapabilityOp, CapabilitySnapshot, Grant,
     Revoke, Right, Rights, decode_op as decode_capability, encode_op as encode_capability,
@@ -828,8 +830,8 @@ impl RoomView {
     }
 }
 
-fn command_is_currently_authorized<T>(
-    capabilities: &CapabilitySnapshot,
+fn command_is_currently_authorized<T, R: Reach>(
+    capabilities: &CapabilitySnapshot<R>,
     history: &DagSnapshot,
     entry: EntryHash,
     envelope: &CommandEnvelope<T>,
@@ -865,7 +867,11 @@ fn extension_commands(
     history: &DagSnapshot,
     roots: &[EntryHash],
 ) -> Vec<(EntryHash, ActorId, ExtensionCommand)> {
-    let capabilities = CapabilitySnapshot::capture(history, roots.iter().copied());
+    let capabilities = CapabilitySnapshot::<LazyReach>::capture_with(
+        history,
+        roots.iter().copied(),
+        LazyReach::new,
+    );
     history
         .entries_topo()
         .into_iter()
@@ -1330,13 +1336,20 @@ where
     /// causal delegation paths.
     pub fn capabilities_for(&self, actor: ActorId) -> MemberCapabilities {
         MemberCapabilities {
-            music: live_grants_for(&self.music.snapshot().history, self.music_root, actor),
-            extension: live_grants_for(
-                &self.extension.snapshot().history,
-                self.extension_root,
-                actor,
-            ),
+            music: self.capabilities_for_lane(actor, RoomLane::Music),
+            extension: self.capabilities_for_lane(actor, RoomLane::Extension),
         }
+    }
+
+    /// Discover live grants for one lane only. Hot command paths should not
+    /// rebuild authority indexes for an unrelated Replica.
+    pub fn capabilities_for_lane(&self, actor: ActorId, lane: RoomLane) -> Vec<EntryHash> {
+        let replica = self.replica(lane);
+        let root = match lane {
+            RoomLane::Music => self.music_root,
+            RoomLane::Extension => self.extension_root,
+        };
+        live_grants_for(&replica.snapshot().history, root, actor)
     }
 
     /// Sign one bounded ephemeral presence update. The signed causal position
@@ -1356,7 +1369,11 @@ where
         let snapshot = self.music.snapshot();
         let at = snapshot.history.frontier();
         let actor = ActorId::from_signing_key(key);
-        let authority = CapabilitySnapshot::capture(&snapshot.history, [self.music_root]);
+        let authority = CapabilitySnapshot::<LazyReach>::capture_with(
+            &snapshot.history,
+            [self.music_root],
+            LazyReach::new,
+        );
         if !authority
             .authorize(&AuthorizationRequest {
                 receiver: actor.receiver(),
@@ -1432,7 +1449,11 @@ where
             return Err(PresenceError::InvalidProof);
         }
         let history = self.music.snapshot().history;
-        let capabilities = CapabilitySnapshot::capture(&history, [self.music_root]);
+        let capabilities = CapabilitySnapshot::<LazyReach>::capture_with(
+            &history,
+            [self.music_root],
+            LazyReach::new,
+        );
         if !capabilities
             .authorize(&verified.authorization_request(history.frontier()))
             .is_allowed()
@@ -1628,10 +1649,23 @@ where
         capabilities: &MemberCapabilities,
         command: RoomCommand,
     ) -> Result<PreparedRoomCommand, RoomError> {
+        let lane = command.lane();
+        self.prepare_author_presenting(key, capabilities.for_lane(lane), command)
+    }
+
+    /// Validate and stage a typed command with the exact grants presented for
+    /// its lane. This keeps capability discovery/cache policy outside the
+    /// Replica while avoiding work on unrelated lanes.
+    pub fn prepare_author_presenting(
+        &self,
+        key: &SigningKey,
+        presented: &[EntryHash],
+        command: RoomCommand,
+    ) -> Result<PreparedRoomCommand, RoomError> {
         let actor = ActorId::from_signing_key(key);
         let lane = command.lane();
         let namespace = self.identity.namespace(lane);
-        let presented = capabilities.for_lane(lane).to_vec();
+        let presented = presented.to_vec();
         let area = match &command {
             RoomCommand::Music(command) => music_command_area(namespace, command),
             RoomCommand::Extension(command) => extension_command_area(namespace, command),
@@ -1713,10 +1747,13 @@ where
         }
     }
 
-    pub fn view(&self) -> RoomView {
-        let music = materialize_music(&self.music.snapshot().history, &[self.music_root]);
-        let extension =
-            materialize_extension(&self.extension.snapshot().history, &[self.extension_root]);
+    pub(crate) fn view_with_frontiers(&self) -> (RoomView, Position, Position) {
+        let music_snapshot = self.music.snapshot();
+        let extension_snapshot = self.extension.snapshot();
+        let music_frontier = music_snapshot.history.frontier();
+        let extension_frontier = extension_snapshot.history.frontier();
+        let music = materialize_music(&music_snapshot.history, &[self.music_root]);
+        let extension = materialize_extension(&extension_snapshot.history, &[self.extension_root]);
         let pieces = match music.tuning.validate("active Room v5 tuning") {
             Ok(active) => extension
                 .pieces
@@ -1726,12 +1763,20 @@ where
                 .collect(),
             Err(_) => BTreeMap::new(),
         };
-        RoomView {
-            music,
-            pieces,
-            pieces_locked: extension.pieces_locked,
-            available_emojis: extension.available_emojis,
-        }
+        (
+            RoomView {
+                music,
+                pieces,
+                pieces_locked: extension.pieces_locked,
+                available_emojis: extension.available_emojis,
+            },
+            music_frontier,
+            extension_frontier,
+        )
+    }
+
+    pub fn view(&self) -> RoomView {
+        self.view_with_frontiers().0
     }
 
     pub fn materialize_checkpoints(
@@ -1923,22 +1968,18 @@ fn prepare_member_grant_on<S: ReplicaStorage + 'static>(
 }
 
 fn live_grants_for(history: &DagSnapshot, root: EntryHash, actor: ActorId) -> Vec<EntryHash> {
-    let capabilities = CapabilitySnapshot::capture(history, [root]);
+    let capabilities =
+        CapabilitySnapshot::<LazyReach>::capture_with(history, [root], LazyReach::new);
     let frontier = history.frontier();
-    history
-        .entries_topo()
-        .into_iter()
-        .filter_map(|entry| {
-            let id = entry.hash();
-            let CapabilityOp::Grant(grant) = decode_capability(&entry.payload).ok()? else {
-                return None;
-            };
-            if grant.receiver != actor.receiver()
-                || !grant.rights.contains(Right::Invoke)
+    let receiver = actor.receiver();
+    capabilities
+        .grants_for_receiver(&receiver)
+        .filter_map(|(id, grant)| {
+            if !grant.rights.contains(Right::Invoke)
                 || !matches!(
                     capabilities.authorize(&AuthorizationRequest {
-                        receiver: actor.receiver(),
-                        area: grant.area,
+                        receiver: receiver.clone(),
+                        area: grant.area.clone(),
                         right: Right::Invoke,
                         presented: vec![id],
                         at: frontier.clone(),
@@ -2352,10 +2393,12 @@ mod tests {
         let owner = ActorId::from_signing_key(&owner_key);
         let room = RoomReplicas::memory("bright-river-song", owner).unwrap();
         let before = room.view();
+        let music_capabilities = room.capabilities_for_lane(owner, RoomLane::Music);
+        assert_eq!(music_capabilities, room.owner_capabilities().music);
         let prepared = room
-            .prepare_author(
+            .prepare_author_presenting(
                 &owner_key,
-                &room.owner_capabilities(),
+                &music_capabilities,
                 MusicOp::AddDegree { degree: degree(4) }.into(),
             )
             .unwrap();

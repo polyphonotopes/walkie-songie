@@ -315,6 +315,14 @@ fn sync_clef_indicators(pitches: &[i32], _pc_count: i32) {
 
 /// Sync toggle overlay elements for toggled/manual pitch classes.
 /// Creates/removes overlay elements with data-key-overlay attribute and toggle-lines pattern.
+fn overlay_key(note: u8) -> i32 {
+    LEFTMOST_KEY + i32::from(note)
+}
+
+fn overlay_keys(notes: &[u8]) -> std::collections::HashSet<i32> {
+    notes.iter().copied().map(overlay_key).collect()
+}
+
 fn sync_toggle_overlays(notes: &[u8]) {
     let Some(kb) = get_keyboard() else { return };
 
@@ -322,17 +330,21 @@ fn sync_toggle_overlays(notes: &[u8]) {
     let existing: web_sys::NodeList = kb.query_selector_all(".toggle-overlay").unwrap();
     let existing_count = existing.length();
 
-    let note_set: std::collections::HashSet<u8> = notes.iter().copied().collect();
-    let mut existing_notes: std::collections::HashSet<u8> = std::collections::HashSet::new();
+    // `data-key-overlay` is an absolute keyboard key (for example 36), while
+    // `notes` contains pitch classes (0..notes-per-octave). Compare in one
+    // coordinate system so an unchanged overlay is retained instead of being
+    // removed and recreated on every projection refresh.
+    let current_keys = overlay_keys(notes);
+    let mut existing_keys: std::collections::HashSet<i32> = std::collections::HashSet::new();
 
     // Remove overlays for notes no longer active, track existing ones
     for i in 0..existing_count {
         if let Some(node) = existing.get(i) {
             let el: web_sys::Element = node.unchecked_into();
             if let Some(key_str) = el.get_attribute("data-key-overlay") {
-                if let Ok(key) = key_str.parse::<u8>() {
-                    if note_set.contains(&key) {
-                        existing_notes.insert(key);
+                if let Ok(key) = key_str.parse::<i32>() {
+                    if current_keys.contains(&key) {
+                        existing_keys.insert(key);
                     } else {
                         el.remove();
                     }
@@ -343,8 +355,8 @@ fn sync_toggle_overlays(notes: &[u8]) {
 
     // Add overlays for new active notes
     for &note in notes {
-        if !existing_notes.contains(&note) {
-            let key_index = LEFTMOST_KEY + note as i32;
+        let key_index = overlay_key(note);
+        if !existing_keys.contains(&key_index) {
             let document = web_sys::window().unwrap().document().unwrap();
             let el = document.create_element("div").unwrap();
             el.set_class_name("toggle-overlay");
@@ -368,8 +380,7 @@ fn sync_piece_overlays(notes: &[u8]) {
     let mut existing_keys: std::collections::HashSet<i32> = std::collections::HashSet::new();
 
     // Build set of current key indices
-    let current_keys: std::collections::HashSet<i32> =
-        notes.iter().map(|&n| LEFTMOST_KEY + n as i32).collect();
+    let current_keys = overlay_keys(notes);
 
     // Remove overlays for notes no longer active, track existing ones
     for i in 0..existing.length() {
@@ -389,7 +400,7 @@ fn sync_piece_overlays(notes: &[u8]) {
 
     // Add overlays for new active notes
     for &note in notes {
-        let key_index = LEFTMOST_KEY + note as i32;
+        let key_index = overlay_key(note);
         if !existing_keys.contains(&key_index) {
             // Create new overlay element
             let el = document.create_element("div").unwrap();
@@ -414,8 +425,7 @@ fn sync_voice_overlays(notes: &[u8]) {
     let mut existing_keys: std::collections::HashSet<i32> = std::collections::HashSet::new();
 
     // Build set of current key indices
-    let current_keys: std::collections::HashSet<i32> =
-        notes.iter().map(|&n| LEFTMOST_KEY + n as i32).collect();
+    let current_keys = overlay_keys(notes);
 
     // Remove overlays for notes no longer active, track existing ones
     for i in 0..existing.length() {
@@ -450,7 +460,7 @@ fn sync_voice_overlays(notes: &[u8]) {
 
     // Add overlays and indicators for new active notes
     for &note in notes {
-        let key_index = LEFTMOST_KEY + note as i32;
+        let key_index = overlay_key(note);
         if !existing_keys.contains(&key_index) {
             // Create new overlay element
             let el = document.create_element("div").unwrap();
@@ -828,38 +838,6 @@ fn create_piece_element(
 
     // Display the emoji
     el.set_text_content(Some(emoji));
-
-    // DEBUG: Add MutationObserver to catch any code that sets data-pitch on this piece
-    {
-        use wasm_bindgen::prelude::*;
-        let piece_id_debug = piece_id.to_string();
-        let el_debug = el.clone();
-        let callback = Closure::<dyn Fn(js_sys::Array)>::new(move |mutations: js_sys::Array| {
-            for i in 0..mutations.length() {
-                if let Ok(mutation) = mutations.get(i).dyn_into::<web_sys::MutationRecord>() {
-                    if let Some(attr) = mutation.attribute_name() {
-                        if attr == "data-pitch" {
-                            let has_it = el_debug.has_attribute("data-pitch");
-                            let val = el_debug.get_attribute("data-pitch").unwrap_or_default();
-                            web_sys::console::error_1(
-                                &format!(
-                                    "[DEBUG] data-pitch MUTATED on piece {}: has={}, val='{}'",
-                                    piece_id_debug, has_it, val
-                                )
-                                .into(),
-                            );
-                        }
-                    }
-                }
-            }
-        });
-        let observer = web_sys::MutationObserver::new(callback.as_ref().unchecked_ref()).unwrap();
-        let options = web_sys::MutationObserverInit::new();
-        options.set_attributes(true);
-        options.set_attribute_filter(&js_sys::Array::of1(&JsValue::from_str("data-pitch")));
-        observer.observe_with_options(&el, &options).ok();
-        callback.forget();
-    }
 
     // Styling handled by CSS .piece-indicator class
     // Only set pointer-events here to ensure it's enabled for drag handling
@@ -1457,12 +1435,11 @@ fn setup_keyboard_events(state: Arc<AppState>) {
                         // Derive an absolute, idempotent intent from the
                         // projected presence — never a toggle involution.
                         let voice_cleared = if state_click.native_backend {
-                            // Connected: the projection of the authoritative
-                            // store is the ONLY writer for pitch presence.
-                            // Read the currently-projected presence and
-                            // dispatch an absolute intent (on → RemoveDegree,
-                            // off → AddDegree). No optimistic local write —
-                            // the projection paints the result.
+                            // Connected: derive an absolute intent from the
+                            // authoritative projection plus any pending local
+                            // intent. `set_native_degree` paints that pending
+                            // intent immediately, then the durable projection
+                            // confirms or corrects it.
                             let present = state_click.degree_is_active(pc);
                             state_click.set_native_degree(pc, !present);
 
@@ -1484,8 +1461,8 @@ fn setup_keyboard_events(state: Arc<AppState>) {
                             state_click.sync_midi_voice_output();
                         }
 
-                        // Re-sync keyboard to reflect new state
-                        sync_active_pitches(&state_click);
+                        // The projection event is the single UI update path for
+                        // both pending intent and durable confirmation.
                         state_click.sync_midi_toggle_output();
                     }
                 }
