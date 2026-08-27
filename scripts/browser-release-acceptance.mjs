@@ -65,6 +65,7 @@ const aggregate = {
     room: report.room,
     sampleCount: report.sampleCount,
     warmupSamplesExcluded: report.warmupSamplesExcluded,
+    hostCondition: report.hostCondition,
     steadyStateLatencyMs: report.steadyStateLatencyMs,
     reconnectMs: report.reconnectMs,
     evaluation: evaluation.trials[index],
@@ -82,6 +83,7 @@ console.log(
         trial: trial.trial,
         strictPassed: trial.evaluation.strictPassed,
         grossPassed: trial.evaluation.grossPassed,
+        hostLoadOneMinute: trial.hostCondition?.finished?.loadAverage?.oneMinute,
         p95Ms: Object.fromEntries(
           trial.evaluation.checks
             .filter(check => check.id !== "reconnect")

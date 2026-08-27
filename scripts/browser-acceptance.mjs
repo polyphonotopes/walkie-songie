@@ -11,6 +11,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createServer } from "node:http";
+import { availableParallelism, freemem, loadavg, totalmem } from "node:os";
 import { dirname, extname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -35,6 +36,7 @@ const targetKey = 36;
 const keyboardVersion = "1.9.0";
 const keyboardSha256 = "bdf2cf76fd1605f5d3923c0ac3b6758f22dbf1d6ead4d5c9f2fdc9aafbcf4a59";
 const enforceLatency = process.env.WALKIE_ENFORCE_LATENCY !== "0";
+const hostConditionStarted = hostCondition();
 // These are release-regression ceilings for the existing durable Room-v5 path,
 // not the tighter target for a future ephemeral performance/session protocol.
 // Use steady-state samples so first-write allocation, JIT, and carrier startup
@@ -59,6 +61,16 @@ const mimeTypes = new Map([
   [".wasm", "application/wasm"],
   [".webmanifest", "application/manifest+json"],
 ]);
+
+function hostCondition() {
+  const [oneMinute, fiveMinutes, fifteenMinutes] = loadavg();
+  return {
+    capturedAt: new Date().toISOString(),
+    logicalCpuCount: availableParallelism(),
+    loadAverage: { oneMinute, fiveMinutes, fifteenMinutes },
+    memoryBytes: { free: freemem(), total: totalmem() },
+  };
+}
 
 function serveRelease() {
   const server = createServer((request, response) => {
@@ -470,6 +482,11 @@ try {
     steadyStateLatencyMs: steady,
     latencyBudgetsMs,
     latencyEnforcement: enforceLatency ? "single-trial" : "external-fixed-trial-policy",
+    hostCondition: {
+      started: hostConditionStarted,
+      finished: hostCondition(),
+      note: "Diagnostic only; host load never relaxes or overrides a latency budget.",
+    },
     localProjectionLatencyMs: {
       samples: timings.localProjection,
       p50: percentile(timings.localProjection, 0.5),
