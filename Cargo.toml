@@ -12,6 +12,11 @@ ignored = ["getrandom"]
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "room-v5-native-probe"
+path = "tests/support/room_v5_native_probe.rs"
+required-features = ["native-net"]
+
 [features]
 default = []
 core = []
