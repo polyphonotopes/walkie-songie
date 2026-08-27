@@ -7,7 +7,7 @@
     "tauri": "tauri",
     "desktop:dev": "tauri dev",
     "desktop:build": "tauri build",
-    "browser:acceptance": "node scripts/browser-acceptance.mjs",
+    "browser:acceptance": "node --test scripts/browser-latency-policy.test.mjs && node scripts/browser-release-acceptance.mjs",
     "check:release-candidate": "bash scripts/check-release-candidate.sh"
   },
   "devDependencies": {

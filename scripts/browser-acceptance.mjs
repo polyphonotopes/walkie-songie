@@ -16,6 +16,13 @@ import { fileURLToPath } from "node:url";
 
 import { chromium } from "playwright";
 
+import {
+  assertStrictLatencyTrial,
+  latencyBudgetsMs,
+  latencySummary,
+  percentile,
+} from "./browser-latency-policy.mjs";
+
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repository = resolve(scriptDirectory, "..");
 const dist = resolve(process.env.WALKIE_RELEASE_DIST ?? join(repository, "target/release-web"));
@@ -27,19 +34,11 @@ const headed = process.env.WALKIE_HEADED === "1";
 const targetKey = 36;
 const keyboardVersion = "1.9.0";
 const keyboardSha256 = "bdf2cf76fd1605f5d3923c0ac3b6758f22dbf1d6ead4d5c9f2fdc9aafbcf4a59";
+const enforceLatency = process.env.WALKIE_ENFORCE_LATENCY !== "0";
 // These are release-regression ceilings for the existing durable Room-v5 path,
 // not the tighter target for a future ephemeral performance/session protocol.
 // Use steady-state samples so first-write allocation, JIT, and carrier startup
 // remain visible in the report without making a release gate host-dependent.
-const latencyBudgetsMs = Object.freeze({
-  localProjectionP95: 15,
-  localVisibleP95: 30,
-  peerProjectionP95: 75,
-  peerVisibleP95: 100,
-  localKeyboardRenderP95: 2,
-  peerKeyboardRenderP95: 2,
-  reconnect: 10_000,
-});
 
 for (const required of ["index.html", "sw.js", "all-around-keyboard.esm.min.js"]) {
   assert.ok(existsSync(join(dist, required)), `missing release artifact: ${join(dist, required)}`);
@@ -108,27 +107,6 @@ function alphabetic(value) {
     number /= 26n;
   } while (number > 0n);
   return result;
-}
-
-function percentile(samples, fraction) {
-  assert.ok(samples.length > 0);
-  const sorted = [...samples].sort((left, right) => left - right);
-  return sorted[Math.ceil(fraction * sorted.length) - 1];
-}
-
-function latencySummary(samples) {
-  return {
-    samples,
-    p50: percentile(samples, 0.5),
-    p95: percentile(samples, 0.95),
-  };
-}
-
-function assertLatencyBudget(metric, actual, maximum) {
-  assert.ok(
-    actual <= maximum,
-    `${metric} p95 ${actual.toFixed(1)}ms exceeded the ${maximum}ms release budget`,
-  );
 }
 
 function workerReadyCount(diagnostics, label) {
@@ -491,6 +469,7 @@ try {
     warmupSamplesExcluded,
     steadyStateLatencyMs: steady,
     latencyBudgetsMs,
+    latencyEnforcement: enforceLatency ? "single-trial" : "external-fixed-trial-policy",
     localProjectionLatencyMs: {
       samples: timings.localProjection,
       p50: percentile(timings.localProjection, 0.5),
@@ -539,40 +518,7 @@ try {
   writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
   console.log(JSON.stringify(report, null, 2));
 
-  assertLatencyBudget(
-    "steady local projection",
-    steady.localProjection.p95,
-    latencyBudgetsMs.localProjectionP95,
-  );
-  assertLatencyBudget(
-    "steady local visibility",
-    steady.localVisible.p95,
-    latencyBudgetsMs.localVisibleP95,
-  );
-  assertLatencyBudget(
-    "steady peer projection",
-    steady.peerProjection.p95,
-    latencyBudgetsMs.peerProjectionP95,
-  );
-  assertLatencyBudget(
-    "steady peer visibility",
-    steady.peerVisible.p95,
-    latencyBudgetsMs.peerVisibleP95,
-  );
-  assertLatencyBudget(
-    "steady local keyboard render",
-    steady.localRenderDuration.p95,
-    latencyBudgetsMs.localKeyboardRenderP95,
-  );
-  assertLatencyBudget(
-    "steady peer keyboard render",
-    steady.peerRenderDuration.p95,
-    latencyBudgetsMs.peerKeyboardRenderP95,
-  );
-  assert.ok(
-    reconnectMs <= latencyBudgetsMs.reconnect,
-    `reconnect ${reconnectMs}ms exceeded the ${latencyBudgetsMs.reconnect}ms release budget`,
-  );
+  if (enforceLatency) assertStrictLatencyTrial(report);
 
   await Promise.all([leftContext.close(), rightContext.close()]);
 } catch (error) {
