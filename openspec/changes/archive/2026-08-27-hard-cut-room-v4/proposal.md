@@ -1,5 +1,9 @@
 # Change: Hard-cut every room runtime to Room v4
 
+> **Archived 2026-08-27:** this completed generation is retained as history.
+> Room v5 supersedes its source-log and authority model; only bounded Room-v4
+> refusal fixtures remain live.
+
 ## Why
 
 A bare `tutti-music` peer cannot participate in the v3 `WalkieLang` DAG without

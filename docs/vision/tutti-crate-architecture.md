@@ -153,7 +153,7 @@ app cannot rebuild the bug family walkie just diagnosed:
 Depends on: `tutti-core`, `hhhs-reactive`, `futures-signals`. **Not**
 `dominator` — dominator is the consumer's renderer; the facade speaks
 futures-signals, which is dominator's own engine
-(`openspec/changes/rewrite-p2panda-hhhs-stack/proposal.md:31-35`), so the
+(`openspec/changes/archive/2026-08-27-rewrite-p2panda-hhhs-stack/proposal.md:31-35`), so the
 binding needs no adapter. dominator-specific helpers (if any prove worth
 sharing) go in a `dominator` feature, off by default.
 

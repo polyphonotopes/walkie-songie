@@ -1,10 +1,10 @@
 # Change: Rewrite transport + state layer on iroh + p2panda + HHHS
 
-> **Status (2026-07-30): partially superseded by
-> `pivot-to-tauri-iroh`.** Retain the completed signed p2panda operation log,
-> HHHS RoomStore, reconciliation tests, and shared identity. The proposed
-> browser-owned raw-Iroh transport is replaced by a Tauri-owned native Iroh
-> runtime; browser shells become optional clients of that runtime.
+> **Archived 2026-08-27:** superseded by `adopt-hhhs-04-replicas`. The current
+> Room-v5 implementation uses capability-native HHHS replicas and Walkie-owned
+> carriers. It does not retain the p2panda source log, dual-log lifting, or
+> shared transport/author identity proposed here. This material is historical
+> research, not current architecture or pending implementation work.
 
 ## Why
 

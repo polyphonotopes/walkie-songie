@@ -221,7 +221,7 @@ growth triggers a coalesced full re-fold and a key-wise diff
 (`lib.rs:60-61`), so Tier 0 covers "render what left" (note-offs, exit
 animations) without any extra machinery — the planned MIDI re-sourcing
 ("MIDI deltas re-source from `Revision` added/retracted",
-`openspec/changes/rewrite-p2panda-hhhs-stack/tasks.md:52-54`) is a Tier 0
+`openspec/changes/archive/2026-08-27-rewrite-p2panda-hhhs-stack/tasks.md:52-54`) is a Tier 0
 consumer.
 
 Tier 0 is also the correct *product* default for this app: walkie is a jam
@@ -250,7 +250,7 @@ yrs `RoomState` inside `state.room: Mutable<RoomState>` (`app.rs:77`,
 diffs from state that already was a diff, and each is a place where a
 rollback's context dies. The coupling design collapses this to
 `RoomStore → hhhs-reactive views → dominator`
-(`openspec/changes/rewrite-p2panda-hhhs-stack/proposal.md:28-35`); this doc
+(`openspec/changes/archive/2026-08-27-rewrite-p2panda-hhhs-stack/proposal.md:28-35`); this doc
 assumes that collapse and adds one thing to it: the fold should expose
 **per-op effect attribution** (§5.2) so Tier 1 can be built as *another
 projection* instead of another pipeline.
@@ -365,7 +365,7 @@ Durational semantics, explicitly:
 ### 5.4 API surface
 
 All types speak `futures-signals` (dominator's engine —
-`rewrite-p2panda-hhhs-stack/proposal.md:32-35`), and the whole surface has a
+`openspec/changes/archive/2026-08-27-rewrite-p2panda-hhhs-stack/proposal.md:32-35`), and the whole surface has a
 structural property worth stating: **there is no method that changes a signal
 without changing data.** Reads are signals over projections; writes are
 intent submissions; UX resolutions are intent submissions.
@@ -493,7 +493,7 @@ individually and anti-entropy transfers arbitrary subsets:
    backlink-chained run and give effect only when a closing "seal" op is
    present. Strict deferral already guarantees a peer cannot materialize the
    chain out of order (`store.rs:275-284`; liveness pinned by W8,
-   `rewrite-p2panda-hhhs-stack/integration-tests.md:65-83`), but every read
+   `openspec/changes/archive/2026-08-27-rewrite-p2panda-hhhs-stack/integration-tests.md:65-83`), but every read
    rule must learn seal-awareness, and an unsealed prefix is a new
    liveness-limbo state to reason about. More machinery for the same
    guarantee option 1 gets structurally.

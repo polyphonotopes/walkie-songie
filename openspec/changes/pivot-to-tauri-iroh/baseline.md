@@ -31,6 +31,6 @@ Tracked changes existed in `.cargo/config.toml`, `Cargo.lock`, `Cargo.toml`,
 `assets/onnx-bridge.js`, `assets/sw.js`, `src/lib.rs`, `src/room/mod.rs`, and
 `src/web/app.rs`; `dist/index.html` was deleted. Generated wasm assets,
 `src/net/`, the RoomStore files, integration tests, and the prior
-`rewrite-p2panda-hhhs-stack` change were untracked. All are treated as recovered
+now-archived `rewrite-p2panda-hhhs-stack` change were untracked. All are treated as recovered
 user work. Removal remains deferred until the corresponding Tauri replacement
 passes its acceptance tests.

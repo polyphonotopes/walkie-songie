@@ -10,6 +10,8 @@ RELEASE_DIST="${WALKIE_RELEASE_DIST:-$REPOSITORY/target/release-web}"
 
 cd "$REPOSITORY"
 
+scripts/check-architecture-records.sh
+
 nix develop --command bash -euo pipefail -c '
   cargo fmt --all -- --check
   cargo fmt --manifest-path relay/Cargo.toml -- --check

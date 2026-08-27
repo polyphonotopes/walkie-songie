@@ -1,5 +1,8 @@
 # Change: Move browser replicas to a dedicated worker
 
+> **Archived 2026-08-27:** implemented and promoted to the current
+> `browser-replica-worker` specification.
+
 ## Why
 
 Release measurements show that the keyboard renderer is sub-millisecond while

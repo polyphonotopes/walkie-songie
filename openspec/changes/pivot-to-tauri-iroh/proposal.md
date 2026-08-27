@@ -2,7 +2,7 @@
 
 ## Why
 
-The interrupted `rewrite-p2panda-hhhs-stack` work proved the signed p2panda
+The now-archived `rewrite-p2panda-hhhs-stack` work proved the signed p2panda
 operation log, HHHS read model, shared Ed25519 identity, and deterministic
 anti-entropy model, but its browser transport direction cannot provide the
 native UDP paths needed for Iroh's real NAT traversal. Wrapping the existing
@@ -62,7 +62,7 @@ and testable.
 ## Impact
 
 - **Supersedes:** the raw browser-Iroh, WebRTC, and wasm-Iroh portions of
-  `rewrite-p2panda-hhhs-stack`. Agregore and Peersky are reprioritized behind
+  archived `rewrite-p2panda-hhhs-stack` plan. Agregore and Peersky are reprioritized behind
   the Tauri milestone and use the common adapter seam if the spike succeeds.
   Completed data-layer and test work remains the implementation foundation.
 - **Consolidates:** the desktop-relevant portions of `add-voice-input-mode` and

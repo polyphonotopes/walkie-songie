@@ -8,7 +8,7 @@ worktree and complete tasks in order.
 - [x] 0.1 Record the current diff and the 73-test baseline; identify completed
   RoomStore, identity, HHHS, and L0 files that must be retained.
 - [x] 0.2 Mark the overlapping browser transport portions of
-  `rewrite-p2panda-hhhs-stack`, `add-voice-input-mode`, and
+  the archived `rewrite-p2panda-hhhs-stack`, `add-voice-input-mode`, and
   `add-channel-ui-and-midi` as superseded by this change.
 - [x] 0.3 Remove no legacy code until its Tauri replacement passes the relevant
   acceptance tests.

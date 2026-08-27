@@ -167,7 +167,8 @@ channels), CLAP + VST3, `MidiConfig::Basic` both directions:
 (`src/plugin/mod.rs:395-676`) is written against **libp2p** (gossipsub/identify/
 `SwarmBuilder`) + the yrs `RoomState`, but `libp2p` appears **zero** times in `Cargo.toml`
 and `Cargo.lock` — the repo has pivoted to iroh + p2panda/HHHS (`openspec/changes/
-pivot-to-tauri-iroh/`, `rewrite-p2panda-hhhs-stack/`; yrs is marked "legacy" in
+pivot-to-tauri-iroh/`,
+`archive/2026-08-27-rewrite-p2panda-hhhs-stack/`; yrs is marked "legacy" in
 `Cargo.toml:80`). `cargo check --features plugin` cannot compile today. The nice-plug port
 therefore has to be paired with (or sequenced before) re-pointing the net thread at the new
 `src/net` + room op-log stack.
@@ -234,7 +235,8 @@ feature toggle like nih_plug_egui did; fonts come via egui-baseview 0.6 defaults
 **Stage 0 — decide the net-thread story (blocker, not nice-plug's fault).** The `plugin`
 feature doesn't compile because `run_networking_loop` still speaks libp2p+yrs. Options:
 (a) port it to the new iroh-gossip + p2panda/HHHS stack in `src/net` + `src/room` (aligns
-with `openspec/changes/rewrite-p2panda-hhhs-stack/`), or (b) temporarily stub the thread
+with the historical
+`openspec/changes/archive/2026-08-27-rewrite-p2panda-hhhs-stack/` plan), or (b) temporarily stub the thread
 (keep `NetCommand`/`NetEvent`, return errors) so the nice-plug migration can be validated
 in isolation. Recommend (b) first, (a) as its own change.
 
