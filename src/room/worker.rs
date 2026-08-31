@@ -12,13 +12,16 @@ use std::{
     pin::Pin,
 };
 
+use futures::SinkExt;
 use hhhs::{Digest, EntryHash};
 use hhhs_replica::{
     AsyncTransactionSink, DurableReplicaHost, ReplicaRecord, ReplicaRepairSnapshot,
 };
-use hhhs_store::{MemoryStorage, StorageTransaction};
-use hhhs_sync::sync_session::SessionStatus;
-use hhhs_sync::{Refusal, Snapshot as _, SyncMessage, SyncSession};
+use hhhs_store::{MemoryStorage, StorageTransaction, history_root};
+use hhhs_sync::{
+    CachedRepairHost, RepairAttemptStatus, RepairDisposition, RepairRetryReason, SessionOutcome,
+    StepwiseRepairAttempt,
+};
 use hhhs_web_browser::{
     ProjectionRevision, ReplicaWorkerService, SubscriptionId, WorkerEventKind, WorkerEventPort,
     WorkerReply, WorkerRequest, WorkerRequestKind,
@@ -28,16 +31,18 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use crate::{
     net::{PeerId, ReplicaLiveRecord, repair_lane, replica_frontier_digest},
     room::v5::{
-        ActorId, RoomCommand, RoomIdentity, RoomLane, RoomPresence, RoomReplicas, RoomView,
+        ActorId, MusicOp, RoomCommand, RoomIdentity, RoomLane, RoomPresence, RoomReplicas, RoomView,
     },
     tuning::TunedPeriodicPitch,
 };
 
-const ROOM_WORKER_PAYLOAD_VERSION: u16 = 1;
-const MAX_ACTIVE_REPAIR_SESSIONS: usize = 8;
-const APPLICATION_REFUSAL_ABORT_PREFIX: &str = "application refused repair entries:";
+use super::session::{RoomSessionFoundation, RoomSessionServicePort, RoomSessionTaskInput};
 
-type DurableLane<D> = DurableReplicaHost<MemoryStorage, super::v5::RoomAdmissionPolicy, D>;
+const ROOM_WORKER_PAYLOAD_VERSION: u16 = 2;
+const MAX_ACTIVE_REPAIR_SESSIONS: usize = 8;
+
+type DurableLane<D> =
+    CachedRepairHost<DurableReplicaHost<MemoryStorage, super::v5::RoomAdmissionPolicy, D>>;
 pub(crate) type RoomWorkerOpenFuture<'a, D> =
     Pin<Box<dyn Future<Output = Result<RoomDataPlane<D>, String>> + 'a>>;
 
@@ -78,6 +83,9 @@ pub(crate) struct RoomWorkerOpen {
     pub owner: ActorId,
     pub identity_seed: [u8; 32],
     pub authority_seed: Option<[u8; 32]>,
+    pub session_trace: bool,
+    #[cfg(feature = "browser-acceptance-faults")]
+    pub session_renewal_test_cut: bool,
 }
 
 impl RoomWorkerOpen {
@@ -92,13 +100,29 @@ impl RoomWorkerOpen {
             owner,
             identity_seed,
             authority_seed,
+            session_trace: false,
+            #[cfg(feature = "browser-acceptance-faults")]
+            session_renewal_test_cut: false,
         }
+    }
+
+    pub(crate) const fn with_session_trace(mut self, enabled: bool) -> Self {
+        self.session_trace = enabled;
+        self
+    }
+
+    #[cfg(feature = "browser-acceptance-faults")]
+    pub(crate) const fn with_session_renewal_test_cut(mut self, enabled: bool) -> Self {
+        self.session_renewal_test_cut = enabled;
+        self
     }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub(crate) struct RoomWorkerProjection {
     pub view: RoomView,
+    pub music_revision: u64,
+    pub music_history_root: [u8; 32],
     pub music_frontier: [u8; 32],
     pub extension_frontier: [u8; 32],
 }
@@ -107,6 +131,9 @@ pub(crate) struct RoomWorkerProjection {
 pub(crate) enum RoomWorkerCommand {
     Commit(RoomCommand),
     GrantPeer(ActorId),
+    StartSessionPeer(ActorId),
+    ResetSessionProjection,
+    DrainSession,
     SignPresence {
         session: u64,
         sequence: u64,
@@ -130,27 +157,66 @@ pub(crate) enum RoomWorkerRepairRequest {
         session: u64,
         frame: Vec<u8>,
     },
-    Close {
+    Finish {
         session: u64,
+        close_error: Option<String>,
     },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub(crate) enum RoomWorkerRepairStatus {
     Exchanging,
-    Aborted,
     Complete,
     Divergent,
-    Closed,
+    Incomplete,
+    PolicyDivergence,
+    RetryFresh(RoomWorkerRepairRetryReason),
 }
 
-impl From<SessionStatus> for RoomWorkerRepairStatus {
-    fn from(value: SessionStatus) -> Self {
+impl From<RepairAttemptStatus> for RoomWorkerRepairStatus {
+    fn from(value: RepairAttemptStatus) -> Self {
         match value {
-            SessionStatus::Exchanging => Self::Exchanging,
-            SessionStatus::Aborted => Self::Aborted,
-            SessionStatus::Complete => Self::Complete,
-            SessionStatus::Divergent => Self::Divergent,
+            RepairAttemptStatus::Exchanging => Self::Exchanging,
+            RepairAttemptStatus::Complete => Self::Complete,
+            RepairAttemptStatus::Divergent => Self::Divergent,
+            RepairAttemptStatus::Incomplete => Self::Incomplete,
+            RepairAttemptStatus::PolicyDivergence => Self::PolicyDivergence,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub(crate) enum RoomWorkerRepairRetryReason {
+    NoCapturedCut,
+    Incomplete,
+    RootMismatch,
+    HistoryAdvanced,
+}
+
+impl From<RepairRetryReason> for RoomWorkerRepairRetryReason {
+    fn from(value: RepairRetryReason) -> Self {
+        match value {
+            RepairRetryReason::NoCapturedCut => Self::NoCapturedCut,
+            RepairRetryReason::Incomplete => Self::Incomplete,
+            RepairRetryReason::RootMismatch => Self::RootMismatch,
+            RepairRetryReason::HistoryAdvanced => Self::HistoryAdvanced,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub(crate) enum RoomWorkerRepairDisposition {
+    Synchronized,
+    RetryFresh(RoomWorkerRepairRetryReason),
+    AwaitPolicyChange,
+}
+
+impl From<RepairDisposition> for RoomWorkerRepairDisposition {
+    fn from(value: RepairDisposition) -> Self {
+        match value {
+            RepairDisposition::Synchronized => Self::Synchronized,
+            RepairDisposition::RetryFresh(reason) => Self::RetryFresh(reason.into()),
+            RepairDisposition::AwaitPolicyChange => Self::AwaitPolicyChange,
         }
     }
 }
@@ -165,12 +231,25 @@ pub(crate) struct RoomWorkerRepairOutcome {
     pub policy_divergence: bool,
 }
 
+impl From<&SessionOutcome> for RoomWorkerRepairOutcome {
+    fn from(value: &SessionOutcome) -> Self {
+        Self {
+            admitted: value.admitted,
+            lifted: value.lifted,
+            frames_sent: value.frames_sent,
+            frames_received: value.frames_received,
+            refused: value.refused,
+            policy_divergence: value.policy_divergence,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub(crate) struct RoomWorkerRepairStep {
     pub session: u64,
-    pub frames: Vec<Vec<u8>>,
     pub status: RoomWorkerRepairStatus,
     pub outcome: RoomWorkerRepairOutcome,
+    pub disposition: Option<RoomWorkerRepairDisposition>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -185,6 +264,14 @@ pub(crate) enum RoomWorkerResponse {
     },
     PeerGranted {
         entries: Vec<(RoomLane, [u8; 32])>,
+        projection_revision: u64,
+    },
+    SessionPeerStarted,
+    SessionProjectionReset {
+        emitted: bool,
+    },
+    SessionDrained {
+        committed: bool,
         projection_revision: u64,
     },
     InboundApplied {
@@ -240,9 +327,7 @@ pub(crate) fn decode_projection(bytes: &[u8]) -> Result<RoomWorkerProjection, St
 
 struct RepairState {
     lane: RoomLane,
-    session: SyncSession,
-    source: ReplicaRepairSnapshot,
-    outcome: RoomWorkerRepairOutcome,
+    attempt: StepwiseRepairAttempt<ReplicaRepairSnapshot>,
 }
 
 pub(crate) struct RoomDataPlane<D>
@@ -279,8 +364,8 @@ where
         .map_err(|error| error.to_string())?;
         let signing_key = hhhs_proof::SigningKey::from_bytes(&request.identity_seed);
         let local_actor = ActorId::from_signing_key(&signing_key);
-        let mut music = room.music_durable_host(music_log);
-        let mut extension = room.extension_durable_host(extension_log);
+        let mut music = CachedRepairHost::new(room.music_durable_host(music_log));
+        let mut extension = CachedRepairHost::new(room.extension_durable_host(extension_log));
 
         let grant_authority = request
             .authority_seed
@@ -297,6 +382,7 @@ where
                     .prepare_member_grant(RoomLane::Music, authority, local_actor)
                     .map_err(|error| error.to_string())?;
                 music
+                    .inner_mut()
                     .commit_prepared(prepared.into_prepared())
                     .await
                     .map_err(|error| error.to_string())?;
@@ -309,6 +395,7 @@ where
                     .prepare_member_grant(RoomLane::Extension, authority, local_actor)
                     .map_err(|error| error.to_string())?;
                 extension
+                    .inner_mut()
                     .commit_prepared(prepared.into_prepared())
                     .await
                     .map_err(|error| error.to_string())?;
@@ -342,8 +429,11 @@ where
 
     fn projection(&self) -> RoomWorkerProjection {
         let (view, music, extension) = self.room.view_with_frontiers();
+        let music_snapshot = self.room.music_snapshot();
         RoomWorkerProjection {
             view,
+            music_revision: music_snapshot.sequence,
+            music_history_root: *history_root(&music_snapshot.history).as_bytes(),
             music_frontier: *replica_frontier_digest(&music).as_bytes(),
             extension_frontier: *replica_frontier_digest(&extension).as_bytes(),
         }
@@ -361,6 +451,7 @@ where
             .map_err(|error| error.to_string())?;
         let committed = self
             .lane_mut(lane)
+            .inner_mut()
             .commit_prepared(prepared.into_prepared())
             .await
             .map_err(|error| error.to_string())?;
@@ -368,6 +459,76 @@ where
             committed.outcome().entry,
             committed.replica_record().clone(),
         ))
+    }
+
+    async fn commit_session(
+        &mut self,
+        plan: &hhhs_session::ReificationPlan,
+        command: MusicOp,
+    ) -> Result<
+        (
+            hhhs::Entry,
+            hhhs_replica::DurableEntryAdmission,
+            ReplicaRecord,
+        ),
+        String,
+    > {
+        let capabilities = self
+            .room
+            .capabilities_for_lane(self.local_actor, RoomLane::Music);
+        if capabilities.is_empty() {
+            return Err("local actor has no live capability for the music session".into());
+        }
+        let (prepared, entry) = self
+            .room
+            .prepare_reified_music(&self.signing_key, &capabilities, plan, command)
+            .map_err(|error| error.to_string())?;
+        let committed = self
+            .music
+            .inner_mut()
+            .commit_prepared(prepared.into_prepared())
+            .await
+            .map_err(|error| error.to_string())?;
+        if committed.outcome().entry != entry.hash() {
+            return Err("session reification committed an unexpected entry identity".into());
+        }
+        Ok((
+            entry,
+            committed.outcome().durable_entry_admission(),
+            committed.replica_record().clone(),
+        ))
+    }
+
+    fn session_foundation(&self, peer: ActorId) -> Result<RoomSessionFoundation, String> {
+        let local_grants = self
+            .room
+            .capabilities_for_lane(self.local_actor, RoomLane::Music);
+        let peer_grants = self.room.capabilities_for_lane(peer, RoomLane::Music);
+        if local_grants.is_empty() || peer_grants.is_empty() {
+            return Err(
+                "session peer does not yet have a complete admitted music foundation".into(),
+            );
+        }
+        let snapshot = self.room.music_snapshot();
+        let root = self
+            .room
+            .owner_capabilities()
+            .music
+            .into_iter()
+            .next()
+            .ok_or("music capability root is absent")?;
+        Ok(RoomSessionFoundation {
+            identity: self.room.identity().clone(),
+            local: self.local_actor,
+            peer,
+            signing_key: self.signing_key.clone(),
+            durable_revision: snapshot.sequence,
+            history: snapshot.history,
+            music_root: root,
+            local_grants,
+            peer_grants,
+            durable_view: self.room.view().music.shared_pitches,
+        })
     }
 
     async fn grant_peer(
@@ -397,6 +558,7 @@ where
                 .map_err(|error| error.to_string())?;
             let committed = self
                 .lane_mut(lane)
+                .inner_mut()
                 .commit_prepared(prepared.into_prepared())
                 .await
                 .map_err(|error| error.to_string())?;
@@ -422,6 +584,18 @@ where
         ))
     }
 
+    fn durable_entry_admission(
+        &self,
+        lane: RoomLane,
+        entry: EntryHash,
+    ) -> Result<hhhs_replica::DurableEntryAdmission, String> {
+        self.lane(lane)
+            .inner()
+            .replica()
+            .durable_entry_admission(entry)
+            .ok_or_else(|| format!("durable {lane:?} entry {entry:?} is not retained"))
+    }
+
     fn sign_presence(
         &self,
         session: u64,
@@ -441,176 +615,134 @@ where
             .map_err(|error| error.to_string())
     }
 
-    fn start_initiator(&mut self, id: u64, lane: RoomLane) -> Result<RoomWorkerRepairStep, String> {
+    async fn start_initiator(
+        &mut self,
+        id: u64,
+        lane: RoomLane,
+        events: &WorkerEventPort,
+    ) -> Result<RoomWorkerRepairStep, String> {
         self.ensure_repair_slot(id)?;
-        let salt: [u8; 16] = rand::random();
-        let source = hhhs_sync::RepairHost::capture(self.lane(lane), salt)
-            .map_err(|error| error.to_string())?;
-        let repair_lane = repair_lane(lane);
-        let (session, opening) = SyncSession::initiate(
-            repair_lane.strategy().clone(),
-            source.index(),
-            hhhs_sync::reconciliation::Config::default(),
-            salt,
-        );
-        let mut session = session.with_budget(hhhs_sync::SessionBudget::default());
-        session.set_root(Some(source.root()));
-        let frames = encode_frames(opening)?;
-        let outcome = RoomWorkerRepairOutcome {
-            frames_sent: frames.len(),
-            ..RoomWorkerRepairOutcome::default()
+        let sink = events.clone();
+        let mut outbound = move |frame| {
+            let sink = sink.clone();
+            async move {
+                sink.send_repair_frame(frame)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
         };
-        self.repair.insert(
-            id,
-            RepairState {
-                lane,
-                session,
-                source,
-                outcome: outcome.clone(),
-            },
-        );
-        Ok(RoomWorkerRepairStep {
-            session: id,
-            frames,
-            status: RoomWorkerRepairStatus::Exchanging,
-            outcome,
-        })
+        let attempt = StepwiseRepairAttempt::initiate(
+            self.lane(lane),
+            &repair_lane(lane),
+            hhhs_sync::SessionLimits::default(),
+            &mut outbound,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let step = repair_step(id, &attempt, None);
+        self.repair.insert(id, RepairState { lane, attempt });
+        Ok(step)
     }
 
-    fn start_responder(
+    async fn start_responder(
         &mut self,
         id: u64,
         lane: RoomLane,
         hello: Vec<u8>,
+        events: &WorkerEventPort,
     ) -> Result<RoomWorkerRepairStep, String> {
         self.ensure_repair_slot(id)?;
-        let message = SyncMessage::decode(&hello).map_err(|error| error.to_string())?;
-        let SyncMessage::Hello(hello) = message else {
-            return Err("first repair frame was not a Hello".into());
+        let sink = events.clone();
+        let mut outbound = move |frame| {
+            let sink = sink.clone();
+            async move {
+                sink.send_repair_frame(frame)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
         };
-        let source = hhhs_sync::RepairHost::capture(self.lane(lane), hello.session_salt)
-            .map_err(|error| error.to_string())?;
-        let repair_lane = repair_lane(lane);
-        let session = SyncSession::accept(
+        let attempt = StepwiseRepairAttempt::accept(
+            self.lane(lane),
+            &repair_lane(lane),
+            hhhs_sync::SessionLimits::default(),
             &hello,
-            repair_lane.strategy().clone(),
-            source.index(),
-            hhhs_sync::reconciliation::Config::default(),
+            &mut outbound,
         )
-        .map_err(|error| format!("repair strategy rejected: {error}"))?;
-        let mut session = session.with_budget(hhhs_sync::SessionBudget::default());
-        session.set_root(Some(source.root()));
-        let outcome = RoomWorkerRepairOutcome {
-            frames_received: 1,
-            ..RoomWorkerRepairOutcome::default()
-        };
-        self.repair.insert(
-            id,
-            RepairState {
-                lane,
-                session,
-                source,
-                outcome: outcome.clone(),
-            },
-        );
-        Ok(RoomWorkerRepairStep {
-            session: id,
-            frames: Vec::new(),
-            status: RoomWorkerRepairStatus::Exchanging,
-            outcome,
-        })
+        .await
+        .map_err(|error| error.to_string())?;
+        let step = repair_step(id, &attempt, None);
+        self.repair.insert(id, RepairState { lane, attempt });
+        Ok(step)
     }
 
     async fn advance_repair(
         &mut self,
         id: u64,
         frame: Vec<u8>,
+        events: &WorkerEventPort,
     ) -> Result<RoomWorkerRepairStep, String> {
         let mut state = self
             .repair
             .remove(&id)
             .ok_or_else(|| format!("repair session {id} is not active"))?;
-        state.outcome.frames_received = state.outcome.frames_received.saturating_add(1);
-        let message = SyncMessage::decode(&frame).map_err(|error| error.to_string())?;
-        let answered_fetch = matches!(message, SyncMessage::Entries { .. });
-        let output = state
-            .session
-            .on_message(message, &state.source)
-            .map_err(|error| format!("HHHS repair session {id} failed: {error}"))?;
-        let mut frames = encode_frames(output.send)?;
-
-        if answered_fetch {
-            let report = hhhs_sync::RepairHost::apply(self.lane_mut(state.lane), &output.ingest)
-                .await
-                .map_err(|error| error.to_string())?;
-            state.outcome.admitted = state.outcome.admitted.saturating_add(report.admitted.len());
-            state.outcome.lifted = state.outcome.lifted.saturating_add(report.lifted);
-            state.outcome.refused = state.outcome.refused.saturating_add(report.refused.len());
-            let policy_refusals = report
-                .refused
-                .iter()
-                .filter(|(_, refusal)| matches!(refusal, Refusal::Unauthorized | Refusal::Declined))
-                .count();
-            if policy_refusals > 0 {
-                state.outcome.policy_divergence = true;
-                frames.push(
-                    SyncMessage::Abort {
-                        reason: format!("{APPLICATION_REFUSAL_ABORT_PREFIX} {policy_refusals}"),
-                    }
-                    .encode(),
-                );
-                state.outcome.frames_sent = state.outcome.frames_sent.saturating_add(frames.len());
-                return Ok(RoomWorkerRepairStep {
-                    session: id,
-                    frames,
-                    status: RoomWorkerRepairStatus::Aborted,
-                    outcome: state.outcome,
-                });
+        let sink = events.clone();
+        let mut outbound = move |frame| {
+            let sink = sink.clone();
+            async move {
+                sink.send_repair_frame(frame)
+                    .await
+                    .map_err(|error| error.to_string())
             }
-            state.source = hhhs_sync::RepairHost::recapture(
-                self.lane(state.lane),
-                &state.source,
-                &report.admitted,
-                state.session.salt(),
-            )
-            .map_err(|error| error.to_string())?;
-            let follow_up = state
-                .session
-                .resume_admitted(
-                    state.source.index(),
-                    &report.admitted,
-                    Some(state.source.root()),
-                )
-                .map_err(|error| error.to_string())?;
-            frames.extend(encode_frames(follow_up)?);
-        }
+        };
+        let result = state
+            .attempt
+            .receive(self.lane_mut(state.lane), &frame, &mut outbound)
+            .await
+            .map_err(|error| error.to_string());
+        let step = repair_step(id, &state.attempt, None);
+        self.repair.insert(id, state);
+        result?;
+        Ok(step)
+    }
 
-        state.outcome.frames_sent = state.outcome.frames_sent.saturating_add(frames.len());
-        let status = RoomWorkerRepairStatus::from(state.session.status());
-        let outcome = state.outcome.clone();
-        if status == RoomWorkerRepairStatus::Exchanging {
-            self.repair.insert(id, state);
+    fn finish_repair(
+        &mut self,
+        id: u64,
+        close_error: Option<String>,
+    ) -> Result<RoomWorkerRepairStep, String> {
+        let mut state = self
+            .repair
+            .remove(&id)
+            .ok_or_else(|| format!("repair session {id} is not active"))?;
+        if !state.attempt.is_terminal() {
+            state.attempt.mark_incomplete();
         }
+        let closed = match close_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        };
+        let confirmed = state
+            .attempt
+            .confirm_close_with_host(self.lane(state.lane), closed)
+            .map_err(|error| error.to_string())?;
+        let disposition = confirmed.disposition();
+        let status = match disposition {
+            RepairDisposition::Synchronized => RoomWorkerRepairStatus::Complete,
+            RepairDisposition::RetryFresh(reason) => {
+                RoomWorkerRepairStatus::RetryFresh(reason.into())
+            }
+            RepairDisposition::AwaitPolicyChange => RoomWorkerRepairStatus::PolicyDivergence,
+        };
         Ok(RoomWorkerRepairStep {
             session: id,
-            frames,
             status,
-            outcome,
+            outcome: confirmed.outcome().into(),
+            disposition: Some(disposition.into()),
         })
     }
 
-    fn close_repair(&mut self, id: u64) -> RoomWorkerRepairStep {
-        let outcome = self
-            .repair
-            .remove(&id)
-            .map(|state| state.outcome)
-            .unwrap_or_default();
-        RoomWorkerRepairStep {
-            session: id,
-            frames: Vec::new(),
-            status: RoomWorkerRepairStatus::Closed,
-            outcome,
-        }
+    fn repair_lane_for(&self, id: u64) -> Option<RoomLane> {
+        self.repair.get(&id).map(|state| state.lane)
     }
 
     fn ensure_repair_slot(&self, id: u64) -> Result<(), String> {
@@ -627,22 +759,21 @@ where
     }
 }
 
-fn encode_frames(messages: Vec<SyncMessage>) -> Result<Vec<Vec<u8>>, String> {
-    let max = hhhs_sync::SessionLimits::default().max_frame_bytes;
-    messages
-        .into_iter()
-        .map(|message| {
-            let frame = message.encode();
-            if frame.len() > max {
-                Err(format!(
-                    "repair frame is {} bytes; maximum is {max}",
-                    frame.len()
-                ))
-            } else {
-                Ok(frame)
-            }
-        })
-        .collect()
+fn repair_step(
+    id: u64,
+    attempt: &StepwiseRepairAttempt<ReplicaRepairSnapshot>,
+    disposition: Option<RoomWorkerRepairDisposition>,
+) -> RoomWorkerRepairStep {
+    RoomWorkerRepairStep {
+        session: id,
+        status: attempt.status().into(),
+        outcome: attempt.outcome().into(),
+        disposition,
+    }
+}
+
+fn repair_revision_advanced(before: Option<u64>, after: u64) -> bool {
+    before.is_some_and(|before| after > before)
 }
 
 pub(crate) trait RoomWorkerFactory: 'static {
@@ -663,6 +794,8 @@ where
     projection: Option<RoomWorkerProjection>,
     revision: u64,
     subscriptions: BTreeSet<SubscriptionId>,
+    session: Option<RoomSessionServicePort>,
+    session_peers: BTreeSet<ActorId>,
 }
 
 impl<F> RoomReplicaWorkerService<F>
@@ -676,7 +809,15 @@ where
             projection: None,
             revision: 0,
             subscriptions: BTreeSet::new(),
+            session: None,
+            session_peers: BTreeSet::new(),
         }
+    }
+
+    pub(crate) fn with_session(factory: F, session: RoomSessionServicePort) -> Self {
+        let mut service = Self::new(factory);
+        service.session = Some(session);
+        service
     }
 
     fn room(&self) -> Result<&RoomDataPlane<F::Durability>, String> {
@@ -691,6 +832,30 @@ where
         self.projection
             .as_ref()
             .ok_or("Room worker has no projection".into())
+    }
+
+    fn current_session_foundations(&self) -> Vec<RoomSessionFoundation> {
+        let Some(room) = self.room.as_ref() else {
+            return Vec::new();
+        };
+        self.session_peers
+            .iter()
+            .filter_map(|peer| room.session_foundation(*peer).ok())
+            .collect()
+    }
+
+    async fn refresh_session_foundations(&mut self) -> Result<(), String> {
+        if self.session.is_none() {
+            return Ok(());
+        }
+        let foundations = self.current_session_foundations();
+        self.session
+            .as_mut()
+            .expect("session runtime checked above")
+            .task
+            .send(RoomSessionTaskInput::RefreshFoundations(foundations))
+            .await
+            .map_err(|_| "Room worker session task closed during foundation refresh".to_owned())
     }
 
     fn publish_projection(&mut self, events: &WorkerEventPort) -> Result<u64, String> {
@@ -732,6 +897,32 @@ where
                         .encode(),
                     )
                     .map_err(|error| error.to_string())?;
+                let durable_advance = (lane == RoomLane::Music && self.session.is_some())
+                    .then(|| {
+                        let snapshot = self.room()?.room.music_snapshot();
+                        let durable_revision = snapshot.sequence;
+                        let durable_view = self.room()?.room.view().music.shared_pitches;
+                        Ok::<_, String>((snapshot.history, durable_view, durable_revision))
+                    })
+                    .transpose()?;
+                if let (Some((history, durable_view, durable_revision)), Some(session)) =
+                    (durable_advance, self.session.as_mut())
+                {
+                    session
+                        .task
+                        .send(RoomSessionTaskInput::DurableAdvanced {
+                            history,
+                            durable_view,
+                            durable_revision,
+                        })
+                        .await
+                        .map_err(|_| {
+                            "Room worker session task closed after music commit".to_owned()
+                        })?;
+                }
+                if lane == RoomLane::Music {
+                    self.refresh_session_foundations().await?;
+                }
                 let projection_revision = self.publish_projection(events)?;
                 Ok(RoomWorkerResponse::CommandCommitted {
                     entry: *entry.as_bytes(),
@@ -756,9 +947,125 @@ where
                         .map_err(|error| error.to_string())?;
                     entries.push((lane, *entry.as_bytes()));
                 }
+                let durable_advance = (entries.iter().any(|(lane, _)| *lane == RoomLane::Music)
+                    && self.session.is_some())
+                .then(|| {
+                    let snapshot = self.room()?.room.music_snapshot();
+                    let durable_revision = snapshot.sequence;
+                    let durable_view = self.room()?.room.view().music.shared_pitches;
+                    Ok::<_, String>((snapshot.history, durable_view, durable_revision))
+                })
+                .transpose()?;
+                if let (Some((history, durable_view, durable_revision)), Some(session)) =
+                    (durable_advance, self.session.as_mut())
+                {
+                    session
+                        .task
+                        .send(RoomSessionTaskInput::DurableAdvanced {
+                            history,
+                            durable_view,
+                            durable_revision,
+                        })
+                        .await
+                        .map_err(|_| {
+                            "Room worker session task closed after music grant".to_owned()
+                        })?;
+                }
+                if entries.iter().any(|(lane, _)| *lane == RoomLane::Music) {
+                    self.refresh_session_foundations().await?;
+                }
                 let projection_revision = self.publish_projection(events)?;
                 Ok(RoomWorkerResponse::PeerGranted {
                     entries,
+                    projection_revision,
+                })
+            }
+            RoomWorkerCommand::StartSessionPeer(peer) => {
+                let foundation = self.room()?.session_foundation(peer)?;
+                self.session
+                    .as_mut()
+                    .ok_or("Room worker session runtime is not configured")?
+                    .task
+                    .send(RoomSessionTaskInput::StartPeer(foundation))
+                    .await
+                    .map_err(|_| "Room worker session task closed".to_owned())?;
+                self.session_peers.insert(peer);
+                Ok(RoomWorkerResponse::SessionPeerStarted)
+            }
+            RoomWorkerCommand::ResetSessionProjection => {
+                let snapshot = self.room()?.room.music_snapshot();
+                let durable_revision = snapshot.sequence;
+                let durable_view = self.room()?.room.view().music.shared_pitches;
+                let (reply, response) = futures::channel::oneshot::channel();
+                self.session
+                    .as_mut()
+                    .ok_or("Room worker session runtime is not configured")?
+                    .task
+                    .send(RoomSessionTaskInput::ResetProjection {
+                        history: snapshot.history,
+                        durable_view,
+                        durable_revision,
+                        reply,
+                    })
+                    .await
+                    .map_err(|_| "Room worker session task closed during reset".to_owned())?;
+                let emitted = response
+                    .await
+                    .map_err(|_| "Room worker session reset reply was dropped".to_owned())??;
+                Ok(RoomWorkerResponse::SessionProjectionReset { emitted })
+            }
+            RoomWorkerCommand::DrainSession => {
+                let reification = self
+                    .session
+                    .as_mut()
+                    .ok_or("Room worker session runtime is not configured")?
+                    .reifications
+                    .try_recv()
+                    .ok();
+                let Some(reification) = reification else {
+                    return Ok(RoomWorkerResponse::SessionDrained {
+                        committed: false,
+                        projection_revision: self.revision,
+                    });
+                };
+                let local = self.room()?.local_actor;
+                let (entry, durable_admission, record) = self
+                    .room_mut()?
+                    .commit_session(&reification.plan, reification.command)
+                    .await?;
+                events
+                    .emit(
+                        WorkerEventKind::OutboundRecord,
+                        ReplicaLiveRecord {
+                            lane: RoomLane::Music,
+                            source: PeerId(local.0),
+                            record,
+                        }
+                        .encode(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                let snapshot = self.room()?.room.music_snapshot();
+                let durable_revision = snapshot.sequence;
+                let durable_view = self.room()?.room.view().music.shared_pitches;
+                self.session
+                    .as_mut()
+                    .expect("session runtime checked above")
+                    .task
+                    .send(RoomSessionTaskInput::LocalCommitted {
+                        peer: reification.peer,
+                        plan: reification.plan,
+                        entry,
+                        durable_admission,
+                        history: snapshot.history,
+                        durable_view,
+                        durable_revision,
+                    })
+                    .await
+                    .map_err(|_| "Room worker session task closed after commit".to_owned())?;
+                self.refresh_session_foundations().await?;
+                let projection_revision = self.publish_projection(events)?;
+                Ok(RoomWorkerResponse::SessionDrained {
+                    committed: true,
                     projection_revision,
                 })
             }
@@ -786,9 +1093,16 @@ where
         events: WorkerEventPort,
     ) -> Pin<Box<dyn Future<Output = Result<WorkerReply, String>> + 'a>> {
         Box::pin(async move {
+            // The exact eaaade2 worker enum is exhaustive; the next upstream
+            // candidate marks it non-exhaustive. Unknown requests must remain
+            // explicit refusals, never implicit successful responses.
+            #[allow(unreachable_patterns)]
             match request.kind() {
                 WorkerRequestKind::Open => {
                     let open: RoomWorkerOpen = decode(request.payload())?;
+                    let session_trace = open.session_trace;
+                    #[cfg(feature = "browser-acceptance-faults")]
+                    let session_renewal_test_cut = open.session_renewal_test_cut;
                     let room = self.factory.open(open).await?;
                     let actor = room.local_actor;
                     let projection = room.projection();
@@ -796,6 +1110,21 @@ where
                     self.projection = Some(projection.clone());
                     self.revision = 0;
                     self.subscriptions.clear();
+                    self.session_peers.clear();
+                    if let Some(session) = self.session.as_mut() {
+                        session
+                            .task
+                            .send(RoomSessionTaskInput::Configure {
+                                events: events.clone(),
+                                trace_enabled: session_trace,
+                                #[cfg(feature = "browser-acceptance-faults")]
+                                renewal_test_cut: session_renewal_test_cut,
+                            })
+                            .await
+                            .map_err(|_| {
+                                "Room worker session task closed during Open".to_owned()
+                            })?;
+                    }
                     Ok(WorkerReply::ready(encode(&RoomWorkerResponse::Opened {
                         actor,
                         projection,
@@ -823,7 +1152,42 @@ where
                 WorkerRequestKind::InboundRecord => {
                     let live = ReplicaLiveRecord::decode(request.payload())
                         .ok_or("invalid Room-v5 live record")?;
+                    let lane = live.lane;
+                    let observed = live.record.entry().clone();
                     let (accepted, entry) = self.room_mut()?.apply_live(live).await?;
+                    if accepted && lane == RoomLane::Music && self.session.is_some() {
+                        let durable_admission =
+                            self.room()?.durable_entry_admission(lane, entry)?;
+                        let snapshot = self.room()?.room.music_snapshot();
+                        let durable_revision = snapshot.sequence;
+                        let durable_view = self.room()?.room.view().music.shared_pitches;
+                        let input =
+                            if hhhs_session::ReifiedSessionCommand::has_domain(&observed.payload) {
+                                RoomSessionTaskInput::Observed {
+                                    entry: observed,
+                                    durable_admission,
+                                    history: snapshot.history,
+                                    durable_view,
+                                    durable_revision,
+                                }
+                            } else {
+                                RoomSessionTaskInput::DurableAdvanced {
+                                    history: snapshot.history,
+                                    durable_view,
+                                    durable_revision,
+                                }
+                            };
+                        self.session
+                            .as_mut()
+                            .expect("session runtime checked above")
+                            .task
+                            .send(input)
+                            .await
+                            .map_err(|_| {
+                                "Room worker session task closed after inbound admission".to_owned()
+                            })?;
+                        self.refresh_session_foundations().await?;
+                    }
                     let projection_revision = self.publish_projection(&events)?;
                     Ok(WorkerReply::response(encode(
                         &RoomWorkerResponse::InboundApplied {
@@ -835,22 +1199,63 @@ where
                 }
                 WorkerRequestKind::RepairFrame => {
                     let operation: RoomWorkerRepairRequest = decode(request.payload())?;
+                    let repaired_music = match &operation {
+                        RoomWorkerRepairRequest::Frame { session, .. } => self
+                            .room()?
+                            .repair_lane_for(*session)
+                            .is_some_and(|lane| lane == RoomLane::Music),
+                        _ => false,
+                    };
+                    let music_revision_before = repaired_music
+                        .then(|| self.room().map(|room| room.room.music_snapshot().sequence))
+                        .transpose()?;
                     let step = match operation {
                         RoomWorkerRepairRequest::StartInitiator { session, lane } => {
-                            self.room_mut()?.start_initiator(session, lane)?
+                            self.room_mut()?
+                                .start_initiator(session, lane, &events)
+                                .await?
                         }
                         RoomWorkerRepairRequest::StartResponder {
                             session,
                             lane,
                             hello,
-                        } => self.room_mut()?.start_responder(session, lane, hello)?,
+                        } => {
+                            self.room_mut()?
+                                .start_responder(session, lane, hello, &events)
+                                .await?
+                        }
                         RoomWorkerRepairRequest::Frame { session, frame } => {
-                            self.room_mut()?.advance_repair(session, frame).await?
+                            self.room_mut()?
+                                .advance_repair(session, frame, &events)
+                                .await?
                         }
-                        RoomWorkerRepairRequest::Close { session } => {
-                            self.room_mut()?.close_repair(session)
-                        }
+                        RoomWorkerRepairRequest::Finish {
+                            session,
+                            close_error,
+                        } => self.room_mut()?.finish_repair(session, close_error)?,
                     };
+                    let music_revision_after = self.room()?.room.music_snapshot().sequence;
+                    let music_revision_advanced =
+                        repair_revision_advanced(music_revision_before, music_revision_after);
+                    if music_revision_advanced && self.session.is_some() {
+                        let snapshot = self.room()?.room.music_snapshot();
+                        let durable_revision = snapshot.sequence;
+                        let durable_view = self.room()?.room.view().music.shared_pitches;
+                        self.session
+                            .as_mut()
+                            .expect("session runtime checked above")
+                            .task
+                            .send(RoomSessionTaskInput::RepairResynchronized {
+                                history: snapshot.history,
+                                durable_view,
+                                durable_revision,
+                            })
+                            .await
+                            .map_err(|_| {
+                                "Room worker session task closed after music repair".to_owned()
+                            })?;
+                        self.refresh_session_foundations().await?;
+                    }
                     let _ = self.publish_projection(&events)?;
                     Ok(WorkerReply::response(encode(&RoomWorkerResponse::Repair(
                         step,
@@ -866,11 +1271,18 @@ where
                     self.room = None;
                     self.projection = None;
                     self.subscriptions.clear();
+                    self.session_peers.clear();
                     Ok(WorkerReply::new(
                         WorkerEventKind::Closed,
                         encode(&RoomWorkerResponse::Closed)?,
                     ))
                 }
+                WorkerRequestKind::AcknowledgeRepairFrame(_) => Err(
+                    "repair-frame acknowledgements must be intercepted by the worker host".into(),
+                ),
+                unknown => Err(format!(
+                    "unsupported Replica worker request kind: {unknown:?}"
+                )),
             }
         })
     }
@@ -931,6 +1343,23 @@ mod tests {
         )
     }
 
+    #[test]
+    fn open_request_disables_session_diagnostics_and_fault_injection_by_default() {
+        let open = open_request("worker-open-defaults", [0x11; 32]);
+        assert!(!open.session_trace);
+        #[cfg(feature = "browser-acceptance-faults")]
+        assert!(!open.session_renewal_test_cut);
+    }
+
+    #[test]
+    fn repair_projection_reset_requires_actual_music_growth() {
+        assert!(!repair_revision_advanced(None, 4));
+        assert!(!repair_revision_advanced(Some(4), 4));
+        assert!(!repair_revision_advanced(Some(5), 4));
+        assert!(repair_revision_advanced(Some(4), 5));
+        assert!(repair_revision_advanced(Some(4), 7));
+    }
+
     async fn open_and_subscribe(
         host: &mut InProcessWorkerHost<RoomReplicaWorkerService<MemoryFactory>>,
         open: RoomWorkerOpen,
@@ -960,13 +1389,22 @@ mod tests {
         host: &mut InProcessWorkerHost<RoomReplicaWorkerService<MemoryFactory>>,
         degree: u16,
     ) {
+        commit_degree_state(host, degree, true).await;
+    }
+
+    async fn commit_degree_state(
+        host: &mut InProcessWorkerHost<RoomReplicaWorkerService<MemoryFactory>>,
+        degree: u16,
+        active: bool,
+    ) {
         let tuning = Tuning::twelve_tet();
-        let command = RoomWorkerCommand::Commit(
-            super::super::v5::MusicOp::AddDegree {
-                degree: TunedDegree::new(&tuning, degree).unwrap(),
-            }
-            .into(),
-        );
+        let degree = TunedDegree::new(&tuning, degree).unwrap();
+        let operation = if active {
+            super::super::v5::MusicOp::AddDegree { degree }
+        } else {
+            super::super::v5::MusicOp::RemoveDegree { degree }
+        };
+        let command = RoomWorkerCommand::Commit(operation.into());
         let dispatched = host
             .dispatch(
                 WorkerRequestKind::Command,
@@ -1001,7 +1439,7 @@ mod tests {
     async fn repair_request(
         host: &mut InProcessWorkerHost<RoomReplicaWorkerService<MemoryFactory>>,
         request: RoomWorkerRepairRequest,
-    ) -> RoomWorkerRepairStep {
+    ) -> (RoomWorkerRepairStep, Vec<Vec<u8>>) {
         let dispatched = host
             .dispatch(
                 WorkerRequestKind::RepairFrame,
@@ -1009,8 +1447,16 @@ mod tests {
             )
             .await
             .unwrap();
+        let frames = dispatched
+            .events
+            .iter()
+            .filter_map(|event| {
+                matches!(event.kind(), WorkerEventKind::RepairFrame { .. })
+                    .then(|| event.payload().to_vec())
+            })
+            .collect();
         match decode_response(dispatched.reply.payload()).unwrap() {
-            RoomWorkerResponse::Repair(step) => step,
+            RoomWorkerResponse::Repair(step) => (step, frames),
             other => panic!("unexpected repair response: {other:?}"),
         }
     }
@@ -1020,14 +1466,14 @@ mod tests {
         bob: &mut InProcessWorkerHost<RoomReplicaWorkerService<MemoryFactory>>,
         session: u64,
         lane: RoomLane,
-    ) {
-        let mut alice_step = repair_request(
+    ) -> (RoomWorkerRepairOutcome, RoomWorkerRepairOutcome) {
+        let (mut alice_step, mut to_bob) = repair_request(
             alice,
             RoomWorkerRepairRequest::StartInitiator { session, lane },
         )
         .await;
-        let hello = alice_step.frames.remove(0);
-        let mut bob_step = repair_request(
+        let hello = to_bob.remove(0);
+        let (mut bob_step, mut to_alice) = repair_request(
             bob,
             RoomWorkerRepairRequest::StartResponder {
                 session,
@@ -1036,23 +1482,147 @@ mod tests {
             },
         )
         .await;
-        let mut to_bob = alice_step.frames;
-        let mut to_alice = bob_step.frames;
         for _ in 0..1_024 {
             if let Some(frame) = to_bob.pop() {
-                bob_step =
+                let (step, frames) =
                     repair_request(bob, RoomWorkerRepairRequest::Frame { session, frame }).await;
-                to_alice.extend(bob_step.frames.clone().into_iter().rev());
+                bob_step = step;
+                to_alice.extend(frames.into_iter().rev());
             } else if let Some(frame) = to_alice.pop() {
-                alice_step =
+                let (step, frames) =
                     repair_request(alice, RoomWorkerRepairRequest::Frame { session, frame }).await;
-                to_bob.extend(alice_step.frames.clone().into_iter().rev());
+                alice_step = step;
+                to_bob.extend(frames.into_iter().rev());
             } else {
                 break;
             }
         }
         assert_eq!(alice_step.status, RoomWorkerRepairStatus::Complete);
         assert_eq!(bob_step.status, RoomWorkerRepairStatus::Complete);
+        let (alice_finished, _) = repair_request(
+            alice,
+            RoomWorkerRepairRequest::Finish {
+                session,
+                close_error: None,
+            },
+        )
+        .await;
+        let (bob_finished, _) = repair_request(
+            bob,
+            RoomWorkerRepairRequest::Finish {
+                session,
+                close_error: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            alice_finished.disposition,
+            Some(RoomWorkerRepairDisposition::Synchronized)
+        );
+        assert_eq!(
+            bob_finished.disposition,
+            Some(RoomWorkerRepairDisposition::Synchronized)
+        );
+        (alice_finished.outcome, bob_finished.outcome)
+    }
+
+    #[test]
+    fn worker_local_advance_requires_a_fresh_repair_cut() {
+        block_on(async {
+            let room_name = "worker-stale-cut-song";
+            let mut alice =
+                InProcessWorkerHost::with_defaults(RoomReplicaWorkerService::new(MemoryFactory));
+            let mut bob =
+                InProcessWorkerHost::with_defaults(RoomReplicaWorkerService::new(MemoryFactory));
+            open_and_subscribe(&mut alice, open_request(room_name, [0x51; 32])).await;
+            open_and_subscribe(&mut bob, open_request(room_name, [0x62; 32])).await;
+            commit_degree(&mut alice, 3).await;
+
+            let session = 41;
+            let (mut alice_step, mut to_bob) = repair_request(
+                &mut alice,
+                RoomWorkerRepairRequest::StartInitiator {
+                    session,
+                    lane: RoomLane::Music,
+                },
+            )
+            .await;
+            let hello = to_bob.remove(0);
+
+            let (mut bob_step, mut to_alice) = repair_request(
+                &mut bob,
+                RoomWorkerRepairRequest::StartResponder {
+                    session,
+                    lane: RoomLane::Music,
+                    hello,
+                },
+            )
+            .await;
+            for _ in 0..1_024 {
+                if let Some(frame) = to_bob.pop() {
+                    let (step, frames) =
+                        repair_request(&mut bob, RoomWorkerRepairRequest::Frame { session, frame })
+                            .await;
+                    bob_step = step;
+                    to_alice.extend(frames.into_iter().rev());
+                } else if let Some(frame) = to_alice.pop() {
+                    let (step, frames) = repair_request(
+                        &mut alice,
+                        RoomWorkerRepairRequest::Frame { session, frame },
+                    )
+                    .await;
+                    alice_step = step;
+                    to_bob.extend(frames.into_iter().rev());
+                } else {
+                    break;
+                }
+            }
+            assert_eq!(alice_step.status, RoomWorkerRepairStatus::Complete);
+            assert_eq!(bob_step.status, RoomWorkerRepairStatus::Complete);
+
+            // A command before terminal repair can be folded into HHHS's
+            // incremental recapture and reconciled in the same attempt. This
+            // one lands after Done/Ack but before carrier-close confirmation,
+            // so the completed cut is truthful yet no longer current.
+            commit_degree(&mut alice, 9).await;
+
+            let (alice_finished, _) = repair_request(
+                &mut alice,
+                RoomWorkerRepairRequest::Finish {
+                    session,
+                    close_error: None,
+                },
+            )
+            .await;
+            let (bob_finished, _) = repair_request(
+                &mut bob,
+                RoomWorkerRepairRequest::Finish {
+                    session,
+                    close_error: None,
+                },
+            )
+            .await;
+            assert_eq!(
+                alice_finished.disposition,
+                Some(RoomWorkerRepairDisposition::RetryFresh(
+                    RoomWorkerRepairRetryReason::HistoryAdvanced
+                ))
+            );
+            assert_eq!(
+                bob_finished.disposition,
+                Some(RoomWorkerRepairDisposition::Synchronized)
+            );
+
+            repair_lane_between(&mut alice, &mut bob, 42, RoomLane::Music).await;
+            let alice_projection = alice.service().room().unwrap().projection();
+            let bob_projection = bob.service().room().unwrap().projection();
+            assert_eq!(alice_projection.view.music, bob_projection.view.music);
+            assert_eq!(
+                alice_projection.music_frontier,
+                bob_projection.music_frontier
+            );
+            assert_eq!(alice_projection.view.music.live.len(), 2);
+        });
     }
 
     #[test]
@@ -1075,6 +1645,90 @@ mod tests {
             let bob_projection = bob.service().room().unwrap().projection();
             assert_eq!(alice_projection, bob_projection);
             assert_eq!(alice_projection.view.music.live.len(), 2);
+
+            let (alice_equal, bob_equal) =
+                repair_lane_between(&mut alice, &mut bob, 9, RoomLane::Music).await;
+            assert_eq!(
+                alice_equal.frames_sent + bob_equal.frames_sent,
+                4,
+                "an equal-root reconnect is Hello/CutRoot/Done/Done only",
+            );
+            assert_eq!(alice_equal.frames_received + bob_equal.frames_received, 4);
+            for host in [&alice, &bob] {
+                let room = host.service().room().unwrap();
+                assert!(room.lane(RoomLane::Music).has_cached_snapshot());
+                assert!(room.lane(RoomLane::Extension).has_cached_snapshot());
+            }
+
+            alice
+                .dispatch(WorkerRequestKind::Close, Vec::new())
+                .await
+                .unwrap();
+            let mut restarted =
+                InProcessWorkerHost::with_defaults(RoomReplicaWorkerService::new(MemoryFactory));
+            open_and_subscribe(&mut restarted, open_request(room_name, [0x31; 32])).await;
+            let reopened = restarted.service().room().unwrap();
+            assert!(!reopened.lane(RoomLane::Music).has_cached_snapshot());
+            assert!(!reopened.lane(RoomLane::Extension).has_cached_snapshot());
+        });
+    }
+
+    #[test]
+    fn browser_worker_shared_degree_can_be_removed_by_the_other_peer() {
+        block_on(async {
+            let room_name = "worker-shared-remove-song";
+            let tuning = Tuning::twelve_tet();
+            let degree = TunedDegree::new(&tuning, 5).unwrap();
+            let mut alice =
+                InProcessWorkerHost::with_defaults(RoomReplicaWorkerService::new(MemoryFactory));
+            let mut bob =
+                InProcessWorkerHost::with_defaults(RoomReplicaWorkerService::new(MemoryFactory));
+            open_and_subscribe(&mut alice, open_request(room_name, [0x51; 32])).await;
+            open_and_subscribe(&mut bob, open_request(room_name, [0x62; 32])).await;
+
+            commit_degree_state(&mut alice, degree.degree.index(), true).await;
+            repair_lane_between(&mut alice, &mut bob, 21, RoomLane::Music).await;
+            assert!(
+                bob.service()
+                    .room()
+                    .unwrap()
+                    .projection()
+                    .view
+                    .music
+                    .shared_pitches
+                    .pitch_classes
+                    .contains(&degree)
+            );
+
+            commit_degree_state(&mut bob, degree.degree.index(), false).await;
+            assert!(
+                !bob.service()
+                    .room()
+                    .unwrap()
+                    .projection()
+                    .view
+                    .music
+                    .shared_pitches
+                    .pitch_classes
+                    .contains(&degree),
+                "the source worker must materialize its own removal before repair",
+            );
+            repair_lane_between(&mut bob, &mut alice, 22, RoomLane::Music).await;
+            for host in [&alice, &bob] {
+                assert!(
+                    !host
+                        .service()
+                        .room()
+                        .unwrap()
+                        .projection()
+                        .view
+                        .music
+                        .shared_pitches
+                        .pitch_classes
+                        .contains(&degree),
+                    "cross-peer observed removal must clear the shared degree"
+                );
+            }
         });
     }
 }

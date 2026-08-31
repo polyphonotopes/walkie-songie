@@ -6,7 +6,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     rc::Rc,
     time::Duration,
 };
@@ -21,14 +21,19 @@ use crate::{
     client::{
         AppError, AppErrorCode, AppEvent, AppEventEnvelope, AppSnapshot, CLIENT_PROTOCOL_VERSION,
         Capabilities, ClientCommand, CommandAck, DiscoverySource, PeerPath, PeerSnapshot,
-        PieceSnapshot, VoiceSnapshot,
+        PieceSnapshot, RealtimeMidiKind, RealtimeMidiSnapshot, VoiceSnapshot,
     },
     is_valid_room_name,
     net::{
         BrowserNetHandle, BrowserRoomInbound, BrowserRoomNetwork, IrohSyncStream,
         NativeNetworkEvent, NativeRoomTicketV5, ReplicaLiveRecord, ReplicaProtocol,
-        ReplicaRepairHint, ReplicaRepairProbe, ReplicaRoomNetworkConfig, SyncStream,
+        ReplicaRepairHint, ReplicaRepairProbe, ReplicaRoomNetworkConfig, RoomRealtime, SyncStream,
         WalkieIdentity, is_routine_repair_initiator, spawn_rendezvous_v5,
+    },
+    room::session::{
+        RoomSessionCompactTrace, RoomSessionEgress, RoomSessionIngress, RoomSessionProjectionGate,
+        RoomSessionProjectionKind, RoomSessionRealtimeEgress, RoomSessionRenewalTrace,
+        is_session_carrier,
     },
     room::v5::{
         ActorId, ExtensionCommand, MusicOp, ProtocolSupport, RoomCommand, RoomLane, RoomView,
@@ -55,6 +60,63 @@ async fn yield_browser_task() {
     gloo_timers::future::TimeoutFuture::new(0).await;
 }
 
+fn browser_time_micros() -> Option<u64> {
+    let performance = web_sys::window()?.performance()?;
+    let milliseconds = performance.time_origin() + performance.now();
+    milliseconds
+        .is_finite()
+        .then_some((milliseconds.max(0.0) * 1_000.0).round() as u64)
+}
+
+fn session_tracing_enabled() -> bool {
+    browser_query_flag("sessionTrace")
+}
+
+#[cfg(feature = "browser-acceptance-faults")]
+fn session_renewal_test_cut_enabled() -> bool {
+    session_tracing_enabled() && browser_query_flag("renewalCut")
+}
+
+fn browser_query_flag(name: &str) -> bool {
+    web_sys::window()
+        .and_then(|window| window.location().search().ok())
+        .is_some_and(|search| {
+            search
+                .trim_start_matches('?')
+                .split('&')
+                .any(|part| part == format!("{name}=1"))
+        })
+}
+
+fn log_session_trace(stage: &str, trace: &RoomSessionCompactTrace) {
+    if !session_tracing_enabled() {
+        return;
+    }
+    let Ok(stage) = serde_json::to_string(stage) else {
+        return;
+    };
+    let Ok(trace) = serde_json::to_string(trace) else {
+        return;
+    };
+    web_sys::console::info_1(
+        &format!(
+            "[session_trace] {{\"stage\":{stage},\"atMicros\":{},\"trace\":{trace}}}",
+            browser_time_micros().map_or_else(|| "null".to_owned(), |at| at.to_string())
+        )
+        .into(),
+    );
+}
+
+fn log_session_renewal_trace(trace: &RoomSessionRenewalTrace) {
+    if !session_tracing_enabled() {
+        return;
+    }
+    let Ok(trace) = serde_json::to_string(trace) else {
+        return;
+    };
+    web_sys::console::info_1(&format!("[session_renewal_trace] {trace}").into());
+}
+
 enum RoomControl {
     Commit {
         command: RoomCommand,
@@ -66,6 +128,7 @@ enum RoomControl {
         response: oneshot::Sender<Result<CommandAck, AppError>>,
     },
     OutboundRecord(Vec<u8>),
+    ResetSessionProjection,
     Shutdown {
         response: oneshot::Sender<()>,
     },
@@ -76,12 +139,106 @@ struct ActiveRoom {
     alive: Rc<Cell<bool>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct RepairKey {
+    peer: [u8; 32],
+    lane: RoomLane,
+}
+
+#[derive(Default)]
+struct RepairCoordinatorState {
+    /// One running initiator per peer/lane. A concurrent trigger records one
+    /// follow-up instead of allocating another HHHS worker session.
+    active: BTreeMap<RepairKey, bool>,
+    /// An inbound duplicate must not allocate another worker session for the
+    /// same peer/lane. Initiator and responder ownership share the same key
+    /// space: deterministic endpoint ordering means a healthy pair never needs
+    /// both roles at once.
+    responders: BTreeSet<RepairKey>,
+}
+
+#[derive(Clone, Default)]
+struct RepairCoordinator(Rc<RefCell<RepairCoordinatorState>>);
+
+impl RepairCoordinator {
+    fn schedule(&self, peer: iroh::EndpointId, lane: RoomLane) -> bool {
+        let key = RepairKey {
+            peer: *peer.as_bytes(),
+            lane,
+        };
+        let mut state = self.0.borrow_mut();
+        if state.responders.contains(&key) {
+            return false;
+        }
+        if let Some(pending) = state.active.get_mut(&key) {
+            *pending = true;
+            false
+        } else {
+            state.active.insert(key, false);
+            true
+        }
+    }
+
+    /// Finish the current batch. `true` consumes one coalesced trigger and
+    /// keeps ownership of the slot for an immediate fresh attempt.
+    fn continue_pending(&self, peer: iroh::EndpointId, lane: RoomLane) -> bool {
+        let key = RepairKey {
+            peer: *peer.as_bytes(),
+            lane,
+        };
+        let mut state = self.0.borrow_mut();
+        match state.active.get_mut(&key) {
+            Some(pending) if *pending => {
+                *pending = false;
+                true
+            }
+            Some(_) => {
+                state.active.remove(&key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn finish(&self, peer: iroh::EndpointId, lane: RoomLane) {
+        self.0.borrow_mut().active.remove(&RepairKey {
+            peer: *peer.as_bytes(),
+            lane,
+        });
+    }
+
+    fn begin_responder(&self, peer: iroh::EndpointId, lane: RoomLane) -> bool {
+        let key = RepairKey {
+            peer: *peer.as_bytes(),
+            lane,
+        };
+        let mut state = self.0.borrow_mut();
+        if state.active.contains_key(&key) || state.responders.contains(&key) {
+            return false;
+        }
+        state.responders.insert(key)
+    }
+
+    fn finish_responder(&self, peer: iroh::EndpointId, lane: RoomLane) {
+        self.0.borrow_mut().responders.remove(&RepairKey {
+            peer: *peer.as_bytes(),
+            lane,
+        });
+    }
+}
+
 struct HostState {
     sequence: u64,
     snapshot: AppSnapshot,
-    pitch_authors: BTreeMap<TunedDegree, Vec<ActorId>>,
+    peer_sync: BTreeMap<ActorId, PeerSyncState>,
     subscribers: Vec<Rc<dyn Fn(AppEventEnvelope)>>,
     active_room: Option<ActiveRoom>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct PeerSyncState {
+    required: u8,
+    complete: u8,
 }
 
 pub struct BrowserHost {
@@ -123,15 +280,18 @@ pub async fn init(on_event: impl Fn(AppEventEnvelope) + 'static) -> Result<(), S
         Some(seed) => seed,
         None => super::storage::get_or_create_identity_seed().await,
     };
+    let identity = WalkieIdentity::from_seed(seed);
+    let mut snapshot = AppSnapshot::empty(browser_capabilities());
+    snapshot.local_actor = Some(identity.capability_actor_id());
     let host = Rc::new(BrowserHost {
         state: Rc::new(RefCell::new(HostState {
             sequence: 0,
-            snapshot: AppSnapshot::empty(browser_capabilities()),
-            pitch_authors: BTreeMap::new(),
+            snapshot,
+            peer_sync: BTreeMap::new(),
             subscribers: Vec::new(),
             active_room: None,
         })),
-        identity: WalkieIdentity::from_seed(seed),
+        identity,
     });
     host.register(Rc::new(on_event));
     let (commands, mut command_rx) = mpsc::unbounded::<QueuedCommand>();
@@ -231,6 +391,21 @@ impl BrowserHost {
                 self.validate_degree(pitch)?;
                 self.submit(MusicOp::RemoveDegree { degree: pitch }.into())
                     .await
+            }
+            ClientCommand::SetRoundTable { config } => {
+                let config = config.validate().map_err(|error| {
+                    AppError::new(AppErrorCode::InvalidCommand, "invalid round-table config")
+                        .with_detail(error.to_string())
+                })?;
+                self.submit(MusicOp::SetRoundTable { config }.into()).await
+            }
+            ClientCommand::AddPitch { pitch } => {
+                self.validate_pitch(pitch)?;
+                self.submit(MusicOp::AddPitch { pitch }.into()).await
+            }
+            ClientCommand::RemovePitch { pitch } => {
+                self.validate_pitch(pitch)?;
+                self.submit(MusicOp::RemovePitch { pitch }.into()).await
             }
             ClientCommand::PutPiece { emoji, pitch } => {
                 self.validate_pitch(pitch)?;
@@ -333,7 +508,12 @@ impl BrowserHost {
 
         let (control, control_rx) = mpsc::channel(64);
         let worker_control = Rc::new(RefCell::new(control.clone()));
+        let session_gate = Rc::new(RefCell::new(RoomSessionProjectionGate::default()));
+        let session_reset_outstanding = Rc::new(Cell::new(false));
         let projection_host = self.clone();
+        let projection_gate = Rc::clone(&session_gate);
+        let projection_reset_outstanding = Rc::clone(&session_reset_outstanding);
+        let projection_reset_control = Rc::clone(&worker_control);
         let outbound_host = self.clone();
         let outbound = Rc::clone(&worker_control);
         let diagnostic_host = self.clone();
@@ -344,11 +524,38 @@ impl BrowserHost {
             room_authority
                 .as_ref()
                 .map(|authority| authority.to_bytes()),
-        );
+        )
+        .with_session_trace(session_tracing_enabled());
+        #[cfg(feature = "browser-acceptance-faults")]
+        let worker_open =
+            worker_open.with_session_renewal_test_cut(session_renewal_test_cut_enabled());
         let (worker, opened) = BrowserReplicaHandle::open(
             worker_open,
-            move |projection| {
-                projection_host.apply_room_view(projection.view);
+            move |projection| match projection_gate
+                .borrow_mut()
+                .canonical(projection.music_revision, projection.music_history_root)
+            {
+                Ok(true) => {
+                    projection_host.apply_room_view(projection.view);
+                }
+                Ok(false) => {
+                    projection_host.apply_non_music_room_view(projection.view);
+                }
+                Err(error) => {
+                    projection_host.emit_diagnostic("canonical_projection_continuity", &error);
+                    if !projection_reset_outstanding.replace(true)
+                        && projection_reset_control
+                            .borrow_mut()
+                            .try_send(RoomControl::ResetSessionProjection)
+                            .is_err()
+                    {
+                        projection_reset_outstanding.set(false);
+                        projection_host.emit_diagnostic(
+                            "session_projection_reset",
+                            "worker control queue is full",
+                        );
+                    }
+                }
             },
             move |record| {
                 if outbound
@@ -389,6 +596,7 @@ impl BrowserHost {
             _ => unreachable!("BrowserReplicaHandle validates its Open response"),
         }
 
+        let room_identity = config.room.clone();
         let topic = config.topic();
         let topic_string = topic.to_string();
         let bootstrap = config.bootstrap.as_ref().map(|address| address.id);
@@ -417,6 +625,7 @@ impl BrowserHost {
         };
 
         let alive = Rc::new(Cell::new(true));
+        let repairs = RepairCoordinator::default();
         let peers = Rc::new(RefCell::new(BTreeMap::<
             iroh::EndpointId,
             (DiscoverySource, PeerPath, ProtocolSupport),
@@ -430,7 +639,12 @@ impl BrowserHost {
                     bootstrap_support.unwrap_or(ProtocolSupport::WALKIE),
                 ),
             );
-            self.update_peer(peer, bootstrap_source, PeerPath::Connecting, false);
+            self.update_peer(
+                peer,
+                bootstrap_source,
+                PeerPath::Connecting,
+                bootstrap_support.unwrap_or(ProtocolSupport::WALKIE),
+            );
         }
         spawn_room_loop(
             self.clone(),
@@ -442,6 +656,18 @@ impl BrowserHost {
             rendezvous_guard,
             peers.clone(),
             alive.clone(),
+            room_identity,
+            repairs.clone(),
+            session_gate.clone(),
+            session_reset_outstanding.clone(),
+        );
+        spawn_session_loop(
+            self.clone(),
+            worker.clone(),
+            handle.clone(),
+            alive.clone(),
+            session_gate,
+            session_reset_outstanding,
         );
         spawn_periodic_repair(self.clone(), worker, handle, peers, alive.clone());
 
@@ -452,6 +678,7 @@ impl BrowserHost {
             state.snapshot.room_topic = Some(topic_string.clone());
             state.snapshot.room_ticket = Some(ticket_string.clone());
             state.snapshot.peers.clear();
+            state.peer_sync.clear();
             state.snapshot.voices.clear();
         }
         self.emit(AppEvent::RoomChanged {
@@ -471,11 +698,11 @@ impl BrowserHost {
             state.snapshot.room_name = None;
             state.snapshot.room_topic = None;
             state.snapshot.room_ticket = None;
-            state.snapshot.active_degrees.clear();
-            state.pitch_authors.clear();
+            state.snapshot.shared_pitches = Default::default();
             state.snapshot.pieces.clear();
             state.snapshot.voices.clear();
             state.snapshot.peers.clear();
+            state.peer_sync.clear();
         }
         self.emit(AppEvent::RoomChanged {
             room_name: None,
@@ -573,6 +800,14 @@ impl BrowserHost {
     }
 
     fn apply_room_view(&self, view: RoomView) -> u64 {
+        self.apply_room_view_inner(view, true)
+    }
+
+    fn apply_non_music_room_view(&self, view: RoomView) -> u64 {
+        self.apply_room_view_inner(view, false)
+    }
+
+    fn apply_room_view_inner(&self, view: RoomView, apply_shared_pitches: bool) -> u64 {
         let mut events = Vec::new();
         {
             let mut state = self.state.borrow_mut();
@@ -583,30 +818,18 @@ impl BrowserHost {
                     definition: view.music.tuning.clone(),
                 });
             }
-            let old_degrees = state.snapshot.active_degrees.clone();
-            let new_degrees: Vec<_> = view.music.live.iter().copied().collect();
-            for pitch in old_degrees {
-                if !view.music.live.contains(&pitch) {
-                    events.push(AppEvent::DegreeRemoved { pitch });
-                }
+            if state.snapshot.round_table != view.music.round_table {
+                state.snapshot.round_table = view.music.round_table;
+                events.push(AppEvent::RoundTableChanged {
+                    config: view.music.round_table,
+                });
             }
-            let holders: BTreeMap<_, Vec<_>> = view
-                .music
-                .holders
-                .iter()
-                .map(|(pitch, actors)| (*pitch, actors.iter().copied().collect()))
-                .collect();
-            for pitch in &new_degrees {
-                let authors = holders.get(pitch).cloned().unwrap_or_default();
-                if state.pitch_authors.get(pitch) != Some(&authors) {
-                    events.push(AppEvent::DegreeAdded {
-                        pitch: *pitch,
-                        authors,
-                    });
-                }
+            if apply_shared_pitches && state.snapshot.shared_pitches != view.music.shared_pitches {
+                state.snapshot.shared_pitches = view.music.shared_pitches.clone();
+                events.push(AppEvent::PitchSetChanged {
+                    shared: view.music.shared_pitches.clone(),
+                });
             }
-            state.snapshot.active_degrees = new_degrees;
-            state.pitch_authors = holders;
 
             let new_pieces: Vec<_> = view
                 .pieces
@@ -644,6 +867,22 @@ impl BrowserHost {
         }
         for event in events {
             self.emit(event);
+        }
+        self.sequence()
+    }
+
+    fn apply_session_pitch_view(&self, shared: tutti_music::SharedPitchSet) -> u64 {
+        let changed = {
+            let mut state = self.state.borrow_mut();
+            if state.snapshot.shared_pitches == shared {
+                false
+            } else {
+                state.snapshot.shared_pitches = shared.clone();
+                true
+            }
+        };
+        if changed {
+            self.emit(AppEvent::PitchSetChanged { shared });
         }
         self.sequence()
     }
@@ -687,10 +926,21 @@ impl BrowserHost {
         endpoint: iroh::EndpointId,
         discovery: DiscoverySource,
         path: PeerPath,
-        synchronized: bool,
+        support: ProtocolSupport,
     ) {
         let actor = ActorId(*endpoint.as_bytes());
-        let mut peer = PeerSnapshot {
+        let synchronized;
+        {
+            let mut state = self.state.borrow_mut();
+            let lane_sync = state.peer_sync.entry(actor).or_default();
+            lane_sync.required = support.bits();
+            if path == PeerPath::Disconnected {
+                lane_sync.complete = 0;
+            }
+            synchronized = lane_sync.required != 0
+                && lane_sync.complete & lane_sync.required == lane_sync.required;
+        }
+        let peer = PeerSnapshot {
             author: actor,
             endpoint_id: endpoint.to_string(),
             path,
@@ -706,9 +956,6 @@ impl BrowserHost {
                 .iter_mut()
                 .find(|existing| existing.author == actor)
             {
-                if path != PeerPath::Disconnected {
-                    peer.synchronized |= existing.synchronized;
-                }
                 *existing = peer.clone();
             } else {
                 state.snapshot.peers.push(peer.clone());
@@ -718,10 +965,19 @@ impl BrowserHost {
         self.emit(AppEvent::PeerUpdated { peer });
     }
 
-    fn mark_synchronized(&self, endpoint: iroh::EndpointId) {
+    fn mark_lane_synchronized(&self, endpoint: iroh::EndpointId, lane: RoomLane) {
         let actor = ActorId(*endpoint.as_bytes());
         let event = {
             let mut state = self.state.borrow_mut();
+            let synchronized = {
+                let lane_sync = state.peer_sync.entry(actor).or_insert(PeerSyncState {
+                    required: lane.tag(),
+                    complete: 0,
+                });
+                lane_sync.complete |= lane.tag();
+                lane_sync.required != 0
+                    && lane_sync.complete & lane_sync.required == lane_sync.required
+            };
             let Some(peer) = state
                 .snapshot
                 .peers
@@ -730,7 +986,7 @@ impl BrowserHost {
             else {
                 return;
             };
-            peer.synchronized = true;
+            peer.synchronized = synchronized;
             peer.clone()
         };
         self.emit(AppEvent::PeerUpdated { peer: event });
@@ -748,12 +1004,17 @@ fn spawn_room_loop(
     rendezvous_guard: Option<crate::net::RendezvousHandle>,
     peers: Rc<RefCell<BTreeMap<iroh::EndpointId, (DiscoverySource, PeerPath, ProtocolSupport)>>>,
     alive: Rc<Cell<bool>>,
+    room_identity: crate::room::v5::RoomIdentity,
+    repairs: RepairCoordinator,
+    _session_gate: Rc<RefCell<RoomSessionProjectionGate>>,
+    session_reset_outstanding: Rc<Cell<bool>>,
 ) {
     let local_actor = host.identity.capability_actor_id();
     spawn_local(async move {
         let _rendezvous_guard = rendezvous_guard;
         let mut presence_session = 0_u64;
         let mut presence_sequence = 0_u64;
+        let mut realtime_replay = BTreeMap::<(crate::net::PeerId, u64), u64>::new();
         let mut shutdown_response = None;
         while alive.get() {
             let control_next = control.next();
@@ -774,14 +1035,22 @@ fn spawn_room_loop(
                 futures::future::Either::Left((futures::future::Either::Left((control, _)), _)) => {
                     match control {
                         Some(RoomControl::Commit { command, response }) => {
-                            let result = worker
-                                .commit(command)
-                                .await
-                                .map(|receipt| {
+                            let result = match command {
+                                RoomCommand::Music(command) if is_session_pitch_edit(&command) => {
+                                    worker
+                                        .send_session(RoomSessionIngress::LocalPitchEdit {
+                                            command,
+                                            trace_token: None,
+                                        })
+                                        .await
+                                        .map(|()| host.sequence())
+                                }
+                                command => worker.commit(command).await.map(|receipt| {
                                     let _ = (receipt.entry, receipt.projection_revision);
                                     host.sequence()
-                                })
-                                .map_err(persistence_error);
+                                }),
+                            }
+                            .map_err(persistence_error);
                             let _ = response.send(
                                 result.map(|accepted_sequence| CommandAck { accepted_sequence }),
                             );
@@ -824,12 +1093,22 @@ fn spawn_room_loop(
                             }
                         }
                         Some(RoomControl::OutboundRecord(bytes)) => {
-                            let repair =
-                                ReplicaLiveRecord::decode(&bytes).map(|live| ReplicaRepairHint {
-                                    lane: live.lane,
-                                    source: live.source,
-                                    entry: live.record.entry_hash(),
-                                });
+                            let live = ReplicaLiveRecord::decode(&bytes);
+                            let repair = live.as_ref().map(|live| ReplicaRepairHint {
+                                lane: live.lane,
+                                source: live.source,
+                                entry: live.record.entry_hash(),
+                            });
+                            if let Some(live) = live.as_ref() {
+                                web_sys::console::debug_1(
+                                    &format!(
+                                        "[replica_live] outbound lane={:?} entry={:?}",
+                                        live.lane,
+                                        live.record.entry_hash()
+                                    )
+                                    .into(),
+                                );
+                            }
                             if let Err(error) = handle.broadcast(bytes).await {
                                 host.emit_diagnostic(
                                     "live_record_broadcast",
@@ -844,6 +1123,24 @@ fn spawn_room_loop(
                                             "durable record broadcast failed; repair hint also failed: {error}"
                                         ),
                                     );
+                                }
+                            }
+                        }
+                        Some(RoomControl::ResetSessionProjection) => {
+                            match worker.reset_session_projection().await {
+                                Ok(true) => {
+                                    // Keep coalescing until the Reset event is accepted.
+                                }
+                                Ok(false) => {
+                                    session_reset_outstanding.set(false);
+                                    host.emit_diagnostic(
+                                        "session_projection_reset",
+                                        "no active presentation session was available to reset",
+                                    );
+                                }
+                                Err(error) => {
+                                    session_reset_outstanding.set(false);
+                                    host.emit_diagnostic("session_projection_reset", &error);
                                 }
                             }
                         }
@@ -876,6 +1173,7 @@ fn spawn_room_loop(
                                 repair.endpoint_id,
                                 lane,
                                 repair.stream.owning(repair.connection),
+                                repairs.clone(),
                             );
                         }
                         BrowserRoomInbound::Event(event) => match event {
@@ -894,7 +1192,7 @@ fn spawn_room_loop(
                                 peers
                                     .borrow_mut()
                                     .insert(endpoint_id, (discovery, path, support));
-                                host.update_peer(endpoint_id, discovery, path, false);
+                                host.update_peer(endpoint_id, discovery, path, support);
                                 if let Err(error) =
                                     worker.grant_peer(ActorId(*endpoint_id.as_bytes())).await
                                 {
@@ -910,13 +1208,14 @@ fn spawn_room_loop(
                                                 alive.clone(),
                                                 endpoint_id,
                                                 lane,
+                                                repairs.clone(),
                                             );
                                         }
                                     }
                                 }
                             }
                             NativeNetworkEvent::NeighborDown { endpoint_id } => {
-                                if let Some((source, path, _)) =
+                                if let Some((source, path, support)) =
                                     peers.borrow_mut().get_mut(&endpoint_id)
                                 {
                                     *path = PeerPath::Disconnected;
@@ -924,12 +1223,79 @@ fn spawn_room_loop(
                                         endpoint_id,
                                         *source,
                                         PeerPath::Disconnected,
-                                        false,
+                                        *support,
                                     );
                                 }
                             }
                             NativeNetworkEvent::Message { bytes, .. } => {
-                                if let Some(live) = ReplicaLiveRecord::decode(&bytes) {
+                                if is_session_carrier(&bytes) {
+                                    if let Err(error) = worker
+                                        .send_session(RoomSessionIngress::Carrier {
+                                            bytes,
+                                            received_at_micros: session_tracing_enabled()
+                                                .then(browser_time_micros)
+                                                .flatten(),
+                                        })
+                                        .await
+                                    {
+                                        host.emit_diagnostic("session_carrier_ingress", &error);
+                                    }
+                                } else if let Ok(realtime) =
+                                    RoomRealtime::decode(&room_identity, &bytes)
+                                {
+                                    let local =
+                                        crate::net::PeerId(*handle.endpoint_id().as_bytes());
+                                    let replay_key = (realtime.source, realtime.session);
+                                    let fresh = realtime.source != local
+                                        && realtime_replay
+                                            .get(&replay_key)
+                                            .map_or(true, |last| realtime.sequence > *last);
+                                    if fresh {
+                                        const MAX_REALTIME_SESSIONS: usize = 128;
+                                        if realtime_replay.len() == MAX_REALTIME_SESSIONS
+                                            && !realtime_replay.contains_key(&replay_key)
+                                            && let Some(oldest) =
+                                                realtime_replay.keys().next().copied()
+                                        {
+                                            realtime_replay.remove(&oldest);
+                                        }
+                                        realtime_replay.insert(replay_key, realtime.sequence);
+                                        if let tutti_realtime::Frame::Midi(frame) = realtime.frame {
+                                            let kind = match frame.kind {
+                                                tutti_realtime::MidiKind::NoteOn => {
+                                                    RealtimeMidiKind::NoteOn
+                                                }
+                                                tutti_realtime::MidiKind::NoteOff => {
+                                                    RealtimeMidiKind::NoteOff
+                                                }
+                                                tutti_realtime::MidiKind::Choke => {
+                                                    RealtimeMidiKind::Choke
+                                                }
+                                                tutti_realtime::MidiKind::PolyPressure => {
+                                                    RealtimeMidiKind::PolyPressure
+                                                }
+                                                tutti_realtime::MidiKind::PitchBend => {
+                                                    RealtimeMidiKind::PitchBend
+                                                }
+                                                tutti_realtime::MidiKind::ChannelPressure => {
+                                                    RealtimeMidiKind::ChannelPressure
+                                                }
+                                            };
+                                            host.emit(AppEvent::RealtimeMidi {
+                                                midi: RealtimeMidiSnapshot {
+                                                    source: ActorId(*realtime.source.as_bytes()),
+                                                    session: realtime.session,
+                                                    sequence: realtime.sequence,
+                                                    voice_id: frame.voice_id,
+                                                    channel: frame.channel,
+                                                    note: frame.note,
+                                                    kind,
+                                                    value: frame.value,
+                                                },
+                                            });
+                                        }
+                                    }
+                                } else if let Some(live) = ReplicaLiveRecord::decode(&bytes) {
                                     let local =
                                         crate::net::PeerId(*handle.endpoint_id().as_bytes());
                                     if live.source != local {
@@ -947,6 +1313,12 @@ fn spawn_room_loop(
                                                     false
                                                 }
                                             };
+                                        web_sys::console::debug_1(
+                                            &format!(
+                                                "[replica_live] inbound lane={lane:?} entry={entry:?} accepted={accepted}"
+                                            )
+                                            .into(),
+                                        );
                                         if !accepted {
                                             request_repair_after_live_failure(
                                                 host.clone(),
@@ -956,6 +1328,7 @@ fn spawn_room_loop(
                                                 source,
                                                 lane,
                                                 entry,
+                                                repairs.clone(),
                                             );
                                         }
                                     }
@@ -974,6 +1347,7 @@ fn spawn_room_loop(
                                         alive.clone(),
                                         source,
                                         hint.lane,
+                                        repairs.clone(),
                                     );
                                 } else if let Some(probe) = ReplicaRepairProbe::decode(&bytes) {
                                     let local =
@@ -996,6 +1370,7 @@ fn spawn_room_loop(
                                             alive.clone(),
                                             source,
                                             probe.lane,
+                                            repairs.clone(),
                                         );
                                     }
                                 } else if let Ok(presence) = worker.verify_presence(bytes).await {
@@ -1025,6 +1400,7 @@ fn spawn_room_loop(
                                                 alive.clone(),
                                                 *peer,
                                                 lane,
+                                                repairs.clone(),
                                             );
                                         }
                                     }
@@ -1050,7 +1426,7 @@ fn spawn_room_loop(
                             peer,
                             DiscoverySource::AddressLookup,
                             PeerPath::Connecting,
-                            false,
+                            support,
                         );
                     }
                     None => rendezvous = None,
@@ -1065,6 +1441,153 @@ fn spawn_room_loop(
         }
         if let Some(response) = shutdown_response {
             let _ = response.send(());
+        }
+    });
+}
+
+fn is_session_pitch_edit(command: &MusicOp) -> bool {
+    matches!(
+        command,
+        MusicOp::AddDegree { .. }
+            | MusicOp::RemoveDegree { .. }
+            | MusicOp::AddPitch { .. }
+            | MusicOp::RemovePitch { .. }
+    )
+}
+
+fn spawn_session_loop(
+    host: Rc<BrowserHost>,
+    worker: BrowserReplicaHandle,
+    handle: BrowserNetHandle,
+    alive: Rc<Cell<bool>>,
+    gate: Rc<RefCell<RoomSessionProjectionGate>>,
+    reset_outstanding: Rc<Cell<bool>>,
+) {
+    let draining = Rc::new(Cell::new(false));
+    spawn_local(async move {
+        while alive.get() {
+            let Some(event) = worker.next_session_event().await else {
+                break;
+            };
+            match event {
+                RoomSessionEgress::Carrier(carrier) => {
+                    let host = host.clone();
+                    let handle = handle.clone();
+                    spawn_local(async move {
+                        if let Err(error) = handle.broadcast(carrier).await {
+                            host.emit_diagnostic(
+                                "session_carrier_broadcast",
+                                &format!("session establishment broadcast failed: {error}"),
+                            );
+                        }
+                    });
+                }
+                RoomSessionEgress::Realtime(RoomSessionRealtimeEgress {
+                    projection,
+                    carrier,
+                    durable,
+                    trace,
+                }) => {
+                    match gate.borrow_mut().accept(&projection) {
+                        Ok(true) => {
+                            if let Some(trace) = trace.as_ref() {
+                                log_session_trace("projection_gate_accepted", trace);
+                            }
+                            if projection.kind == RoomSessionProjectionKind::Reset {
+                                reset_outstanding.set(false);
+                            }
+                            host.apply_session_pitch_view(projection.view);
+                            if let Some(trace) = trace.as_ref() {
+                                log_session_trace("signal_applied", trace);
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            host.emit_diagnostic("session_projection_continuity", &error);
+                            if !reset_outstanding.replace(true) {
+                                let host = host.clone();
+                                let worker = worker.clone();
+                                let reset_outstanding = reset_outstanding.clone();
+                                spawn_local(async move {
+                                    match worker.reset_session_projection().await {
+                                        Ok(true) => {
+                                            // Keep coalescing requests until the accepted Reset
+                                            // snapshot itself crosses the sideband.
+                                        }
+                                        Ok(false) => {
+                                            reset_outstanding.set(false);
+                                            host.emit_diagnostic(
+                                                "session_projection_reset",
+                                                "no active presentation session was available to reset",
+                                            );
+                                        }
+                                        Err(error) => {
+                                            reset_outstanding.set(false);
+                                            host.emit_diagnostic(
+                                                "session_projection_reset",
+                                                &error,
+                                            );
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
+
+                    if let Some(carrier) = carrier {
+                        let host = host.clone();
+                        let handle = handle.clone();
+                        let trace = trace.clone();
+                        spawn_local(async move {
+                            if let Some(trace) = trace.as_ref() {
+                                log_session_trace("carrier_broadcast_call_started", trace);
+                            }
+                            if let Err(error) = handle.broadcast(carrier).await {
+                                host.emit_diagnostic(
+                                    "session_carrier_broadcast",
+                                    &format!("session event broadcast failed: {error}"),
+                                );
+                            } else if let Some(trace) = trace.as_ref() {
+                                log_session_trace("carrier_broadcast_call_completed", trace);
+                            }
+                        });
+                    }
+
+                    if !durable.is_empty() && !draining.replace(true) {
+                        let host = host.clone();
+                        let worker = worker.clone();
+                        let draining = draining.clone();
+                        spawn_local(async move {
+                            loop {
+                                match worker.drain_session().await {
+                                    Ok(true) => {}
+                                    Ok(false) => break,
+                                    Err(error) => {
+                                        host.emit_diagnostic("session_reification", &error);
+                                        break;
+                                    }
+                                }
+                            }
+                            draining.set(false);
+                        });
+                    }
+                }
+                RoomSessionEgress::FallbackDurable(command) => {
+                    let host = host.clone();
+                    let worker = worker.clone();
+                    spawn_local(async move {
+                        if let Err(error) = worker.commit(RoomCommand::Music(command)).await {
+                            host.emit_diagnostic("session_durable_fallback", &error);
+                        }
+                    });
+                }
+                RoomSessionEgress::Diagnostic(message) => {
+                    host.emit_diagnostic("hhhs_session", &message);
+                }
+                RoomSessionEgress::RenewalTrace(trace) => {
+                    log_session_renewal_trace(&trace);
+                }
+            }
         }
     });
 }
@@ -1136,31 +1659,94 @@ fn spawn_repair_initiator(
     alive: Rc<Cell<bool>>,
     peer: iroh::EndpointId,
     lane: RoomLane,
+    repairs: RepairCoordinator,
 ) {
+    if !repairs.schedule(peer, lane) {
+        return;
+    }
     spawn_local(async move {
-        if !alive.get() {
-            return;
-        }
-        let connection = match handle.begin_replica(peer, lane).await {
-            Ok(connection) => connection,
-            Err(error) => {
-                host.emit_diagnostic("replica_repair_dial", &error.to_string());
-                return;
+        const DIVERGENT_BACKOFF_MS: [u64; 3] = [100, 300, 900];
+        loop {
+            let mut retry = 0;
+            let mut completed = false;
+            while alive.get() {
+                let (session, result) =
+                    run_initiator_repair_attempt(&worker, &handle, &alive, peer, lane).await;
+                let retry_fresh = matches!(
+                    &result,
+                    Ok((
+                        RoomWorkerRepairStatus::Divergent | RoomWorkerRepairStatus::RetryFresh(_),
+                        _
+                    ))
+                );
+                completed = matches!(&result, Ok((RoomWorkerRepairStatus::Complete, _)));
+                if completed
+                    && lane == RoomLane::Music
+                    && let Err(error) = worker.start_session_peer(ActorId(*peer.as_bytes())).await
+                {
+                    host.emit_diagnostic("session_establishment", &error);
+                }
+                report_repair(
+                    host.clone(),
+                    &alive,
+                    peer,
+                    lane,
+                    "initiator",
+                    session,
+                    result,
+                );
+                if !retry_fresh || retry == DIVERGENT_BACKOFF_MS.len() {
+                    break;
+                }
+                let delay_ms = DIVERGENT_BACKOFF_MS[retry];
+                host.emit_diagnostic(
+                    "replica_repair_retry",
+                    &format!(
+                        "{lane:?} repair with {peer} attempt={session} requires a fresh cut; scheduling another attempt after {delay_ms}ms"
+                    ),
+                );
+                n0_future::time::sleep(Duration::from_millis(delay_ms)).await;
+                retry += 1;
             }
-        };
-        if !alive.get() {
-            connection.close(0u32.into(), b"room closed");
-            return;
-        }
-        let stream = match IrohSyncStream::open(&connection).await {
-            Ok(stream) => stream.owning(connection),
-            Err(error) => {
-                host.emit_diagnostic("replica_repair_stream", &error.to_string());
-                return;
+
+            if !alive.get() || !completed {
+                repairs.finish(peer, lane);
+                break;
             }
-        };
-        run_repair(host, worker, &alive, peer, lane, stream, true).await;
+            if !repairs.continue_pending(peer, lane) {
+                break;
+            }
+        }
     });
+}
+
+async fn run_initiator_repair_attempt(
+    worker: &BrowserReplicaHandle,
+    handle: &BrowserNetHandle,
+    alive: &Cell<bool>,
+    peer: iroh::EndpointId,
+    lane: RoomLane,
+) -> (
+    u64,
+    Result<(RoomWorkerRepairStatus, RoomWorkerRepairOutcome), String>,
+) {
+    let connection = match handle.begin_replica(peer, lane).await {
+        Ok(connection) => connection,
+        Err(error) => {
+            return (0, Err(format!("dial: {error}")));
+        }
+    };
+    if !alive.get() {
+        connection.close(0u32.into(), b"room closed");
+        return (0, Err("cancelled because the room closed".into()));
+    }
+    let stream = match IrohSyncStream::open(&connection).await {
+        Ok(stream) => stream.owning(connection),
+        Err(error) => {
+            return (0, Err(format!("stream: {error}")));
+        }
+    };
+    drive_worker_repair(stream, worker, lane, true).await
 }
 
 fn spawn_repair_responder(
@@ -1170,12 +1756,35 @@ fn spawn_repair_responder(
     peer: iroh::EndpointId,
     lane: RoomLane,
     stream: IrohSyncStream,
+    repairs: RepairCoordinator,
 ) {
+    if !repairs.begin_responder(peer, lane) {
+        let close_host = host.clone();
+        spawn_local(async move {
+            if let Err(error) = stream.close().await {
+                close_host.emit_diagnostic(
+                    "replica_repair_duplicate_close",
+                    &format!(
+                        "{lane:?} duplicate responder stream with {peer} failed to close: {error}"
+                    ),
+                );
+            }
+        });
+        return;
+    }
     spawn_local(async move {
         if !alive.get() {
+            repairs.finish_responder(peer, lane);
+            if let Err(error) = stream.close().await {
+                host.emit_diagnostic(
+                    "replica_repair_cancel_close",
+                    &format!("{lane:?} responder stream with {peer} failed to close: {error}"),
+                );
+            }
             return;
         }
         run_repair(host, worker, &alive, peer, lane, stream, false).await;
+        repairs.finish_responder(peer, lane);
     });
 }
 
@@ -1187,13 +1796,14 @@ fn request_repair_after_live_failure(
     source: crate::net::PeerId,
     lane: RoomLane,
     entry: hhhs::EntryHash,
+    repairs: RepairCoordinator,
 ) {
     let local = crate::net::PeerId(*handle.endpoint_id().as_bytes());
     let Ok(source_endpoint) = iroh::EndpointId::from_bytes(source.as_bytes()) else {
         return;
     };
     if is_routine_repair_initiator(local, source) {
-        spawn_repair_initiator(host, worker, handle, alive, source_endpoint, lane);
+        spawn_repair_initiator(host, worker, handle, alive, source_endpoint, lane, repairs);
         return;
     }
     spawn_local(async move {
@@ -1228,23 +1838,57 @@ async fn run_repair(
     stream: IrohSyncStream,
     initiator: bool,
 ) {
-    let result = drive_worker_repair(stream, &worker, lane, initiator).await;
+    let (session, result) = drive_worker_repair(stream, &worker, lane, initiator).await;
+    if lane == RoomLane::Music
+        && matches!(&result, Ok((RoomWorkerRepairStatus::Complete, _)))
+        && let Err(error) = worker.start_session_peer(ActorId(*peer.as_bytes())).await
+    {
+        host.emit_diagnostic("session_establishment", &error);
+    }
+    report_repair(
+        host,
+        alive,
+        peer,
+        lane,
+        if initiator { "initiator" } else { "responder" },
+        session,
+        result,
+    );
+}
+
+fn report_repair(
+    host: Rc<BrowserHost>,
+    alive: &Cell<bool>,
+    peer: iroh::EndpointId,
+    lane: RoomLane,
+    role: &'static str,
+    session: u64,
+    result: Result<(RoomWorkerRepairStatus, RoomWorkerRepairOutcome), String>,
+) {
     if !alive.get() {
         return;
     }
     match result {
-        Ok((RoomWorkerRepairStatus::Complete, _outcome)) => {
-            host.mark_synchronized(peer);
+        Ok((RoomWorkerRepairStatus::Complete, outcome)) => {
+            web_sys::console::info_1(
+                &format!(
+                    "[replica_repair_complete] lane={lane:?} peer={peer} attempt={session} role={role} outcome={outcome:?}"
+                )
+                .into(),
+            );
+            host.mark_lane_synchronized(peer, lane);
         }
         Ok((status, outcome)) => {
             host.emit_diagnostic(
                 "replica_repair_incomplete",
-                &format!("{lane:?} repair with {peer} ended {status:?}: {outcome:?}"),
+                &format!(
+                    "{lane:?} repair with {peer} attempt={session} role={role} ended {status:?}: {outcome:?}"
+                ),
             );
         }
         Err(error) => host.emit_diagnostic(
             "replica_repair",
-            &format!("{lane:?} repair with {peer} failed: {error}"),
+            &format!("{lane:?} repair with {peer} attempt={session} role={role} failed: {error}"),
         ),
     }
 }
@@ -1254,16 +1898,31 @@ async fn drive_worker_repair(
     worker: &BrowserReplicaHandle,
     lane: RoomLane,
     initiator: bool,
-) -> Result<(RoomWorkerRepairStatus, RoomWorkerRepairOutcome), String> {
+) -> (
+    u64,
+    Result<(RoomWorkerRepairStatus, RoomWorkerRepairOutcome), String>,
+) {
+    let _permit = worker.repair_permit().await;
     let session = worker.next_repair_session();
     let result = drive_worker_repair_inner(&mut stream, worker, session, lane, initiator).await;
-    if result.is_err() {
-        let _ = worker
-            .repair(RoomWorkerRepairRequest::Close { session })
-            .await;
-    }
-    stream.close().await;
-    result
+    let close = stream.close().await.map_err(|error| error.to_string());
+    let close_error = close.as_ref().err().cloned();
+    let finish = worker
+        .repair(RoomWorkerRepairRequest::Finish {
+            session,
+            close_error,
+        })
+        .await;
+    let result = match (result, close, finish) {
+        (Ok(()), Ok(()), Ok(step)) => Ok((step.status, step.outcome)),
+        (Err(repair), Err(close), _) => Err(format!(
+            "repair failed ({repair}) and its stream also failed to close ({close})"
+        )),
+        (Err(repair), _, _) => Err(repair),
+        (_, Err(close), _) => Err(format!("repair stream failed to close: {close}")),
+        (_, _, Err(finish)) => Err(format!("repair close confirmation failed: {finish}")),
+    };
+    (session, result)
 }
 
 async fn drive_worker_repair_inner(
@@ -1272,35 +1931,44 @@ async fn drive_worker_repair_inner(
     session: u64,
     lane: RoomLane,
     initiator: bool,
-) -> Result<(RoomWorkerRepairStatus, RoomWorkerRepairOutcome), String> {
-    let mut step = if initiator {
+) -> Result<(), String> {
+    let step = if initiator {
         worker
-            .repair(RoomWorkerRepairRequest::StartInitiator { session, lane })
+            .repair_with_stream(
+                RoomWorkerRepairRequest::StartInitiator { session, lane },
+                stream,
+            )
             .await?
     } else {
         let hello = receive_repair_frame(stream).await?;
         worker
-            .repair(RoomWorkerRepairRequest::StartResponder {
-                session,
-                lane,
-                hello,
-            })
+            .repair_with_stream(
+                RoomWorkerRepairRequest::StartResponder {
+                    session,
+                    lane,
+                    hello,
+                },
+                stream,
+            )
             .await?
     };
 
+    pump_worker_repair(stream, worker, session, step).await
+}
+
+async fn pump_worker_repair(
+    stream: &mut IrohSyncStream,
+    worker: &BrowserReplicaHandle,
+    session: u64,
+    mut step: crate::room::worker::RoomWorkerRepairStep,
+) -> Result<(), String> {
     loop {
-        for frame in &step.frames {
-            stream
-                .send_frame(frame)
-                .await
-                .map_err(|error| error.to_string())?;
-        }
         if step.status != RoomWorkerRepairStatus::Exchanging {
-            return Ok((step.status, step.outcome));
+            return Ok(());
         }
         let frame = receive_repair_frame(stream).await?;
         step = worker
-            .repair(RoomWorkerRepairRequest::Frame { session, frame })
+            .repair_with_stream(RoomWorkerRepairRequest::Frame { session, frame }, stream)
             .await?;
     }
 }

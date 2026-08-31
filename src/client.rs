@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::room::v5::{ActorId, PieceId};
 use crate::tuning::{TunedDegree, TunedPeriodicPitch, TuningDefinition, TuningId};
+use tutti_music::{SharedPitchSet, roundtable::RoundTableConfig};
 
-pub const CLIENT_PROTOCOL_VERSION: u16 = 2;
+pub const CLIENT_PROTOCOL_VERSION: u16 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
@@ -52,10 +53,23 @@ pub enum ClientCommand {
     RemoveDegree {
         pitch: TunedDegree,
     },
+    SetRoundTable {
+        config: RoundTableConfig,
+    },
+    AddPitch {
+        pitch: TunedPeriodicPitch,
+    },
+    RemovePitch {
+        pitch: TunedPeriodicPitch,
+    },
+    /// Add an emoji piece. Its pitch class contributes to the room's derived
+    /// sounding set while remaining distinct from manual pitch membership.
     PutPiece {
         emoji: String,
         pitch: TunedPeriodicPitch,
     },
+    /// Move an emoji piece. The sounding contribution follows the piece's
+    /// causal identity; no mirrored manual-pitch operation is authored.
     MovePiece {
         piece: PieceId,
         pitch: TunedPeriodicPitch,
@@ -135,15 +149,45 @@ pub struct MidiPortSnapshot {
     pub selected: bool,
 }
 
+/// A signed, transient MIDI event received from a room peer.
+///
+/// This deliberately is not part of [`AppSnapshot`]: held notes are session
+/// state, not durable HHHS musical history. The source/session/sequence tuple
+/// lets every UI adapter apply the same replay and stuck-note boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealtimeMidiSnapshot {
+    pub source: ActorId,
+    pub session: u64,
+    pub sequence: u64,
+    pub voice_id: i32,
+    pub channel: u8,
+    pub note: u8,
+    pub kind: RealtimeMidiKind,
+    pub value: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RealtimeMidiKind {
+    NoteOn,
+    NoteOff,
+    Choke,
+    PolyPressure,
+    PitchBend,
+    ChannelPressure,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppSnapshot {
     pub capabilities: Capabilities,
+    pub local_actor: Option<ActorId>,
     pub room_name: Option<String>,
     pub room_topic: Option<String>,
     pub room_ticket: Option<String>,
     pub tuning: Option<TuningDefinition>,
     pub tuning_id: Option<TuningId>,
-    pub active_degrees: Vec<TunedDegree>,
+    pub round_table: RoundTableConfig,
+    pub shared_pitches: SharedPitchSet,
     pub pieces: Vec<PieceSnapshot>,
     pub pieces_locked: bool,
     pub available_emojis: Option<String>,
@@ -157,12 +201,14 @@ impl AppSnapshot {
     pub fn empty(capabilities: Capabilities) -> Self {
         Self {
             capabilities,
+            local_actor: None,
             room_name: None,
             room_topic: None,
             room_ticket: None,
             tuning: None,
             tuning_id: None,
-            active_degrees: Vec::new(),
+            round_table: RoundTableConfig::default(),
+            shared_pitches: SharedPitchSet::default(),
             pieces: Vec::new(),
             pieces_locked: false,
             available_emojis: None,
@@ -188,12 +234,11 @@ pub enum AppEvent {
     TuningChanged {
         definition: TuningDefinition,
     },
-    DegreeAdded {
-        pitch: TunedDegree,
-        authors: Vec<ActorId>,
+    RoundTableChanged {
+        config: RoundTableConfig,
     },
-    DegreeRemoved {
-        pitch: TunedDegree,
+    PitchSetChanged {
+        shared: SharedPitchSet,
     },
     PieceUpserted {
         piece: PieceSnapshot,
@@ -221,6 +266,9 @@ pub enum AppEvent {
     MidiPortsChanged {
         inputs: Vec<MidiPortSnapshot>,
         outputs: Vec<MidiPortSnapshot>,
+    },
+    RealtimeMidi {
+        midi: RealtimeMidiSnapshot,
     },
     Diagnostic {
         code: String,
@@ -311,6 +359,42 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<AppEventEnvelope>(&bytes).unwrap(),
             envelope
+        );
+    }
+
+    #[test]
+    fn transient_midi_event_round_trips_without_entering_snapshot() {
+        let envelope = AppEventEnvelope {
+            sequence: 8,
+            event: AppEvent::RealtimeMidi {
+                midi: RealtimeMidiSnapshot {
+                    source: ActorId([7; 32]),
+                    session: 11,
+                    sequence: 12,
+                    voice_id: -1,
+                    channel: 2,
+                    note: 60,
+                    kind: RealtimeMidiKind::NoteOn,
+                    value: 48_000,
+                },
+            },
+        };
+        let bytes = serde_json::to_vec(&envelope).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<AppEventEnvelope>(&bytes).unwrap(),
+            envelope
+        );
+    }
+
+    #[test]
+    fn round_table_command_round_trips() {
+        let command = ClientCommand::SetRoundTable {
+            config: RoundTableConfig::default(),
+        };
+        let bytes = serde_json::to_vec(&command).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ClientCommand>(&bytes).unwrap(),
+            command
         );
     }
 }

@@ -1,7 +1,7 @@
 //! Main web application entry point.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -16,11 +16,12 @@ use futures_signals::signal::from_stream;
 
 use crate::client::{
     AppEvent, AppEventEnvelope, AppSnapshot, ClientCommand, DiscoverySource, MidiPortSnapshot,
-    PeerPath,
+    PeerPath, RealtimeMidiKind, RealtimeMidiSnapshot,
 };
 use crate::pitch::{PitchDetectorConfig, PitchEvent, SwiftF0Detector};
-use crate::room::{Piece, RoomEvent, RoomProjection};
+use crate::room::{Piece, RoomEvent, RoomProjection, snapshot_active_pitches};
 use crate::tuning::{PitchClass, TunedDegree, TunedPeriodicPitch, Tuning, TuningDefinition};
+use tutti_music::roundtable::RoundTableConfig;
 
 use crate::words::generate_room_name;
 
@@ -64,6 +65,17 @@ pub struct AppState {
     /// UI-only intent overlay while a durable degree command is in flight.
     /// Authoritative snapshots always win once their matching event arrives.
     pending_degrees: Rc<RefCell<HashMap<TunedDegree, bool>>>,
+    pending_round_table: Rc<RefCell<Option<RoundTableConfig>>>,
+    /// Optimistic absolute-pitch edits awaiting canonical HHHS confirmation.
+    pending_pitches: Rc<RefCell<HashMap<TunedPeriodicPitch, bool>>>,
+    /// Default connected-keyboard mode: pitch-class taps edit the durable
+    /// round-table pattern instead of the legacy held-degree set.
+    pub arpeggiator_edit_mode: Mutable<bool>,
+    arp_midi_held: Rc<RefCell<HashSet<u8>>>,
+    /// Per-peer held notes from the signed realtime room lane. These are
+    /// projected over durable degrees but never written into HHHS history.
+    remote_realtime_notes: Rc<RefCell<HashMap<(crate::room::v5::ActorId, u8, u8), u64>>>,
+    remote_realtime_sessions: Rc<RefCell<HashMap<crate::room::v5::ActorId, u64>>>,
     /// Native MIDI ports rendered by the existing settings component.
     pub native_midi_inputs: Mutable<Vec<MidiPortSnapshot>>,
     pub native_midi_outputs: Mutable<Vec<MidiPortSnapshot>>,
@@ -95,6 +107,9 @@ pub struct AppState {
     pub committed_pitch: Mutable<Option<PitchClass>>,
     /// Voice-committed pitch (single slot, separate from manual pitches).
     pub voice_pitch: Mutable<Option<PitchClass>>,
+    /// Exact quantized pitch awaiting commit when the voice gesture ends.
+    /// Continuous Hz, confidence, vibrato, and bend never enter this value.
+    pub committed_voice_note: Mutable<Option<TunedPeriodicPitch>>,
     /// Rolling confidence accumulator per pitch class during voice input.
     pub pitch_votes: Rc<RefCell<HashMap<u16, f64>>>,
     /// Currently "locked" pitch (last high-confidence detection).
@@ -171,6 +186,12 @@ impl AppState {
             native_snapshot: Mutable::new(None),
             native_sequence: Mutable::new(0),
             pending_degrees: Rc::new(RefCell::new(HashMap::new())),
+            pending_round_table: Rc::new(RefCell::new(None)),
+            pending_pitches: Rc::new(RefCell::new(HashMap::new())),
+            arpeggiator_edit_mode: Mutable::new(true),
+            arp_midi_held: Rc::new(RefCell::new(HashSet::new())),
+            remote_realtime_notes: Rc::new(RefCell::new(HashMap::new())),
+            remote_realtime_sessions: Rc::new(RefCell::new(HashMap::new())),
             native_midi_inputs: Mutable::new(Vec::new()),
             native_midi_outputs: Mutable::new(Vec::new()),
             native_status: Mutable::new(
@@ -190,6 +211,7 @@ impl AppState {
             current_pitch: Mutable::new(None),
             committed_pitch: Mutable::new(None),
             voice_pitch: Mutable::new(None),
+            committed_voice_note: Mutable::new(None),
             pitch_votes: Rc::new(RefCell::new(HashMap::new())),
             locked_pitch: Rc::new(RefCell::new(None)),
             locked_at: Rc::new(RefCell::new(None)),
@@ -332,15 +354,34 @@ impl AppState {
         let Some(pitch) = self.current_native_pitch(pitch_class) else {
             return;
         };
+        let absolute_members = if active {
+            Vec::new()
+        } else {
+            self.native_snapshot
+                .lock_ref()
+                .as_ref()
+                .map(|snapshot| {
+                    snapshot
+                        .shared_pitches
+                        .pitches
+                        .iter()
+                        .copied()
+                        .filter(|candidate| {
+                            candidate.tuning_id == pitch.tuning_id
+                                && candidate.pitch.degree() == pitch.degree
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         self.pending_degrees.borrow_mut().insert(pitch, active);
-        {
-            let mut room = self.room_mut();
-            if active {
-                room.add_pitch(pitch_class);
-            } else {
-                room.remove_pitch(pitch_class);
-            }
-        }
+        // Pending intent is used only to make repeated taps idempotent while
+        // admission is in flight. The room adapter is a projection of the
+        // canonical worker snapshot, so writing the intent into it here would
+        // create a second visible authority: the optimistic overlay can be
+        // removed by an intervening snapshot and then added again when the
+        // durable entry materializes.
+        self.project_native_snapshot();
         let command = if active {
             ClientCommand::AddDegree { pitch }
         } else {
@@ -357,9 +398,17 @@ impl AppState {
         #[cfg(feature = "browser-net")]
         if self.browser_host {
             super::replica_host::dispatch(command, on_error);
-            return;
+        } else {
+            super::native_bridge::dispatch(command, on_error);
         }
+        #[cfg(not(feature = "browser-net"))]
         super::native_bridge::dispatch(command, on_error);
+
+        // A pitch-class removal means that performed class is absent, even if
+        // some adapter represented it as one or more absolute pitches.
+        for absolute in absolute_members {
+            self.set_native_periodic_pitch(absolute, false);
+        }
     }
 
     /// Presence of a pitch class in the projected (authoritative) snapshot —
@@ -373,10 +422,64 @@ impl AppState {
         if let Some(active) = self.pending_degrees.borrow().get(&pitch) {
             return *active;
         }
-        self.native_snapshot
-            .lock_ref()
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.active_degrees.contains(&pitch))
+        self.pending_pitches
+            .borrow()
+            .iter()
+            .any(|(candidate, active)| {
+                *active
+                    && candidate.tuning_id == pitch.tuning_id
+                    && candidate.pitch.degree() == pitch.degree
+            })
+            || self
+                .native_snapshot
+                .lock_ref()
+                .as_ref()
+                .is_some_and(|snapshot| {
+                    snapshot.shared_pitches.pitch_classes.contains(&pitch)
+                        || snapshot.shared_pitches.pitches.iter().any(|candidate| {
+                            candidate.tuning_id == pitch.tuning_id
+                                && candidate.pitch.degree() == pitch.degree
+                                && self
+                                    .pending_pitches
+                                    .borrow()
+                                    .get(candidate)
+                                    .copied()
+                                    .unwrap_or(true)
+                        })
+                })
+    }
+
+    fn set_native_periodic_pitch(self: &Arc<Self>, pitch: TunedPeriodicPitch, active: bool) {
+        self.pending_pitches.borrow_mut().insert(pitch, active);
+        self.project_native_snapshot();
+        let command = if active {
+            ClientCommand::AddPitch { pitch }
+        } else {
+            ClientCommand::RemovePitch { pitch }
+        };
+        let state = self.clone();
+        let on_error = move |error: String| {
+            if state.pending_pitches.borrow().get(&pitch) == Some(&active) {
+                state.pending_pitches.borrow_mut().remove(&pitch);
+            }
+            state.native_status.set(format!("⚠ {error}"));
+            state.project_native_snapshot();
+        };
+        #[cfg(feature = "browser-net")]
+        if self.browser_host {
+            super::replica_host::dispatch(command, on_error);
+            return;
+        }
+        super::native_bridge::dispatch(command, on_error);
+    }
+
+    fn toggle_native_shared_pitch_class(self: &Arc<Self>, midi_note: u8) {
+        let hz = 440.0 * 2.0_f64.powf((f64::from(midi_note) - 69.0) / 12.0);
+        let Ok(result) = self.tuning.lock_ref().quantize(hz) else {
+            return;
+        };
+        let pitch_class = result.pitch_class;
+        self.set_native_degree(pitch_class, !self.degree_is_active(pitch_class));
     }
 
     pub fn put_native_piece(&self, emoji: String, absolute_pitch: i32) {
@@ -411,8 +514,11 @@ impl AppState {
         let Some(snapshot) = self.native_snapshot.get_cloned() else {
             return;
         };
-        for pitch in snapshot.active_degrees {
+        for pitch in snapshot.shared_pitches.pitch_classes {
             self.dispatch_native(ClientCommand::RemoveDegree { pitch });
+        }
+        for pitch in snapshot.shared_pitches.pitches {
+            self.dispatch_native(ClientCommand::RemovePitch { pitch });
         }
         for piece in snapshot.pieces {
             self.dispatch_native(ClientCommand::RemovePiece { piece: piece.id });
@@ -454,16 +560,34 @@ impl AppState {
         }
         self.native_sequence.set(envelope.sequence);
 
+        if let AppEvent::RealtimeMidi { midi } = &envelope.event {
+            self.apply_realtime_midi(*midi);
+            self.project_native_snapshot();
+            return;
+        }
+
         match &envelope.event {
-            AppEvent::DegreeAdded { pitch, .. }
-                if self.pending_degrees.borrow().get(pitch) == Some(&true) =>
-            {
-                self.pending_degrees.borrow_mut().remove(pitch);
+            AppEvent::RoomChanged { .. } => {
+                self.remote_realtime_notes.borrow_mut().clear();
+                self.remote_realtime_sessions.borrow_mut().clear();
+                self.pending_round_table.borrow_mut().take();
+                self.pending_degrees.borrow_mut().clear();
+                self.pending_pitches.borrow_mut().clear();
+                self.arp_midi_held.borrow_mut().clear();
             }
-            AppEvent::DegreeRemoved { pitch }
-                if self.pending_degrees.borrow().get(pitch) == Some(&false) =>
-            {
-                self.pending_degrees.borrow_mut().remove(pitch);
+            AppEvent::PeerRemoved { author }
+            | AppEvent::PeerUpdated {
+                peer:
+                    crate::client::PeerSnapshot {
+                        author,
+                        path: PeerPath::Disconnected,
+                        ..
+                    },
+            } => {
+                self.remote_realtime_notes
+                    .borrow_mut()
+                    .retain(|(source, _, _), _| source != author);
+                self.remote_realtime_sessions.borrow_mut().remove(author);
             }
             _ => {}
         }
@@ -483,7 +607,56 @@ impl AppState {
                 }
             }
         }
+        let round_table_confirmed =
+            self.native_snapshot
+                .lock_ref()
+                .as_ref()
+                .is_some_and(|snapshot| {
+                    self.pending_round_table.borrow().as_ref() == Some(&snapshot.round_table)
+                });
+        if round_table_confirmed {
+            self.pending_round_table.borrow_mut().take();
+        }
+        if let Some(snapshot) = self.native_snapshot.lock_ref().as_ref() {
+            self.pending_degrees.borrow_mut().retain(|pitch, active| {
+                snapshot.shared_pitches.pitch_classes.contains(pitch) != *active
+            });
+            self.pending_pitches
+                .borrow_mut()
+                .retain(|pitch, active| snapshot.shared_pitches.pitches.contains(pitch) != *active);
+        }
         self.project_native_snapshot();
+    }
+
+    fn apply_realtime_midi(&self, midi: RealtimeMidiSnapshot) {
+        let prior_session = self
+            .remote_realtime_sessions
+            .borrow()
+            .get(&midi.source)
+            .copied();
+        if prior_session != Some(midi.session) {
+            self.remote_realtime_notes
+                .borrow_mut()
+                .retain(|(source, _, _), _| *source != midi.source);
+            self.remote_realtime_sessions
+                .borrow_mut()
+                .insert(midi.source, midi.session);
+        }
+
+        let key = (midi.source, midi.channel, midi.note);
+        match midi.kind {
+            RealtimeMidiKind::NoteOn if midi.value != 0 => {
+                self.remote_realtime_notes
+                    .borrow_mut()
+                    .insert(key, midi.session);
+            }
+            RealtimeMidiKind::NoteOn | RealtimeMidiKind::NoteOff | RealtimeMidiKind::Choke => {
+                self.remote_realtime_notes.borrow_mut().remove(&key);
+            }
+            RealtimeMidiKind::PolyPressure
+            | RealtimeMidiKind::PitchBend
+            | RealtimeMidiKind::ChannelPressure => {}
+        }
     }
 
     fn project_native_snapshot(self: &Arc<Self>) {
@@ -546,23 +719,43 @@ impl AppState {
 
         let tuning = self.tuning.lock_ref();
         let degree_count = i64::try_from(tuning.pitch_class_count()).unwrap_or(1);
-        let mut pitches: Vec<_> = snapshot
-            .active_degrees
+        let active_degrees: Vec<_> = snapshot
+            .shared_pitches
+            .pitch_classes
             .iter()
+            .copied()
             .filter(|pitch| pitch.tuning_id == tuning.id())
-            .map(|pitch| PitchClass::from(pitch.degree))
             .collect();
-        for (pitch, active) in self.pending_degrees.borrow().iter() {
-            if pitch.tuning_id != tuning.id() {
-                continue;
-            }
-            let pitch_class = PitchClass::from(pitch.degree);
-            if *active && !pitches.contains(&pitch_class) {
-                pitches.push(pitch_class);
-            } else if !*active {
-                pitches.retain(|current| *current != pitch_class);
-            }
-        }
+        let active_absolute: Vec<_> = snapshot
+            .shared_pitches
+            .pitches
+            .iter()
+            .copied()
+            .filter(|pitch| pitch.tuning_id == tuning.id())
+            .collect();
+        // Pending commands intentionally do not alter the room projection.
+        // They remain an input de-duplication aid until the worker publishes a
+        // matching canonical materialization; displaying them as membership
+        // created another visible authority that fresh peers could not share.
+        let mut pitches: Vec<_> = active_degrees
+            .iter()
+            .map(|pitch| PitchClass::from(pitch.degree))
+            .chain(
+                active_absolute
+                    .iter()
+                    .map(|pitch| PitchClass::from(pitch.pitch.degree())),
+            )
+            .collect();
+        pitches.sort();
+        pitches.dedup();
+        // The keyboard is the durable room-owned pitch-set editor. Realtime
+        // note edges are intentionally not folded into it: they are transient,
+        // are not replayed to a late joiner, and may be lost when a carrier
+        // changes path. Painting them as set membership made two healthy tabs
+        // display different "active" notes and disguised stuck performance
+        // notes as HHHS convergence failures. Keep tracking realtime notes for
+        // a dedicated performance indicator, but never materialize them as the
+        // shared set.
         let pieces: Vec<_> = snapshot
             .pieces
             .iter()
@@ -608,6 +801,8 @@ impl AppState {
             snapshot.pieces_locked,
             snapshot.available_emojis.as_deref(),
         );
+        self.sync_midi_toggle_output();
+        sync_active_pitches(self);
     }
 
     /// Handle pitch detection event from SwiftF0, applying conditioner modifier.
@@ -735,6 +930,7 @@ impl AppState {
 
                     // Display shows current locked pitch directly
                     self.committed_pitch.set(Some(pc));
+                    self.committed_voice_note.set(Some(native_pitch));
 
                     // Set voice_pitch during singing (shows as lit/green on keyboard)
                     self.voice_pitch.set(Some(pc));
@@ -793,6 +989,7 @@ impl AppState {
 
         self.voice_active.set(true);
         self.committed_pitch.set(None);
+        self.committed_voice_note.set(None);
         let next_session = self.voice_session.borrow().wrapping_add(1).max(1);
         *self.voice_session.borrow_mut() = next_session;
         self.send_native_voice(None);
@@ -902,16 +1099,19 @@ impl AppState {
         // Clear prev_lit tracking
         *self.prev_lit_note.borrow_mut() = None;
 
-        // Commit the detected pitch to the voice_pitch slot (single, replaces previous)
+        // Commit exactly one quantized discrete note. Detection drift and
+        // expression stayed in preview state and never entered room history.
         self.voice_pitch.set(self.committed_pitch.get());
         if self.native_backend {
-            if let Some(pitch) = self.committed_pitch.get() {
-                self.set_native_degree(pitch, true);
+            if let Some(pitch) = self.committed_voice_note.get() {
+                self.set_native_periodic_pitch(pitch, true);
             }
             // Dispatch only; the projection clears the voice adapter when the
             // SetVoicePreview(None) echo arrives. No optimistic local write.
             self.send_native_voice(None);
             self.voice_pitch.set(None);
+        } else if let Some(pitch) = self.committed_pitch.get() {
+            self.room_mut().add_pitch(pitch);
         }
 
         // Re-sync keyboard (voice pitch -> lit/green, manual -> pressed/red)
@@ -997,7 +1197,15 @@ impl AppState {
         };
         let pitch_class = result.pitch_class;
 
-        if self.browser_host {
+        if self.native_backend && self.arpeggiator_edit_mode.get() {
+            if event.is_note_on {
+                if self.arp_midi_held.borrow_mut().insert(event.note) {
+                    self.toggle_native_shared_pitch_class(event.note);
+                }
+            } else {
+                self.arp_midi_held.borrow_mut().remove(&event.note);
+            }
+        } else if self.native_backend {
             // The signed store is authoritative: route note-on/off as durable
             // degree commands; the projection updates the UI.
             self.set_native_degree(pitch_class, event.is_note_on);
@@ -1031,29 +1239,34 @@ impl AppState {
             return;
         }
 
-        let room = self.room.lock_ref();
-        let local_peer = room.local_peer_id();
         let pitch_count = self.tuning.lock_ref().pitch_class_count() as u16;
+        let mut current_notes = std::collections::HashSet::new();
 
-        // Get current pitch classes from local peer's set
-        let mut current_notes: std::collections::HashSet<u8> =
-            if let Some(set) = room.all_peer_sets().get(local_peer) {
-                set.pitch_classes
-                    .iter()
-                    .filter_map(|pc| pitch_class_to_midi_note(pc.index(), pitch_count))
-                    .collect()
-            } else {
-                std::collections::HashSet::new()
-            };
+        // Pitch-class output comes from the single materialized room
+        // projection: manual membership plus live emoji-piece contributions.
+        // The orange keyboard overlay still reads `room.shared_pitches()`.
+        current_notes.extend(
+            snapshot_active_pitches(&self.room.lock_ref())
+                .unified_pitch_classes(pitch_count)
+                .into_iter()
+                .filter_map(|pitch| pitch_class_to_midi_note(pitch, pitch_count)),
+        );
 
-        // Add piece absolute pitches as MIDI notes
-        for piece in room.all_pieces() {
-            // Pieces have absolute pitch, use directly as MIDI note (clamped to valid range)
-            let midi_note = piece.pitch.clamp(0, 127) as u8;
-            current_notes.insert(midi_note);
+        if let Some(snapshot) = self.native_snapshot.lock_ref().as_ref() {
+            let tuning = self.tuning.lock_ref();
+            for pitch in &snapshot.shared_pitches.pitches {
+                if pitch.tuning_id != tuning.id() {
+                    continue;
+                }
+                let absolute = i64::from(pitch.pitch.period())
+                    .checked_mul(i64::from(pitch_count))
+                    .and_then(|value| value.checked_add(i64::from(pitch.pitch.degree().index())))
+                    .and_then(|value| value.checked_add(60));
+                if let Some(note) = absolute.and_then(|value| u8::try_from(value).ok()) {
+                    current_notes.insert(note);
+                }
+            }
         }
-
-        drop(room);
 
         // Sync with MIDI output
         if let Ok(midi) = self.midi.try_borrow() {
@@ -1203,6 +1416,18 @@ fn apply_native_delta(snapshot: &mut AppSnapshot, event: AppEvent) {
             room_topic,
             ticket,
         } => {
+            // Entering a room is metadata for the projection the backend has
+            // already opened and published. Clearing it here created a split
+            // brain between the visible RoomProjection and the intent reader
+            // after reload: a visible member was mistaken for absent and the
+            // next click authored another add. Only an actual leave resets the
+            // musical snapshot; room switches publish their new projection.
+            if room_name.is_none() {
+                snapshot.shared_pitches = Default::default();
+                snapshot.pieces.clear();
+                snapshot.voices.clear();
+                snapshot.peers.clear();
+            }
             snapshot.room_name = room_name;
             snapshot.room_topic = room_topic;
             snapshot.room_ticket = ticket;
@@ -1211,15 +1436,8 @@ fn apply_native_delta(snapshot: &mut AppSnapshot, event: AppEvent) {
             snapshot.tuning_id = Some(definition.id);
             snapshot.tuning = Some(definition);
         }
-        AppEvent::DegreeAdded { pitch, .. } => {
-            if !snapshot.active_degrees.contains(&pitch) {
-                snapshot.active_degrees.push(pitch);
-                snapshot.active_degrees.sort();
-            }
-        }
-        AppEvent::DegreeRemoved { pitch } => {
-            snapshot.active_degrees.retain(|current| *current != pitch);
-        }
+        AppEvent::RoundTableChanged { config } => snapshot.round_table = config,
+        AppEvent::PitchSetChanged { shared } => snapshot.shared_pitches = shared,
         AppEvent::PieceUpserted { piece } => {
             if let Some(current) = snapshot
                 .pieces
@@ -1275,6 +1493,10 @@ fn apply_native_delta(snapshot: &mut AppSnapshot, event: AppEvent) {
         AppEvent::MidiPortsChanged { inputs, outputs } => {
             snapshot.midi_inputs = inputs;
             snapshot.midi_outputs = outputs;
+        }
+        AppEvent::RealtimeMidi { .. } => {
+            // Transient room MIDI is applied directly by `apply_native_event`
+            // and intentionally never mutates the durable snapshot.
         }
         AppEvent::Diagnostic { code, message } => {
             web_sys::console::warn_1(&format!("[native:{code}] {message}").into());
@@ -1536,20 +1758,18 @@ fn compute_active_pitches_data(
 ) -> Vec<(String, bool, bool, i32)> {
     let pc_count = tuning.pitch_class_count() as i32;
 
-    // Get combined pitches from the current Replica projection.
-    let room_result = room.compute_room_result();
-
     // Get the local projected voice pitch (shows as green).
     let (_, local_voice_pc) = room.local_voice();
 
     // Build list of active pitches: (name, is_voice, is_piece, sort_key)
     let mut active: Vec<(String, bool, bool, i32)> = Vec::new();
 
-    // Add all pitches from room result (toggle mode pitches)
-    for pc in &room_result.pitch_classes {
-        let is_voice = local_voice_pc == Some(*pc);
+    // The durable shared set is the room result. Voice observations remain a
+    // separate ephemeral channel and never become peer-owned set members.
+    for pc in room.shared_pitches() {
+        let is_voice = local_voice_pc == Some(pc);
         active.push((
-            tuning.note_name(*pc).to_string(),
+            tuning.note_name(pc).to_string(),
             is_voice,
             false,
             pc.index() as i32,
@@ -1558,7 +1778,7 @@ fn compute_active_pitches_data(
 
     // Add pieces with octave info
     for piece in room.all_pieces() {
-        let pc_idx = piece.pitch.rem_euclid(pc_count) as u8;
+        let pc_idx = (piece.pitch - 60).rem_euclid(pc_count) as u8;
         let pc = crate::tuning::PitchClass::new(pc_idx);
         let octave = piece.octave();
         let name = format!("{}{}", tuning.note_name(pc), octave);

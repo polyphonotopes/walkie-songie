@@ -23,8 +23,10 @@ use hhhs_proof::{
 };
 use hhhs_replica::{
     AdmissionOutcome, AdmissionPolicy, AdmissionRequest, AdmittedAuthority, AsyncTransactionSink,
-    DurableReplicaHost, PreparedAdmission, Replica, ReplicaError, ReplicaRecord, ReplicaRepairHost,
+    CapabilityBundle, CapabilityExportError, DurableReplicaHost, PreparedAdmission, Replica,
+    ReplicaError, ReplicaRecord, ReplicaRepairHost,
 };
+use hhhs_session::ReificationPlan;
 use hhhs_store::{
     Materializer, MemoryStorage, ProjectionCheckpoint, ProjectionKey, ReplicaStorage, SecretKey,
     SecretValue, StorageTransaction,
@@ -32,7 +34,9 @@ use hhhs_store::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 pub use tutti_music::MusicOp;
-use tutti_music::{Envelope, TunedDegree, TuningDefinition};
+use tutti_music::{
+    Envelope, SharedPitchSet, TunedDegree, TuningDefinition, roundtable::RoundTableConfig,
+};
 
 use crate::tuning::{MAX_SCALE_DEGREES, TunedPeriodicPitch};
 
@@ -40,7 +44,7 @@ const MAX_ABS_PERIOD: i32 = 1_000_000;
 
 pub const ROOM_PROTOCOL_GENERATION: u32 = 5;
 pub const MUSIC_REPAIR_ALPN: &[u8] = tutti_music_hhhs::REPAIR_ALPN;
-pub const EXTENSION_REPAIR_ALPN: &[u8] = b"walkie/extension/hhhs-replica/5";
+pub const EXTENSION_REPAIR_ALPN: &[u8] = b"walkie/extension/hhhs-replica/5/repair-2";
 pub const LANE_STRATEGY_VERSION: u32 = 1;
 pub const MUSIC_STRATEGY_NAME: &str = tutti_music_hhhs::STRATEGY_NAME;
 pub const EXTENSION_STRATEGY_NAME: &str = "walkie-extension-hhhs-entry";
@@ -741,8 +745,13 @@ fn resolve_register<T>(reach: &ReachIndex, values: Vec<(EntryHash, T)>) -> Optio
 pub struct MusicView {
     pub live: BTreeSet<TunedDegree>,
     pub holders: BTreeMap<TunedDegree, BTreeSet<ActorId>>,
+    pub live_pitches: BTreeSet<TunedPeriodicPitch>,
+    pub pitch_holders: BTreeMap<TunedPeriodicPitch, BTreeSet<ActorId>>,
     pub envelopes: BTreeMap<TunedDegree, Envelope>,
     pub tuning: TuningDefinition,
+    /// Durable arpeggiator/round-table settings from the shared music lane.
+    pub round_table: RoundTableConfig,
+    pub shared_pitches: SharedPitchSet,
 }
 
 impl Default for MusicView {
@@ -750,8 +759,12 @@ impl Default for MusicView {
         Self {
             live: BTreeSet::new(),
             holders: BTreeMap::new(),
+            live_pitches: BTreeSet::new(),
+            pitch_holders: BTreeMap::new(),
             envelopes: BTreeMap::new(),
             tuning: TuningDefinition::twelve_tet(),
+            round_table: RoundTableConfig::default(),
+            shared_pitches: SharedPitchSet::default(),
         }
     }
 }
@@ -788,11 +801,28 @@ pub struct RoomViewDelta {
     pub pieces_upserted: BTreeMap<PieceId, Piece>,
     pub pieces_retracted: BTreeSet<PieceId>,
     pub tuning_changed: bool,
+    pub round_table_changed: bool,
+    pub shared_pitches_changed: bool,
     pub pieces_locked_changed: bool,
     pub available_emojis_changed: bool,
 }
 
 impl RoomView {
+    /// Materialize the pitch set heard by room outputs from canonical facts in
+    /// both lanes. Manual membership remains in `music.shared_pitches`; each
+    /// live emoji piece contributes its tuning-scoped pitch class without
+    /// becoming a manual (orange-key) assertion.
+    ///
+    /// This pure projection authors no mirrored music operation, so moving or
+    /// removing a piece cannot strand a duplicate note in music history.
+    pub fn sounding_pitch_set(&self) -> SharedPitchSet {
+        let mut sounding = self.music.shared_pitches.clone();
+        sounding
+            .pitch_classes
+            .extend(self.pieces.values().map(|piece| piece.pitch.degree()));
+        sounding
+    }
+
     pub fn changes_since(&self, previous: &Self) -> RoomViewDelta {
         let pitches_added = self
             .music
@@ -824,6 +854,8 @@ impl RoomView {
             pieces_upserted,
             pieces_retracted,
             tuning_changed: self.music.tuning != previous.music.tuning,
+            round_table_changed: self.music.round_table != previous.music.round_table,
+            shared_pitches_changed: self.sounding_pitch_set() != previous.sounding_pitch_set(),
             pieces_locked_changed: self.pieces_locked != previous.pieces_locked,
             available_emojis_changed: self.available_emojis != previous.available_emojis,
         }
@@ -858,8 +890,12 @@ pub fn materialize_music(history: &DagSnapshot, roots: &[EntryHash]) -> MusicVie
     MusicView {
         live: view.live,
         holders: view.holders,
+        live_pitches: view.live_pitches,
+        pitch_holders: view.pitch_holders,
         envelopes: view.envelopes,
         tuning: view.tuning,
+        round_table: view.round_table,
+        shared_pitches: view.shared_pitches,
     }
 }
 
@@ -998,8 +1034,14 @@ struct MusicMaterializer {
 struct MusicCheckpointState {
     live: Vec<TunedDegree>,
     holders: Vec<(TunedDegree, Vec<ActorId>)>,
+    live_pitches: Vec<TunedPeriodicPitch>,
+    pitch_holders: Vec<(TunedPeriodicPitch, Vec<ActorId>)>,
     envelopes: Vec<(TunedDegree, Envelope)>,
     tuning: TuningDefinition,
+    #[serde(default)]
+    round_table: RoundTableConfig,
+    #[serde(default)]
+    shared_pitches: SharedPitchSet,
 }
 
 impl From<MusicView> for MusicCheckpointState {
@@ -1011,8 +1053,16 @@ impl From<MusicView> for MusicCheckpointState {
                 .into_iter()
                 .map(|(degree, actors)| (degree, actors.into_iter().collect()))
                 .collect(),
+            live_pitches: view.live_pitches.into_iter().collect(),
+            pitch_holders: view
+                .pitch_holders
+                .into_iter()
+                .map(|(pitch, actors)| (pitch, actors.into_iter().collect()))
+                .collect(),
             envelopes: view.envelopes.into_iter().collect(),
             tuning: view.tuning,
+            round_table: view.round_table,
+            shared_pitches: view.shared_pitches,
         }
     }
 }
@@ -1026,8 +1076,16 @@ impl From<MusicCheckpointState> for MusicView {
                 .into_iter()
                 .map(|(degree, actors)| (degree, actors.into_iter().collect()))
                 .collect(),
+            live_pitches: state.live_pitches.into_iter().collect(),
+            pitch_holders: state
+                .pitch_holders
+                .into_iter()
+                .map(|(pitch, actors)| (pitch, actors.into_iter().collect()))
+                .collect(),
             envelopes: state.envelopes.into_iter().collect(),
             tuning: state.tuning,
+            round_table: state.round_table,
+            shared_pitches: state.shared_pitches,
         }
     }
 }
@@ -1036,7 +1094,7 @@ impl Materializer for MusicMaterializer {
     type Error = serde_json::Error;
 
     fn key(&self) -> ProjectionKey {
-        ProjectionKey::new("walkie/music", 5).expect("constant projection key")
+        ProjectionKey::new("walkie/music", 7).expect("constant projection key")
     }
 
     fn project(
@@ -1225,6 +1283,10 @@ pub enum RoomError {
     Checkpoint(serde_json::Error),
     #[error("durable room recovery failed: {0}")]
     Recovery(String),
+    #[error("HHHS session reification failed: {0}")]
+    Session(String),
+    #[error("capability bundle export failed: {0}")]
+    CapabilityExport(#[from] CapabilityExportError),
 }
 
 type LaneReplica<S> = Replica<S, RoomAdmissionPolicy>;
@@ -1691,6 +1753,50 @@ where
         Ok(PreparedRoomCommand { lane, prepared })
     }
 
+    /// Stage one session event as an ordinary capability-presented music
+    /// admission at the exact predecessors selected by the upstream session
+    /// reification planner.
+    ///
+    /// The session contributes only correlation and causal placement. The
+    /// canonical Tutti command encoding, Ed25519 presentation, admission
+    /// policy, external durability, and public Replica record remain the same
+    /// authority path as a non-session command.
+    pub fn prepare_reified_music(
+        &self,
+        key: &SigningKey,
+        presented: &[EntryHash],
+        plan: &ReificationPlan,
+        command: MusicOp,
+    ) -> Result<(PreparedRoomCommand, Entry), RoomError> {
+        let actor = ActorId::from_signing_key(key);
+        let namespace = self.identity.music;
+        let area = music_command_area(namespace, &command);
+        let command = encode_music_command(namespace, actor, presented, command)?;
+        let entry = plan
+            .entry(&command)
+            .map_err(|error| RoomError::Session(error.to_string()))?;
+        let context = self
+            .music
+            .presentation_context(&entry, area.clone(), Right::Invoke)?;
+        let presentation =
+            Ed25519Verifier::present(key, presented.to_vec(), &context).map_err(|error| {
+                RoomError::Session(format!("foundation presentation failed: {error:?}"))
+            })?;
+        let prepared = self.music.prepare(AdmissionRequest::presented(
+            entry.clone(),
+            presentation,
+            area,
+            Right::Invoke,
+        ))?;
+        Ok((
+            PreparedRoomCommand {
+                lane: RoomLane::Music,
+                prepared,
+            },
+            entry,
+        ))
+    }
+
     pub fn commit_prepared(
         &self,
         prepared: PreparedRoomCommand,
@@ -1817,6 +1923,18 @@ where
         self.music.snapshot()
     }
 
+    /// Export one receiver-bound music delegation closure. Carrier-specific
+    /// size limits remain the caller's responsibility.
+    pub fn export_music_capability_bundle(
+        &self,
+        expected_receiver: ActorId,
+        selected_leaves: impl IntoIterator<Item = EntryHash>,
+    ) -> Result<CapabilityBundle, RoomError> {
+        Ok(self
+            .music
+            .export_capability_bundle(expected_receiver.receiver(), selected_leaves)?)
+    }
+
     pub fn extension_snapshot(&self) -> hhhs_store::StorageSnapshot {
         self.extension.snapshot()
     }
@@ -1907,13 +2025,17 @@ fn initialize_lane<S: ReplicaStorage + 'static>(
         Position::empty(),
     );
     let root_id = root.hash();
-    let replica = Replica::builder(
+    let mut builder = Replica::builder(
         storage,
         RoomAdmissionPolicy::new(lane, namespace),
         namespace,
     )
-    .ed25519_capabilities([root_id])?
-    .build()?;
+    .ed25519_capabilities([root_id])?;
+    if lane == RoomLane::Music {
+        let vocabulary = tutti_music_hhhs::MusicVocabularyProfile::embedded_compatible();
+        builder = builder.max_replica_record_bytes(vocabulary.max_replica_record_bytes);
+    }
+    let replica = builder.build()?;
     if !replica.snapshot().history.contains(&root_id) {
         replica.admit(AdmissionRequest::trusted_root(root))?;
     }
@@ -2005,12 +2127,190 @@ mod tests {
     use super::*;
     use crate::tuning::{TunedDegree, Tuning};
 
+    #[test]
+    fn extension_repair_alpn_names_the_exact_hhhs_wire_generation() {
+        assert_eq!(hhhs_sync::REPAIR_WIRE_GENERATION, 2);
+        assert!(EXTENSION_REPAIR_ALPN.ends_with(b"/repair-2"));
+    }
+
     fn key(byte: u8) -> SigningKey {
         SigningKey::from_bytes(&[byte; 32])
     }
 
     fn degree(index: u16) -> TunedDegree {
         TunedDegree::new(&Tuning::twelve_tet(), index).unwrap()
+    }
+
+    #[test]
+    fn emoji_piece_contributes_to_sound_without_becoming_manual_membership() {
+        let tuning = Tuning::twelve_tet();
+        let manual = TunedDegree::new(&tuning, 2).unwrap();
+        let piece_degree = TunedDegree::new(&tuning, 7).unwrap();
+        let mut music = MusicView::default();
+        music.shared_pitches.pitch_classes.insert(manual);
+        let room = RoomView {
+            music,
+            pieces: BTreeMap::from([(
+                PieceId([1; 32]),
+                Piece {
+                    owner: ActorId([2; 32]),
+                    emoji: "🌱".to_owned(),
+                    pitch: TunedPeriodicPitch::new(&tuning, 7, 0).unwrap(),
+                },
+            )]),
+            pieces_locked: false,
+            available_emojis: None,
+        };
+
+        assert_eq!(
+            room.music.shared_pitches.pitch_classes,
+            BTreeSet::from([manual]),
+            "the orange/manual facet must not include the emoji"
+        );
+        assert_eq!(
+            room.sounding_pitch_set().pitch_classes,
+            BTreeSet::from([manual, piece_degree])
+        );
+    }
+
+    #[test]
+    fn piece_move_and_remove_update_only_the_piece_contribution() {
+        let owner_key = key(7);
+        let owner = ActorId::from_signing_key(&owner_key);
+        let room = RoomReplicas::memory("bright-river-song", owner).unwrap();
+        let capabilities = room.owner_capabilities();
+        let tuning = Tuning::twelve_tet();
+        let manual = degree(2);
+        let destination = degree(9);
+
+        room.author(
+            &owner_key,
+            &capabilities,
+            MusicOp::AddDegree { degree: manual }.into(),
+        )
+        .unwrap();
+        let put = room
+            .author(
+                &owner_key,
+                &capabilities,
+                ExtensionCommand::PutPiece {
+                    emoji: "🌱".to_owned(),
+                    pitch: TunedPeriodicPitch::new(&tuning, 7, 0).unwrap(),
+                }
+                .into(),
+            )
+            .unwrap();
+        let piece = PieceId::from_entry(put.entry);
+        assert_eq!(
+            room.view().sounding_pitch_set().pitch_classes,
+            BTreeSet::from([manual, degree(7)])
+        );
+
+        room.author(
+            &owner_key,
+            &capabilities,
+            ExtensionCommand::MovePiece {
+                piece,
+                pitch: TunedPeriodicPitch::new(&tuning, 9, 0).unwrap(),
+            }
+            .into(),
+        )
+        .unwrap();
+        assert_eq!(
+            room.view().sounding_pitch_set().pitch_classes,
+            BTreeSet::from([manual, destination])
+        );
+
+        room.author(
+            &owner_key,
+            &capabilities,
+            MusicOp::AddDegree {
+                degree: destination,
+            }
+            .into(),
+        )
+        .unwrap();
+        room.author(
+            &owner_key,
+            &capabilities,
+            ExtensionCommand::RemovePiece { piece }.into(),
+        )
+        .unwrap();
+        let view = room.view();
+        assert_eq!(
+            view.music.shared_pitches.pitch_classes,
+            BTreeSet::from([manual, destination]),
+            "removing an emoji must not erase an independent manual assertion"
+        );
+        assert_eq!(view.sounding_pitch_set(), view.music.shared_pitches);
+    }
+
+    #[test]
+    fn manual_and_piece_sources_converge_across_partition_and_repair() {
+        let owner_key = key(8);
+        let member_key = key(9);
+        let owner = ActorId::from_signing_key(&owner_key);
+        let member = ActorId::from_signing_key(&member_key);
+        let a = RoomReplicas::memory("bright-river-song", owner).unwrap();
+        let b = RoomReplicas::memory("bright-river-song", owner).unwrap();
+        let invitation = a.grant_member(&owner_key, member).unwrap();
+        repair(&a, &b);
+
+        let tuning = Tuning::twelve_tet();
+        a.author(
+            &owner_key,
+            &a.owner_capabilities(),
+            MusicOp::AddDegree { degree: degree(2) }.into(),
+        )
+        .unwrap();
+        let put = b
+            .author(
+                &member_key,
+                &invitation.capabilities,
+                ExtensionCommand::PutPiece {
+                    emoji: "🐟".to_owned(),
+                    pitch: TunedPeriodicPitch::new(&tuning, 7, 0).unwrap(),
+                }
+                .into(),
+            )
+            .unwrap();
+        let piece = PieceId::from_entry(put.entry);
+
+        repair(&a, &b);
+        repair(&b, &a);
+        assert_eq!(a.view(), b.view());
+        assert_eq!(
+            a.view().sounding_pitch_set().pitch_classes,
+            BTreeSet::from([degree(2), degree(7)])
+        );
+
+        // Independent sources may overlap. Removing the piece must leave the
+        // concurrent manual assertion alive after both lanes repair.
+        a.author(
+            &owner_key,
+            &a.owner_capabilities(),
+            ExtensionCommand::RemovePiece { piece }.into(),
+        )
+        .unwrap();
+        b.author(
+            &member_key,
+            &invitation.capabilities,
+            MusicOp::AddDegree { degree: degree(7) }.into(),
+        )
+        .unwrap();
+        repair(&a, &b);
+        repair(&b, &a);
+
+        assert_eq!(a.view(), b.view());
+        assert!(a.view().pieces.is_empty());
+        assert_eq!(
+            a.view().sounding_pitch_set().pitch_classes,
+            BTreeSet::from([degree(2), degree(7)])
+        );
+        assert_eq!(
+            a.view().music.shared_pitches.pitch_classes,
+            BTreeSet::from([degree(2), degree(7)])
+        );
     }
 
     fn repair_lane<S1, S2>(
@@ -2058,7 +2358,7 @@ mod tests {
             MusicOp::AddDegree { degree: degree(4) },
         )
         .unwrap();
-        assert!(decode_envelope::<MusicOp>(RoomLane::Music, &canonical).is_ok());
+        assert!(tutti_music_hhhs::decode_command(&canonical).is_ok());
         assert!(matches!(
             decode_envelope::<ExtensionCommand>(RoomLane::Extension, &canonical),
             Err(CommandCodecError::WrongDomain)
@@ -2066,8 +2366,8 @@ mod tests {
         let mut spaced = canonical.clone();
         spaced.insert(tutti_music_hhhs::COMMAND_DOMAIN.len(), b' ');
         assert!(matches!(
-            decode_envelope::<MusicOp>(RoomLane::Music, &spaced),
-            Err(CommandCodecError::NonCanonical)
+            tutti_music_hhhs::decode_command(&spaced),
+            Err(tutti_music_hhhs::CommandCodecError::NonCanonical)
         ));
     }
 

@@ -8,10 +8,14 @@ publish = false
 # THE point of this crate is its dependency list: the shared music protocol,
 # HHHS Replica/repair seams, and NOTHING from walkie-songie.
 [dependencies]
-tutti-music = { version = "0.1.0", git = "https://github.com/polyphonotopes/tutti.git", tag = "v0.4.5" }
-tutti-music-hhhs = { version = "0.4.4", git = "https://github.com/polyphonotopes/tutti.git", tag = "v0.4.5" }
-hhhs = { version = "0.4.4", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.4" }
-hhhs-proof = { version = "0.4.4", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.4" }
-hhhs-replica = { version = "0.4.4", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.4" }
-hhhs-store = { version = "0.4.4", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.4" }
-hhhs-sync = { version = "0.4.4", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.4", features = ["driver"] }
+# This remains a separate, Walkie-free crate/process, but it must compile the
+# same canonical music generation currently under interoperability test. When
+# the root returns from the local Tutti candidate to a release tag, move these
+# two dependencies back in the same change.
+tutti-music = { path = "../../../tutti/tutti-music" }
+tutti-music-hhhs = { path = "../../../tutti/tutti-music-hhhs" }
+hhhs = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "332ae1b5c5059a844cd468e52c8f6a3e5b0e9b55" }
+hhhs-proof = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "332ae1b5c5059a844cd468e52c8f6a3e5b0e9b55" }
+hhhs-replica = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "332ae1b5c5059a844cd468e52c8f6a3e5b0e9b55" }
+hhhs-store = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "332ae1b5c5059a844cd468e52c8f6a3e5b0e9b55" }
+hhhs-sync = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "332ae1b5c5059a844cd468e52c8f6a3e5b0e9b55", features = ["driver"] }

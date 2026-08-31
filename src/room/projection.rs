@@ -14,7 +14,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::tuning::PitchClass;
 
-use super::{CombinationMethod, PeerPitchSet, RoomEvent, RoomPitchResult};
+use super::RoomEvent;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
@@ -32,7 +32,7 @@ pub struct Piece {
 
 impl Piece {
     pub fn pitch_class(&self, notes_per_octave: u8) -> u8 {
-        self.pitch.rem_euclid(i32::from(notes_per_octave)) as u8
+        (self.pitch - 60).rem_euclid(i32::from(notes_per_octave)) as u8
     }
 
     pub fn octave(&self) -> i32 {
@@ -58,7 +58,6 @@ pub struct RoomProjection {
     shared_pitches: HashSet<PitchClass>,
     pieces: HashMap<String, Piece>,
     voices: HashMap<String, (Option<i32>, Option<PitchClass>)>,
-    combination_method: CombinationMethod,
     tuning_scl: String,
     pieces_locked: bool,
     available_emojis: Vec<String>,
@@ -78,7 +77,6 @@ impl RoomProjection {
             shared_pitches: HashSet::new(),
             pieces: HashMap::new(),
             voices: HashMap::new(),
-            combination_method: CombinationMethod::Union,
             tuning_scl: String::new(),
             pieces_locked: false,
             available_emojis: default_emojis(),
@@ -284,76 +282,6 @@ impl RoomProjection {
 
     pub fn shared_pitches(&self) -> HashSet<PitchClass> {
         self.shared_pitches.clone()
-    }
-
-    pub fn all_peer_sets(&self) -> HashMap<String, PeerPitchSet> {
-        let mut sets = HashMap::new();
-        if !self.shared_pitches.is_empty() {
-            sets.insert(
-                "shared".to_owned(),
-                PeerPitchSet {
-                    pitch_classes: self.shared_pitches.clone(),
-                },
-            );
-        }
-        for (actor, (_, pitch_class)) in &self.voices {
-            if let Some(pitch_class) = pitch_class {
-                sets.entry(actor.clone())
-                    .or_insert_with(PeerPitchSet::new)
-                    .add(*pitch_class);
-            }
-        }
-        sets
-    }
-
-    pub fn compute_room_result(&self) -> RoomPitchResult {
-        let peer_sets = self.all_peer_sets();
-        let mut result = RoomPitchResult::default();
-        for (actor, set) in &peer_sets {
-            for pitch_class in &set.pitch_classes {
-                result
-                    .attribution
-                    .entry(*pitch_class)
-                    .or_default()
-                    .push(actor.clone());
-            }
-        }
-        result.pitch_classes = match &self.combination_method {
-            CombinationMethod::Union | CombinationMethod::Custom(_) => peer_sets
-                .values()
-                .flat_map(|set| set.pitch_classes.iter().copied())
-                .collect(),
-            CombinationMethod::Intersection => {
-                let mut sets = peer_sets.values();
-                sets.next().map_or_else(HashSet::new, |first| {
-                    sets.fold(first.pitch_classes.clone(), |intersection, next| {
-                        intersection
-                            .intersection(&next.pitch_classes)
-                            .copied()
-                            .collect()
-                    })
-                })
-            }
-        };
-        result
-    }
-
-    pub fn combination_method(&self) -> &CombinationMethod {
-        &self.combination_method
-    }
-
-    pub fn get_combination_method(&self) -> CombinationMethod {
-        self.combination_method.clone()
-    }
-
-    pub fn set_combination_method(&mut self, method: CombinationMethod) {
-        if self.combination_method != method {
-            self.combination_method = method;
-            self.emit(RoomEvent::CombinationMethodChanged {
-                method: self.combination_method.as_str().to_owned(),
-            });
-            self.notify();
-        }
     }
 
     pub fn tuning_scl(&self) -> &str {
@@ -599,6 +527,11 @@ mod tests {
 
         assert_eq!(projection.shared_pitches(), HashSet::from([PitchClass(5)]));
         assert_eq!(projection.all_pieces()[0].id, "piece");
+        assert_eq!(
+            crate::room::snapshot_active_pitches(&projection).unified_pitch_classes(12),
+            HashSet::from([5, 7]),
+            "the sounding projection includes the piece without changing the manual facet"
+        );
         assert_eq!(projection.get_peer_voice("remote").0, Some(69));
         assert!(projection.pieces_locked());
         assert_eq!(projection.available_emojis(), ["🐟", "🦠"]);

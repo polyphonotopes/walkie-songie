@@ -11,7 +11,7 @@ use hhhs_proof::SigningKey;
 use hhhs_replica::{ReplicaError, ReplicaRepairHost};
 use hhhs_store::MemoryStorage;
 use hhhs_sync::{
-    FrameStream, Lane, SessionLimits, SessionOutcome, SyncError, SyncTimer, drive_initiator,
+    ConfirmedRepair, FrameStream, Lane, SessionLimits, SyncError, SyncTimer, drive_initiator,
 };
 use tutti_music::MusicOp;
 use tutti_music_hhhs::{ActorId, MusicReplica, MusicView};
@@ -81,7 +81,7 @@ impl BareMusicPeer {
         stream: S,
         timer: &T,
         limits: SessionLimits,
-    ) -> Result<SessionOutcome, SyncError>
+    ) -> Result<ConfirmedRepair, SyncError>
     where
         S: FrameStream,
         T: SyncTimer,

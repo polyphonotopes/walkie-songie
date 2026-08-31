@@ -5,9 +5,9 @@ import assert from "node:assert/strict";
 // strict enough to catch a return to the pre-worker multi-hundred-ms local
 // path.
 export const latencyBudgetsMs = Object.freeze({
-  localProjectionP95: 15,
+  localDomMutationP95: 15,
   localVisibleP95: 30,
-  peerProjectionP95: 75,
+  peerDomMutationP95: 75,
   peerVisibleP95: 100,
   localKeyboardRenderP95: 2,
   peerKeyboardRenderP95: 2,
@@ -19,9 +19,9 @@ export const requiredPassingTrials = 2;
 export const grossCeilingMultiplier = 4;
 
 const metricDefinitions = Object.freeze([
-  ["localProjection", "steady local projection", "localProjectionP95"],
+  ["localDomMutation", "steady local DOM mutation", "localDomMutationP95"],
   ["localVisible", "steady local visibility", "localVisibleP95"],
-  ["peerProjection", "steady peer projection", "peerProjectionP95"],
+  ["peerDomMutation", "steady peer DOM mutation", "peerDomMutationP95"],
   ["peerVisible", "steady peer visibility", "peerVisibleP95"],
   ["localRenderDuration", "steady local keyboard render", "localKeyboardRenderP95"],
   ["peerRenderDuration", "steady peer keyboard render", "peerKeyboardRenderP95"],

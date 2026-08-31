@@ -38,7 +38,14 @@ pub const MAX_REPAIR_FRAME_BYTES: usize = hhhs_sync::driver::DEFAULT_MAX_FRAME_B
 /// Upper bound for waiting until the peer acknowledges every byte queued before
 /// our stream FIN. `finish()` alone only schedules the FIN; dropping the owning
 /// [`Connection`] immediately afterwards can discard the terminal sync frame.
-const FIN_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+// A repair can use an Iroh relay whose QUIC packet-loss recovery needs several
+// PTO rounds. Two seconds was shorter than a healthy repair's observed FIN
+// recovery under relay loss: the browser timed out, dropped the connection,
+// and made the native peer report a false close failure after both HHHS sides
+// had already reached terminal status. Ten seconds remains a strict carrier
+// bound while allowing multiple retransmission rounds; it does not turn EOF or
+// timeout into success.
+const FIN_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Error)]
 pub enum RepairError {
@@ -115,16 +122,48 @@ impl SyncStream for IrohSyncStream {
         read_frame(&mut self.recv).await.map_err(Into::into)
     }
 
-    async fn close(mut self) {
+    async fn close(mut self) -> Result<(), TransportError> {
         let stopped = self.send.stopped();
-        let _ = self.send.finish();
-        // Keep the owning connection alive until the peer has acknowledged all
-        // buffered stream bytes. The timeout preserves the driver's guarantee
-        // that closing after a failed/silent session cannot park forever.
+        self.send
+            .finish()
+            .map_err(|error| TransportError::Backend(error.to_string()))?;
+        let send_confirm = async {
+            match stopped
+                .await
+                .map_err(|error| TransportError::Backend(error.to_string()))?
+            {
+                Some(code) => Err(TransportError::Backend(format!(
+                    "peer stopped the repair send stream with code {code}"
+                ))),
+                None => Ok(()),
+            }
+        };
+        let receive_confirm = async {
+            self.recv
+                .read_to_end(0)
+                .await
+                .map_err(|error| TransportError::Backend(error.to_string()))?;
+            Ok(())
+        };
+        // Both peers perform the same symmetric close. Reading the peer FIN
+        // only after waiting for acknowledgement of our own FIN can deadlock:
+        // each peer withholds the read which would let the other's `stopped`
+        // future complete. Drive both halves concurrently under one deadline.
+        let confirm = async {
+            futures::try_join!(send_confirm, receive_confirm)?;
+            Ok::<(), TransportError>(())
+        };
+        // Keep the owning connection alive until our FIN is acknowledged and
+        // the peer's FIN is observed. One bounded deadline covers both halves.
         #[cfg(target_arch = "wasm32")]
-        let _ = n0_future::time::timeout(FIN_ACK_TIMEOUT, stopped).await;
+        let result = n0_future::time::timeout(FIN_ACK_TIMEOUT, confirm)
+            .await
+            .map_err(|error| TransportError::Backend(format!("repair close timed out: {error}")))?;
         #[cfg(not(target_arch = "wasm32"))]
-        let _ = tokio::time::timeout(FIN_ACK_TIMEOUT, stopped).await;
+        let result = tokio::time::timeout(FIN_ACK_TIMEOUT, confirm)
+            .await
+            .map_err(|error| TransportError::Backend(format!("repair close timed out: {error}")))?;
+        result
     }
 }
 

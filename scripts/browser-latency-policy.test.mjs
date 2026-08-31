@@ -50,9 +50,9 @@ test("one trial reports every durable-path budget", () => {
   assert.deepEqual(
     evaluation.checks.map(check => check.id),
     [
-      "localProjection",
+      "localDomMutation",
       "localVisible",
-      "peerProjection",
+      "peerDomMutation",
       "peerVisible",
       "localRenderDuration",
       "peerRenderDuration",
@@ -64,9 +64,9 @@ test("one trial reports every durable-path budget", () => {
 function report(factor) {
   return {
     steadyStateLatencyMs: {
-      localProjection: { p95: latencyBudgetsMs.localProjectionP95 * factor },
+      localDomMutation: { p95: latencyBudgetsMs.localDomMutationP95 * factor },
       localVisible: { p95: latencyBudgetsMs.localVisibleP95 * factor },
-      peerProjection: { p95: latencyBudgetsMs.peerProjectionP95 * factor },
+      peerDomMutation: { p95: latencyBudgetsMs.peerDomMutationP95 * factor },
       peerVisible: { p95: latencyBudgetsMs.peerVisibleP95 * factor },
       localRenderDuration: { p95: latencyBudgetsMs.localKeyboardRenderP95 * factor },
       peerRenderDuration: { p95: latencyBudgetsMs.peerKeyboardRenderP95 * factor },

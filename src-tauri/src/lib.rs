@@ -51,7 +51,6 @@ struct ActiveRoom {
 struct RuntimeState {
     sequence: u64,
     snapshot: AppSnapshot,
-    pitch_authors: BTreeMap<walkie_songie::TunedDegree, Vec<ActorId>>,
     subscribers: Vec<Channel<AppEventEnvelope>>,
     active_room: Option<ActiveRoom>,
 }
@@ -84,7 +83,6 @@ impl AppRuntime {
             state: Arc::new(Mutex::new(RuntimeState {
                 sequence: 0,
                 snapshot: AppSnapshot::empty(Capabilities::tauri_desktop()),
-                pitch_authors: BTreeMap::new(),
                 subscribers: Vec::new(),
                 active_room: None,
             })),
@@ -690,8 +688,7 @@ impl AppRuntime {
         state.snapshot.room_name = None;
         state.snapshot.room_topic = None;
         state.snapshot.room_ticket = None;
-        state.snapshot.active_degrees.clear();
-        state.pitch_authors.clear();
+        state.snapshot.shared_pitches = Default::default();
         state.snapshot.pieces.clear();
         state.snapshot.pieces_locked = false;
         state.snapshot.available_emojis = None;
@@ -964,8 +961,8 @@ impl AppRuntime {
     }
 
     fn sync_midi_from_snapshot(&self) {
-        let (snapshot, pitch_authors) = match self.lock() {
-            Ok(state) => (state.snapshot.clone(), state.pitch_authors.clone()),
+        let snapshot = match self.lock() {
+            Ok(state) => state.snapshot.clone(),
             Err(_) => return,
         };
         let Some(definition) = snapshot.tuning.as_ref() else {
@@ -993,20 +990,15 @@ impl AppRuntime {
         }
 
         let mut desired = BTreeMap::new();
-        for pitch in &snapshot.active_degrees {
+        for pitch in &snapshot.shared_pitches.pitch_classes {
             let periodic = walkie_songie::TunedPeriodicPitch {
                 tuning_id: pitch.tuning_id,
                 pitch: walkie_songie::PeriodicPitch::from_degree(pitch.degree, 0),
             };
-            for author in pitch_authors.get(pitch).into_iter().flatten() {
-                desired.insert(
-                    MidiSource::DurableDegree {
-                        author: *author,
-                        pitch: *pitch,
-                    },
-                    periodic,
-                );
-            }
+            desired.insert(MidiSource::SharedDegree { pitch: *pitch }, periodic);
+        }
+        for pitch in &snapshot.shared_pitches.pitches {
+            desired.insert(MidiSource::SharedPitch { pitch: *pitch }, *pitch);
         }
         for piece in &snapshot.pieces {
             desired.insert(MidiSource::Piece { id: piece.id }, piece.pitch);
@@ -1069,37 +1061,12 @@ impl AppRuntime {
             });
         }
 
-        let old_degrees = state.snapshot.active_degrees.clone();
-        let new_degrees: Vec<_> = view.music.live.iter().copied().collect();
-        for pitch in &old_degrees {
-            if !view.music.live.contains(pitch) {
-                events.push(AppEvent::DegreeRemoved { pitch: *pitch });
-            }
+        if state.snapshot.shared_pitches != view.music.shared_pitches {
+            state.snapshot.shared_pitches = view.music.shared_pitches.clone();
+            events.push(AppEvent::PitchSetChanged {
+                shared: view.music.shared_pitches.clone(),
+            });
         }
-        let new_authors: BTreeMap<_, Vec<_>> = view
-            .music
-            .holders
-            .iter()
-            .map(|(pitch, authors)| (*pitch, authors.iter().copied().collect()))
-            .collect();
-        for pitch in &new_degrees {
-            let authors: Vec<_> = view
-                .music
-                .holders
-                .get(pitch)
-                .into_iter()
-                .flatten()
-                .copied()
-                .collect();
-            if state.pitch_authors.get(pitch) != Some(&authors) {
-                events.push(AppEvent::DegreeAdded {
-                    pitch: *pitch,
-                    authors,
-                });
-            }
-        }
-        state.snapshot.active_degrees = new_degrees;
-        state.pitch_authors = new_authors;
 
         let new_pieces: Vec<_> = view
             .pieces

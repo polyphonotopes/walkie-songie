@@ -12,6 +12,8 @@
 pub mod identity;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-net"))]
 pub mod native;
+/// Signed, bounded Room-v5 realtime messages carried by gossip.
+pub mod realtime;
 /// HHHS 0.4 Replica repair over any walkie-owned framed carrier.
 pub mod replica;
 
@@ -52,6 +54,7 @@ pub mod webrtc_transport;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-net"))]
 pub use identity::FileSeedStore;
 pub use identity::{MemorySeedStore, SeedStore, WalkieIdentity};
+pub use realtime::{RoomRealtime, RoomRealtimeError};
 pub use replica::{
     ReplicaFrameStream, ReplicaLiveRecord, ReplicaProtocol, ReplicaRepairHint, ReplicaRepairProbe,
     ReplicaTimer, drive_replica_initiator, drive_replica_responder, is_routine_repair_initiator,
@@ -151,9 +154,9 @@ pub trait SyncStream {
     /// Receive one encoded `SyncMessage`; `Ok(None)` is a clean end of stream.
     fn recv_frame(&mut self) -> impl Future<Output = Result<Option<Vec<u8>>, TransportError>>;
 
-    /// Release the stream. Backends that must signal an error code to the peer
-    /// do it here rather than on drop.
-    fn close(self) -> impl Future<Output = ()>;
+    /// Complete the carrier close handshake. EOF/drop is not success: the
+    /// backend must report whether the peer confirmed the terminal boundary.
+    fn close(self) -> impl Future<Output = Result<(), TransportError>>;
 }
 
 /// Runtime-owned clock used only to adapt the application's task runtime to the

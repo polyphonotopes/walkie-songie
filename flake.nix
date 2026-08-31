@@ -48,8 +48,10 @@
 
           buildInputs = with pkgs; [
             alsa-lib
+            dbus
             glib
             gtk3
+            jack2
             libayatana-appindicator
             librsvg
             libsoup_3
@@ -60,6 +62,7 @@
 
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
             pkgs.alsa-lib
+            pkgs.jack2
             pkgs.libayatana-appindicator
             pkgs.udev
           ];

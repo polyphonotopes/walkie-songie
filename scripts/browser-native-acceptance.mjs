@@ -1,24 +1,42 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
-import { createReadStream, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
+import {
+  createReadStream,
+  existsSync,
+  mkdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { dirname, extname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { chromium } from "playwright";
+import {
+  artifactTreeSha256,
+  hhhsPinFromLock,
+  sourceProvenance,
+} from "./browser-provenance.mjs";
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repository = resolve(scriptDirectory, "..");
 const dist = resolve(process.env.WALKIE_RELEASE_DIST ?? join(repository, "target/release-web"));
 const nativeProbe = resolve(
-  process.env.WALKIE_NATIVE_PROBE ?? join(repository, "target/debug/room-v5-native-probe"),
+  process.env.WALKIE_NATIVE_PROBE ?? join(repository, "target/debug/walkie-room-interop-probe"),
 );
 const reportPath = resolve(
   process.env.WALKIE_BROWSER_NATIVE_REPORT ??
     join(repository, "output/playwright/browser-native-acceptance.json"),
 );
+const runStartedAt = new Date();
+rmSync(reportPath, { force: true });
+const source = sourceProvenance(repository);
+const hhhsPin = hhhsPinFromLock(repository);
+const artifactSha256 = artifactTreeSha256(dist);
+const artifactProfile = process.env.WALKIE_ARTIFACT_PROFILE ?? "production";
 const timeoutMs = Number(process.env.WALKIE_BROWSER_NATIVE_TIMEOUT_MS ?? 90_000);
 const targetKey = 36;
 
@@ -238,6 +256,7 @@ const diagnostics = [];
 const { server, origin } = await serveRelease();
 let browser;
 let context;
+let chromiumProvenance;
 
 try {
   const ready = await native.waitFor((event) => event.event === "ready", "readiness");
@@ -246,6 +265,10 @@ try {
     launchOptions.executablePath = process.env.WALKIE_BROWSER_EXECUTABLE;
   }
   browser = await chromium.launch(launchOptions);
+  chromiumProvenance = {
+    executable: process.env.WALKIE_BROWSER_EXECUTABLE ?? chromium.executablePath(),
+    version: browser.version(),
+  };
   context = await browser.newContext({ serviceWorkers: "allow" });
   const page = await context.newPage();
   page.on("console", (message) => diagnostics.push({ type: message.type(), text: message.text() }));
@@ -306,12 +329,12 @@ try {
   native.send({ cmd: "repair" });
   const [musicRepair, extensionRepair] = await Promise.all([
     native.waitFor(
-      (event) => event.event === "repair" && event.role === "initiator" && event.lane === "music" && event.ok,
+      (event) => event.event === "repair" && event.lane === "music" && event.ok,
       "complete music repair",
       repairStart,
     ),
     native.waitFor(
-      (event) => event.event === "repair" && event.role === "initiator" && event.lane === "extension" && event.ok,
+      (event) => event.event === "repair" && event.lane === "extension" && event.ok,
       "complete extension repair",
       repairStart,
     ),
@@ -330,16 +353,28 @@ try {
   assert.ok(converged.music_frames > 0, "music repair exchanged frames");
   assert.ok(converged.extension_frames > 0, "extension repair exchanged frames");
   assert.deepEqual(converged.violations, [], "repair never carried a foreign-lane record");
+  const failedRepairs = native.events
+    .slice(repairStart)
+    .filter((event) => event.event === "repair" && event.ok === false);
+  assert.deepEqual(failedRepairs, [], `repair sessions failed: ${JSON.stringify(failedRepairs)}`);
 
   const pageErrors = diagnostics.filter((entry) => entry.type === "pageerror");
   assert.deepEqual(pageErrors, [], `browser page errors: ${JSON.stringify(pageErrors)}`);
 
   const report = {
-    schema: "walkie.browser-native-acceptance@1",
-    captured_at: new Date().toISOString(),
+    schema: "walkie.browser-native-acceptance@2",
+    runStartedAt: runStartedAt.toISOString(),
+    capturedAt: new Date().toISOString(),
     room,
-    release_dist: relative(repository, dist),
-    native_endpoint: ready.endpoint,
+    releaseDist: relative(repository, dist),
+    provenance: {
+      ...source,
+      hhhsPin,
+      artifactSha256,
+      artifactProfile,
+      chromium: chromiumProvenance,
+    },
+    nativeEndpoint: ready.endpoint,
     partition: {
       browser_music: 2,
       browser_extension: "pieces_locked",
@@ -360,7 +395,38 @@ try {
   };
   mkdirSync(dirname(reportPath), { recursive: true });
   writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+  const written = statSync(reportPath);
+  assert.ok(
+    written.mtimeMs >= runStartedAt.getTime(),
+    "browser-native report predates the current acceptance run",
+  );
+  assert.equal(report.releaseDist, relative(repository, dist));
+  assert.equal(report.provenance.hhhsPin, hhhsPin);
+  assert.equal(report.provenance.artifactSha256, artifactSha256);
   console.log(JSON.stringify(report, null, 2));
+} catch (error) {
+  console.error(
+    JSON.stringify(
+      {
+        failure: String(error),
+        runStartedAt: runStartedAt.toISOString(),
+        releaseDist: relative(repository, dist),
+        provenance: {
+          ...source,
+          hhhsPin,
+          artifactSha256,
+          artifactProfile,
+          chromium: chromiumProvenance ?? null,
+        },
+        nativeEvents: native.events,
+        nativeStderr: native.stderr,
+        diagnostics,
+      },
+      null,
+      2,
+    ),
+  );
+  throw error;
 } finally {
   if (context) await context.close();
   if (browser) await browser.close();

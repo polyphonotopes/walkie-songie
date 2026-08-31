@@ -54,8 +54,9 @@ impl PitchDelta {
     }
 }
 
-/// Snapshot of all active pitches/pitch classes from all sources.
-/// Used internally for computing deltas.
+/// Snapshot of canonical source facets. Manual toggles and durable emoji
+/// pieces both contribute to sounding membership; voice detection remains a
+/// preview until explicitly committed.
 #[derive(Debug, Clone, Default)]
 pub struct ActivePitchesSnapshot {
     /// Toggle pitch classes (manual keyboard clicks)
@@ -67,28 +68,22 @@ pub struct ActivePitchesSnapshot {
 }
 
 impl ActivePitchesSnapshot {
-    /// Compute unified pitch classes from all sources.
-    pub fn unified_pitch_classes(&self) -> HashSet<u16> {
-        let mut unified = self.toggle_pitch_classes.clone();
-
-        // Add piece pitch classes
-        for &pitch in &self.piece_pitches {
-            unified.insert(pitch.rem_euclid(12) as u16);
-        }
-
-        // Add voice pitch classes
-        for &pitch in &self.voice_pitches {
-            unified.insert(pitch.rem_euclid(12) as u16);
-        }
-
-        unified
+    /// Deterministically materialize the room's sounding pitch classes.
+    /// Manual and emoji-piece facts stay distinguishable to the UI even when
+    /// they contribute the same class.
+    pub fn unified_pitch_classes(&self, pitch_class_count: u16) -> HashSet<u16> {
+        self.toggle_pitch_classes
+            .union(&self.piece_pitch_classes(pitch_class_count))
+            .copied()
+            .collect()
     }
 
     /// Compute piece pitch classes (for separate output).
-    pub fn piece_pitch_classes(&self) -> HashSet<u16> {
+    pub fn piece_pitch_classes(&self, pitch_class_count: u16) -> HashSet<u16> {
+        let pitch_class_count = i32::from(pitch_class_count.max(1));
         self.piece_pitches
             .iter()
-            .map(|&p| p.rem_euclid(12) as u16)
+            .map(|&p| (p - 60).rem_euclid(pitch_class_count) as u16)
             .collect()
     }
 
@@ -114,9 +109,8 @@ pub fn snapshot_active_pitches(room: &RoomProjection) -> ActivePitchesSnapshot {
 // DELTA STREAMS (for MIDI output)
 // =============================================================================
 
-/// Stream of unified pitch class deltas.
-/// This is THE key stream for MIDI output - note-off only fires when
-/// a pitch class is inactive from ALL sources (toggles + pieces + voice).
+/// Stream of canonical sounding pitch-class deltas. Manual assertions and
+/// durable emoji pieces are causal sources; transient voice preview is not.
 ///
 /// The first emitted delta represents the initial state (empty → current).
 /// Consumers should use this for the main MIDI output.
@@ -124,12 +118,16 @@ pub fn snapshot_active_pitches(room: &RoomProjection) -> ActivePitchesSnapshot {
 /// Takes the application projection so it can query current state on each event.
 pub fn unified_pitch_class_deltas(
     room: Arc<RwLock<RoomProjection>>,
+    pitch_class_count: u16,
 ) -> impl Stream<Item = PitchClassDelta> {
     // Get initial state and event stream (read lock, release immediately)
     let (initial_unified, events) = {
         let room_guard = room.read().unwrap();
         let snapshot = snapshot_active_pitches(&room_guard);
-        (snapshot.unified_pitch_classes(), room_guard.events())
+        (
+            snapshot.unified_pitch_classes(pitch_class_count),
+            room_guard.events(),
+        )
     };
 
     // Emit initial state as first delta (empty → current)
@@ -148,7 +146,7 @@ pub fn unified_pitch_class_deltas(
             // Read lock, grab data, release immediately
             let new_unified = {
                 let room_guard = room_for_stream.read().unwrap();
-                snapshot_active_pitches(&room_guard).unified_pitch_classes()
+                snapshot_active_pitches(&room_guard).unified_pitch_classes(pitch_class_count)
             };
 
             // Compute delta (lock already released)
@@ -269,18 +267,21 @@ pub fn voice_pitch_deltas(room: Arc<RwLock<RoomProjection>>) -> impl Stream<Item
 // Only available in wasm32 where futures-signals is available.
 // =============================================================================
 
-/// Signal of unified pitch classes (all sources combined).
-/// Emits the current set whenever any pitch-related change occurs.
-/// Use this for keyboard highlighting, etc.
+/// Signal of canonical shared pitch classes.
+/// Emits the current set whenever any relevant projection change occurs.
 #[cfg(target_arch = "wasm32")]
 pub fn unified_pitch_classes_signal(
     room: Arc<RwLock<RoomProjection>>,
+    pitch_class_count: u16,
 ) -> impl Signal<Item = HashSet<u16>> {
     // Get initial state and events
     let (initial, events) = {
         let room_guard = room.read().unwrap();
         let snapshot = snapshot_active_pitches(&room_guard);
-        (snapshot.unified_pitch_classes(), room_guard.events())
+        (
+            snapshot.unified_pitch_classes(pitch_class_count),
+            room_guard.events(),
+        )
     };
 
     // Stream that emits current state on each relevant event
@@ -289,7 +290,7 @@ pub fn unified_pitch_classes_signal(
         .filter(|e| ready(e.affects_pitches() || e.affects_voice()))
         .map(move |_| {
             let room_guard = room_for_stream.read().unwrap();
-            snapshot_active_pitches(&room_guard).unified_pitch_classes()
+            snapshot_active_pitches(&room_guard).unified_pitch_classes(pitch_class_count)
         });
 
     // Prepend initial state, convert to signal
@@ -406,23 +407,28 @@ mod tests {
     }
 
     #[test]
-    fn test_active_pitches_unified() {
+    fn durable_pieces_contribute_without_admitting_voice_preview() {
         let mut snapshot = ActivePitchesSnapshot::default();
 
         // Toggle C
         snapshot.toggle_pitch_classes.insert(0);
 
-        // Piece at C4 (pitch 60)
-        snapshot.piece_pitches.insert(60);
+        // Piece at G4 (pitch 67)
+        snapshot.piece_pitches.insert(67);
 
-        // Voice at G4 (pitch 67)
-        snapshot.voice_pitches.insert(67);
+        // Uncommitted voice preview at A4 (pitch 69)
+        snapshot.voice_pitches.insert(69);
 
-        let unified = snapshot.unified_pitch_classes();
+        let unified = snapshot.unified_pitch_classes(12);
 
-        // Should have C (0) from toggle and piece, G (7) from voice
+        // Manual and piece facts contribute; the voice preview does not.
         assert!(unified.contains(&0));
         assert!(unified.contains(&7));
+        assert!(!unified.contains(&9));
         assert_eq!(unified.len(), 2);
+
+        let nineteen_tet = snapshot.unified_pitch_classes(19);
+        assert!(nineteen_tet.contains(&7));
+        assert!(!nineteen_tet.contains(&10));
     }
 }

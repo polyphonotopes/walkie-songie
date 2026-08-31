@@ -13,9 +13,14 @@ ignored = ["getrandom"]
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
-name = "room-v5-native-probe"
+name = "walkie-room-interop-probe"
 path = "tests/support/room_v5_native_probe.rs"
-required-features = ["native-net"]
+required-features = ["interop-probe"]
+
+[[bin]]
+name = "tutti-walkie-songie-standalone"
+path = "src/plugin_main.rs"
+required-features = ["standalone"]
 
 [features]
 default = []
@@ -63,6 +68,9 @@ browser-net = [
     "dep:noq-udp",
     "dep:send_wrapper",
 ]
+# Acceptance-only availability fault injection. Ordinary `web-ui` artifacts
+# must not compile this hook or its URL/query control surface.
+browser-acceptance-faults = []
 native-net = [
     "dep:iroh",
     "dep:iroh-base",
@@ -76,6 +84,20 @@ native-net = [
 native-midi = ["dep:midir", "dep:wmidi"]
 client-adapter = ["native-net"]
 tauri-app = ["native-net", "native-midi"]
+plugin = [
+    "dep:egui",
+    "dep:nice-plug",
+    "dep:nice-plug-egui",
+    "dep:tracing-subscriber",
+    "native-net",
+]
+standalone = ["plugin", "nice-plug/standalone"]
+# Developer-only independent-process interoperability harness. Keeping this
+# separate prevents normal plugin bundles from linking a second native binary.
+interop-probe = ["native-net"]
+# Native BLE central used by the optional ESP bridge. The adapter and its
+# asynchronous driver remain absent from ordinary browser/plugin builds.
+desktop-ble = ["dep:btleplug"]
 
 [workspace]
 members = [
@@ -104,36 +126,59 @@ uuid = { version = "1.16", features = ["v4", "rng-getrandom"] }
 web-time = "1.1"
 thiserror = "2.0"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", optional = true }
 rand = "0.9"
 qrcode = "0.14"
 unicode-segmentation = "1.11"
 blake3 = "=1.8.5"
+crossbeam-queue = "0.3"
+getrandom = { version = "0.3", features = ["wasm_js"] }
+# Iroh 1.0 and current UUID/futures-signals resolve getrandom 0.4 as a
+# separate major. Keep its browser backend selected for the complete graph;
+# these feature selections are harmless on native test targets.
+getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 
 # The music protocol (tutti Phase II): tuning identity (`crate::tuning` re-exports
 # it), the MusicOp/MusicLang reference wire, the fold combinators `walkie_fold`
 # drives, and the render seam. Wasm-safe.
-tutti-music = { version = "0.1.0", git = "https://github.com/polyphonotopes/tutti.git", tag = "v0.4.5" }
+tutti-music = { path = "../tutti/tutti-music" }
 # Capability-native canonical-history adapter shared with independent music
 # peers. It owns no Walkie extension or network runtime.
-tutti-music-hhhs = { version = "0.4.4", git = "https://github.com/polyphonotopes/tutti.git", tag = "v0.4.5" }
+tutti-music-hhhs = { path = "../tutti/tutti-music-hhhs" }
 
 # The reactive MIDI bridge: walkie's source-balanced ledger + input tracker
 # (promoted; `src/midi` re-exports them) and the reconcile-on-reconnect core.
-tutti-midi = { version = "0.1.0", git = "https://github.com/polyphonotopes/tutti.git", tag = "v0.4.5" }
+tutti-midi = { path = "../tutti/tutti-midi" }
+# Experimental host/ESP interoperability waist. Keep this as a local path until
+# the frozen GATT/session vectors have landed in a tagged Tutti release.
+tutti-ble = { path = "../tutti/tutti-ble" }
+tutti-session = { path = "../tutti/tutti-session" }
+tutti-realtime = { path = "../tutti/tutti-realtime" }
+tutti-roundtable = { path = "../tutti/tutti-roundtable" }
+ed25519-dalek = "3"
 
-# HHHS 0.4.4 release. The Replica owns admission,
-# persistence, materialization and repair-host state; walkie continues to own
-# iroh/WebRTC/loopback carriers and execution.
-hhhs = { version = "0.4.4", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.4" }
-hhhs-sync = { version = "0.4.4", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.4", features = ["driver"] }
-hhhs-cap = { version = "0.4.4", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.4" }
-hhhs-proof = { version = "0.4.4", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.4" }
-hhhs-store = { version = "0.4.4", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.4" }
-hhhs-replica = { version = "0.4.4", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.4" }
+# nice-plug powers the DAW shell only. BridgeCore itself has no plugin/UI
+# dependency and can also be hosted by Tauri, a standalone process, or mobile.
+nice-plug = { version = "0.3.0", optional = true, features = ["assert_process_allocs"] }
+# Keep the mature OpenGL/baseview renderer on the plugin critical path.  The
+# current egui-baseview WGPU backend unwraps surface creation and can terminate
+# the entire standalone/DAW host on X11 configurations it cannot represent.
+nice-plug-egui = { version = "0.4.0", optional = true, default-features = false, features = ["opengl"] }
+egui = { version = "0.36.1", optional = true }
+
+# Exact HHHS main candidate qualified as one dependency graph. The completed
+# 1568b4f physical overlay remains the control; do not mix generations across crates.
+hhhs = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "332ae1b5c5059a844cd468e52c8f6a3e5b0e9b55" }
+hhhs-sync = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "332ae1b5c5059a844cd468e52c8f6a3e5b0e9b55", features = ["driver"] }
+hhhs-cap = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "332ae1b5c5059a844cd468e52c8f6a3e5b0e9b55" }
+hhhs-proof = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "332ae1b5c5059a844cd468e52c8f6a3e5b0e9b55" }
+hhhs-store = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "332ae1b5c5059a844cd468e52c8f6a3e5b0e9b55" }
+hhhs-replica = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "332ae1b5c5059a844cd468e52c8f6a3e5b0e9b55" }
+hhhs-session = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "332ae1b5c5059a844cd468e52c8f6a3e5b0e9b55", features = ["replica", "xchacha20poly1305"] }
 # Browser placement protocol and in-process parity host. The actual Worker and
 # IndexedDB handles remain wasm-only inside this crate, while its typed service
 # seam is testable on native targets.
-hhhs-web-browser = { version = "0.4.4", git = "https://gitlab.com/micahscopes/hhhs-rs.git", tag = "v0.4.4" }
+hhhs-web-browser = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "332ae1b5c5059a844cd468e52c8f6a3e5b0e9b55" }
 ciborium = "0.2"
 # futures-signals drives the HHHS reactive read model (room::mirror) on ALL targets
 # (native plugin + wasm UI); dominator (wasm-only, below) consumes the same signals.
@@ -152,6 +197,7 @@ tempfile = "3"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.32", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "io-util"] }
 futures = "0.3"
+btleplug = { version = "=0.12.0", optional = true }
 
 # Native transport: QUIC, relay-assisted hole punching, gossip, and room-scoped mDNS.
 iroh = { version = "=1.0.3", optional = true }
@@ -206,7 +252,7 @@ send_wrapper = { version = "0.6", optional = true }
 
 gloo-timers = { version = "0.3", features = ["futures"], optional = true }
 web-sys = { version = "0.3", optional = true, features = [
-    "Window", "Location", "console",
+    "Window", "WorkerGlobalScope", "Performance", "Location", "console",
     "Document", "Element", "HtmlElement", "HtmlButtonElement", "HtmlTextAreaElement", "HtmlInputElement", "HtmlSelectElement",
     "HtmlCollection", "DomTokenList", "NodeList",
     "AudioContext", "AudioContextState", "AudioWorklet", "AudioWorkletNode", "AudioWorkletNodeOptions",
@@ -227,7 +273,6 @@ web-sys = { version = "0.3", optional = true, features = [
 ] }
 console_error_panic_hook = { version = "0.1", optional = true }
 tracing-wasm = { version = "0.2", optional = true }
-getrandom = { version = "0.3", features = ["wasm_js"] }
 js-sys = { version = "0.3", optional = true }
 
 # UI framework (wasm-only). futures-signals is declared once at the top level.

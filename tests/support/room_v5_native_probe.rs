@@ -17,15 +17,15 @@ use std::{
 
 use hhhs::DagRead;
 use hhhs_replica::ReplicaRecord;
-use hhhs_store::MemoryStorage;
+use hhhs_store::{MemoryStorage, history_root};
 use hhhs_sync::{RepairHost, SessionLimits, SyncMessage};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use walkie_songie::net::{
     IrohSyncStream, NativeNetworkEvent, NativeRoomNetwork, PeerId, RelayPolicy, ReplicaLiveRecord,
-    ReplicaRepairHint, ReplicaRoomNetworkConfig, RoomInbound, SyncStream, TokioTimer,
-    TransportError, WalkieIdentity, drive_replica_initiator, drive_replica_responder,
-    replica_frontier_digest, spawn_rendezvous_v5,
+    ReplicaRepairHint, ReplicaRepairProbe, ReplicaRoomNetworkConfig, RoomInbound, SyncStream,
+    TokioTimer, TransportError, WalkieIdentity, drive_replica_initiator, drive_replica_responder,
+    is_routine_repair_initiator, replica_frontier_digest, spawn_rendezvous_v5,
 };
 use walkie_songie::room::v5::{
     ActorId, ExtensionCommand, ProtocolSupport, RoomCommand, RoomLane, RoomReplicas,
@@ -67,8 +67,8 @@ impl SyncStream for AuditedStream {
         Ok(frame)
     }
 
-    async fn close(self) {
-        self.inner.close().await;
+    async fn close(self) -> Result<(), TransportError> {
+        self.inner.close().await
     }
 }
 
@@ -198,23 +198,28 @@ fn repair_host(
     }
 }
 
-fn emit_repair<E>(role: &str, lane: RoomLane, result: Result<hhhs_sync::SessionOutcome, E>)
+fn emit_repair<E>(role: &str, lane: RoomLane, result: Result<hhhs_sync::ConfirmedRepair, E>)
 where
     E: std::fmt::Display,
 {
     match result {
-        Ok(outcome) => emit(json!({
-            "event": "repair",
-            "role": role,
-            "lane": lane_name(lane),
-            "ok": !outcome.incomplete && !outcome.root_mismatch && outcome.refused == 0,
-            "incomplete": outcome.incomplete,
-            "root_mismatch": outcome.root_mismatch,
-            "admitted": outcome.admitted,
-            "refused": outcome.refused,
-            "frames_sent": outcome.frames_sent,
-            "frames_received": outcome.frames_received,
-        })),
+        Ok(confirmed) => {
+            let outcome = confirmed.outcome();
+            emit(json!({
+                "event": "repair",
+                "role": role,
+                "lane": lane_name(lane),
+                "ok": confirmed.disposition() == hhhs_sync::RepairDisposition::Synchronized,
+                "disposition": format!("{:?}", confirmed.disposition()),
+                "freshness": format!("{:?}", confirmed.freshness()),
+                "incomplete": outcome.incomplete,
+                "root_mismatch": outcome.root_mismatch,
+                "admitted": outcome.admitted,
+                "refused": outcome.refused,
+                "frames_sent": outcome.frames_sent,
+                "frames_received": outcome.frames_received,
+            }))
+        }
         Err(error) => emit(json!({
             "event": "repair",
             "role": role,
@@ -368,8 +373,10 @@ async fn emit_status(room: &SharedRoom, audit: &SharedAudit, partitioned: bool) 
         "pieces_locked": view.pieces_locked,
         "music_entries": music.history.all_hashes().len(),
         "extension_entries": extension.history.all_hashes().len(),
-        "music_root": hex(replica_frontier_digest(&music.history.frontier()).as_bytes()),
-        "extension_root": hex(replica_frontier_digest(&extension.history.frontier()).as_bytes()),
+        "music_root": hex(history_root(&music.history).as_bytes()),
+        "extension_root": hex(history_root(&extension.history).as_bytes()),
+        "music_frontier": hex(replica_frontier_digest(&music.history.frontier()).as_bytes()),
+        "extension_frontier": hex(replica_frontier_digest(&extension.history.frontier()).as_bytes()),
         "music_frames": audit.music_frames,
         "extension_frames": audit.extension_frames,
         "violations": audit.violations,
@@ -398,7 +405,7 @@ fn hex(bytes: &[u8]) -> String {
 async fn main() -> ProbeResult<()> {
     let room_name = std::env::args()
         .nth(1)
-        .ok_or("usage: room-v5-native-probe <room-name>")?;
+        .ok_or("usage: walkie-room-interop-probe <room-name>")?;
     if !walkie_songie::is_valid_room_name(&room_name) {
         return Err(format!("invalid room name {room_name:?}").into());
     }
@@ -528,10 +535,26 @@ async fn main() -> ProbeResult<()> {
                     }
                     Command::Status => emit_status(&room, &audit, partitioned.load(Ordering::SeqCst)).await,
                     Command::Repair => {
+                        let local = PeerId(*endpoint_id.as_bytes());
                         for (peer, support) in peers.iter().map(|(peer, support)| (*peer, *support)).collect::<Vec<_>>() {
+                            let remote = PeerId(*peer.as_bytes());
                             for lane in [RoomLane::Music, RoomLane::Extension] {
-                                if support.supports(lane) {
+                                if !support.supports(lane) {
+                                    continue;
+                                }
+                                if is_routine_repair_initiator(local, remote) {
                                     spawn_initiator(endpoint.clone(), peer, room.clone(), lane, audit.clone(), in_flight.clone(), partitioned.clone());
+                                } else {
+                                    let snapshot = match lane {
+                                        RoomLane::Music => room.music_snapshot(),
+                                        RoomLane::Extension => room.extension_snapshot(),
+                                    };
+                                    network.broadcast(ReplicaRepairProbe {
+                                        lane,
+                                        source: local,
+                                        frontier: replica_frontier_digest(&snapshot.history.frontier()),
+                                    }.encode()).await?;
+                                    emit(json!({"event": "repair_probe", "lane": lane_name(lane), "peer": peer.to_string()}));
                                 }
                             }
                         }

@@ -23,13 +23,17 @@ pub use native::{
 use crate::room::v5::{ActorId, PieceId};
 use crate::tuning::TunedDegree;
 
-/// One independent reason a MIDI note is sounding, walkie's vocabulary:
-/// sources, not pitches, are the unit of ownership, so two sources may share an
-/// output voice without either being able to silence the other.
+/// One independent reason a MIDI note is sounding in Walkie's projection.
+/// The durable shared set has one source per member, independent of authorship;
+/// pieces, voice previews, and locally held keys remain separate sources.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MidiSource {
-    /// A durable shared degree, held per author (authorship-as-channel).
-    DurableDegree { author: ActorId, pitch: TunedDegree },
+    /// One member of the durable shared pitch-class set.
+    SharedDegree { pitch: TunedDegree },
+    /// One explicitly octave-bearing member of the durable shared pitch set.
+    SharedPitch {
+        pitch: crate::tuning::TunedPeriodicPitch,
+    },
     /// An emoji piece, keyed by its creating op.
     Piece { id: PieceId },
     /// A peer's live voice preview (presence-leased, never durable).

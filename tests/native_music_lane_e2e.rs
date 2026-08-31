@@ -84,7 +84,9 @@ impl FrameStream for RecordingEnd {
         Ok(self.receive.next().await)
     }
 
-    async fn close(self) {}
+    async fn close(self) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 impl SyncStream for RecordingEnd {
@@ -97,7 +99,9 @@ impl SyncStream for RecordingEnd {
         Ok(self.receive.next().await)
     }
 
-    async fn close(self) {}
+    async fn close(self) -> Result<(), TransportError> {
+        Ok(())
+    }
 }
 
 struct NeverTimer;
@@ -248,7 +252,18 @@ fn bare_music_replica_converges_without_receiving_extension_state() {
     ));
     let bare_first = bare_first.unwrap();
     let walkie_first = walkie_first.unwrap();
-    assert_eq!(bare_first.refused + walkie_first.refused, 0);
+    assert_eq!(
+        bare_first.disposition(),
+        hhhs_sync::RepairDisposition::Synchronized
+    );
+    assert_eq!(
+        walkie_first.disposition(),
+        hhhs_sync::RepairDisposition::Synchronized
+    );
+    assert_eq!(
+        bare_first.outcome().refused + walkie_first.outcome().refused,
+        0
+    );
 
     let bare_entry = bare
         .author(
@@ -315,7 +330,12 @@ fn bare_music_replica_converges_without_receiving_extension_state() {
     ));
     let bare_outcome = bare_outcome.unwrap();
     let walkie_outcome = walkie_outcome.unwrap();
-    for outcome in [&bare_outcome, &walkie_outcome] {
+    for confirmed in [&bare_outcome, &walkie_outcome] {
+        assert_eq!(
+            confirmed.disposition(),
+            hhhs_sync::RepairDisposition::Synchronized
+        );
+        let outcome = confirmed.outcome();
         assert!(!outcome.incomplete);
         assert!(!outcome.root_mismatch);
         assert_eq!(outcome.refused, 0);

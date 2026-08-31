@@ -491,6 +491,20 @@ pub fn midi_settings(state: Arc<AppState>) -> Dom {
                 .class("section-label")
                 .text("MIDI")
             }),
+            html!("label", {
+                .class("midi-row")
+                .attr("title", "When enabled, keyboard taps and MIDI note-ons edit the shared ESP arpeggiator pattern")
+                .children(&mut [
+                    html!("input", {
+                        .attr("type", "checkbox")
+                        .prop_signal("checked", state.arpeggiator_edit_mode.signal())
+                        .event(clone!(state => move |_: events::Change| {
+                            state.arpeggiator_edit_mode.set(!state.arpeggiator_edit_mode.get());
+                        }))
+                    }),
+                    html!("span", { .text("Edit shared arpeggiator (default)") }),
+                ])
+            }),
             html!("div", {
                 .class("midi-row")
                 .children(&mut [
@@ -805,10 +819,11 @@ fn compute_info_panel_data(
         return InfoPanelData::default();
     }
 
-    // Use canonical unified pitch classes (includes toggles + pieces + voice)
+    // Scale identity follows the canonical sounding projection: manual
+    // membership plus durable emoji pieces. Voice preview stays separate.
     let snapshot = snapshot_active_pitches(room);
     let pitch_classes: Vec<u8> = snapshot
-        .unified_pitch_classes()
+        .unified_pitch_classes(tuning.pitch_class_count() as u16)
         .into_iter()
         .filter_map(|pitch| u8::try_from(pitch).ok())
         .collect();

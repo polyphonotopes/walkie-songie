@@ -7,6 +7,7 @@
 //!
 //! The core library has no UI dependencies and can be used from
 //! Tauri, optional browser clients, plugins, or CLI applications.
+pub mod bridge;
 pub mod client;
 pub mod midi;
 pub mod net;
@@ -15,12 +16,15 @@ pub mod room;
 pub mod tuning;
 pub mod words;
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "plugin"))]
+pub mod plugin;
+
 #[cfg(all(target_arch = "wasm32", feature = "web-ui"))]
 pub mod web;
 
 // Re-export core types
 pub use pitch::{PitchDetectorConfig, PitchEvent, SwiftF0Detector};
-pub use room::{CombinationMethod, RoomProjection};
+pub use room::RoomProjection;
 pub use tuning::{
     KeyboardMapping, PeriodicPitch, PitchClass, ScaleDegree, TunedDegree, TunedPeriodicPitch,
     Tuning, TuningDefinition, TuningId,

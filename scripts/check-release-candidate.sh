@@ -18,7 +18,7 @@ nix develop --command bash -euo pipefail -c '
   cargo test --workspace --all-targets --locked
   cargo test --manifest-path relay/Cargo.toml --locked
   cargo clippy --workspace --all-targets --locked -- -D warnings
-  cargo build --locked --features native-net --bin room-v5-native-probe
+  cargo build --locked --features interop-probe --bin walkie-room-interop-probe
   cargo check --locked --target wasm32-unknown-unknown --features web-ui
   NO_COLOR=false trunk build --release --locked --dist "$1"
 ' bash "$RELEASE_DIST"

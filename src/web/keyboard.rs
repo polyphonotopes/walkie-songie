@@ -226,7 +226,7 @@ pub fn sync_active_pitches(state: &Arc<AppState>) {
     let pieces = room.all_pieces();
     let piece_notes: Vec<u8> = pieces
         .iter()
-        .map(|p| p.pitch.rem_euclid(pc_count) as u8)
+        .map(|p| (p.pitch - 60).rem_euclid(pc_count) as u8)
         .collect();
 
     // Update piece overlays (piece-dots pattern for key highlight)
@@ -799,7 +799,7 @@ fn setup_piece_sync(state: Arc<AppState>, keyboard_el: web_sys::HtmlElement) {
 
             // Add or update pieces
             for piece in pieces {
-                let pitch_class = piece.pitch.rem_euclid(pitch_count as i32);
+                let pitch_class = (piece.pitch - 60).rem_euclid(pitch_count as i32);
                 let key_index = LEFTMOST_KEY + pitch_class;
 
                 if let Some(el) = elements.get(&piece.id) {
@@ -1064,7 +1064,7 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
 
         // Fallback: use drag vector heuristic
         let drag_dx = e.client_x() - start_x;
-        let start_pc = start_pitch.rem_euclid(pc_count);
+        let start_pc = (start_pitch - 60).rem_euclid(pc_count);
 
         let vector_key = if drag_dx.abs() > 20 {
             let estimated_offset = (drag_dx as f32 / 35.0).round() as i32;
@@ -1124,7 +1124,7 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
         };
 
         // Update the piece position
-        let pitch_class = display_pitch.rem_euclid(pc_count);
+        let pitch_class = (display_pitch - 60).rem_euclid(pc_count);
         let key_index = LEFTMOST_KEY + pitch_class;
 
         // Reset styling
@@ -1203,7 +1203,7 @@ fn setup_document_drag_handlers(state: Arc<AppState>) {
             let tuning = state_cancel.tuning.lock_ref();
             let pc_count = tuning.pitch_class_count() as i32;
             drop(tuning);
-            let pitch_class = drag.start_pitch.rem_euclid(pc_count);
+            let pitch_class = (drag.start_pitch - 60).rem_euclid(pc_count);
             let key_index = LEFTMOST_KEY + pitch_class;
             piece_el
                 .set_attribute("data-key", &key_index.to_string())
@@ -1477,9 +1477,9 @@ fn setup_keyboard_events(state: Arc<AppState>) {
                         let voice_cleared = if state_click.native_backend {
                             // Connected: derive an absolute intent from the
                             // authoritative projection plus any pending local
-                            // intent. `set_native_degree` paints that pending
-                            // intent immediately, then the durable projection
-                            // confirms or corrects it.
+                            // intent. Pending intent only de-duplicates input;
+                            // the durable projection remains the sole writer
+                            // of visible room membership.
                             let present = state_click.degree_is_active(pc);
                             state_click.set_native_degree(pc, !present);
 

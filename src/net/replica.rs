@@ -8,7 +8,7 @@ use core::future::Future;
 
 use hhhs::{Digest, Encoder, EntryHash, Position};
 use hhhs_sync::{
-    FrameStream, Lane, RepairHost, SessionLimits, SessionOutcome, SyncError,
+    ConfirmedRepair, FrameStream, Lane, RepairFreshness, SessionLimits, SyncError,
     SyncTimer as HhhsSyncTimer, drive_initiator, drive_responder,
 };
 
@@ -236,8 +236,8 @@ impl<S: SyncStream> FrameStream for ReplicaFrameStream<S> {
         self.0.recv_frame().await
     }
 
-    async fn close(self) {
-        self.0.close().await;
+    async fn close(self) -> Result<(), Self::Error> {
+        self.0.close().await
     }
 }
 
@@ -265,11 +265,12 @@ pub async fn drive_replica_initiator<S, T, R>(
     replica: &mut R,
     lane: RoomLane,
     limits: SessionLimits,
-) -> Result<SessionOutcome, SyncError>
+) -> Result<ConfirmedRepair, SyncError>
 where
     S: SyncStream,
     T: SyncTimer,
-    R: RepairHost,
+    R: RepairFreshness,
+    R::Snapshot: Sync,
 {
     drive_initiator(
         ReplicaFrameStream(stream),
@@ -287,11 +288,12 @@ pub async fn drive_replica_responder<S, T, R>(
     replica: &mut R,
     lane: RoomLane,
     limits: SessionLimits,
-) -> Result<SessionOutcome, SyncError>
+) -> Result<ConfirmedRepair, SyncError>
 where
     S: SyncStream,
     T: SyncTimer,
-    R: RepairHost,
+    R: RepairFreshness,
+    R::Snapshot: Sync,
 {
     drive_responder(
         ReplicaFrameStream(stream),
@@ -309,6 +311,7 @@ mod tests {
     use futures::{future::pending, join};
     use hhhs::DagRead;
     use hhhs_proof::SigningKey;
+    use hhhs_sync::RepairHost;
     use tutti_music::{MusicOp, TunedDegree, Tuning};
 
     use super::*;
@@ -471,9 +474,10 @@ mod tests {
             Ok(self.receive.recv().await.ok())
         }
 
-        async fn close(self) {
+        async fn close(self) -> Result<(), TransportError> {
             self.send.close();
             self.receive.close();
+            Ok(())
         }
     }
 
@@ -519,8 +523,14 @@ mod tests {
                     SessionLimits::default(),
                 )
             );
-            assert!(!dial.unwrap().incomplete);
-            assert!(!accept.unwrap().incomplete);
+            assert_eq!(
+                dial.unwrap().disposition(),
+                hhhs_sync::RepairDisposition::Synchronized
+            );
+            assert_eq!(
+                accept.unwrap().disposition(),
+                hhhs_sync::RepairDisposition::Synchronized
+            );
             let left_hashes: std::collections::BTreeSet<_> = left
                 .music_snapshot()
                 .history

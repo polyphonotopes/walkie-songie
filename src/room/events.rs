@@ -51,8 +51,6 @@ pub enum RoomEvent {
     PiecesLockChanged { locked: bool },
     /// Tuning (SCL content) changed
     TuningChanged { scl: String },
-    /// Combination method changed
-    CombinationMethodChanged { method: String },
     /// Available emojis palette changed
     EmojisChanged { emojis: Vec<String> },
 
@@ -118,7 +116,6 @@ impl RoomEvent {
             self,
             RoomEvent::PiecesLockChanged { .. }
                 | RoomEvent::TuningChanged { .. }
-                | RoomEvent::CombinationMethodChanged { .. }
                 | RoomEvent::EmojisChanged { .. }
         )
     }
