@@ -99,6 +99,12 @@ impl ReservedWriteMessage {
             .take()
             .expect("reserved BLE write message taken once")
     }
+
+    fn message(&self) -> &BleWriteMessage {
+        self.message
+            .as_ref()
+            .expect("reserved BLE write message is still present")
+    }
 }
 
 impl Drop for ReservedWriteMessage {
@@ -125,12 +131,14 @@ fn reserve_bounded(
 
 struct DriverTxMessage {
     _reservation: ReservedWriteMessage,
+    message_id: u16,
     cursor: FragmentCursor,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct PreparedTxFragment {
     priority: BleWritePriority,
+    message_id: u16,
     completes_message: bool,
     value: Vec<u8>,
 }
@@ -164,9 +172,11 @@ impl DriverTxScheduler {
                 "BLE TX stream is faulted until a fresh connection".into(),
             ));
         }
+        let message_id = reserved.message().message_id();
         let (priority, cursor) = reserved.take_message().into_cursor()?;
         let message = DriverTxMessage {
             _reservation: reserved,
+            message_id,
             cursor,
         };
         self.queue_mut(priority).push_back(message);
@@ -227,6 +237,7 @@ impl DriverTxScheduler {
         value.truncate(used);
         let pending = PreparedTxFragment {
             priority,
+            message_id: message.message_id,
             completes_message: message.cursor.is_complete(),
             value,
         };
@@ -234,13 +245,13 @@ impl DriverTxScheduler {
         Ok(Some(pending))
     }
 
-    fn confirm_pending(&mut self) {
-        let Some(prepared) = self.pending.take() else {
-            return;
-        };
+    fn confirm_pending(&mut self) -> Option<u16> {
+        let prepared = self.pending.take()?;
         if prepared.completes_message {
             self.queue_mut(prepared.priority).pop_front();
+            return Some(prepared.message_id);
         }
+        None
     }
 
     fn clear(&mut self) {
@@ -596,7 +607,11 @@ async fn driver_loop(
                     .write(&active.rx, &prepared.value, active.write_type)
                     .await
                 {
-                    Ok(()) => tx.confirm_pending(),
+                    Ok(()) => {
+                        if let Some(message_id) = tx.confirm_pending() {
+                            send_event(&events, BleHostEvent::WriteComplete { message_id });
+                        }
+                    }
                     Err(error) => {
                         // The cursor may already point beyond this fragment,
                         // but it remains fenced by `pending` until success.
@@ -1477,6 +1492,42 @@ mod tests {
         assert!(completed.contains(&repair));
         assert_eq!(messages.load(Ordering::Acquire), 0);
         assert_eq!(bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn repair_lifecycle_control_cannot_overtake_its_repair_prefix() {
+        let messages = Arc::new(AtomicUsize::new(0));
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let mut tx = DriverTxScheduler::default();
+        tx.fresh_connection();
+        tx.enqueue(reserved_test_message(
+            30,
+            vec![0x52; 100],
+            BleWritePriority::Repair,
+            &messages,
+            &bytes,
+        ))
+        .unwrap();
+        // FIN is a Control-lane authenticated payload, but its carrier
+        // priority is Repair so this second message stays behind the prefix.
+        tx.enqueue(reserved_test_message(
+            31,
+            vec![0x46; 40],
+            BleWritePriority::Repair,
+            &messages,
+            &bytes,
+        ))
+        .unwrap();
+
+        let mut ids = Vec::new();
+        while !tx.is_empty() {
+            let fragment = tx.prepare_next().unwrap().unwrap();
+            ids.push(fragment.message_id);
+            tx.confirm_pending();
+        }
+        let fin_start = ids.iter().position(|id| *id == 31).unwrap();
+        assert!(ids[..fin_start].iter().all(|id| *id == 30));
+        assert!(ids[fin_start..].iter().all(|id| *id == 31));
     }
 
     #[derive(Default)]

@@ -367,6 +367,27 @@ pub enum BridgeCommand {
         binding: BoardSessionBinding,
         bundle: Vec<u8>,
     },
+    /// Begin one ordinary HHHS music repair against the provisioned board.
+    StartBoardRepair(BoardSessionBinding),
+    /// Byte-exact HHHS frame emitted by the room-owned stepwise attempt.
+    SendBoardRepairFrame {
+        binding: BoardSessionBinding,
+        frame: Vec<u8>,
+    },
+    /// Byte-exact HHHS frame received from the authenticated BLE lane.
+    ObserveBoardRepairFrame {
+        binding: BoardSessionBinding,
+        frame: Vec<u8>,
+    },
+    /// The room-owned HHHS attempt is terminal; begin explicit BLE FIN/Ack.
+    FinishBoardRepair(BoardSessionBinding),
+    /// The BLE carrier proved both terminal prefixes and acknowledgements.
+    ConfirmBoardRepairClose(BoardSessionBinding),
+    /// The room-owned attempt additionally proved same-placement freshness
+    /// after carrier close; only this transition may make the board Ready.
+    CompleteBoardRepair(BoardSessionBinding),
+    /// Abandon an in-flight attempt after link/session/room replacement.
+    AbortBoardRepair(BoardSessionBinding),
     /// Publish room-wide round-table timing/timbre settings.
     PublishRoundTable(tutti_roundtable::Frame),
     /// Queue one explicit board-origin gesture as a bounded source envelope.
@@ -480,6 +501,24 @@ pub enum TransportEvent {
     },
     /// The board imported and proved possession for the exact bundle digest.
     BoardProvisioned(BoardSessionBinding),
+    BoardRepairOutbound {
+        binding: BoardSessionBinding,
+        frame: Vec<u8>,
+    },
+    BoardRepairInbound {
+        binding: BoardSessionBinding,
+        frame: Vec<u8>,
+    },
+    BoardRepairTerminal(BoardSessionBinding),
+    BoardRepairCarrierClosed(BoardSessionBinding),
+    BoardRepairSynchronized(BoardSessionBinding),
+    /// The room-owned stepwise attempt failed before symmetric close. The
+    /// board leg must abandon the matching authenticated attempt and must not
+    /// remain observably ready or repairing.
+    BoardRepairFailed {
+        binding: BoardSessionBinding,
+        reason: String,
+    },
     RoundTable(tutti_roundtable::Frame),
     /// Materialized shared set received from the Iroh room leg.
     RoomPitchSet(SharedPitchSet),
@@ -1683,7 +1722,19 @@ fn handle_transport_event(
         TransportEvent::BoardProvisioningRequired(_)
         | TransportEvent::BoardCapabilityBundlePrepared { .. }
         | TransportEvent::BoardProvisioningFailed { .. }
-        | TransportEvent::BoardProvisioned(_) => {}
+        | TransportEvent::BoardProvisioned(_)
+        | TransportEvent::BoardRepairOutbound { .. }
+        | TransportEvent::BoardRepairInbound { .. }
+        | TransportEvent::BoardRepairTerminal(_)
+        | TransportEvent::BoardRepairCarrierClosed(_)
+        | TransportEvent::BoardRepairSynchronized(_) => {}
+        TransportEvent::BoardRepairFailed { reason, .. } => {
+            publish_event(
+                &queues.ui_events,
+                status,
+                BridgeEvent::Diagnostic(format!("board HHHS repair failed: {reason}")),
+            );
+        }
         TransportEvent::PitchIntentOutcome { .. } | TransportEvent::PitchIntentReset { .. } => {}
         TransportEvent::Diagnostic(message) => {
             publish_event(&queues.ui_events, status, BridgeEvent::Diagnostic(message));

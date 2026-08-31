@@ -6,14 +6,18 @@
 //! still owns OS permissions and GATT objects; HHHS admission remains outside
 //! this module.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    time::{Duration, Instant},
+};
 
 use ed25519_dalek::SigningKey;
 use tutti_ble::{
     CAPABILITY_HHHS_REPAIR, CAPABILITY_REALTIME, ControlFrame, DEFAULT_MAX_PAYLOAD_BYTES,
     HARD_MAX_WIRE_BYTES, Lane, LaneProfile, MIN_FRAGMENT_VALUE_BYTES, PeerHello, Reassembler,
-    ReassemblyBudget, SessionCodec, channel_binding, decode_answer, decode_control_frame,
-    encode_control_capability_bundle, encode_control_profile, realtime_generation,
+    ReassemblyBudget, RepairCloseState, SessionCodec, channel_binding, decode_answer,
+    decode_control_frame, encode_control_capability_bundle, encode_control_profile,
+    encode_control_repair_ack, encode_control_repair_fin, realtime_generation, repair_attempt_id,
     session_protocol_id, with_realtime_generation,
 };
 use tutti_realtime::{Frame as RealtimeFrame, MidiFrame, MidiKind};
@@ -26,7 +30,7 @@ use super::{
 };
 
 const TRANSPORT_EVENT_CAPACITY: usize = 256;
-const DEFAULT_REPAIR_QUEUE_CAPACITY: usize = 8;
+const REPAIR_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub struct BleLinkConfig {
@@ -35,7 +39,6 @@ pub struct BleLinkConfig {
     pub local_profile: ProtocolProfile,
     pub max_payload_bytes: usize,
     pub max_repair_frame_bytes: usize,
-    pub repair_queue_capacity: usize,
 }
 
 impl BleLinkConfig {
@@ -49,7 +52,6 @@ impl BleLinkConfig {
             local_profile: ProtocolProfile::WALKIE,
             max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
             max_repair_frame_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
-            repair_queue_capacity: DEFAULT_REPAIR_QUEUE_CAPACITY,
         }
     }
 
@@ -67,11 +69,6 @@ impl BleLinkConfig {
         {
             return Err(BridgeError::Transport(
                 "BLE repair-frame budget must fit the authenticated payload budget".into(),
-            ));
-        }
-        if self.repair_queue_capacity == 0 {
-            return Err(BridgeError::Transport(
-                "BLE repair queue capacity is zero".into(),
             ));
         }
         Ok(())
@@ -93,9 +90,11 @@ pub struct BleLinkTransport<H> {
     pending: Option<PendingInitiator>,
     codec: Option<SessionCodec>,
     reassembler: Reassembler,
-    repair_frames: VecDeque<Vec<u8>>,
-    repair_queue_capacity: usize,
     negotiated_repair_frame_bytes: usize,
+    repair_close: Option<(BoardSessionBinding, RepairCloseState)>,
+    repair_ack_write: Option<(u16, u64)>,
+    repair_awaiting_confirmation: Option<BoardSessionBinding>,
+    repair_deadline: Option<Instant>,
     next_message_id: u16,
     dropped_events: u64,
     desired_address: Option<super::BleAddress>,
@@ -145,9 +144,11 @@ where
                     .map_err(wire_error)?,
             )
             .map_err(wire_error)?,
-            repair_frames: VecDeque::with_capacity(config.repair_queue_capacity),
-            repair_queue_capacity: config.repair_queue_capacity,
             negotiated_repair_frame_bytes: config.max_repair_frame_bytes,
+            repair_close: None,
+            repair_ack_write: None,
+            repair_awaiting_confirmation: None,
+            repair_deadline: None,
             next_message_id: 0,
             dropped_events: 0,
             desired_address: None,
@@ -157,22 +158,14 @@ where
         })
     }
 
-    pub fn try_receive_repair_frame(&mut self) -> Option<Vec<u8>> {
-        self.repair_frames.pop_front()
-    }
-
-    pub fn send_repair_frame(&mut self, frame: &[u8]) -> Result<(), BridgeError> {
-        if !self
-            .remote_hello
-            .is_some_and(|hello| hello.supports(CAPABILITY_HHHS_REPAIR))
-        {
-            return Err(BridgeError::Unavailable(
-                "BLE peer does not advertise an HHHS repair driver".into(),
-            ));
-        }
-        if self.remote_lane_profile.is_none() {
-            return Err(BridgeError::Unavailable(
-                "BLE repair lane is not authenticated".into(),
+    fn send_board_repair_frame(
+        &mut self,
+        binding: BoardSessionBinding,
+        frame: &[u8],
+    ) -> Result<(), BridgeError> {
+        if self.current_board_binding() != Some(binding) {
+            return Err(BridgeError::Transport(
+                "repair frame belongs to a stale board placement".into(),
             ));
         }
         if frame.len() > self.negotiated_repair_frame_bytes {
@@ -182,7 +175,128 @@ where
                 self.negotiated_repair_frame_bytes
             )));
         }
-        self.send_authenticated(Lane::HhhsRepair, frame)
+        if self.repair_close.is_none() {
+            self.repair_awaiting_confirmation = None;
+            self.repair_close = Some((
+                binding,
+                RepairCloseState::new(repair_attempt_id(binding.session_id, frame)),
+            ));
+            self.repair_deadline = Some(Instant::now() + REPAIR_CLOSE_TIMEOUT);
+            self.publish(TransportEvent::BoardLink(LinkState::Repairing));
+        }
+        if self
+            .repair_close
+            .as_ref()
+            .is_some_and(|(current, _)| *current != binding)
+        {
+            return Err(BridgeError::Transport(
+                "another board repair attempt is still active".into(),
+            ));
+        }
+        let (sequence, _) = self.send_authenticated_tracked(Lane::HhhsRepair, frame)?;
+        self.repair_close
+            .as_mut()
+            .expect("repair close installed above")
+            .1
+            .observe_local_repair(sequence)
+            .map_err(|error| BridgeError::Transport(error.to_string()))
+    }
+
+    fn finish_board_repair(&mut self, binding: BoardSessionBinding) -> Result<(), BridgeError> {
+        let Some((current, close)) = self.repair_close.as_mut() else {
+            return Err(BridgeError::Unavailable(
+                "no board repair attempt is active".into(),
+            ));
+        };
+        if *current != binding {
+            return Err(BridgeError::Transport(
+                "repair terminal outcome belongs to a stale board placement".into(),
+            ));
+        }
+        close.mark_local_terminal();
+        if close.local_fin_pending() {
+            let fin = close
+                .local_fin()
+                .map_err(|error| BridgeError::Transport(error.to_string()))?;
+            // FIN is an authenticated control message, but it is ordered in
+            // the repair TX lane so it cannot overtake the exact HHHS prefix
+            // whose final sequence it declares.
+            let (sequence, _) = self.send_authenticated_tracked_with_priority(
+                Lane::Control,
+                &encode_control_repair_fin(fin),
+                BleWritePriority::Repair,
+            )?;
+            self.repair_close
+                .as_mut()
+                .expect("repair close remains active")
+                .1
+                .observe_local_fin_encoded(sequence)
+                .map_err(|error| BridgeError::Transport(error.to_string()))?;
+        }
+        self.maybe_send_repair_ack()?;
+        self.maybe_publish_repair_closed()
+    }
+
+    fn maybe_send_repair_ack(&mut self) -> Result<(), BridgeError> {
+        let Some((_, close)) = self.repair_close.as_ref() else {
+            return Ok(());
+        };
+        if !close.remote_ack_pending() {
+            return Ok(());
+        }
+        let ack = close
+            .remote_ack()
+            .map_err(|error| BridgeError::Transport(error.to_string()))?;
+        let (sequence, message_id) =
+            self.send_authenticated_tracked(Lane::Control, &encode_control_repair_ack(ack))?;
+        self.repair_close
+            .as_mut()
+            .expect("repair close remains active")
+            .1
+            .observe_remote_ack_encoded(sequence)
+            .map_err(|error| BridgeError::Transport(error.to_string()))?;
+        self.repair_ack_write = Some((message_id, sequence));
+        Ok(())
+    }
+
+    fn handle_repair_control(
+        &mut self,
+        sequence: u64,
+        control: ControlFrame<'_>,
+    ) -> Result<(), BridgeError> {
+        let Some((_, close)) = self.repair_close.as_mut() else {
+            return Err(BridgeError::Transport(
+                "repair lifecycle control arrived without an active attempt".into(),
+            ));
+        };
+        match control {
+            ControlFrame::RepairFin(fin) => close
+                .observe_remote_fin(fin, sequence)
+                .map_err(|error| BridgeError::Transport(error.to_string()))?,
+            ControlFrame::RepairAck(ack) => close
+                .observe_local_fin_ack(ack)
+                .map_err(|error| BridgeError::Transport(error.to_string()))?,
+            _ => unreachable!("repair control caller filters variants"),
+        }
+        self.maybe_send_repair_ack()?;
+        self.maybe_publish_repair_closed()
+    }
+
+    fn maybe_publish_repair_closed(&mut self) -> Result<(), BridgeError> {
+        let closed = self
+            .repair_close
+            .as_ref()
+            .is_some_and(|(_, close)| close.is_confirmed_closed());
+        if closed {
+            let (binding, _) = self
+                .repair_close
+                .take()
+                .expect("confirmed repair close exists");
+            self.repair_ack_write = None;
+            self.repair_awaiting_confirmation = Some(binding);
+            self.publish(TransportEvent::BoardRepairCarrierClosed(binding));
+        }
+        Ok(())
     }
 
     pub fn send_round_table(&mut self, frame: tutti_roundtable::Frame) -> Result<(), BridgeError> {
@@ -247,6 +361,16 @@ where
         self.events.push_back(event);
     }
 
+    fn publish_repair(&mut self, event: TransportEvent) -> Result<(), BridgeError> {
+        if self.events.len() == TRANSPORT_EVENT_CAPACITY {
+            return Err(BridgeError::QueueFull {
+                queue: "BLE transport events",
+            });
+        }
+        self.events.push_back(event);
+        Ok(())
+    }
+
     fn reset_session(&mut self) {
         self.remote_hello = None;
         self.remote_lane_profile = None;
@@ -254,7 +378,10 @@ where
         self.pending = None;
         self.codec = None;
         self.reassembler.reset();
-        self.repair_frames.clear();
+        self.repair_close = None;
+        self.repair_ack_write = None;
+        self.repair_awaiting_confirmation = None;
+        self.repair_deadline = None;
         self.next_message_id = 0;
         self.negotiated_repair_frame_bytes =
             self.local_lane_profile.max_repair_frame_bytes as usize;
@@ -265,6 +392,10 @@ where
         self.codec = None;
         self.remote_lane_profile = None;
         self.pending_provisioning = None;
+        self.repair_close = None;
+        self.repair_ack_write = None;
+        self.repair_awaiting_confirmation = None;
+        self.repair_deadline = None;
         self.reassembler.reset();
         self.scan_requested = false;
         self.connect_pending = false;
@@ -328,6 +459,14 @@ where
     }
 
     fn send_wire(&mut self, wire: &[u8], priority: BleWritePriority) -> Result<(), BridgeError> {
+        self.send_wire_tracked(wire, priority).map(|_| ())
+    }
+
+    fn send_wire_tracked(
+        &mut self,
+        wire: &[u8],
+        priority: BleWritePriority,
+    ) -> Result<u16, BridgeError> {
         let remote = self
             .remote_hello
             .ok_or_else(|| BridgeError::Transport("cannot send before the board hello".into()))?;
@@ -336,27 +475,46 @@ where
         self.next_message_id = self.next_message_id.wrapping_add(1);
         let message = BleWriteMessage::new(message_id, wire.to_vec(), value_bytes, priority)
             .map_err(ble_error)?;
-        self.host.write_rx_message(message).map_err(ble_error)
+        self.host.write_rx_message(message).map_err(ble_error)?;
+        Ok(message_id)
     }
 
     fn send_authenticated(&mut self, lane: Lane, payload: &[u8]) -> Result<(), BridgeError> {
-        if self.remote_lane_profile.is_none() && lane != Lane::Control {
-            return Err(BridgeError::Unavailable(
-                "BLE lanes are not compatible and ready".into(),
-            ));
-        }
-        let wire = self
-            .codec
-            .as_mut()
-            .ok_or_else(|| BridgeError::Unavailable("BLE session is not authenticated".into()))?
-            .encode(lane, payload)
-            .map_err(wire_error)?;
+        self.send_authenticated_tracked(lane, payload).map(|_| ())
+    }
+
+    fn send_authenticated_tracked(
+        &mut self,
+        lane: Lane,
+        payload: &[u8],
+    ) -> Result<(u64, u16), BridgeError> {
         let priority = match lane {
             Lane::Control => BleWritePriority::Control,
             Lane::Realtime => BleWritePriority::Realtime,
             Lane::HhhsRepair => BleWritePriority::Repair,
         };
-        self.send_wire(&wire, priority)
+        self.send_authenticated_tracked_with_priority(lane, payload, priority)
+    }
+
+    fn send_authenticated_tracked_with_priority(
+        &mut self,
+        lane: Lane,
+        payload: &[u8],
+        priority: BleWritePriority,
+    ) -> Result<(u64, u16), BridgeError> {
+        if self.remote_lane_profile.is_none() && lane != Lane::Control {
+            return Err(BridgeError::Unavailable(
+                "BLE lanes are not compatible and ready".into(),
+            ));
+        }
+        let encoded = self
+            .codec
+            .as_mut()
+            .ok_or_else(|| BridgeError::Unavailable("BLE session is not authenticated".into()))?
+            .encode_with_sequence(lane, payload)
+            .map_err(wire_error)?;
+        let message_id = self.send_wire_tracked(&encoded.wire, priority)?;
+        Ok((encoded.sequence, message_id))
     }
 
     fn handle_host_event(&mut self, event: BleHostEvent) {
@@ -419,6 +577,30 @@ where
             }
             BleHostEvent::Info(bytes) => self.handle_info(&bytes),
             BleHostEvent::Notification(bytes) => self.handle_notification(&bytes),
+            BleHostEvent::WriteComplete { message_id } => (|| -> Result<(), BridgeError> {
+                if let Some((expected, sequence)) = self.repair_ack_write {
+                    if message_id == expected {
+                        let close = &mut self
+                            .repair_close
+                            .as_mut()
+                            .ok_or_else(|| {
+                                BridgeError::Transport(
+                                    "repair ACK completed after attempt abandonment".into(),
+                                )
+                            })?
+                            .1;
+                        close
+                            .confirm_remote_ack_sent(sequence)
+                            .map_err(|error| BridgeError::Transport(error.to_string()))?;
+                        self.repair_ack_write = None;
+                        self.maybe_publish_repair_closed()
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    Ok(())
+                }
+            })(),
             BleHostEvent::Diagnostic(message) => {
                 self.publish(TransportEvent::Diagnostic(message));
                 Ok(())
@@ -509,21 +691,21 @@ where
             .decode(wire)
             .map_err(wire_error)?;
         match message.lane {
-            Lane::Control => self.handle_remote_control(&message.payload),
+            Lane::Control => self.handle_remote_control(message.sequence, &message.payload),
             Lane::Realtime => self.handle_realtime(&message.payload),
-            Lane::HhhsRepair => self.handle_repair_frame(message.payload),
+            Lane::HhhsRepair => self.handle_repair_frame(message.sequence, message.payload),
         }
     }
 
-    fn handle_remote_control(&mut self, bytes: &[u8]) -> Result<(), BridgeError> {
+    fn handle_remote_control(&mut self, sequence: u64, bytes: &[u8]) -> Result<(), BridgeError> {
         match decode_control_frame(bytes).map_err(wire_error)? {
             ControlFrame::Profile(profile) => self.handle_remote_profile(profile),
             ControlFrame::CapabilityBundle(_) => Err(BridgeError::Transport(
                 "board sent a capability bundle to the provisioning host".into(),
             )),
-            ControlFrame::RepairFin(_) | ControlFrame::RepairAck(_) => Err(
-                BridgeError::Unavailable("BLE repair close driver is not attached".into()),
-            ),
+            control @ (ControlFrame::RepairFin(_) | ControlFrame::RepairAck(_)) => {
+                self.handle_repair_control(sequence, control)
+            }
             ControlFrame::CapabilityReady(ready) => {
                 let (binding, expected_digest) = self.pending_provisioning.ok_or_else(|| {
                     BridgeError::Transport(
@@ -540,7 +722,7 @@ where
                 }
                 self.pending_provisioning = None;
                 self.publish(TransportEvent::BoardProvisioned(binding));
-                self.publish(TransportEvent::BoardLink(LinkState::Ready));
+                self.publish(TransportEvent::BoardLink(LinkState::Repairing));
                 Ok(())
             }
         }
@@ -632,7 +814,7 @@ where
         Ok(())
     }
 
-    fn handle_repair_frame(&mut self, frame: Vec<u8>) -> Result<(), BridgeError> {
+    fn handle_repair_frame(&mut self, sequence: u64, frame: Vec<u8>) -> Result<(), BridgeError> {
         if !self
             .remote_hello
             .is_some_and(|hello| hello.supports(CAPABILITY_HHHS_REPAIR))
@@ -653,12 +835,24 @@ where
                 self.negotiated_repair_frame_bytes
             )));
         }
-        if self.repair_frames.len() == self.repair_queue_capacity {
-            return Err(BridgeError::QueueFull {
-                queue: "BLE repair ingress",
-            });
+        let binding = self.current_board_binding().ok_or_else(|| {
+            BridgeError::Transport("repair frame has no authenticated board placement".into())
+        })?;
+        let Some((current, close)) = self.repair_close.as_mut() else {
+            return Err(BridgeError::Transport(
+                "board sent repair before the room opened an attempt".into(),
+            ));
+        };
+        if *current != binding {
+            return Err(BridgeError::Transport(
+                "repair frame belongs to a stale board placement".into(),
+            ));
         }
-        self.repair_frames.push_back(frame);
+        close
+            .observe_remote_repair(sequence)
+            .map_err(|error| BridgeError::Transport(error.to_string()))?;
+        self.publish_repair(TransportEvent::BoardRepairInbound { binding, frame })?;
+        self.maybe_send_repair_ack()?;
         Ok(())
     }
 }
@@ -781,6 +975,33 @@ where
             BridgeCommand::SendBoardCapabilityBundle { binding, bundle } => {
                 self.send_capability_bundle(binding, bundle)
             }
+            BridgeCommand::SendBoardRepairFrame { binding, frame } => {
+                self.send_board_repair_frame(binding, &frame)
+            }
+            BridgeCommand::FinishBoardRepair(binding) => self.finish_board_repair(binding),
+            BridgeCommand::CompleteBoardRepair(binding) => {
+                if self.current_board_binding() != Some(binding)
+                    || self.repair_awaiting_confirmation != Some(binding)
+                {
+                    return Err(BridgeError::Transport(
+                        "repair completion belongs to an unconfirmed or stale board attempt".into(),
+                    ));
+                }
+                self.repair_awaiting_confirmation = None;
+                self.repair_deadline = None;
+                self.publish(TransportEvent::BoardLink(LinkState::Ready));
+                Ok(())
+            }
+            BridgeCommand::AbortBoardRepair(binding) => {
+                if self.current_board_binding() == Some(binding) {
+                    self.repair_close = None;
+                    self.repair_ack_write = None;
+                    self.repair_awaiting_confirmation = None;
+                    self.repair_deadline = None;
+                    self.fail("board HHHS repair attempt was abandoned");
+                }
+                Ok(())
+            }
             BridgeCommand::SendBoardRoundTable(frame) => self.send_round_table(frame),
             BridgeCommand::ConfigureBle {
                 identity_seed,
@@ -805,6 +1026,9 @@ where
             | BridgeCommand::SelectRoom(_)
             | BridgeCommand::LeaveRoom
             | BridgeCommand::PrepareBoardProvisioning(_)
+            | BridgeCommand::StartBoardRepair(_)
+            | BridgeCommand::ObserveBoardRepairFrame { .. }
+            | BridgeCommand::ConfirmBoardRepairClose(_)
             | BridgeCommand::PublishRoundTable(_)
             | BridgeCommand::PublishBoardEdit { .. }
             | BridgeCommand::SetSharedPitch { .. } => Err(BridgeError::Unavailable(
@@ -820,6 +1044,15 @@ where
     }
 
     fn poll_event(&mut self) -> Option<TransportEvent> {
+        if self
+            .repair_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.fail(format!(
+                "board HHHS repair did not close within {} seconds",
+                REPAIR_CLOSE_TIMEOUT.as_secs()
+            ));
+        }
         if self.dropped_events != 0 {
             let dropped = std::mem::take(&mut self.dropped_events);
             return Some(TransportEvent::Diagnostic(format!(
@@ -963,7 +1196,11 @@ mod tests {
                         bundle: test_capability_bundle(binding.identity),
                     })
                     .unwrap(),
-                TransportEvent::BoardLink(LinkState::Ready) => ready = true,
+                // This unit harness owns only the BLE adapter, not the
+                // composite/native-room repair driver. Receiver-bound bundle
+                // acknowledgement is therefore its terminal setup gate; the
+                // production composite remains Repairing until FIN/Ack.
+                TransportEvent::BoardProvisioned(_) => ready = true,
                 _ => {}
             }
         }
@@ -1185,6 +1422,7 @@ mod tests {
             if !self.connected {
                 return Err(BleHostError::Operation("not connected".into()));
             }
+            let message_id = message.message_id();
             let (_, mut cursor) = message.into_cursor()?;
             let mut value = vec![0; cursor.fragment_value_bytes()];
             while let Some(used) = cursor
@@ -1193,6 +1431,8 @@ mod tests {
             {
                 self.peer.receive(&value[..used], &mut self.events);
             }
+            self.events
+                .push_back(BleHostEvent::WriteComplete { message_id });
             Ok(())
         }
 
@@ -1422,25 +1662,82 @@ mod tests {
     }
 
     #[test]
-    fn repair_frame_survives_small_mtu_fragmentation_byte_exactly() {
+    fn repair_frames_survive_small_mtu_without_a_second_retained_queue() {
         let mut transport = establish(false);
-        let frame = (0_u16..300).flat_map(u16::to_be_bytes).collect::<Vec<_>>();
-        transport.send_repair_frame(&frame).unwrap();
-        let mut received = None;
-        for _ in 0..64 {
-            let _ = transport.poll_event();
-            if let Some(candidate) = transport.try_receive_repair_frame() {
-                received = Some(candidate);
-                break;
+        let binding = transport
+            .current_board_binding()
+            .expect("authenticated board binding");
+        for index in 0_u8..12 {
+            let frame = if index == 0 {
+                (0_u16..300).flat_map(u16::to_be_bytes).collect::<Vec<_>>()
+            } else {
+                vec![index; 300]
+            };
+            transport.send_board_repair_frame(binding, &frame).unwrap();
+            let mut received = None;
+            for _ in 0..64 {
+                if let Some(TransportEvent::BoardRepairInbound {
+                    frame: candidate, ..
+                }) = transport.poll_event()
+                {
+                    received = Some(candidate);
+                    break;
+                }
             }
+            assert_eq!(received.as_deref(), Some(frame.as_slice()));
         }
-        assert_eq!(received.as_deref(), Some(frame.as_slice()));
 
         let oversized = vec![0; 1_025];
         assert!(matches!(
-            transport.send_repair_frame(&oversized),
+            transport.send_board_repair_frame(binding, &oversized),
             Err(BridgeError::Transport(_))
         ));
+    }
+
+    #[test]
+    fn board_ready_requires_room_freshness_after_carrier_close() {
+        let mut transport = establish(false);
+        let binding = transport.current_board_binding().unwrap();
+        transport.events.clear();
+        assert!(matches!(
+            transport.handle_command(BridgeCommand::CompleteBoardRepair(binding)),
+            Err(BridgeError::Transport(_))
+        ));
+        assert!(
+            !transport
+                .events
+                .iter()
+                .any(|event| *event == TransportEvent::BoardLink(LinkState::Ready))
+        );
+
+        transport.repair_awaiting_confirmation = Some(binding);
+        transport
+            .handle_command(BridgeCommand::CompleteBoardRepair(binding))
+            .unwrap();
+        assert_eq!(
+            transport.poll_event(),
+            Some(TransportEvent::BoardLink(LinkState::Ready))
+        );
+    }
+
+    #[test]
+    fn stalled_repair_close_times_out_and_fences_the_link() {
+        let mut transport = establish(false);
+        let binding = transport.current_board_binding().unwrap();
+        transport.events.clear();
+        transport.repair_close = Some((
+            binding,
+            RepairCloseState::new(tutti_ble::RepairAttemptId::new([0x55; 16])),
+        ));
+        transport.repair_deadline = Some(Instant::now() - Duration::from_millis(1));
+
+        assert_eq!(
+            transport.poll_event(),
+            Some(TransportEvent::BoardLink(LinkState::Failed))
+        );
+        assert!(!transport.link_connected);
+        assert!(transport.repair_close.is_none());
+        assert!(transport.repair_deadline.is_none());
     }
 
     #[test]

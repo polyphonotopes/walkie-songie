@@ -12,9 +12,12 @@ use std::{
 
 use ed25519_dalek::SigningKey as RealtimeSigningKey;
 use hhhs::DagRead;
-use hhhs_replica::ReplicaRepairHost;
+use hhhs_replica::{ReplicaRepairHost, ReplicaRepairSnapshot};
 use hhhs_store::MemoryStorage;
-use hhhs_sync::{CachedRepairHost, RepairHost, SessionLimits};
+use hhhs_sync::{
+    CachedRepairHost, Lane as RepairLane, RepairDisposition, RepairHost, SessionBudget,
+    SessionLimits, StepwiseRepairAttempt,
+};
 use tokio::{sync::mpsc, task::JoinSet};
 use tutti_music::{
     MusicOp, SharedPitchSet, TunedDegree, TunedPeriodicPitch, roundtable::RoundTableConfig,
@@ -97,6 +100,13 @@ enum DriverCommand {
     Join(String),
     Leave,
     PrepareBoardProvisioning(BoardSessionBinding),
+    StartBoardRepair(BoardSessionBinding),
+    ObserveBoardRepairFrame {
+        binding: BoardSessionBinding,
+        frame: Vec<u8>,
+    },
+    ConfirmBoardRepairClose(BoardSessionBinding),
+    AbortBoardRepair(BoardSessionBinding),
     Send(RealtimeFrame),
     RoundTable(RoundTableFrame),
     BoardEdit {
@@ -201,6 +211,21 @@ impl BridgeTransport for NativeRoomTransport {
             BridgeCommand::PrepareBoardProvisioning(binding) => {
                 self.command(DriverCommand::PrepareBoardProvisioning(binding))
             }
+            BridgeCommand::StartBoardRepair(binding) => {
+                self.command(DriverCommand::StartBoardRepair(binding))
+            }
+            BridgeCommand::ObserveBoardRepairFrame { binding, frame } => {
+                self.command(DriverCommand::ObserveBoardRepairFrame { binding, frame })
+            }
+            BridgeCommand::ConfirmBoardRepairClose(binding) => {
+                self.command(DriverCommand::ConfirmBoardRepairClose(binding))
+            }
+            BridgeCommand::AbortBoardRepair(binding) => {
+                self.command(DriverCommand::AbortBoardRepair(binding))
+            }
+            BridgeCommand::CompleteBoardRepair(_) => Err(BridgeError::Unavailable(
+                "the native room leg cannot complete the board carrier".into(),
+            )),
             BridgeCommand::PublishRoundTable(frame) => {
                 self.command(DriverCommand::RoundTable(frame))
             }
@@ -306,6 +331,13 @@ impl EventSink {
             }
         }
     }
+
+    fn send_repair(&self, event: TransportEvent) -> Result<(), String> {
+        self.sender.try_send(event).map_err(|error| match error {
+            TrySendError::Full(_) => "bounded native room repair egress is full".to_owned(),
+            TrySendError::Disconnected(_) => "native room repair egress is disconnected".to_owned(),
+        })
+    }
 }
 
 struct ActiveRoom {
@@ -331,6 +363,12 @@ struct ActiveRoom {
     replay: BTreeMap<(PeerId, u64), u64>,
     in_flight: InFlight,
     repairs: JoinSet<()>,
+    board_repair: Option<BoardRepairAttempt>,
+}
+
+struct BoardRepairAttempt {
+    binding: BoardSessionBinding,
+    attempt: StepwiseRepairAttempt<ReplicaRepairSnapshot>,
 }
 
 trait BoardEditAdmissionHost {
@@ -434,6 +472,7 @@ impl ActiveRoom {
             replay: BTreeMap::new(),
             in_flight: Arc::new(tokio::sync::Mutex::new(BTreeSet::new())),
             repairs: JoinSet::new(),
+            board_repair: None,
         })
     }
 
@@ -462,6 +501,128 @@ impl ActiveRoom {
             .map_err(|error| error.to_string())?;
         tutti_music_hhhs::encode_embedded_capability_bundle(&bundle)
             .map_err(|error| error.to_string())
+    }
+
+    async fn start_board_repair(
+        &mut self,
+        binding: BoardSessionBinding,
+        events: &EventSink,
+    ) -> Result<(), String> {
+        if self.board_repair.is_some() {
+            return Err("another board repair attempt is still active".into());
+        }
+        let host = self.replica.music_repair_host();
+        let lane = RepairLane::new(
+            tutti_music_hhhs::REPAIR_ALPN,
+            tutti_music_hhhs::STRATEGY_NAME,
+            tutti_music_hhhs::STRATEGY_VERSION,
+        );
+        let limits = SessionLimits {
+            budget: SessionBudget {
+                max_frame_bytes: tutti_music_hhhs::EMBEDDED_REPAIR_FRAME_BYTES,
+                ..SessionBudget::default()
+            },
+            max_frame_bytes: tutti_music_hhhs::EMBEDDED_REPAIR_FRAME_BYTES,
+            ..SessionLimits::default()
+        };
+        let mut outbound = |frame: Vec<u8>| {
+            std::future::ready(
+                events.send_repair(TransportEvent::BoardRepairOutbound { binding, frame }),
+            )
+        };
+        let attempt = StepwiseRepairAttempt::initiate(&host, &lane, limits, &mut outbound)
+            .await
+            .map_err(|error| error.to_string())?;
+        let terminal = attempt.is_terminal();
+        self.board_repair = Some(BoardRepairAttempt { binding, attempt });
+        if terminal {
+            events.send(TransportEvent::BoardRepairTerminal(binding));
+        }
+        Ok(())
+    }
+
+    async fn observe_board_repair_frame(
+        &mut self,
+        binding: BoardSessionBinding,
+        frame: Vec<u8>,
+        events: &EventSink,
+    ) -> Result<(), String> {
+        let repair = self
+            .board_repair
+            .as_mut()
+            .ok_or_else(|| "board repair frame arrived without an active attempt".to_owned())?;
+        if repair.binding != binding {
+            return Err("board repair frame belongs to a stale placement".into());
+        }
+        let mut host = self.replica.music_repair_host();
+        let mut outbound = |frame: Vec<u8>| {
+            std::future::ready(
+                events.send_repair(TransportEvent::BoardRepairOutbound { binding, frame }),
+            )
+        };
+        repair
+            .attempt
+            .receive(&mut host, &frame, &mut outbound)
+            .await
+            .map_err(|error| error.to_string())?;
+        let terminal = repair.attempt.is_terminal();
+        self.publish_round_table_if_changed(events, false);
+        self.publish_pitch_set_if_changed(events, false);
+        if terminal {
+            events.send(TransportEvent::BoardRepairTerminal(binding));
+        }
+        Ok(())
+    }
+
+    async fn confirm_board_repair_close(
+        &mut self,
+        binding: BoardSessionBinding,
+        events: &EventSink,
+    ) -> Result<(), String> {
+        let repair = self
+            .board_repair
+            .take()
+            .ok_or_else(|| "board repair close arrived without an active attempt".to_owned())?;
+        if repair.binding != binding {
+            self.board_repair = Some(repair);
+            return Err("board repair close belongs to a stale placement".into());
+        }
+        let host = self.replica.music_repair_host();
+        let confirmed = repair
+            .attempt
+            .confirm_close_with_host(&host, Ok::<(), String>(()))
+            .map_err(|error| error.to_string())?;
+        self.publish_round_table_if_changed(events, false);
+        self.publish_pitch_set_if_changed(events, false);
+        match confirmed.disposition() {
+            RepairDisposition::Synchronized => {
+                events.send(TransportEvent::Diagnostic(format!(
+                    "board HHHS repair synchronized (admitted={}, frames={}/{})",
+                    confirmed.outcome().admitted,
+                    confirmed.outcome().frames_sent,
+                    confirmed.outcome().frames_received
+                )));
+                events.send(TransportEvent::BoardRepairSynchronized(binding));
+                Ok(())
+            }
+            disposition => {
+                events.send(TransportEvent::Diagnostic(format!(
+                    "board HHHS repair closed with {disposition:?}; starting a fresh attempt"
+                )));
+                self.start_board_repair(binding, events).await
+            }
+        }
+    }
+
+    fn abort_board_repair(&mut self, binding: BoardSessionBinding) {
+        if self
+            .board_repair
+            .as_ref()
+            .is_some_and(|repair| repair.binding == binding)
+            && let Some(mut repair) = self.board_repair.take()
+        {
+            repair.attempt.mark_incomplete();
+        }
     }
 
     async fn send_realtime(&mut self, frame: RealtimeFrame) -> Result<(), String> {
@@ -995,6 +1156,60 @@ async fn driver_loop(
                     Err(reason) => {
                         events.send(TransportEvent::BoardProvisioningFailed { binding, reason })
                     }
+                }
+            }
+            LoopEvent::Command(Some(DriverCommand::StartBoardRepair(binding))) => {
+                let result = if let Some(room) = active.as_mut() {
+                    room.start_board_repair(binding, &events).await
+                } else {
+                    Err("no active room is available for board repair".into())
+                };
+                if let Err(error) = result {
+                    if let Some(room) = active.as_mut() {
+                        room.abort_board_repair(binding);
+                    }
+                    events.send(TransportEvent::BoardRepairFailed {
+                        binding,
+                        reason: format!("start failed: {error}"),
+                    });
+                }
+            }
+            LoopEvent::Command(Some(DriverCommand::ObserveBoardRepairFrame { binding, frame })) => {
+                let result = if let Some(room) = active.as_mut() {
+                    room.observe_board_repair_frame(binding, frame, &events)
+                        .await
+                } else {
+                    Err("no active room is available for board repair".into())
+                };
+                if let Err(error) = result {
+                    if let Some(room) = active.as_mut() {
+                        room.abort_board_repair(binding);
+                    }
+                    events.send(TransportEvent::BoardRepairFailed {
+                        binding,
+                        reason: format!("receive failed: {error}"),
+                    });
+                }
+            }
+            LoopEvent::Command(Some(DriverCommand::ConfirmBoardRepairClose(binding))) => {
+                let result = if let Some(room) = active.as_mut() {
+                    room.confirm_board_repair_close(binding, &events).await
+                } else {
+                    Err("no active room is available for board repair".into())
+                };
+                if let Err(error) = result {
+                    if let Some(room) = active.as_mut() {
+                        room.abort_board_repair(binding);
+                    }
+                    events.send(TransportEvent::BoardRepairFailed {
+                        binding,
+                        reason: format!("close confirmation failed: {error}"),
+                    });
+                }
+            }
+            LoopEvent::Command(Some(DriverCommand::AbortBoardRepair(binding))) => {
+                if let Some(room) = active.as_mut() {
+                    room.abort_board_repair(binding);
                 }
             }
             LoopEvent::Command(Some(DriverCommand::Send(frame))) => {

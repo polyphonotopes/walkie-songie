@@ -38,6 +38,11 @@ pub enum BleHostEvent {
     Info(Vec<u8>),
     /// GATT TX value. Platform hosts must emit `Connected` before notifications.
     Notification(Vec<u8>),
+    /// Final GATT fragment of one complete bounded wire message was accepted
+    /// by the peripheral. Queue admission alone is not this event.
+    WriteComplete {
+        message_id: u16,
+    },
     /// Non-fatal platform detail. This must never be used for a condition that
     /// invalidates the installed connection or authenticated session.
     Diagnostic(String),
@@ -92,6 +97,10 @@ impl BleWriteMessage {
 
     pub fn retained_wire_bytes(&self) -> usize {
         self.wire.len()
+    }
+
+    pub const fn message_id(&self) -> u16 {
+        self.message_id
     }
 
     pub(crate) fn into_cursor(self) -> Result<(BleWritePriority, FragmentCursor), BleHostError> {
@@ -170,6 +179,7 @@ impl BleHost for InMemoryBleHost {
         if self.connected.is_none() {
             return Err(BleHostError::Operation("no board is connected".into()));
         }
+        let message_id = message.message_id();
         let (_, mut cursor) = message.into_cursor()?;
         let mut value = vec![0; cursor.fragment_value_bytes()];
         while let Some(used) = cursor
@@ -178,6 +188,8 @@ impl BleHost for InMemoryBleHost {
         {
             self.writes.push_back(value[..used].to_vec());
         }
+        self.events
+            .push_back(BleHostEvent::WriteComplete { message_id });
         Ok(())
     }
 
@@ -207,6 +219,10 @@ mod tests {
         )
         .unwrap();
         assert!(host.pop_write().is_some());
+        assert_eq!(
+            host.poll_event(),
+            Some(BleHostEvent::WriteComplete { message_id: 1 })
+        );
         host.disconnect().unwrap();
         assert!(matches!(
             host.poll_event(),

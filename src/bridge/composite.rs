@@ -151,6 +151,24 @@ where
             .push_back(TransportEvent::Diagnostic(format!("{leg}: {error}")));
     }
 
+    fn fence_board_repair(
+        &mut self,
+        binding: super::BoardSessionBinding,
+        leg: &'static str,
+        error: BridgeError,
+    ) {
+        if self.board_binding != Some(binding) {
+            return;
+        }
+        let _ = self
+            .room
+            .handle_command(BridgeCommand::AbortBoardRepair(binding));
+        let _ = self
+            .board
+            .handle_command(BridgeCommand::AbortBoardRepair(binding));
+        self.diagnostic(leg, error);
+    }
+
     fn start_failed(&mut self, leg: CarrierLegKind, error: BridgeError) {
         let link = match leg {
             CarrierLegKind::Room => TransportEvent::RoomLink(super::LinkState::Failed),
@@ -183,22 +201,60 @@ where
                 self.request_board_provisioning();
             }
             TransportEvent::BoardCapabilityBundlePrepared { binding, bundle } => {
-                if self.board_binding == Some(*binding) {
-                    if let Err(error) =
+                if self.board_binding == Some(*binding)
+                    && let Err(error) =
                         self.board
                             .handle_command(BridgeCommand::SendBoardCapabilityBundle {
                                 binding: *binding,
                                 bundle: bundle.clone(),
                             })
-                    {
-                        self.provisioning_requested = None;
-                        self.diagnostic("board provisioning", error);
-                    }
+                {
+                    self.provisioning_requested = None;
+                    self.diagnostic("board provisioning", error);
                 }
             }
             TransportEvent::BoardProvisioningFailed { binding, .. } => {
                 if self.board_binding == Some(*binding) {
                     self.provisioning_requested = None;
+                }
+            }
+            TransportEvent::BoardRepairOutbound { binding, frame } => {
+                if self.board_binding == Some(*binding)
+                    && let Err(error) =
+                        self.board
+                            .handle_command(BridgeCommand::SendBoardRepairFrame {
+                                binding: *binding,
+                                frame: frame.clone(),
+                            })
+                {
+                    self.fence_board_repair(*binding, "board repair output", error);
+                }
+            }
+            TransportEvent::BoardRepairTerminal(binding) => {
+                if self.board_binding == Some(*binding)
+                    && let Err(error) = self
+                        .board
+                        .handle_command(BridgeCommand::FinishBoardRepair(*binding))
+                {
+                    self.fence_board_repair(*binding, "board repair close", error);
+                }
+            }
+            TransportEvent::BoardRepairFailed { binding, .. } => {
+                if self.board_binding == Some(*binding)
+                    && let Err(error) = self
+                        .board
+                        .handle_command(BridgeCommand::AbortBoardRepair(*binding))
+                {
+                    self.diagnostic("board repair failure fence", error);
+                }
+            }
+            TransportEvent::BoardRepairSynchronized(binding) => {
+                if self.board_binding == Some(*binding)
+                    && let Err(error) = self
+                        .board
+                        .handle_command(BridgeCommand::CompleteBoardRepair(*binding))
+                {
+                    self.fence_board_repair(*binding, "board repair completion", error);
                 }
             }
             _ => {}
@@ -226,11 +282,44 @@ where
                             "stale board provisioning completion was ignored".into(),
                         ),
                     );
+                } else if let Err(error) = self
+                    .room
+                    .handle_command(BridgeCommand::StartBoardRepair(*binding))
+                {
+                    self.fence_board_repair(*binding, "board repair start", error);
+                }
+            }
+            TransportEvent::BoardRepairInbound { binding, frame } => {
+                if self.board_binding == Some(*binding)
+                    && let Err(error) =
+                        self.room
+                            .handle_command(BridgeCommand::ObserveBoardRepairFrame {
+                                binding: *binding,
+                                frame: frame.clone(),
+                            })
+                {
+                    self.fence_board_repair(*binding, "board repair input", error);
+                }
+            }
+            TransportEvent::BoardRepairCarrierClosed(binding) => {
+                if self.board_binding == Some(*binding)
+                    && let Err(error) = self
+                        .room
+                        .handle_command(BridgeCommand::ConfirmBoardRepairClose(*binding))
+                {
+                    self.fence_board_repair(*binding, "board repair confirmation", error);
                 }
             }
             TransportEvent::BoardLink(link)
                 if !matches!(link, super::LinkState::Ready | super::LinkState::Repairing) =>
             {
+                if let Some(binding) = self.board_binding
+                    && let Err(error) = self
+                        .room
+                        .handle_command(BridgeCommand::AbortBoardRepair(binding))
+                {
+                    self.diagnostic("board repair abandonment", error);
+                }
                 self.board_binding = None;
                 self.provisioning_requested = None;
             }
@@ -274,6 +363,10 @@ where
             | BridgeCommand::SelectRoom(_)
             | BridgeCommand::LeaveRoom
             | BridgeCommand::PrepareBoardProvisioning(_)
+            | BridgeCommand::StartBoardRepair(_)
+            | BridgeCommand::ObserveBoardRepairFrame { .. }
+            | BridgeCommand::ConfirmBoardRepairClose(_)
+            | BridgeCommand::AbortBoardRepair(_)
             | BridgeCommand::PublishRoundTable(_)
             | BridgeCommand::PublishBoardEdit { .. }
             | BridgeCommand::SetSharedPitch { .. } => self.room.handle_command(command),
@@ -283,6 +376,15 @@ where
             BridgeCommand::SendBoardCapabilityBundle { binding, bundle } => self
                 .board
                 .handle_command(BridgeCommand::SendBoardCapabilityBundle { binding, bundle }),
+            BridgeCommand::SendBoardRepairFrame { binding, frame } => self
+                .board
+                .handle_command(BridgeCommand::SendBoardRepairFrame { binding, frame }),
+            BridgeCommand::FinishBoardRepair(binding) => self
+                .board
+                .handle_command(BridgeCommand::FinishBoardRepair(binding)),
+            BridgeCommand::CompleteBoardRepair(binding) => self
+                .board
+                .handle_command(BridgeCommand::CompleteBoardRepair(binding)),
             command => self.board.handle_command(command),
         }
     }
@@ -665,6 +767,78 @@ mod tests {
             });
         let _ = composite.poll_event();
         assert!(board.0.lock().unwrap().commands.is_empty());
+    }
+
+    #[test]
+    fn failed_room_repair_abandons_the_exact_board_attempt() {
+        let room = TestLeg::default();
+        let board = TestLeg::default();
+        let binding = BoardSessionBinding {
+            identity: [0x61; 32],
+            boot_nonce: 17,
+            session_id: 19,
+        };
+        board
+            .0
+            .lock()
+            .unwrap()
+            .events
+            .push_back(TransportEvent::BoardProvisioningRequired(binding));
+        let mut composite = CompositeTransport::new(room.clone(), board.clone());
+        let _ = composite.poll_event();
+        board.0.lock().unwrap().commands.clear();
+
+        room.0
+            .lock()
+            .unwrap()
+            .events
+            .push_back(TransportEvent::BoardRepairFailed {
+                binding,
+                reason: "injected stepwise failure".into(),
+            });
+
+        assert!(matches!(
+            composite.poll_event(),
+            Some(TransportEvent::BoardRepairFailed { binding: failed, .. }) if failed == binding
+        ));
+        assert_eq!(
+            board.0.lock().unwrap().commands,
+            [BridgeCommand::AbortBoardRepair(binding)]
+        );
+    }
+
+    #[test]
+    fn same_placement_freshness_completion_crosses_to_the_board_leg() {
+        let room = TestLeg::default();
+        let board = TestLeg::default();
+        let binding = BoardSessionBinding {
+            identity: [0x71; 32],
+            boot_nonce: 23,
+            session_id: 29,
+        };
+        board
+            .0
+            .lock()
+            .unwrap()
+            .events
+            .push_back(TransportEvent::BoardProvisioningRequired(binding));
+        let mut composite = CompositeTransport::new(room.clone(), board.clone());
+        let _ = composite.poll_event();
+        board.0.lock().unwrap().commands.clear();
+        room.0
+            .lock()
+            .unwrap()
+            .events
+            .push_back(TransportEvent::BoardRepairSynchronized(binding));
+
+        assert_eq!(
+            composite.poll_event(),
+            Some(TransportEvent::BoardRepairSynchronized(binding))
+        );
+        assert_eq!(
+            board.0.lock().unwrap().commands,
+            [BridgeCommand::CompleteBoardRepair(binding)]
+        );
     }
 
     #[test]
