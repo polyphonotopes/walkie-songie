@@ -50,6 +50,12 @@ const keyboardSha256 = "bdf2cf76fd1605f5d3923c0ac3b6758f22dbf1d6ead4d5c9f2fdc9aa
 const enforceLatency = process.env.WALKIE_ENFORCE_LATENCY !== "0";
 const sessionTraceEnabled = process.env.WALKIE_SESSION_TRACE !== "0";
 const hostConditionStarted = hostCondition();
+// `timeOrigin + performance.now()` is comparable across Window/Worker globals,
+// but Chromium independently quantizes each reading. Adjacent stages can
+// therefore appear one 0.1 ms tick out of order. Preserve every adjustment in
+// the report and refuse anything beyond two ticks.
+const traceClockQuantizationToleranceMs = 0.2;
+const traceClockQuantizationAdjustments = [];
 // These are release-regression ceilings for the existing durable Room-v5 path,
 // not the tighter target for a future ephemeral performance/session protocol.
 // Use steady-state samples so first-write allocation, JIT, and carrier startup
@@ -392,8 +398,14 @@ function pushDuration(target, endMicros, startMicros, label) {
   assert.ok(Number.isFinite(endMicros), `${label} end timestamp is missing`);
   assert.ok(Number.isFinite(startMicros), `${label} start timestamp is missing`);
   const duration = (endMicros - startMicros) / 1_000;
-  assert.ok(duration >= 0, `${label} clock regressed by ${duration}ms`);
-  target.push(duration);
+  assert.ok(
+    duration >= -traceClockQuantizationToleranceMs,
+    `${label} clock regressed by ${duration}ms beyond the ${traceClockQuantizationToleranceMs}ms quantization bound`,
+  );
+  if (duration < 0) {
+    traceClockQuantizationAdjustments.push({ label, rawDurationMs: duration });
+  }
+  target.push(Math.max(0, duration));
 }
 
 function assertCompactSessionPipeline({
@@ -889,6 +901,10 @@ try {
       observation: sessionTraceEnabled
         ? "Opt-in application-sideband trace; token maps explicitly to worker-minted correlation."
         : "Disabled at RoomWorkerOpen; trace=None and no scheduling timestamps sampled.",
+      crossGlobalClockQuantization: {
+        toleranceMs: traceClockQuantizationToleranceMs,
+        adjustments: traceClockQuantizationAdjustments,
+      },
     },
     warmupSamplesExcluded,
     steadyStateLatencyMs: steady,
