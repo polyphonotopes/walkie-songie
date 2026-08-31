@@ -1,48 +1,71 @@
-# Tasks: Add nih-plug Plugin Peer
+# Tasks: Add a nice-plug Tutti bridge peer
 
-## 1. Feature Flag & Dependencies
-- [x] 1.1 Add `plugin` feature to Cargo.toml
-- [x] 1.2 Add nih-plug dependency (feature-gated)
-- [x] 1.3 Add nih_plug_egui for GUI (feature-gated)
-- [x] 1.4 Add qrcode crate for QR generation
-- [x] 1.5 Configure cargo-nih-plug bundling in xtask or workspace
+## 1. Shared protocol prerequisite
 
-## 2. Plugin Core
-- [x] 2.1 Create `src/plugin/mod.rs` module (feature-gated)
-- [x] 2.2 Implement `Plugin` trait with audio passthrough
-- [x] 2.3 Define `Params` struct with `#[persist = "channel"]` for address
-- [x] 2.4 Export VST3 and CLAP via `nih_export_vst3!` / `nih_export_clap!`
+- [x] 1.1 Review frozen Tutti BLE hello, fragment, lane, and handshake vectors.
+- [x] 1.2 Align Walkie and ESP on one tagged Tutti music protocol generation and
+  HHHS dependency line; refuse mismatches rather than translating.
+- [ ] 1.3 Add carrier-equivalence fixtures proving Iroh and BLE repair produce
+  identical canonical records and history roots.
 
-## 3. Networking Thread
-- [x] 3.1 Create background networking task spawned on plugin init
-- [x] 3.2 Use channel (mpsc) for communication between UI/audio and network thread
-- [x] 3.3 Integrate with iroh-gossip for P2P networking
-- [x] 3.4 Handle peer connection lifecycle without blocking audio thread
-- [x] 3.5 Graceful shutdown on plugin deactivate/drop
+## 2. Bridge core
 
-## 4. Plugin UI
-- [x] 4.1 Create egui-based editor implementing `Editor` trait
-- [x] 4.2 Generate and display QR code from channel address
-- [x] 4.3 Add "Shuffle Channel" button with random channel generation
-- [x] 4.4 Add text input for custom channel address entry
-- [x] 4.5 Display connection status (connected peers count)
-- [x] 4.6 Style UI to be compact and DAW-friendly
+- [x] 2.1 Add runtime-independent bridge commands, events, status snapshots,
+  and explicit bounded queue policies.
+- [ ] 2.2 Own native Iroh/Room-v5 and local Tutti link supervision on a dedicated
+  background runtime.
+- [ ] 2.3 Route compact realtime messages separately from durable HHHS repair
+  and correlate provisional intents with confirmation/correction.
+- [ ] 2.4 Add in-memory link tests for reconnect, duplicate delivery,
+  partition/rejoin, saturation, refusal, and cancellation.
+- [ ] 2.5 Add one shared causal pitch/pitch-class set which any authorized peer
+  may edit, including observed cross-peer removal and concurrent add-wins tests.
+- [ ] 2.6 Adapt host MIDI, board web/MIDI inputs, and browser controls to edit
+  that shared set and add state-derived offs-before-ons output reconciliation.
 
-## 5. State Synchronization & MIDI
-- [x] 5.1 Connect plugin to RoomState for pitch/note sharing (YrsRoomState refactored with YMap)
-- [x] 5.2 Add voice state per-peer (pitch number + pitch class) to CRDT
-- [x] 5.3 Bridge incoming MIDI note events to room state (broadcast to peers)
-- [x] 5.4 Convert remote peer pitch changes to outgoing MIDI note events
-- [x] 5.5 Plugin bundled as VST3 and CLAP
-- [x] 5.6 MIDI channel routing:
-  - Channel 1 (input): Pitch class selection → room PCS contribution
-  - Channel 1 (output): Room PCS (union of all peers' pitch classes, notes 60-71)
-  - Channel 2 (input): Voice pitch → broadcast voice state
-  - Channel 2 (output): All active voice pitches from peers
+## 3. nice-plug host
 
-## 6. Testing & Validation
-- [ ] 6.1 Test plugin loads in DAW (Reaper, Bitwig, etc.)
-- [ ] 6.2 Test QR code scans correctly on mobile
-- [ ] 6.3 Test P2P connection between plugin and web app
-- [ ] 6.4 Test channel persistence across plugin reload
-- [ ] 6.5 Verify audio thread never blocks on network operations
+- [x] 3.1 Replace the obsolete nih-plug xtask/dependency plan with nice-plug
+  using the maintained Polyphonotopes patterns.
+- [x] 3.2 Implement a CLAP MIDI-effect shell over bounded non-blocking queues.
+- [x] 3.3 Add a compact editor for room, peer, board, trust, link, and repair
+  status without exposing transport state as musical authority.
+- [x] 3.4 Persist room selection and trusted board identities outside the
+  realtime callback.
+- [x] 3.5 Add the optional nice-plug standalone executable using the same plugin
+  and bridge core.
+
+## 4. Desktop BLE adapter
+
+- [x] 4.1 Define the platform BLE host trait and in-memory conformance adapter.
+- [ ] 4.2 Select and feature-gate a desktop backend after lifecycle and resource
+  probes on supported operating systems.
+- [ ] 4.3 Implement scan, connect, GATT subscribe/write, reconnect, TOFU, and
+  bounded lane routing.
+- [x] 4.4 Expose permissions and connection failures as observable bridge
+  events without blocking audio.
+
+## 5. ESP32 gateway probe
+
+- [x] 5.1 Add a feature-gated GATT-server probe sharing the existing Bluedroid
+  driver with the BLE-MIDI central; preserve the default path and flash the
+  probe only after explicit approval.
+- [ ] 5.2 Measure dual-role idle/active/repair heap, PSRAM, task stacks, flash,
+  connection latency, and MIDI coexistence.
+- [ ] 5.3 Connect the authenticated realtime and HHHS lanes to the existing leaf
+  session/Replica seams.
+- [ ] 5.4 Verify one BLE gateway fans durable and realtime state to sibling
+  boards through existing ESP-NOW behavior.
+
+## 6. Acceptance
+
+- [ ] 6.1 Prove the plugin audio callback performs no I/O, waits, locks, heap
+  allocation, HHHS operations, or cryptography.
+- [ ] 6.2 Load and save the CLAP plugin in at least one production host; verify
+  multiple instances and clean shutdown.
+- [ ] 6.3 Verify optional standalone startup, MIDI routing, reconnect, and state
+  persistence.
+- [ ] 6.4 Run two-board partition/edit/rejoin convergence with identical roots
+  and no history growth from high-rate controls.
+- [ ] 6.5 Record p50/p95 realtime feedback and separate durable confirmation
+  latency, plus ten-minute memory watermarks.

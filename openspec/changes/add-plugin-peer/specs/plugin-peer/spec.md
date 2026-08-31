@@ -2,124 +2,86 @@
 
 ## Purpose
 
-VST3/CLAP audio plugin that connects to walkie-songie P2P channels, enabling DAW users to collaborate with mobile and web users.
+A nice-plug CLAP and optional standalone host for the shared Walkie/Tutti
+bridge core.
 
 ## ADDED Requirements
 
-### Requirement: Plugin Feature Gate
-The plugin code SHALL be conditionally compiled behind the `plugin` feature flag.
+### Requirement: nice-plug host
+The plugin peer SHALL use nice-plug and SHALL export a CLAP plugin. An optional
+standalone executable SHALL instantiate the same plugin and bridge core.
 
-#### Scenario: Feature disabled by default
-- **WHEN** building without `--features plugin`
-- **THEN** no plugin-related code is compiled
-- **AND** no nih-plug dependencies are included
+#### Scenario: CLAP host loads the peer
+- **WHEN** a CLAP host instantiates the plugin
+- **THEN** it receives the same bridge behavior and persistent settings as the
+  standalone shell
+- **AND** no obsolete nih-plug or Yrs networking path is constructed
 
-#### Scenario: Feature enabled
-- **WHEN** building with `--features plugin`
-- **THEN** the plugin binary target is available
-- **AND** VST3 and CLAP exports are generated
+#### Scenario: Standalone feature is disabled
+- **WHEN** the plugin is built without the standalone feature
+- **THEN** standalone audio/MIDI backend dependencies are not included
 
-### Requirement: Realtime-Safe Networking
-The plugin SHALL perform all networking operations on a dedicated background thread, never on the audio thread.
+### Requirement: Realtime-safe ownership
+The plugin SHALL perform networking, BLE, HHHS, persistence, cryptography, and
+UI work outside the audio callback.
 
-#### Scenario: Audio thread isolation
-- **WHEN** the plugin processes audio
-- **THEN** no network I/O, DNS lookups, or blocking operations occur on the audio thread
+#### Scenario: Audio processing
+- **WHEN** the host invokes the audio callback
+- **THEN** the callback performs no blocking wait, network or BLE I/O, mutex
+  acquisition, heap allocation, HHHS operation, or cryptographic operation
+- **AND** it communicates through bounded non-blocking queues
 
-#### Scenario: Network thread communication
-- **WHEN** the UI or audio thread needs to send/receive network data
-- **THEN** communication occurs via lock-free message channels
+#### Scenario: Queue saturation
+- **WHEN** an ephemeral input or output queue is full
+- **THEN** the configured coalescing or drop policy is applied without blocking
+- **AND** saturation becomes observable outside the audio callback
 
-#### Scenario: Network thread lifecycle
-- **WHEN** the plugin is instantiated
-- **THEN** a background networking thread is spawned
-- **AND** when the plugin is dropped, the thread shuts down gracefully
+### Requirement: MIDI bridge
+The plugin SHALL translate local MIDI input into bounded bridge intents and
+remote projected musical changes into sample-positioned MIDI output.
 
-### Requirement: QR Code Channel Display
-The plugin editor SHALL display a QR code that mobile users can scan to join the same channel.
+#### Scenario: Local note input
+- **WHEN** the plugin receives a MIDI note event
+- **THEN** it enqueues the corresponding compact realtime intent immediately
+- **AND** any durable musical edit is confirmed separately by the Room-v5
+  replica
 
-#### Scenario: QR code generation
-- **WHEN** the plugin editor opens
-- **THEN** a QR code is displayed containing the current channel address
+#### Scenario: Remote confirmation or correction
+- **WHEN** a projected durable revision confirms or contradicts provisional
+  realtime feedback
+- **THEN** the plugin emits the minimal MIDI difference needed to match the
+  durable projection
 
-#### Scenario: QR code content format
-- **WHEN** a QR code is generated
-- **THEN** it contains a URL in the format `walkie-songie://channel/<address>`
+### Requirement: Persistent bridge selection
+The plugin SHALL persist room selection and trusted board identities without
+persisting ephemeral session keys or live connection state.
 
-#### Scenario: QR code updates on channel change
-- **WHEN** the channel address changes
-- **THEN** the QR code regenerates to reflect the new address
+#### Scenario: DAW project reload
+- **WHEN** a saved project restores the plugin
+- **THEN** the plugin restores its room and trust configuration
+- **AND** creates fresh Iroh and BLE sessions
 
-### Requirement: Channel Shuffle
-The plugin editor SHALL provide a button to generate a new random channel address.
+### Requirement: Independent carrier lifecycle
+The native Room-v5 carrier and local BLE-board carrier SHALL retain independent
+connection and failure lifecycles while sharing the bridge core.
 
-#### Scenario: Shuffle button press
-- **WHEN** the user clicks the shuffle button
-- **THEN** a new random channel address is generated
-- **AND** the plugin reconnects to the new channel
-- **AND** the QR code updates
+#### Scenario: Room is joined and left with a board connected
+- **GIVEN** the BLE board has reached authenticated Ready
+- **WHEN** the plugin joins and then leaves a native Room-v5 session
+- **THEN** the room transitions through its own Ready and Offline states
+- **AND** the board remains authenticated Ready throughout
 
-### Requirement: Custom Channel Address
-The plugin editor SHALL allow users to enter a custom channel address.
+#### Scenario: One carrier cannot initialize
+- **WHEN** native Iroh or the platform BLE adapter fails during startup
+- **THEN** that carrier publishes its own Failed state and diagnostic
+- **AND** the other carrier still starts and remains usable
 
-#### Scenario: Enter custom address
-- **WHEN** the user types a channel address in the text input
-- **AND** confirms the input
-- **THEN** the plugin connects to the specified channel
-- **AND** the QR code updates to the new address
+### Requirement: Multiple instances
+Multiple plugin instances SHALL not duplicate heavyweight service ownership or
+share musical routing accidentally.
 
-#### Scenario: Invalid address handling
-- **WHEN** the user enters an invalid channel address
-- **THEN** the plugin displays an error message
-- **AND** does not disconnect from the current channel
-
-### Requirement: Channel Address Persistence
-The plugin SHALL persist the current channel address in its saved state.
-
-#### Scenario: Save state
-- **WHEN** the DAW saves the plugin state (project save, preset save)
-- **THEN** the current channel address is included in the saved state
-
-#### Scenario: Restore state
-- **WHEN** the DAW loads a saved plugin state
-- **THEN** the plugin restores the saved channel address
-- **AND** reconnects to that channel
-
-### Requirement: MIDI Input to Room
-The plugin SHALL broadcast incoming MIDI note events to the connected room.
-
-#### Scenario: MIDI note on
-- **WHEN** the plugin receives a MIDI note-on event
-- **THEN** the corresponding pitch class is toggled on in the local peer's pitch set
-- **AND** the change is broadcast to connected peers
-
-#### Scenario: MIDI note off
-- **WHEN** the plugin receives a MIDI note-off event
-- **THEN** the corresponding pitch class is toggled off in the local peer's pitch set
-- **AND** the change is broadcast to connected peers
-
-### Requirement: Room to MIDI Output
-The plugin SHALL output MIDI note events when remote peers change their pitch sets.
-
-#### Scenario: Remote peer note on
-- **WHEN** a remote peer adds a pitch class to their set
-- **THEN** the plugin outputs a MIDI note-on event for that pitch
-
-#### Scenario: Remote peer note off
-- **WHEN** a remote peer removes a pitch class from their set
-- **THEN** the plugin outputs a MIDI note-off event for that pitch
-
-### Requirement: Multiple Instance Support
-Multiple plugin instances in the same DAW session SHALL operate independently.
-
-#### Scenario: Independent peer identities
-- **WHEN** multiple plugin instances are loaded
-- **THEN** each instance receives a unique peer ID
-
-#### Scenario: Independent channels
-- **WHEN** multiple plugin instances are configured with different channel addresses
-- **THEN** each instance connects to its own channel independently
-
-#### Scenario: Same channel collaboration
-- **WHEN** multiple plugin instances join the same channel
-- **THEN** they discover each other via local P2P and can exchange pitch data
+#### Scenario: Two instances use different rooms
+- **WHEN** two instances in one process select different rooms
+- **THEN** their MIDI queues and room projections remain isolated
+- **AND** any process-level network or BLE service sharing preserves that
+  isolation
