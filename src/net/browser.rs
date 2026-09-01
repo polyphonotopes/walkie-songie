@@ -156,6 +156,13 @@ impl BrowserNetHandle {
             .map_err(|error| NativeNetError::Gossip(error.to_string()))
     }
 
+    /// Best-effort direct acceleration for an already-authenticated compact
+    /// pair-session Event. The ordinary gossip copy remains mandatory and is
+    /// the delivery fallback; `false` only means no direct copy was accepted.
+    pub fn try_send_session(&self, endpoint_id: EndpointId, bytes: &[u8]) -> bool {
+        self.webrtc.try_send_session(*endpoint_id.as_bytes(), bytes)
+    }
+
     pub async fn begin_replica(
         &self,
         endpoint_id: EndpointId,
@@ -267,6 +274,9 @@ impl BrowserRoomNetwork {
         let (webrtc_transport, webrtc_port) =
             super::webrtc_transport::WebRtcTransport::new(local_id);
         let mut direct_ready = webrtc_port.subscribe_ready();
+        let mut direct_session = webrtc_port
+            .take_direct_session_inbound()
+            .expect("new WebRTC signal port owns one direct-session receiver");
 
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(secret_key)
@@ -316,16 +326,31 @@ impl BrowserRoomNetwork {
             .map_err(|error| NativeNetError::Gossip(error.to_string()))?;
         let (gossip_sender, mut gossip_events) = gossip_topic.split();
 
+        enum DirectEvent {
+            Ready(Result<super::webrtc_transport::DirectReady, async_broadcast::RecvError>),
+            Session(Option<super::webrtc_transport::DirectSessionFrame>),
+        }
+
         // No mDNS branch in a browser, so the event task is a single stream
         // pump: gossip events in, `NativeNetworkEvent`s out. Bootstrap peers
         // keep their `Ticket` attribution; everyone else arrived via gossip.
         let event_task = n0_future::task::spawn(async move {
             loop {
                 let gossip_next = gossip_events.try_next();
-                let direct_next = direct_ready.recv();
+                let direct_next = async {
+                    let ready_next = direct_ready.recv();
+                    let session_next = direct_session.next();
+                    futures::pin_mut!(ready_next, session_next);
+                    match futures::future::select(ready_next, session_next).await {
+                        futures::future::Either::Left((ready, _)) => DirectEvent::Ready(ready),
+                        futures::future::Either::Right((session, _)) => {
+                            DirectEvent::Session(session)
+                        }
+                    }
+                };
                 futures::pin_mut!(gossip_next, direct_next);
                 match futures::future::select(gossip_next, direct_next).await {
-                    futures::future::Either::Right((Ok(ready), _)) => {
+                    futures::future::Either::Right((DirectEvent::Ready(Ok(ready)), _)) => {
                         let Ok(endpoint_id) = EndpointId::from_bytes(&ready.peer) else {
                             continue;
                         };
@@ -344,16 +369,39 @@ impl BrowserRoomNetwork {
                         }
                     }
                     futures::future::Either::Right((
-                        Err(async_broadcast::RecvError::Overflowed(_)),
+                        DirectEvent::Ready(Err(async_broadcast::RecvError::Overflowed(_))),
                         _,
                     )) => continue,
                     futures::future::Either::Right((
-                        Err(async_broadcast::RecvError::Closed),
+                        DirectEvent::Ready(Err(async_broadcast::RecvError::Closed)),
                         _,
                     )) => {
                         let _ = events_tx
                             .send(NativeNetworkEvent::Diagnostic(
                                 "WebRTC direct-ready stream closed".into(),
+                            ))
+                            .await;
+                        break;
+                    }
+                    futures::future::Either::Right((DirectEvent::Session(Some(frame)), _)) => {
+                        let Ok(delivered_from) = EndpointId::from_bytes(&frame.peer) else {
+                            continue;
+                        };
+                        if events_tx
+                            .send(NativeNetworkEvent::Message {
+                                delivered_from,
+                                bytes: frame.bytes,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    futures::future::Either::Right((DirectEvent::Session(None), _)) => {
+                        let _ = events_tx
+                            .send(NativeNetworkEvent::Diagnostic(
+                                "WebRTC direct-session stream closed".into(),
                             ))
                             .await;
                         break;

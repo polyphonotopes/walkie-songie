@@ -150,16 +150,32 @@ function workerReadyCount(diagnostics, label) {
   ).length;
 }
 
-function attachDiagnostics(page, label, diagnostics, sessionTraces) {
+function attachDiagnostics(page, label, diagnostics, sessionTraces, renewalTraces) {
   page.on("console", (message) => {
     const entry = { label, type: message.type(), text: message.text() };
     diagnostics.push(entry);
-    const prefix = "[session_trace] ";
-    if (entry.text.startsWith(prefix)) {
+    if (
+      process.env.WALKIE_STREAM_BROWSER_CONSOLE === "1" &&
+      /(walkie::webrtc|iroh-gossip|relay|connectionState|data channel|gossip|session_carrier_broadcast)/i.test(
+        entry.text,
+      )
+    ) {
+      process.stderr.write(`[browser:${label}:${entry.type}] ${entry.text}\n`);
+    }
+    const sessionPrefix = "[session_trace] ";
+    if (entry.text.startsWith(sessionPrefix)) {
       try {
-        sessionTraces.push({ label, ...JSON.parse(entry.text.slice(prefix.length)) });
+        sessionTraces.push({ label, ...JSON.parse(entry.text.slice(sessionPrefix.length)) });
       } catch (error) {
         sessionTraces.push({ label, parseError: String(error), raw: entry.text });
+      }
+    }
+    const renewalPrefix = "[session_renewal_trace] ";
+    if (entry.text.startsWith(renewalPrefix)) {
+      try {
+        renewalTraces.push({ label, ...JSON.parse(entry.text.slice(renewalPrefix.length)) });
+      } catch (error) {
+        renewalTraces.push({ label, parseError: String(error), raw: entry.text });
       }
     }
   });
@@ -193,9 +209,9 @@ function attachDiagnostics(page, label, diagnostics, sessionTraces) {
   });
 }
 
-async function openPeer(context, label, url, diagnostics, sessionTraces) {
+async function openPeer(context, label, url, diagnostics, sessionTraces, renewalTraces) {
   const page = await context.newPage();
-  attachDiagnostics(page, label, diagnostics, sessionTraces);
+  attachDiagnostics(page, label, diagnostics, sessionTraces, renewalTraces);
   await page.goto(url, { waitUntil: "domcontentloaded" });
   await page.waitForSelector("all-around-keyboard", { state: "attached", timeout: timeoutMs });
   await page.waitForFunction(
@@ -229,6 +245,31 @@ async function waitForSynchronized(page) {
   );
 }
 
+async function waitForCommonSessionInstallation(renewalTraces, leftLabel, rightLabel) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    assert.deepEqual(
+      renewalTraces.filter((trace) => trace.parseError),
+      [],
+      "malformed session-renewal trace records",
+    );
+    const leftEpochs = new Set(
+      renewalTraces
+        .filter((trace) => trace.label === leftLabel && trace.stage === "SessionInstalled")
+        .map((trace) => trace.epoch),
+    );
+    const common = renewalTraces.find(
+      (trace) =>
+        trace.label === rightLabel &&
+        trace.stage === "SessionInstalled" &&
+        leftEpochs.has(trace.epoch),
+    );
+    if (common) return common.epoch;
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+  }
+  assert.fail(`${leftLabel}/${rightLabel} did not install a common compact session`);
+}
+
 function assertReplicaWorkersReady(diagnostics, labels) {
   for (const label of labels) {
     assert.ok(
@@ -241,6 +282,27 @@ function assertReplicaWorkersReady(diagnostics, labels) {
       `${label} never reported a ready dedicated Replica worker`,
     );
   }
+}
+
+function assertDirectSessionDelivery(diagnostics, offset, senderLabel, receiverLabel) {
+  const current = diagnostics.slice(offset);
+  const sent = current.some(
+    (entry) =>
+      entry.label === senderLabel &&
+      entry.text.includes(
+        "first compact session Event sent over DIRECT reliable WebRTC lane",
+      ),
+  );
+  const received = current.some(
+    (entry) =>
+      entry.label === receiverLabel &&
+      entry.text.includes(
+        "first compact session Event received over DIRECT reliable WebRTC lane",
+      ),
+  );
+  assert.ok(sent, `${senderLabel} never proved a direct reliable session Event send`);
+  assert.ok(received, `${receiverLabel} never proved a direct reliable session Event receive`);
+  return { sender: senderLabel, receiver: receiverLabel, sent, received };
 }
 
 async function installOverlayObserver(page) {
@@ -417,6 +479,35 @@ async function assertSingleOverlayRender(page, label) {
     `${label} expected one keyboard overlay render, got ${JSON.stringify(renders)}`,
   );
   return renders[0];
+}
+
+async function waitForDurableMusicAdmission(
+  diagnostics,
+  offset,
+  sourceLabel,
+  peerLabel,
+) {
+  const outbound = /^\[replica_live\] outbound lane=Music entry=EntryHash\(Digest\(([0-9a-f]+)\.\.\)\)$/;
+  const inbound = /^\[replica_live\] inbound lane=Music entry=EntryHash\(Digest\(([0-9a-f]+)\.\.\)\) accepted=true$/;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const current = diagnostics.slice(offset);
+    const outboundHashes = new Set(
+      current
+        .filter((entry) => entry.label === sourceLabel)
+        .map((entry) => outbound.exec(entry.text)?.[1])
+        .filter(Boolean),
+    );
+    const admitted = current
+      .filter((entry) => entry.label === peerLabel)
+      .map((entry) => inbound.exec(entry.text)?.[1])
+      .find((hash) => hash && outboundHashes.has(hash));
+    if (admitted) return admitted;
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+  }
+  assert.fail(
+    `${sourceLabel}/${peerLabel} did not observe one matching durable Music admission`,
+  );
 }
 
 function tokenKey(token) {
@@ -719,9 +810,11 @@ async function operate({
   present,
   timings,
   sessionTraces,
+  diagnostics,
 }) {
   const key = 36 + note;
   const traceOffset = sessionTraces.length;
+  const durableOffset = diagnostics.length;
   await Promise.all([resetOverlayEvents(source), resetOverlayEvents(peer)]);
   const started = await dispatchPitch(source, note);
   const pressedFeedback = await waitForPressedFeedback(source, note, started, sourceLabel);
@@ -731,8 +824,19 @@ async function operate({
   ]);
   await Promise.all([waitForOverlayRender(source), waitForOverlayRender(peer)]);
 
-  // The peer-visible mutation proves durable admission. Leave a short quiet
-  // window to catch a redundant local confirmation repaint if one regresses.
+  // Compact visibility is intentionally reversible. Do not begin the next
+  // gesture until the exact ordinary ReplicaRecord has been authored by the
+  // source and admitted/projected by its peer; otherwise a prior operation's
+  // canonical catch-up can be misattributed to this operation's render window.
+  await waitForDurableMusicAdmission(
+    diagnostics,
+    durableOffset,
+    sourceLabel,
+    peerLabel,
+  );
+
+  // Leave a short quiet window after durable admission to catch a redundant
+  // agreeing-confirmation repaint if one regresses.
   await source.waitForTimeout(250);
   const action = present ? "add" : "remove";
   const [sourceMutation, peerMutation, sourceRender, peerRender] = await Promise.all([
@@ -784,6 +888,7 @@ function assertNoRepairFailures(diagnostics) {
 
 const diagnostics = [];
 const sessionTraces = [];
+const renewalTraces = [];
 const timings = {
   localPressedFeedback: [],
   localDomMutation: [],
@@ -841,9 +946,24 @@ try {
   const rightContext = await browser.newContext({ serviceWorkers: "allow" });
   const url = `${origin}/${sessionTraceEnabled ? "?sessionTrace=1" : ""}#${room}`;
 
-  let left = await openPeer(leftContext, "left", url, diagnostics, sessionTraces);
-  let right = await openPeer(rightContext, "right", url, diagnostics, sessionTraces);
+  let left = await openPeer(
+    leftContext,
+    "left",
+    url,
+    diagnostics,
+    sessionTraces,
+    renewalTraces,
+  );
+  let right = await openPeer(
+    rightContext,
+    "right",
+    url,
+    diagnostics,
+    sessionTraces,
+    renewalTraces,
+  );
   await Promise.all([waitForSynchronized(left), waitForSynchronized(right)]);
+  await waitForCommonSessionInstallation(renewalTraces, "left", "right");
   assertReplicaWorkersReady(diagnostics, ["left", "right"]);
   await Promise.all([installOverlayObserver(left), installOverlayObserver(right)]);
 
@@ -862,6 +982,7 @@ try {
       present: true,
       timings,
       sessionTraces,
+      diagnostics,
     });
     await operate({
       source,
@@ -872,8 +993,13 @@ try {
       present: false,
       timings,
       sessionTraces,
+      diagnostics,
     });
   }
+  const initialDirectSessionProof = [
+    assertDirectSessionDelivery(diagnostics, 0, "left", "right"),
+    assertDirectSessionDelivery(diagnostics, 0, "right", "left"),
+  ];
 
   // Leave one durable fact present, remove its peer, and prove that the
   // remaining browser reconstructs it from IndexedDB before a peer can repair.
@@ -886,6 +1012,7 @@ try {
     present: true,
     timings,
     sessionTraces,
+    diagnostics,
   });
   await left.close();
   const rightWorkerGenerationsBeforeReload = workerReadyCount(diagnostics, "right");
@@ -900,9 +1027,18 @@ try {
   // Reopen the other independent profile, prove its own durable reconstruction,
   // then wait for the normal carrier to report direct synchronized repair.
   const reconnectStarted = Date.now();
-  left = await openPeer(leftContext, "left-reopened", url, diagnostics, sessionTraces);
+  const reconnectDiagnosticOffset = diagnostics.length;
+  left = await openPeer(
+    leftContext,
+    "left-reopened",
+    url,
+    diagnostics,
+    sessionTraces,
+    renewalTraces,
+  );
   await waitForOverlay(left, targetKey + 7, true);
   await Promise.all([waitForSynchronized(left), waitForSynchronized(right)]);
+  await waitForCommonSessionInstallation(renewalTraces, "left-reopened", "right");
   assertReplicaWorkersReady(diagnostics, ["left-reopened"]);
   const reconnectMs = Date.now() - reconnectStarted;
   await Promise.all([installOverlayObserver(left), installOverlayObserver(right)]);
@@ -915,7 +1051,14 @@ try {
     present: false,
     timings,
     sessionTraces,
+    diagnostics,
   });
+  const reincarnatedDirectSessionProof = assertDirectSessionDelivery(
+    diagnostics,
+    reconnectDiagnosticOffset,
+    "right",
+    "left-reopened",
+  );
 
   assertNoRepairFailures(diagnostics);
   // The first two operations from each source include first-write allocation,
@@ -959,6 +1102,12 @@ try {
         toleranceMs: traceClockQuantizationToleranceMs,
         adjustments: traceClockQuantizationAdjustments,
       },
+    },
+    directSessionCarrier: {
+      lane: "reliable-unordered WebRTC DataChannel",
+      authority: "authenticated compact Event duplicate; ordinary gossip remains fallback",
+      initial: initialDirectSessionProof,
+      reincarnated: reincarnatedDirectSessionProof,
     },
     warmupSamplesExcluded,
     steadyStateLatencyMs: steady,

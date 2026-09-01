@@ -455,6 +455,7 @@ struct WindowWorkerState {
 
 const REPAIR_FRAME_QUEUE_CAPACITY: usize = 8;
 const SESSION_EVENT_QUEUE_CAPACITY: usize = 64;
+const ROOM_PROJECTION_SUBSCRIPTION: SubscriptionId = SubscriptionId::new(1);
 
 async fn next_repair_frame(receiver: Rc<RefCell<mpsc::Receiver<Vec<u8>>>>) -> Option<Vec<u8>> {
     futures::future::poll_fn(move |context| {
@@ -849,13 +850,15 @@ impl BrowserReplicaHandle {
             return Err("Replica worker Open returned an unexpected response".into());
         }
 
-        let subscription_id = SubscriptionId::new(1);
         state.borrow_mut().subscription = Some(ProjectionSubscription::new(
             client.current_generation(),
-            subscription_id,
+            ROOM_PROJECTION_SUBSCRIPTION,
         ));
         let snapshot = client
-            .request(WorkerRequestKind::Subscribe(subscription_id), Vec::new())
+            .request(
+                WorkerRequestKind::Subscribe(ROOM_PROJECTION_SUBSCRIPTION),
+                Vec::new(),
+            )
             .await
             .map_err(worker_error)?;
         state.borrow_mut().accept_initial_snapshot(&snapshot)?;
@@ -1158,6 +1161,29 @@ impl BrowserReplicaHandle {
         *self.repair_failure.borrow_mut() = None;
         while self.repair_frames.borrow_mut().try_recv().is_ok() {}
         permit
+    }
+
+    /// Grant and consume one bounded projection-delivery credit.
+    ///
+    /// Protocol v5 does not deliver projection changes through the generic
+    /// event callback. The room-generation supervisor must continuously pull
+    /// this subscription and must resolve an outstanding pull through worker
+    /// close/termination instead of silently abandoning its continuity.
+    pub(super) async fn pull_projection(&self) -> Result<bool, String> {
+        let Some(event) = self
+            .client
+            .pull_projection(ROOM_PROJECTION_SUBSCRIPTION)
+            .await
+            .map_err(worker_error)?
+        else {
+            return Ok(false);
+        };
+        self.state.borrow_mut().receive(event);
+        match self.state.borrow().lifecycle.get_cloned() {
+            BrowserReplicaLifecycle::Failed { message } => Err(message),
+            BrowserReplicaLifecycle::Closing | BrowserReplicaLifecycle::Closed => Ok(false),
+            BrowserReplicaLifecycle::Opening | BrowserReplicaLifecycle::Ready { .. } => Ok(true),
+        }
     }
 
     pub(super) async fn close(&self) -> Result<(), String> {

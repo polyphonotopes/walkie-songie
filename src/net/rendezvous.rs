@@ -573,6 +573,18 @@ async fn run_rendezvous<S: SignalStream>(
                                         );
                                     }
                                 });
+                            } else if let Some(port) = peering.webrtc.as_ref()
+                                && rtc == Some(true)
+                                && !port.is_connected(id.as_bytes())
+                            {
+                                // A same-incarnation Hello is also a bounded
+                                // opportunity for the deterministic offerer to
+                                // retransmit its current SDP. WebSocket delivery
+                                // is ordered, but a reconnect can lose the one
+                                // fan-out that carried the initial Offer.
+                                let _ = port.commands.unbounded_send(
+                                    super::webrtc_transport::Command::Dial(*id.as_bytes()),
+                                );
                             }
                         } else if joined.len() < MAX_RENDEZVOUS_PEERS {
                             joined.insert(id);

@@ -94,6 +94,15 @@ pub const WEBRTC_TRANSPORT_ID: u64 = 0x5765_6252_5443;
 /// it and refuse to interop, mirroring the ALPN discipline in [`super::iroh_common`].
 const DATA_CHANNEL_LABEL: &str = "walkie/iroh-quic/2";
 
+/// A reliable-unordered side channel for already authenticated compact-session
+/// carriers. QUIC still uses [`DATA_CHANNEL_LABEL`] with datagram semantics;
+/// this lane only accelerates tiny pair-session Events while the ordinary gossip
+/// broadcast remains the interoperable native/multi-hop fallback.
+const SESSION_CHANNEL_LABEL: &str = "walkie/session-carrier/1";
+const MAX_DIRECT_SESSION_FRAME_BYTES: usize = 16 * 1024;
+const DIRECT_SESSION_QUEUE_DEPTH: usize = 64;
+const MAX_DIRECT_SESSION_BUFFERED_BYTES: u32 = 64 * 1024;
+
 /// One WebRTC offer attempt. The endpoint id is intentionally stable across a
 /// room-placement restart, so it cannot fence callbacks or signaling from the
 /// retired browser `RTCPeerConnection`. A fresh random attempt is minted by the
@@ -220,6 +229,12 @@ pub(crate) struct DirectReady {
     pub(crate) attempt: RtcAttempt,
 }
 
+#[derive(Debug)]
+pub(crate) struct DirectSessionFrame {
+    pub(crate) peer: [u8; 32],
+    pub(crate) bytes: Vec<u8>,
+}
+
 /// The handles the rendezvous loop needs to bridge signaling for this transport.
 /// Flows to rendezvous through `RendezvousPeering` (populated by
 /// `BrowserNetHandle::rendezvous_peering`), so `browser_host` wiring is unchanged.
@@ -239,6 +254,7 @@ pub struct WebRtcSignalPort {
     /// Keeps the broadcast open across brief intervals with no active waiter.
     /// `async-broadcast` closes permanently when its final receiver disappears.
     _ready_keepalive: async_broadcast::InactiveReceiver<DirectReady>,
+    direct_session_inbound: Rc<RefCell<Option<mpsc::Receiver<DirectSessionFrame>>>>,
     incarnation: [u8; 8],
 }
 
@@ -271,6 +287,46 @@ impl WebRtcSignalPort {
 
     pub(crate) fn subscribe_ready(&self) -> async_broadcast::Receiver<DirectReady> {
         self.ready.new_receiver()
+    }
+
+    pub(crate) fn take_direct_session_inbound(&self) -> Option<mpsc::Receiver<DirectSessionFrame>> {
+        self.direct_session_inbound.borrow_mut().take()
+    }
+
+    /// Best-effort low-latency delivery of one compact session Event to a known
+    /// browser peer. `false` means the caller must rely on its ordinary gossip
+    /// broadcast; it never means the authenticated Event was rejected.
+    pub(crate) fn try_send_session(&self, peer: [u8; 32], bytes: &[u8]) -> bool {
+        if bytes.len() > MAX_DIRECT_SESSION_FRAME_BYTES {
+            return false;
+        }
+        let mut shared = self.shared.borrow_mut();
+        let Some(link) = shared.links.get_mut(&peer) else {
+            return false;
+        };
+        if link.pc.connection_state() != web_sys::RtcPeerConnectionState::Connected {
+            return false;
+        }
+        let Some(channel) = link.session_channel.as_ref() else {
+            return false;
+        };
+        if channel.ready_state() != RtcDataChannelState::Open
+            || channel.buffered_amount().saturating_add(bytes.len() as u32)
+                > MAX_DIRECT_SESSION_BUFFERED_BYTES
+        {
+            return false;
+        }
+        let sent = channel.send_with_u8_array(bytes).is_ok();
+        if sent && !link.logged_first_session_send {
+            link.logged_first_session_send = true;
+            tracing::info!(
+                target: "walkie::webrtc",
+                "first compact session Event sent over DIRECT reliable WebRTC lane to {} attempt={}",
+                short(&peer),
+                link.attempt
+            );
+        }
+        sent
     }
 
     pub fn is_connected(&self, peer: &[u8; 32]) -> bool {
@@ -381,6 +437,7 @@ struct Shared {
     cmd_tx: mpsc::UnboundedSender<Command>,
     /// Data-channel readiness notifications for direct-first rendezvous.
     ready: async_broadcast::Sender<DirectReady>,
+    direct_session_tx: mpsc::Sender<DirectSessionFrame>,
 }
 
 /// One peer's WebRTC connection state.
@@ -389,12 +446,21 @@ struct PeerLink {
     attempt: RtcAttempt,
     /// The data channel once created (offerer) or received (answerer).
     channel: Option<RtcDataChannel>,
+    /// Reliable-unordered application lane for compact pair-session Events.
+    /// It carries only authenticated session bytes and never canonical records.
+    session_channel: Option<RtcDataChannel>,
     /// True once the remote description is set — ICE candidates that arrive before
     /// that must be buffered in `pending_ice` and flushed here.
     remote_desc_set: bool,
     pending_ice: Vec<(String, Option<String>, Option<u16>)>,
     logged_first_send: bool,
     logged_first_recv: bool,
+    logged_first_session_send: bool,
+    logged_first_session_recv: bool,
+    /// Cached offer makes a known-peer Hello a bounded signaling retry for the
+    /// same attempt. This repairs a lost rendezvous fan-out without replacing
+    /// a still-valid attempt or reopening any transport authority.
+    offer_sdp: Option<String>,
     /// Cached answer makes an exact duplicate Offer idempotent without applying
     /// the same remote description twice.
     answer_sdp: Option<String>,
@@ -450,6 +516,7 @@ impl WebRtcTransport {
     pub fn new(local_id: [u8; 32]) -> (Self, WebRtcSignalPort) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded::<Command>();
         let (signal_tx, signal_rx) = mpsc::unbounded::<SignalOut>();
+        let (direct_session_tx, direct_session_rx) = mpsc::channel(DIRECT_SESSION_QUEUE_DEPTH);
         let (mut ready, ready_rx) = async_broadcast::broadcast(64);
         ready.set_overflow(true);
         let ready_keepalive = ready_rx.deactivate();
@@ -464,6 +531,7 @@ impl WebRtcTransport {
             dialing: HashSet::new(),
             cmd_tx: cmd_tx.clone(),
             ready: ready.clone(),
+            direct_session_tx,
         }));
 
         spawn_local(run_driver(shared.clone(), cmd_rx, signal_tx));
@@ -478,6 +546,7 @@ impl WebRtcTransport {
             shared,
             ready,
             _ready_keepalive: ready_keepalive,
+            direct_session_inbound: Rc::new(RefCell::new(Some(direct_session_rx))),
             incarnation,
         };
         (transport, port)
@@ -739,6 +808,11 @@ fn retire_link(shared: &SharedRef, peer: [u8; 32], attempt: RtcAttempt) -> bool 
         channel.set_onopen(None);
         channel.close();
     }
+    if let Some(channel) = link.session_channel.as_ref() {
+        channel.set_onmessage(None);
+        channel.set_onopen(None);
+        channel.close();
+    }
     link.pc.close();
     true
 }
@@ -806,6 +880,50 @@ fn wire_channel(
     closures.push(AnyClosure::Unit(onopen));
 }
 
+fn wire_session_channel(
+    shared: &SharedRef,
+    peer: [u8; 32],
+    attempt: RtcAttempt,
+    channel: &RtcDataChannel,
+    closures: &mut Vec<AnyClosure>,
+) {
+    channel.set_binary_type(RtcDataChannelType::Arraybuffer);
+    let shared_message = shared.clone();
+    let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {
+        if !attempt_is_current(&shared_message, peer, attempt) {
+            return;
+        }
+        let bytes = js_sys::Uint8Array::new(&event.data()).to_vec();
+        if bytes.len() > MAX_DIRECT_SESSION_FRAME_BYTES {
+            return;
+        }
+        // The callback cannot await. A full bounded fast-lane queue drops only
+        // this acceleration copy; the ordinary gossip copy remains authoritative
+        // carrier fallback and HHHS replay fencing deduplicates successful twins.
+        let mut state = shared_message.borrow_mut();
+        if state
+            .direct_session_tx
+            .try_send(DirectSessionFrame { peer, bytes })
+            .is_ok()
+            && let Some(link) = state
+                .links
+                .get_mut(&peer)
+                .filter(|link| link.attempt == attempt)
+            && !link.logged_first_session_recv
+        {
+            link.logged_first_session_recv = true;
+            tracing::info!(
+                target: "walkie::webrtc",
+                "first compact session Event received over DIRECT reliable WebRTC lane from {} attempt={}",
+                short(&peer),
+                attempt
+            );
+        }
+    }) as Box<dyn FnMut(MessageEvent)>);
+    channel.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+    closures.push(AnyClosure::Msg(onmessage));
+}
+
 /// Store an inbound (answerer-side) data channel into its link and wire it.
 fn attach_incoming_channel(
     shared: &SharedRef,
@@ -818,15 +936,27 @@ fn attach_incoming_channel(
         channel.close();
         return;
     }
+    let label = channel.label();
     let mut closures = Vec::new();
-    wire_channel(shared, ready, peer, attempt, &channel, &mut closures);
+    if label == DATA_CHANNEL_LABEL {
+        wire_channel(shared, ready, peer, attempt, &channel, &mut closures);
+    } else if label == SESSION_CHANNEL_LABEL {
+        wire_session_channel(shared, peer, attempt, &channel, &mut closures);
+    } else {
+        channel.close();
+        return;
+    }
     let mut s = shared.borrow_mut();
     if let Some(link) = s
         .links
         .get_mut(&peer)
         .filter(|link| link.attempt == attempt)
     {
-        link.channel = Some(channel);
+        if label == DATA_CHANNEL_LABEL {
+            link.channel = Some(channel);
+        } else {
+            link.session_channel = Some(channel);
+        }
         link._closures.extend(closures);
     }
 }
@@ -915,6 +1045,7 @@ fn ensure_link(
     closures.push(AnyClosure::Unit(onstate));
 
     let mut channel = None;
+    let mut session_channel = None;
     if offerer {
         // The offerer creates the (unreliable, unordered) data channel *before* the
         // offer, so the generated SDP carries its m-line.
@@ -924,6 +1055,12 @@ fn ensure_link(
         let dc = pc.create_data_channel_with_data_channel_dict(DATA_CHANNEL_LABEL, &init);
         wire_channel(shared, ready.clone(), peer, attempt, &dc, &mut closures);
         channel = Some(dc);
+        let session_init = RtcDataChannelInit::new();
+        session_init.set_ordered(false);
+        let session_dc =
+            pc.create_data_channel_with_data_channel_dict(SESSION_CHANNEL_LABEL, &session_init);
+        wire_session_channel(shared, peer, attempt, &session_dc, &mut closures);
+        session_channel = Some(session_dc);
     } else {
         // The answerer receives the channel via `ondatachannel`.
         let shared_for_dc = shared.clone();
@@ -947,10 +1084,14 @@ fn ensure_link(
             pc: pc.clone(),
             attempt,
             channel,
+            session_channel,
             remote_desc_set: false,
             pending_ice: Vec::new(),
             logged_first_send: false,
             logged_first_recv: false,
+            logged_first_session_send: false,
+            logged_first_session_recv: false,
+            offer_sdp: None,
             answer_sdp: None,
             _closures: closures,
         },
@@ -971,6 +1112,23 @@ async fn handle_dial(
         return;
     }
     if !local_is_offerer(local_id, peer) {
+        return;
+    }
+    let retry = shared.borrow().links.get(&peer).and_then(|link| {
+        let open = link
+            .channel
+            .as_ref()
+            .is_some_and(|channel| channel.ready_state() == RtcDataChannelState::Open);
+        (!open)
+            .then(|| link.offer_sdp.clone().map(|sdp| (link.attempt, sdp)))
+            .flatten()
+    });
+    if let Some((attempt, sdp)) = retry {
+        tracing::info!(target: "walkie::webrtc", "retrying offer to {} attempt={}", short(&peer), attempt);
+        let _ = signal_tx.unbounded_send(SignalOut {
+            to: peer,
+            payload: RtcPayload::Offer { attempt, sdp },
+        });
         return;
     }
     if current_attempt(shared, peer).is_some() {
@@ -999,6 +1157,22 @@ async fn handle_dial(
         return;
     }
     if let Some(sdp) = offer.get_sdp() {
+        let retained = {
+            let mut state = shared.borrow_mut();
+            if let Some(link) = state
+                .links
+                .get_mut(&peer)
+                .filter(|link| link.attempt == attempt)
+            {
+                link.offer_sdp = Some(sdp.clone());
+                true
+            } else {
+                false
+            }
+        };
+        if !retained {
+            return;
+        }
         tracing::info!(target: "walkie::webrtc", "dialing {} attempt={} — sending offer", short(&peer), attempt);
         let _ = signal_tx.unbounded_send(SignalOut {
             to: peer,

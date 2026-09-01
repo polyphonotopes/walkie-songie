@@ -630,6 +630,16 @@ pub(crate) fn is_session_carrier(bytes: &[u8]) -> bool {
     bytes.starts_with(SESSION_CARRIER_DOMAIN)
 }
 
+/// Return the target only for compact realtime Events. Establishment Offer and
+/// Answer frames deliberately stay on the ordinary gossip carrier so a direct
+/// acceleration copy cannot create a second handshake lifecycle.
+pub(crate) fn session_event_target(bytes: &[u8]) -> Option<ActorId> {
+    match SessionCarrierBody::decode(bytes).ok()? {
+        SessionCarrierBody::Event { target, .. } => Some(target),
+        SessionCarrierBody::Offer { .. } | SessionCarrierBody::Answer { .. } => None,
+    }
+}
+
 /// Acceptance-only classifier used to retain one real signed offer for a
 /// deliberate stale-delivery browser gate. Production builds have neither the
 /// classifier nor the replay control surface.
@@ -680,6 +690,10 @@ struct PendingSession {
     manifest: SessionManifest<2>,
     local_foundation: VerifiedSeatFoundation,
     renewal_floor: Option<SessionRenewalFloor>,
+    /// Exact signed Offer retained for idempotent retransmission after a later
+    /// equal-root repair proves the peer is still reachable. This never mints
+    /// another epoch or changes the pending authorization state.
+    offer_carrier: Vec<u8>,
 }
 
 enum PairAuthorization {
@@ -919,7 +933,21 @@ impl RoomSessionTask {
     async fn start_peer(&mut self, foundation: RoomSessionFoundation) -> Result<(), String> {
         let peer = foundation.peer;
         self.foundations.insert(peer, foundation.clone());
-        if self.active.contains_key(&peer) || self.pending.contains_key(&peer) {
+        if let Some(pending) = self.pending.get(&peer) {
+            if pending.manifest.base() == &foundation.history.frontier() {
+                return self
+                    .emit(RoomSessionEgress::Carrier(pending.offer_carrier.clone()))
+                    .await;
+            }
+            // Repair or ordinary admission advanced the canonical base while
+            // this Offer was pending. The old bytes remain authenticated but
+            // can no longer authorize the current placement, so replace them
+            // at the same minimum next epoch from the fresh foundation.
+            self.pending.remove(&peer);
+            self.renewal_needed.insert(peer);
+            return self.begin_session(foundation).await;
+        }
+        if self.active.contains_key(&peer) {
             return Ok(());
         }
         let recovering = self.load_renewal_floor(&foundation).await?.is_some();
@@ -988,6 +1016,7 @@ impl RoomSessionTask {
                 manifest,
                 local_foundation,
                 renewal_floor,
+                offer_carrier: carrier.clone(),
             },
         );
         self.renewal_needed.remove(&peer);
@@ -3193,6 +3222,99 @@ mod tests {
         (owner, member)
     }
 
+    #[test]
+    fn repeated_start_peer_retransmits_the_exact_pending_offer() {
+        let (owner, member) = renewal_foundations();
+        let initiator = if owner.local.0 < owner.peer.0 {
+            owner
+        } else {
+            member
+        };
+        let delivered = Rc::new(RefCell::new(Vec::<RoomSessionEgress>::new()));
+        let captured = Rc::clone(&delivered);
+        let events = WorkerEventPort::new(WorkerGeneration::new(1), move |event| {
+            captured.borrow_mut().push(decode(event.payload())?);
+            Ok(())
+        });
+        let (reifications, _) = mpsc::channel(1);
+        let mut task = RoomSessionTask::new(
+            reifications,
+            Rc::new(TestRenewalStore::default()),
+            test_lease_clock(),
+        );
+        task.events = Some(events);
+
+        block_on(task.start_peer(initiator.clone())).unwrap();
+        let pending = task
+            .pending
+            .get(&initiator.peer)
+            .expect("first start must retain one pending handshake");
+        let session_id = pending.session_id;
+        let offer = pending.offer_carrier.clone();
+        block_on(task.start_peer(initiator.clone())).unwrap();
+
+        let carriers: Vec<_> = delivered
+            .borrow()
+            .iter()
+            .filter_map(|event| match event {
+                RoomSessionEgress::Carrier(bytes) => Some(bytes.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(carriers, vec![offer.clone(), offer]);
+        assert_eq!(task.pending.len(), 1);
+        assert_eq!(task.pending[&initiator.peer].session_id, session_id);
+    }
+
+    #[test]
+    fn repeated_start_peer_retransmits_a_pending_renewal_over_the_active_epoch() {
+        let (owner, member) = renewal_foundations();
+        let (initiator, counterpart) = if owner.local.0 < owner.peer.0 {
+            (owner, member)
+        } else {
+            (member, owner)
+        };
+        let old_session_id = 0x9911;
+        let (authorized, floor) =
+            authorize_fixture(&initiator, &counterpart, old_session_id, 1, None).unwrap();
+        let (keys, _) = session_key_pair(&initiator, &counterpart, old_session_id);
+        let active =
+            ActiveSession::new(initiator.clone(), authorized, old_session_id, keys, 0).unwrap();
+        let delivered = Rc::new(RefCell::new(Vec::<RoomSessionEgress>::new()));
+        let captured = Rc::clone(&delivered);
+        let events = WorkerEventPort::new(WorkerGeneration::new(1), move |event| {
+            captured.borrow_mut().push(decode(event.payload())?);
+            Ok(())
+        });
+        let (reifications, _) = mpsc::channel(1);
+        let mut task = RoomSessionTask::new(
+            reifications,
+            Rc::new(TestRenewalStore::default()),
+            test_lease_clock(),
+        );
+        task.events = Some(events);
+        task.foundations.insert(initiator.peer, initiator.clone());
+        task.active.insert(initiator.peer, active);
+        task.renewal_floors.insert(initiator.peer, Some(floor));
+        task.renewal_needed.insert(initiator.peer);
+
+        block_on(task.start_ready_renewals()).unwrap();
+        let offer = task.pending[&initiator.peer].offer_carrier.clone();
+        block_on(task.start_peer(initiator.clone())).unwrap();
+
+        let carriers: Vec<_> = delivered
+            .borrow()
+            .iter()
+            .filter_map(|event| match event {
+                RoomSessionEgress::Carrier(bytes) => Some(bytes.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(carriers, vec![offer.clone(), offer]);
+        assert_eq!(task.pending.len(), 1);
+        assert!(task.active.contains_key(&initiator.peer));
+    }
+
     fn authorize_fixture(
         owner: &RoomSessionFoundation,
         member: &RoomSessionFoundation,
@@ -3346,6 +3468,36 @@ mod tests {
 
     fn degree() -> TunedDegree {
         TunedDegree::new(&tutti_music::Tuning::twelve_tet(), 7).unwrap()
+    }
+
+    #[test]
+    fn direct_session_target_accepts_only_realtime_events() {
+        let source = ActorId([31; 32]);
+        let target = ActorId([47; 32]);
+        let event = SessionCarrierBody::Event {
+            source,
+            target,
+            session_id: 9,
+            frame: vec![1, 2, 3],
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(session_event_target(&event), Some(target));
+
+        let (owner, _) = renewal_foundations();
+        assert_eq!(session_event_target(&signed_offer(&owner, 0x5100, 1)), None);
+        let answer = SessionCarrierBody::Answer {
+            source,
+            target,
+            session_id: 9,
+            grants: Vec::new(),
+            handshake: Vec::new(),
+            foundation: Vec::new(),
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(session_event_target(&answer), None);
+        assert_eq!(session_event_target(b"not a carrier"), None);
     }
 
     #[test]

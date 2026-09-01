@@ -574,6 +574,24 @@ async function runTrial({ browser, origin, kind, query, expectedDelta, restarted
           ),
       `${kind} stale old-session traffic refusal`,
     );
+    const commonRecoveredInstall = await waitUntil(() => {
+      const sourceInstall = renewalTraces.find(
+        (trace) =>
+          trace.label === "source" &&
+          trace.stage === "SessionInstalled" &&
+          trace.epoch === recoveredInstall.epoch,
+      );
+      return (
+        sourceInstall &&
+        renewalTraces.some(
+          (trace) =>
+            trace.label === "peer" &&
+            trace.stage === "SessionInstalled" &&
+            trace.epoch === recoveredInstall.epoch,
+        ) &&
+        sourceInstall
+      );
+    }, `${kind} common recovered compact session installation`);
     const freshDirect = await waitForFreshDirectAttempt(
       diagnostics,
       freshDirectTraceIndex,
@@ -668,6 +686,7 @@ async function runTrial({ browser, origin, kind, query, expectedDelta, restarted
           epoch: staleRefusal.epoch,
           armedTraceIndex: staleReplayArmTraceIndex,
         },
+        commonRecoveredEpoch: commonRecoveredInstall.epoch,
         exactAbsentOrOneDurableTransaction: true,
         freshDirectAttemptInstalledOnBothPeers: freshDirect.attempt,
         postRecoveryAuthoritativeConvergence: true,
@@ -695,13 +714,28 @@ async function runTrial({ browser, origin, kind, query, expectedDelta, restarted
               entry.type === "pageerror" ||
               entry.text.includes("[native:") ||
               entry.text.includes("[replica_worker]") ||
-              entry.text.includes("[replica_repair"),
+              entry.text.includes("[replica_repair") ||
+              entry.text.includes("webrtc_transport") ||
+              entry.text.includes("walkie::webrtc") ||
+              entry.text.includes("reincarnat"),
           ),
           renewalTraces,
           workerStates: [
             latestAuthoritativeState(workerStates, "source"),
             latestAuthoritativeState(workerStates, "peer"),
-          ].filter(Boolean),
+          ]
+            .filter(Boolean)
+            .map((state) => ({
+              label: state.label,
+              generation: state.generation,
+              observedAfterArmAt: state.observedAfterArmAt,
+              projection: {
+                music_revision: state.projection.music_revision,
+                music_history_root: state.projection.music_history_root,
+                music_frontier: state.projection.music_frontier,
+                extension_frontier: state.projection.extension_frontier,
+              },
+            })),
         },
         null,
         2,

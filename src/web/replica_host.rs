@@ -41,7 +41,7 @@ use crate::{
     room::session::{
         RoomSessionCompactTrace, RoomSessionEgress, RoomSessionIngress, RoomSessionProjectionGate,
         RoomSessionProjectionKind, RoomSessionRealtimeEgress, RoomSessionRenewalTrace,
-        is_session_carrier,
+        is_session_carrier, session_event_target,
     },
     room::v5::{
         ActorId, ExtensionCommand, MusicOp, ProtocolSupport, RoomCommand, RoomLane, RoomView,
@@ -1243,6 +1243,12 @@ impl BrowserHost {
             task_failed,
             stopped_tx,
         );
+        spawn_projection_loop(
+            spawner.clone(),
+            self.clone(),
+            worker.clone(),
+            task_lifetime.clone(),
+        );
         spawn_session_loop(
             spawner.clone(),
             self.clone(),
@@ -1251,6 +1257,13 @@ impl BrowserHost {
             task_lifetime.clone(),
             session_gate,
             session_reset_outstanding,
+        );
+        spawn_periodic_session_establishment(
+            spawner.clone(),
+            self.clone(),
+            worker.clone(),
+            peers.clone(),
+            task_lifetime.clone(),
         );
         spawn_periodic_repair(
             spawner.clone(),
@@ -2295,6 +2308,51 @@ fn spawn_worker_failure_loop(
     }
 }
 
+fn spawn_projection_loop(
+    spawner: RoomGenerationSpawner,
+    host: Rc<BrowserHost>,
+    worker: BrowserReplicaHandle,
+    lifetime: RoomGenerationToken,
+) {
+    let generation = worker.generation();
+    let failure_host = host.clone();
+    if spawner
+        .spawn(async move {
+            while lifetime.is_alive() {
+                // Do not select this future against cancellation. An issued
+                // pull is a guarded HHHS delivery credit: normal worker Close
+                // resolves it with None, while generation failure explicitly
+                // terminates the worker and resolves it as an error.
+                match worker.pull_projection().await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        if lifetime.is_alive() {
+                            host.fail_active_room_generation(
+                                generation,
+                                "Replica worker projection subscription closed before its room generation"
+                                    .into(),
+                            );
+                        }
+                        return;
+                    }
+                    Err(error) => {
+                        if lifetime.is_alive() {
+                            host.fail_active_room_generation(generation, error);
+                        }
+                        return;
+                    }
+                }
+            }
+        })
+        .is_err()
+    {
+        failure_host.fail_active_room_generation(
+            generation,
+            "room generation scope refused its projection-pull task".into(),
+        );
+    }
+}
+
 fn spawn_session_loop(
     spawner: RoomGenerationSpawner,
     host: Rc<BrowserHost>,
@@ -2446,6 +2504,15 @@ fn spawn_session_loop(
                         let _ = task_spawner.spawn(async move {
                             if let Some(trace) = trace.as_ref() {
                                 log_session_trace("carrier_broadcast_call_started", trace);
+                            }
+                            if let Some(target) = session_event_target(&carrier)
+                                && let Ok(endpoint_id) = iroh::EndpointId::from_bytes(&target.0)
+                            {
+                                // This is only a bounded low-latency duplicate.
+                                // Gossip always runs below as the multi-hop/failure
+                                // carrier, while HHHS replay fencing makes either
+                                // arrival order converge to one accepted Event.
+                                let _ = handle.try_send_session(endpoint_id, &carrier);
                             }
                             let Some(result) =
                                 until_generation_cancelled(&lifetime, handle.broadcast(carrier))
@@ -2648,6 +2715,55 @@ fn spawn_session_loop(
             "room generation scope refused its session task".into(),
         );
     }
+}
+
+/// Retries only the worker's retained pending establishment state.
+///
+/// `StartPeer` retransmits byte-identical signed Offer bytes while its durable
+/// base is unchanged, rebases only after canonical growth, and is a no-op for
+/// an active pair. Keeping this clock separate prevents repair probes from
+/// imposing their deliberately slower cadence on realtime readiness.
+fn spawn_periodic_session_establishment(
+    spawner: RoomGenerationSpawner,
+    host: Rc<BrowserHost>,
+    worker: BrowserReplicaHandle,
+    peers: Rc<RefCell<BTreeMap<iroh::EndpointId, (DiscoverySource, PeerPath, ProtocolSupport)>>>,
+    lifetime: RoomGenerationToken,
+) {
+    let _ = spawner.spawn(async move {
+        while lifetime.is_alive() {
+            let sleep = n0_future::time::sleep(Duration::from_secs(2)).fuse();
+            let cancelled = lifetime.cancelled().fuse();
+            futures::pin_mut!(sleep, cancelled);
+            if matches!(
+                futures::future::select(sleep, cancelled).await,
+                futures::future::Either::Right(_)
+            ) {
+                break;
+            }
+            let session_peers = peers
+                .borrow()
+                .iter()
+                .filter_map(|(peer, (_, path, support))| {
+                    (*path != PeerPath::Disconnected && support.supports(RoomLane::Music))
+                        .then_some(*peer)
+                })
+                .collect::<Vec<_>>();
+            for peer in session_peers {
+                let Some(result) = until_generation_cancelled(
+                    &lifetime,
+                    worker.start_session_peer(ActorId(*peer.as_bytes())),
+                )
+                .await
+                else {
+                    return;
+                };
+                if let Err(error) = result {
+                    host.emit_diagnostic("session_establishment_retry", &error);
+                }
+            }
+        }
+    });
 }
 
 fn spawn_periodic_repair(
