@@ -950,6 +950,8 @@ impl ActiveRoom {
                 ));
             }
             NativeNetworkEvent::MdnsDiscovered { .. } | NativeNetworkEvent::MdnsExpired { .. } => {}
+            #[cfg(target_arch = "wasm32")]
+            NativeNetworkEvent::DirectReady { .. } => {}
         }
     }
 

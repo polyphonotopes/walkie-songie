@@ -21,7 +21,10 @@
 //! only per-target seams: `n0-future` on wasm, tokio on native — the same split
 //! the rest of `net` already makes.
 
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    time::Duration,
+};
 
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, address_lookup::MemoryLookup};
 use iroh_gossip::api::GossipSender;
@@ -40,7 +43,8 @@ pub const HELLO_VERSION_V5: u32 = 5;
 const RTC_KIND: &str = "walkie-rtc";
 /// WebRTC signaling envelope version.
 #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
-const RTC_VERSION: u32 = 1;
+const RTC_VERSION: u32 = 2;
+const RTC_INCARNATIONS_REMEMBERED_PER_PEER: usize = 8;
 /// Keepalive re-hello once our relay is known. Also refreshes peers' addressing
 /// and re-advertises us to anyone who joined since our last hello.
 const RE_HELLO_INTERVAL: Duration = Duration::from_secs(30);
@@ -150,6 +154,11 @@ pub struct HelloV5 {
     pub relay: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtc: Option<bool>,
+    /// Random browser-transport placement identity. Unlike `id`, this changes
+    /// across a whole room-generation reopen, so a surviving deterministic
+    /// offerer can replace its stale link before connectionState catches up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtc_incarnation: Option<[u8; 8]>,
 }
 
 impl HelloV5 {
@@ -158,6 +167,7 @@ impl HelloV5 {
         id: String,
         relay: Option<String>,
         rtc: Option<bool>,
+        rtc_incarnation: Option<[u8; 8]>,
     ) -> Self {
         Self {
             kind: HELLO_KIND.to_owned(),
@@ -166,6 +176,7 @@ impl HelloV5 {
             id,
             relay,
             rtc,
+            rtc_incarnation,
         }
     }
 
@@ -174,6 +185,44 @@ impl HelloV5 {
             return None;
         }
         ProtocolSupport::from_bits(self.support)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncarnationObservation {
+    First,
+    Known,
+    Reincarnated,
+    CapacityRefused,
+}
+
+/// Bounded replay memory for browser transport incarnations. Remembering recent
+/// values prevents a delayed Hello from an already-retired placement from
+/// toggling the survivor back to that stale carrier.
+#[derive(Default)]
+struct RtcIncarnationTracker {
+    seen: HashMap<EndpointId, VecDeque<[u8; 8]>>,
+}
+
+impl RtcIncarnationTracker {
+    fn observe(&mut self, peer: EndpointId, incarnation: [u8; 8]) -> IncarnationObservation {
+        if !self.seen.contains_key(&peer) && self.seen.len() >= MAX_RENDEZVOUS_PEERS {
+            return IncarnationObservation::CapacityRefused;
+        }
+        let values = self.seen.entry(peer).or_default();
+        if values.contains(&incarnation) {
+            return IncarnationObservation::Known;
+        }
+        let observation = if values.is_empty() {
+            IncarnationObservation::First
+        } else {
+            IncarnationObservation::Reincarnated
+        };
+        values.push_back(incarnation);
+        if values.len() > RTC_INCARNATIONS_REMEMBERED_PER_PEER {
+            values.pop_front();
+        }
+        observation
     }
 }
 
@@ -270,8 +319,12 @@ async fn send_hello<S: SignalStream>(
     // in (browser build); a peer only offers to peers that flag `rtc`.
     #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
     let rtc = peering.webrtc.is_some().then_some(true);
+    #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+    let rtc_incarnation = peering.webrtc.as_ref().map(|port| port.incarnation());
     #[cfg(not(all(target_arch = "wasm32", feature = "browser-net")))]
     let rtc = None;
+    #[cfg(not(all(target_arch = "wasm32", feature = "browser-net")))]
+    let rtc_incarnation = None;
     let relay_string = relay.as_ref().map(|url| url.as_str().to_owned());
     let RendezvousGeneration::V5 { local_support } = generation;
     let data = serde_json::to_value(HelloV5::new(
@@ -279,6 +332,7 @@ async fn send_hello<S: SignalStream>(
         our_id.to_string(),
         relay_string,
         rtc,
+        rtc_incarnation,
     ))?;
     let message = ClientMessage::Publish {
         topic: channel.to_owned(),
@@ -298,6 +352,9 @@ enum Turn {
     /// The WebRTC driver produced a signaling payload to publish (browser only).
     #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
     SignalOut(super::webrtc_transport::SignalOut),
+    /// One owned deferred direct-path/rejoin child completed (browser only).
+    #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+    ChildCompleted,
 }
 
 /// Drive one signaling session to completion (until the socket closes or errors).
@@ -312,6 +369,7 @@ async fn run_rendezvous<S: SignalStream>(
     generation: RendezvousGeneration,
     on_discovered: &impl Fn(EndpointId, Option<u8>),
     joined: &mut HashSet<EndpointId>,
+    rtc_incarnations: &mut RtcIncarnationTracker,
 ) -> Result<(), RendezvousError> {
     let our_id = peering.endpoint.id();
 
@@ -323,6 +381,8 @@ async fn run_rendezvous<S: SignalStream>(
         .webrtc
         .as_ref()
         .map(|port| OutboundGuard::take(&port.outbound));
+    #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+    let mut children = n0_future::task::JoinSet::new();
 
     let subscribe = ClientMessage::Subscribe {
         topics: vec![channel.to_owned()],
@@ -359,7 +419,8 @@ async fn run_rendezvous<S: SignalStream>(
             let recv = socket.recv().fuse();
             let timer = rdv_sleep(interval).fuse();
             let signal = next_outbound(outbound.as_mut().and_then(|guard| guard.rx())).fuse();
-            futures::pin_mut!(recv, timer, signal);
+            let child = next_rendezvous_child(&mut children).fuse();
+            futures::pin_mut!(recv, timer, signal, child);
             futures::select! {
                 message = recv => match message? {
                     Some(text) => Turn::Message(text),
@@ -367,6 +428,7 @@ async fn run_rendezvous<S: SignalStream>(
                 },
                 () = timer => Turn::ReHello,
                 out = signal => Turn::SignalOut(out),
+                () = child => Turn::ChildCompleted,
             }
         };
 
@@ -394,6 +456,8 @@ async fn run_rendezvous<S: SignalStream>(
                     socket.send(serde_json::to_string(&message)?).await?;
                 }
             }
+            #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+            Turn::ChildCompleted => {}
             Turn::Message(text) => {
                 let Ok(message) = serde_json::from_str::<ServerMessage>(&text) else {
                     continue;
@@ -420,8 +484,13 @@ async fn run_rendezvous<S: SignalStream>(
                         let Some(support) = hello.validate() else {
                             continue;
                         };
-                        let (id_text, relay_text, rtc, support_bits) =
-                            (hello.id, hello.relay, hello.rtc, Some(support.bits()));
+                        let (id_text, relay_text, rtc, rtc_incarnation, support_bits) = (
+                            hello.id,
+                            hello.relay,
+                            hello.rtc,
+                            hello.rtc_incarnation,
+                            Some(support.bits()),
+                        );
                         #[cfg(not(all(target_arch = "wasm32", feature = "browser-net")))]
                         let _ = rtc;
                         let Ok(id) = id_text.parse::<EndpointId>() else {
@@ -430,6 +499,13 @@ async fn run_rendezvous<S: SignalStream>(
                         if id == our_id {
                             continue; // our own hello, fanned back to us
                         }
+                        let reincarnated = rtc == Some(true)
+                            && rtc_incarnation.is_some_and(|incarnation| {
+                                rtc_incarnations.observe(id, incarnation)
+                                    == IncarnationObservation::Reincarnated
+                            });
+                        #[cfg(not(all(target_arch = "wasm32", feature = "browser-net")))]
+                        let _ = reincarnated;
                         let relay = relay_text
                             .as_deref()
                             .and_then(|url| url.parse::<RelayUrl>().ok());
@@ -455,6 +531,49 @@ async fn run_rendezvous<S: SignalStream>(
                             // changed) but do not re-join or re-announce, or two
                             // peers ping-pong hellos forever.
                             peering.memory_lookup.add_endpoint_info(endpoint_addr);
+                            #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+                            if reincarnated && let Some(port) = peering.webrtc.as_ref() {
+                                // Re-announce the transport reincarnation to the
+                                // application and re-kick gossip only after the
+                                // fresh direct attempt opens (or the existing
+                                // bounded relay fallback expires).
+                                on_discovered(id, support_bits);
+                                let port = port.clone();
+                                let gossip = peering.gossip_sender.clone();
+                                if children.len() >= MAX_RENDEZVOUS_PEERS {
+                                    tracing::debug!(
+                                        target: "walkie::rendezvous",
+                                        peer = %id,
+                                        "refusing reincarnation child because the bounded rendezvous scope is full"
+                                    );
+                                    continue;
+                                }
+                                children.spawn_local(async move {
+                                    let direct = match port.reincarnate(*id.as_bytes()).await {
+                                        Some(fence) => {
+                                            port.wait_fresh_connected(
+                                                *id.as_bytes(),
+                                                fence,
+                                                DIRECT_FIRST_TIMEOUT,
+                                            )
+                                            .await
+                                        }
+                                        None => false,
+                                    };
+                                    tracing::info!(
+                                        target: "walkie::rendezvous",
+                                        peer = %id,
+                                        direct,
+                                        "rejoining gossip after peer transport reincarnation"
+                                    );
+                                    if let Err(error) = gossip.join_peers(vec![id]).await {
+                                        tracing::debug!(
+                                            target: "walkie::rendezvous",
+                                            "rejoin_peers for reincarnated {id} failed: {error}"
+                                        );
+                                    }
+                                });
+                            }
                         } else if joined.len() < MAX_RENDEZVOUS_PEERS {
                             joined.insert(id);
                             #[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
@@ -494,7 +613,15 @@ async fn run_rendezvous<S: SignalStream>(
                                     let gossip = peering.gossip_sender.clone();
                                     let lookup = peering.memory_lookup.clone();
                                     let fallback_addr = endpoint_addr.clone();
-                                    wasm_bindgen_futures::spawn_local(async move {
+                                    if children.len() >= MAX_RENDEZVOUS_PEERS {
+                                        tracing::debug!(
+                                            target: "walkie::rendezvous",
+                                            peer = %id,
+                                            "refusing direct-path child because the bounded rendezvous scope is full"
+                                        );
+                                        continue;
+                                    }
+                                    children.spawn_local(async move {
                                         let direct = port
                                             .wait_connected(*id.as_bytes(), DIRECT_FIRST_TIMEOUT)
                                             .await;
@@ -612,6 +739,18 @@ async fn next_outbound(rx: Option<&mut SignalRx>) -> super::webrtc_transport::Si
     }
 }
 
+/// Poll one child from the signaling session's owned scope. An empty scope is
+/// deliberately pending so it cannot win the main socket/timer/signal select.
+/// Dropping `run_rendezvous` drops this `JoinSet` and aborts every child.
+#[cfg(all(target_arch = "wasm32", feature = "browser-net"))]
+async fn next_rendezvous_child(children: &mut n0_future::task::JoinSet<()>) {
+    if children.is_empty() {
+        std::future::pending().await
+    } else {
+        let _ = children.join_next().await;
+    }
+}
+
 /// Route an inbound `walkie-rtc` envelope to the WebRTC driver, if it is addressed
 /// to us and well-formed. Unauthenticated, like hellos: a forged payload at worst
 /// yields a failed WebRTC handshake — the QUIC handshake *inside* the data channel
@@ -651,6 +790,7 @@ async fn rendezvous_main(
 ) {
     let channel = generation.channel(topic);
     let mut joined: HashSet<EndpointId> = HashSet::new();
+    let mut rtc_incarnations = RtcIncarnationTracker::default();
     loop {
         match connect_signal(SIGNALING_SERVER_URL).await {
             Ok(mut socket) => {
@@ -661,6 +801,7 @@ async fn rendezvous_main(
                     generation,
                     &on_discovered,
                     &mut joined,
+                    &mut rtc_incarnations,
                 )
                 .await
                 {
@@ -685,7 +826,7 @@ async fn rendezvous_main(
 /// task (hold the handle for the room's duration) is all the shutdown needed.
 pub struct RendezvousHandle {
     #[cfg(target_arch = "wasm32")]
-    task: n0_future::task::JoinHandle<()>,
+    task: n0_future::task::AbortOnDropHandle<()>,
     #[cfg(not(target_arch = "wasm32"))]
     task: tokio::task::JoinHandle<()>,
 }
@@ -734,7 +875,7 @@ pub fn spawn_rendezvous_v5(
     on_discovered: impl Fn(EndpointId, ProtocolSupport) + 'static,
 ) -> RendezvousHandle {
     RendezvousHandle {
-        task: n0_future::task::spawn(rendezvous_main(
+        task: n0_future::task::AbortOnDropHandle::new(n0_future::task::spawn(rendezvous_main(
             peering,
             topic,
             RendezvousGeneration::V5 { local_support },
@@ -743,7 +884,7 @@ pub fn spawn_rendezvous_v5(
                     on_discovered(id, support);
                 }
             },
-        )),
+        ))),
     }
 }
 
@@ -956,9 +1097,11 @@ mod tests {
             "aa".repeat(32),
             Some("https://relay.wondering.xyz/".to_owned()),
             Some(true),
+            Some([17; 8]),
         );
         let json = serde_json::to_string(&hello).unwrap();
         assert!(json.contains("\"support\":3"));
+        assert!(json.contains("\"rtc_incarnation\":[17,17,17,17,17,17,17,17]"));
         assert!(!json.contains("\"lanes\""));
         assert_eq!(
             serde_json::from_str::<HelloV5>(&json).unwrap().validate(),
@@ -974,6 +1117,58 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn placement_incarnation_changes_once_and_delayed_old_hello_is_ignored() {
+        let peer = iroh::SecretKey::from_bytes(&[0x42; 32]).public();
+        let mut tracker = RtcIncarnationTracker::default();
+        assert_eq!(
+            tracker.observe(peer, [11; 8]),
+            IncarnationObservation::First
+        );
+        assert_eq!(
+            tracker.observe(peer, [11; 8]),
+            IncarnationObservation::Known
+        );
+        assert_eq!(
+            tracker.observe(peer, [12; 8]),
+            IncarnationObservation::Reincarnated
+        );
+        assert_eq!(
+            tracker.observe(peer, [11; 8]),
+            IncarnationObservation::Known
+        );
+        assert_eq!(
+            tracker.observe(peer, [12; 8]),
+            IncarnationObservation::Known
+        );
+    }
+
+    #[test]
+    fn placement_incarnation_peer_cardinality_is_bounded() {
+        let mut tracker = RtcIncarnationTracker::default();
+        let peers: Vec<_> = (0..=MAX_RENDEZVOUS_PEERS)
+            .map(|index| {
+                let mut seed = [0x51; 32];
+                seed[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                iroh::SecretKey::from_bytes(&seed).public()
+            })
+            .collect();
+        for peer in &peers[..MAX_RENDEZVOUS_PEERS] {
+            assert_eq!(
+                tracker.observe(*peer, [1; 8]),
+                IncarnationObservation::First
+            );
+        }
+        assert_eq!(
+            tracker.observe(peers[MAX_RENDEZVOUS_PEERS], [1; 8]),
+            IncarnationObservation::CapacityRefused
+        );
+        assert_eq!(
+            tracker.observe(peers[0], [1; 8]),
+            IncarnationObservation::Known
+        );
     }
 
     #[test]

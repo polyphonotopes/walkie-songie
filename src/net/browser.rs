@@ -266,6 +266,7 @@ impl BrowserRoomNetwork {
         let local_id = *secret_key.public().as_bytes();
         let (webrtc_transport, webrtc_port) =
             super::webrtc_transport::WebRtcTransport::new(local_id);
+        let mut direct_ready = webrtc_port.subscribe_ready();
 
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(secret_key)
@@ -320,8 +321,47 @@ impl BrowserRoomNetwork {
         // keep their `Ticket` attribution; everyone else arrived via gossip.
         let event_task = n0_future::task::spawn(async move {
             loop {
-                match gossip_events.try_next().await {
-                    Ok(Some(GossipEvent::NeighborUp(endpoint_id))) => {
+                let gossip_next = gossip_events.try_next();
+                let direct_next = direct_ready.recv();
+                futures::pin_mut!(gossip_next, direct_next);
+                match futures::future::select(gossip_next, direct_next).await {
+                    futures::future::Either::Right((Ok(ready), _)) => {
+                        let Ok(endpoint_id) = EndpointId::from_bytes(&ready.peer) else {
+                            continue;
+                        };
+                        tracing::info!(
+                            target: "walkie::webrtc",
+                            peer = %endpoint_id,
+                            attempt = %ready.attempt,
+                            "publishing fresh direct carrier readiness"
+                        );
+                        if events_tx
+                            .send(NativeNetworkEvent::DirectReady { endpoint_id })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    futures::future::Either::Right((
+                        Err(async_broadcast::RecvError::Overflowed(_)),
+                        _,
+                    )) => continue,
+                    futures::future::Either::Right((
+                        Err(async_broadcast::RecvError::Closed),
+                        _,
+                    )) => {
+                        let _ = events_tx
+                            .send(NativeNetworkEvent::Diagnostic(
+                                "WebRTC direct-ready stream closed".into(),
+                            ))
+                            .await;
+                        break;
+                    }
+                    futures::future::Either::Left((
+                        Ok(Some(GossipEvent::NeighborUp(endpoint_id))),
+                        _,
+                    )) => {
                         let discovery = if bootstrap_ids.contains(&endpoint_id) {
                             DiscoverySource::Ticket
                         } else {
@@ -338,7 +378,10 @@ impl BrowserRoomNetwork {
                             break;
                         }
                     }
-                    Ok(Some(GossipEvent::NeighborDown(endpoint_id))) => {
+                    futures::future::Either::Left((
+                        Ok(Some(GossipEvent::NeighborDown(endpoint_id))),
+                        _,
+                    )) => {
                         if events_tx
                             .send(NativeNetworkEvent::NeighborDown { endpoint_id })
                             .await
@@ -347,7 +390,10 @@ impl BrowserRoomNetwork {
                             break;
                         }
                     }
-                    Ok(Some(GossipEvent::Received(message))) => {
+                    futures::future::Either::Left((
+                        Ok(Some(GossipEvent::Received(message))),
+                        _,
+                    )) => {
                         if events_tx
                             .send(NativeNetworkEvent::Message {
                                 delivered_from: message.delivered_from,
@@ -359,16 +405,16 @@ impl BrowserRoomNetwork {
                             break;
                         }
                     }
-                    Ok(Some(GossipEvent::Lagged)) => {
+                    futures::future::Either::Left((Ok(Some(GossipEvent::Lagged)), _)) => {
                         if events_tx.send(NativeNetworkEvent::Lagged).await.is_err() {
                             break;
                         }
                     }
-                    Ok(None) => {
+                    futures::future::Either::Left((Ok(None), _)) => {
                         let _ = events_tx.send(NativeNetworkEvent::Closed).await;
                         break;
                     }
-                    Err(error) => {
+                    futures::future::Either::Left((Err(error), _)) => {
                         let _ = events_tx
                             .send(NativeNetworkEvent::Diagnostic(format!(
                                 "gossip event stream failed: {error}"

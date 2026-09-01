@@ -8,7 +8,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
     future::Future,
-    rc::Rc,
+    rc::{Rc, Weak},
     time::Duration,
 };
 
@@ -271,7 +271,7 @@ enum RoomControl {
 
 struct ActiveRoom {
     control: mpsc::Sender<RoomControl>,
-    lifetime: RoomGenerationLifetime,
+    scope: OwnedRoomGenerationScope,
     worker: BrowserReplicaHandle,
     generation: u64,
     operation: u64,
@@ -280,27 +280,52 @@ struct ActiveRoom {
     stopped: oneshot::Receiver<()>,
 }
 
-#[derive(Clone)]
-struct RoomGenerationLifetime {
-    alive: Rc<Cell<bool>>,
-    cancelled: Mutable<bool>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RoomGenerationExitCause {
+    Completed,
+    Superseded,
+    Failed(String),
+    Refused,
+    ParentClosed,
 }
 
-impl RoomGenerationLifetime {
-    fn new() -> Self {
+#[derive(Clone)]
+struct RoomGenerationToken {
+    generation: u64,
+    alive: Rc<Cell<bool>>,
+    cancelled: Mutable<bool>,
+    exit: Rc<RefCell<Option<RoomGenerationExitCause>>>,
+}
+
+impl RoomGenerationToken {
+    fn new(generation: u64) -> Self {
         Self {
+            generation,
             alive: Rc::new(Cell::new(true)),
             cancelled: Mutable::new(false),
+            exit: Rc::new(RefCell::new(None)),
         }
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation
     }
 
     fn is_alive(&self) -> bool {
         self.alive.get()
     }
 
-    fn cancel(&self) {
+    fn close(&self, cause: RoomGenerationExitCause) {
+        if self.exit.borrow().is_some() {
+            return;
+        }
+        *self.exit.borrow_mut() = Some(cause);
         self.alive.set(false);
         self.cancelled.set(true);
+    }
+
+    fn exit_cause(&self) -> Option<RoomGenerationExitCause> {
+        self.exit.borrow().clone()
     }
 
     async fn cancelled(&self) {
@@ -308,8 +333,87 @@ impl RoomGenerationLifetime {
     }
 }
 
+struct RoomGenerationScopeState {
+    token: RoomGenerationToken,
+    tasks: RefCell<Option<n0_future::task::JoinSet<()>>>,
+}
+
+/// Weak capability for adding a child task to one room generation.
+///
+/// Child tasks never retain the owning scope. Dropping the sole owner therefore
+/// drops the `JoinSet`, whose n0-future implementation aborts every remaining
+/// browser task.
+#[derive(Clone)]
+struct RoomGenerationSpawner(Weak<RoomGenerationScopeState>);
+
+impl RoomGenerationSpawner {
+    fn spawn(
+        &self,
+        future: impl Future<Output = ()> + 'static,
+    ) -> Result<(), RoomGenerationExitCause> {
+        let Some(state) = self.0.upgrade() else {
+            return Err(RoomGenerationExitCause::ParentClosed);
+        };
+        if !state.token.is_alive() {
+            return Err(state
+                .token
+                .exit_cause()
+                .unwrap_or(RoomGenerationExitCause::Refused));
+        }
+        let mut tasks = state.tasks.borrow_mut();
+        let Some(tasks) = tasks.as_mut() else {
+            return Err(RoomGenerationExitCause::Refused);
+        };
+        tasks.spawn_local(future);
+        Ok(())
+    }
+}
+
+/// Sole owner of all asynchronous work belonging to one worker generation.
+///
+/// `close` first publishes the typed exit cause and wakes cooperative children.
+/// `graceful_shutdown` then joins those children. If the owner is dropped before
+/// that path completes, n0-future's abort-on-drop `JoinSet` is the fail-closed
+/// resource fence.
+struct OwnedRoomGenerationScope(Rc<RoomGenerationScopeState>);
+
+impl OwnedRoomGenerationScope {
+    fn new(generation: u64) -> Self {
+        Self(Rc::new(RoomGenerationScopeState {
+            token: RoomGenerationToken::new(generation),
+            tasks: RefCell::new(Some(n0_future::task::JoinSet::new())),
+        }))
+    }
+
+    fn token(&self) -> RoomGenerationToken {
+        self.0.token.clone()
+    }
+
+    fn spawner(&self) -> RoomGenerationSpawner {
+        RoomGenerationSpawner(Rc::downgrade(&self.0))
+    }
+
+    fn close(&self, cause: RoomGenerationExitCause) {
+        self.0.token.close(cause);
+    }
+
+    async fn graceful_shutdown(self, cause: RoomGenerationExitCause) {
+        self.close(cause);
+        let tasks = self.0.tasks.borrow_mut().take();
+        if let Some(mut tasks) = tasks {
+            while tasks.join_next().await.is_some() {}
+        }
+    }
+}
+
+impl Drop for OwnedRoomGenerationScope {
+    fn drop(&mut self) {
+        self.close(RoomGenerationExitCause::ParentClosed);
+    }
+}
+
 async fn until_generation_cancelled<F: Future>(
-    lifetime: &RoomGenerationLifetime,
+    lifetime: &RoomGenerationToken,
     future: F,
 ) -> Option<F::Output> {
     let future = future.fuse();
@@ -897,7 +1001,8 @@ impl BrowserHost {
             state.room_operation = state.room_operation.saturating_add(1).max(1);
             state.room_operation
         };
-        self.stop_active_room().await;
+        self.stop_active_room(RoomGenerationExitCause::Superseded)
+            .await;
         self.launch_room(
             RoomRestartSpec {
                 room_name,
@@ -1063,7 +1168,9 @@ impl BrowserHost {
             (None, None)
         };
 
-        let lifetime = RoomGenerationLifetime::new();
+        let scope = OwnedRoomGenerationScope::new(worker.generation());
+        let lifetime = scope.token();
+        let spawner = scope.spawner();
         let repairs = RepairCoordinator::default();
         let peers = Rc::new(RefCell::new(BTreeMap::<
             iroh::EndpointId,
@@ -1103,7 +1210,7 @@ impl BrowserHost {
             debug_assert_eq!(state.room_operation, operation);
             state.active_room = Some(ActiveRoom {
                 control,
-                lifetime,
+                scope,
                 worker: worker.clone(),
                 generation: worker.generation(),
                 operation,
@@ -1119,6 +1226,7 @@ impl BrowserHost {
             state.snapshot.voices.clear();
         }
         spawn_room_loop(
+            spawner.clone(),
             self.clone(),
             worker.clone(),
             network,
@@ -1136,6 +1244,7 @@ impl BrowserHost {
             stopped_tx,
         );
         spawn_session_loop(
+            spawner.clone(),
             self.clone(),
             worker.clone(),
             handle.clone(),
@@ -1144,13 +1253,14 @@ impl BrowserHost {
             session_reset_outstanding,
         );
         spawn_periodic_repair(
+            spawner.clone(),
             self.clone(),
             worker.clone(),
             handle,
             peers,
             task_lifetime.clone(),
         );
-        spawn_worker_failure_loop(self.clone(), worker.clone(), task_lifetime);
+        spawn_worker_failure_loop(spawner, self.clone(), worker.clone(), task_lifetime);
         self.emit(AppEvent::RoomChanged {
             room_name,
             room_topic: Some(topic_string),
@@ -1166,7 +1276,8 @@ impl BrowserHost {
             let mut state = self.state.borrow_mut();
             state.room_operation = state.room_operation.saturating_add(1).max(1);
         }
-        self.stop_active_room().await;
+        self.stop_active_room(RoomGenerationExitCause::Completed)
+            .await;
         {
             let mut state = self.state.borrow_mut();
             state.snapshot.room_name = None;
@@ -1188,7 +1299,7 @@ impl BrowserHost {
         })
     }
 
-    async fn stop_active_room(&self) {
+    async fn stop_active_room(&self, cause: RoomGenerationExitCause) {
         let (active, generation) = {
             let mut state = self.state.borrow_mut();
             (state.active_room.take(), state.performance_generation)
@@ -1197,11 +1308,12 @@ impl BrowserHost {
             self.reset_performance_feedback(generation);
         }
         if let Some(mut active) = active {
-            active.lifetime.cancel();
+            active.scope.close(cause.clone());
             let (response, closed) = oneshot::channel();
             let _ = active.control.try_send(RoomControl::Shutdown { response });
             drop(closed);
             let _ = active.stopped.await;
+            active.scope.graceful_shutdown(cause).await;
         }
     }
 
@@ -1223,8 +1335,10 @@ impl BrowserHost {
         );
         self.reset_performance_feedback(generation);
         active.failed.set(true);
-        active.lifetime.cancel();
-        active.worker.fail_and_terminate(reason);
+        active
+            .scope
+            .close(RoomGenerationExitCause::Failed(reason.clone()));
+        active.worker.fail_and_terminate(reason.clone());
         self.emit_diagnostic(
             "replica_worker_generation_terminal",
             &format!(
@@ -1245,9 +1359,13 @@ impl BrowserHost {
         let operation = active.operation;
         let restart = active.restart;
         let stopped = active.stopped;
+        let scope = active.scope;
         let host = self.clone();
         spawn_local(async move {
             let _ = stopped.await;
+            scope
+                .graceful_shutdown(RoomGenerationExitCause::Failed(reason))
+                .await;
             // `terminate()` releases the worker-owned Web Lock asynchronously.
             // HHHS itself refuses a second writer immediately, so retry that
             // fail-closed acquisition on a bounded, operation-fenced schedule.
@@ -1561,6 +1679,7 @@ impl BrowserHost {
 
 #[allow(clippy::too_many_arguments)]
 fn spawn_room_loop(
+    spawner: RoomGenerationSpawner,
     host: Rc<BrowserHost>,
     worker: BrowserReplicaHandle,
     mut network: BrowserRoomNetwork,
@@ -1569,7 +1688,7 @@ fn spawn_room_loop(
     mut rendezvous: Option<mpsc::Receiver<(iroh::EndpointId, ProtocolSupport)>>,
     rendezvous_guard: Option<crate::net::RendezvousHandle>,
     peers: Rc<RefCell<BTreeMap<iroh::EndpointId, (DiscoverySource, PeerPath, ProtocolSupport)>>>,
-    lifetime: RoomGenerationLifetime,
+    lifetime: RoomGenerationToken,
     room_identity: crate::room::v5::RoomIdentity,
     repairs: RepairCoordinator,
     _session_gate: Rc<RefCell<RoomSessionProjectionGate>>,
@@ -1578,7 +1697,11 @@ fn spawn_room_loop(
     stopped: oneshot::Sender<()>,
 ) {
     let local_actor = host.identity.capability_actor_id();
-    spawn_local(async move {
+    let generation = lifetime.generation();
+    let failure_host = host.clone();
+    let task_spawner = spawner.clone();
+    if spawner
+        .spawn(async move {
         let _rendezvous_guard = rendezvous_guard;
         let mut presence_session = 0_u64;
         let mut presence_sequence = 0_u64;
@@ -1770,6 +1893,7 @@ fn spawn_room_loop(
                                 continue;
                             };
                             spawn_repair_responder(
+                                task_spawner.clone(),
                                 host.clone(),
                                 worker.clone(),
                                 lifetime.clone(),
@@ -1805,6 +1929,7 @@ fn spawn_room_loop(
                                     for lane in [RoomLane::Music, RoomLane::Extension] {
                                         if support.supports(lane) {
                                             spawn_repair_initiator(
+                                                task_spawner.clone(),
                                                 host.clone(),
                                                 worker.clone(),
                                                 handle.clone(),
@@ -1828,6 +1953,38 @@ fn spawn_room_loop(
                                         PeerPath::Disconnected,
                                         *support,
                                     );
+                                }
+                            }
+                            NativeNetworkEvent::DirectReady { endpoint_id } => {
+                                let (discovery, support) = peers
+                                    .borrow()
+                                    .get(&endpoint_id)
+                                    .map(|(discovery, _, support)| (*discovery, *support))
+                                    .unwrap_or((
+                                        DiscoverySource::AddressLookup,
+                                        ProtocolSupport::WALKIE,
+                                    ));
+                                peers
+                                    .borrow_mut()
+                                    .insert(endpoint_id, (discovery, PeerPath::Direct, support));
+                                host.update_peer(endpoint_id, discovery, PeerPath::Direct, support);
+                                let local = crate::net::PeerId(*handle.endpoint_id().as_bytes());
+                                let remote = crate::net::PeerId(*endpoint_id.as_bytes());
+                                if is_routine_repair_initiator(local, remote) {
+                                    for lane in [RoomLane::Music, RoomLane::Extension] {
+                                        if support.supports(lane) {
+                                            spawn_repair_initiator(
+                                                task_spawner.clone(),
+                                                host.clone(),
+                                                worker.clone(),
+                                                handle.clone(),
+                                                lifetime.clone(),
+                                                endpoint_id,
+                                                lane,
+                                                repairs.clone(),
+                                            );
+                                        }
+                                    }
                                 }
                             }
                             NativeNetworkEvent::Message { bytes, .. } => {
@@ -1930,6 +2087,7 @@ fn spawn_room_loop(
                                         );
                                         if !accepted {
                                             request_repair_after_live_failure(
+                                                task_spawner.clone(),
                                                 host.clone(),
                                                 worker.clone(),
                                                 handle.clone(),
@@ -1950,6 +2108,7 @@ fn spawn_room_loop(
                                         iroh::EndpointId::from_bytes(hint.source.as_bytes())
                                 {
                                     spawn_repair_initiator(
+                                        task_spawner.clone(),
                                         host.clone(),
                                         worker.clone(),
                                         handle.clone(),
@@ -1973,6 +2132,7 @@ fn spawn_room_loop(
                                             iroh::EndpointId::from_bytes(probe.source.as_bytes())
                                     {
                                         spawn_repair_initiator(
+                                            task_spawner.clone(),
                                             host.clone(),
                                             worker.clone(),
                                             handle.clone(),
@@ -2003,6 +2163,7 @@ fn spawn_room_loop(
                                     for lane in [RoomLane::Music, RoomLane::Extension] {
                                         if support.supports(lane) {
                                             spawn_repair_initiator(
+                                                task_spawner.clone(),
                                                 host.clone(),
                                                 worker.clone(),
                                                 handle.clone(),
@@ -2052,7 +2213,7 @@ fn spawn_room_loop(
             }
             yield_browser_task().await;
         }
-        lifetime.cancel();
+        lifetime.close(RoomGenerationExitCause::ParentClosed);
         let _ = network.shutdown().await;
         if !failed.get()
             && let Err(error) = worker.close().await
@@ -2063,7 +2224,14 @@ fn spawn_room_loop(
             let _ = response.send(());
         }
         let _ = stopped.send(());
-    });
+        })
+        .is_err()
+    {
+        failure_host.fail_active_room_generation(
+            generation,
+            "room generation scope refused its primary room task".into(),
+        );
+    }
 }
 
 fn is_session_pitch_edit(command: &MusicOp) -> bool {
@@ -2098,29 +2266,41 @@ fn require_intent_token(
 }
 
 fn spawn_worker_failure_loop(
+    spawner: RoomGenerationSpawner,
     host: Rc<BrowserHost>,
     worker: BrowserReplicaHandle,
-    lifetime: RoomGenerationLifetime,
+    lifetime: RoomGenerationToken,
 ) {
-    spawn_local(async move {
-        let Some(reason) = until_generation_cancelled(&lifetime, worker.next_failure()).await
-        else {
-            return;
-        };
-        let Some(reason) = reason else {
-            return;
-        };
-        if lifetime.is_alive() {
-            host.fail_active_room_generation(worker.generation(), reason);
-        }
-    });
+    let generation = worker.generation();
+    let failure_host = host.clone();
+    if spawner
+        .spawn(async move {
+            let Some(reason) = until_generation_cancelled(&lifetime, worker.next_failure()).await
+            else {
+                return;
+            };
+            let Some(reason) = reason else {
+                return;
+            };
+            if lifetime.is_alive() {
+                host.fail_active_room_generation(worker.generation(), reason);
+            }
+        })
+        .is_err()
+    {
+        failure_host.fail_active_room_generation(
+            generation,
+            "room generation scope refused its worker-failure task".into(),
+        );
+    }
 }
 
 fn spawn_session_loop(
+    spawner: RoomGenerationSpawner,
     host: Rc<BrowserHost>,
     worker: BrowserReplicaHandle,
     handle: BrowserNetHandle,
-    lifetime: RoomGenerationLifetime,
+    lifetime: RoomGenerationToken,
     gate: Rc<RefCell<RoomSessionProjectionGate>>,
     reset_outstanding: Rc<Cell<bool>>,
 ) {
@@ -2131,7 +2311,11 @@ fn spawn_session_loop(
     let retained_offer = Rc::new(RefCell::new(load_stale_renewal_offer()));
     #[cfg(feature = "browser-acceptance-faults")]
     let stale_offer_replayed = Rc::new(Cell::new(false));
-    spawn_local(async move {
+    let generation = worker.generation();
+    let failure_host = host.clone();
+    let task_spawner = spawner.clone();
+    if spawner
+        .spawn(async move {
         while lifetime.is_alive() {
             let event = {
                 let next = worker.next_session_event().fuse();
@@ -2165,7 +2349,7 @@ fn spawn_session_loop(
                     let host = host.clone();
                     let handle = handle.clone();
                     let lifetime = lifetime.clone();
-                    spawn_local(async move {
+                    let _ = task_spawner.spawn(async move {
                         let Some(result) =
                             until_generation_cancelled(&lifetime, handle.broadcast(carrier)).await
                         else {
@@ -2214,7 +2398,7 @@ fn spawn_session_loop(
                                 let worker = worker.clone();
                                 let reset_outstanding = reset_outstanding.clone();
                                 let lifetime = lifetime.clone();
-                                spawn_local(async move {
+                                let _ = task_spawner.spawn(async move {
                                     let Some(result) = until_generation_cancelled(
                                         &lifetime,
                                         worker.reset_session_projection(),
@@ -2259,7 +2443,7 @@ fn spawn_session_loop(
                         let handle = handle.clone();
                         let trace = trace.clone();
                         let lifetime = lifetime.clone();
-                        spawn_local(async move {
+                        let _ = task_spawner.spawn(async move {
                             if let Some(trace) = trace.as_ref() {
                                 log_session_trace("carrier_broadcast_call_started", trace);
                             }
@@ -2285,7 +2469,7 @@ fn spawn_session_loop(
                         let worker = worker.clone();
                         let draining = draining.clone();
                         let lifetime = lifetime.clone();
-                        spawn_local(async move {
+                        let _ = task_spawner.spawn(async move {
                             loop {
                                 let Some(result) =
                                     until_generation_cancelled(&lifetime, worker.drain_session())
@@ -2319,7 +2503,7 @@ fn spawn_session_loop(
                     let host = host.clone();
                     let worker = worker.clone();
                     let lifetime = lifetime.clone();
-                    spawn_local(async move {
+                    let _ = task_spawner.spawn(async move {
                         let Some(result) = until_generation_cancelled(
                             &lifetime,
                             worker.commit(RoomCommand::Music(command)),
@@ -2396,7 +2580,7 @@ fn spawn_session_loop(
                             let host = host.clone();
                             let worker = worker.clone();
                             let lifetime = lifetime.clone();
-                            spawn_local(async move {
+                            let _ = task_spawner.spawn(async move {
                                 host.emit_diagnostic(
                                     "session_stale_offer_replay",
                                     "delivering the retained signed Offer to the recovered worker",
@@ -2432,17 +2616,25 @@ fn spawn_session_loop(
         } else {
             host.invalidate_performance_generation(worker.generation());
         }
-    });
+        })
+        .is_err()
+    {
+        failure_host.fail_active_room_generation(
+            generation,
+            "room generation scope refused its session task".into(),
+        );
+    }
 }
 
 fn spawn_periodic_repair(
+    spawner: RoomGenerationSpawner,
     host: Rc<BrowserHost>,
     worker: BrowserReplicaHandle,
     handle: BrowserNetHandle,
     peers: Rc<RefCell<BTreeMap<iroh::EndpointId, (DiscoverySource, PeerPath, ProtocolSupport)>>>,
-    lifetime: RoomGenerationLifetime,
+    lifetime: RoomGenerationToken,
 ) {
-    spawn_local(async move {
+    let _ = spawner.spawn(async move {
         let local = crate::net::PeerId(*handle.endpoint_id().as_bytes());
         while lifetime.is_alive() {
             let sleep = n0_future::time::sleep(Duration::from_secs(27)).fuse();
@@ -2504,10 +2696,11 @@ fn spawn_periodic_repair(
 }
 
 fn spawn_repair_initiator(
+    spawner: RoomGenerationSpawner,
     host: Rc<BrowserHost>,
     worker: BrowserReplicaHandle,
     handle: BrowserNetHandle,
-    lifetime: RoomGenerationLifetime,
+    lifetime: RoomGenerationToken,
     peer: iroh::EndpointId,
     lane: RoomLane,
     repairs: RepairCoordinator,
@@ -2515,7 +2708,9 @@ fn spawn_repair_initiator(
     if !repairs.schedule(peer, lane) {
         return;
     }
-    spawn_local(async move {
+    let refused_repairs = repairs.clone();
+    if spawner
+        .spawn(async move {
         const DIVERGENT_BACKOFF_MS: [u64; 3] = [100, 300, 900];
         loop {
             let mut retry = 0;
@@ -2586,13 +2781,17 @@ fn spawn_repair_initiator(
                 break;
             }
         }
-    });
+        })
+        .is_err()
+    {
+        refused_repairs.finish(peer, lane);
+    }
 }
 
 async fn run_initiator_repair_attempt(
     worker: &BrowserReplicaHandle,
     handle: &BrowserNetHandle,
-    lifetime: &RoomGenerationLifetime,
+    lifetime: &RoomGenerationToken,
     peer: iroh::EndpointId,
     lane: RoomLane,
 ) -> (
@@ -2619,9 +2818,10 @@ async fn run_initiator_repair_attempt(
 }
 
 fn spawn_repair_responder(
+    spawner: RoomGenerationSpawner,
     host: Rc<BrowserHost>,
     worker: BrowserReplicaHandle,
-    lifetime: RoomGenerationLifetime,
+    lifetime: RoomGenerationToken,
     peer: iroh::EndpointId,
     lane: RoomLane,
     stream: IrohSyncStream,
@@ -2629,7 +2829,7 @@ fn spawn_repair_responder(
 ) {
     if !repairs.begin_responder(peer, lane) {
         let close_host = host.clone();
-        spawn_local(async move {
+        let _ = spawner.spawn(async move {
             if let Err(error) = stream.close().await {
                 close_host.emit_diagnostic(
                     "replica_repair_duplicate_close",
@@ -2641,30 +2841,37 @@ fn spawn_repair_responder(
         });
         return;
     }
-    spawn_local(async move {
-        if !lifetime.is_alive() {
-            repairs.finish_responder(peer, lane);
-            if let Err(error) = stream.close().await {
-                host.emit_diagnostic(
-                    "replica_repair_cancel_close",
-                    &format!("{lane:?} responder stream with {peer} failed to close: {error}"),
-                );
+    let refused_repairs = repairs.clone();
+    if spawner
+        .spawn(async move {
+            if !lifetime.is_alive() {
+                repairs.finish_responder(peer, lane);
+                if let Err(error) = stream.close().await {
+                    host.emit_diagnostic(
+                        "replica_repair_cancel_close",
+                        &format!("{lane:?} responder stream with {peer} failed to close: {error}"),
+                    );
+                }
+                return;
             }
-            return;
-        }
-        let repair = run_repair(host, worker, &lifetime, peer, lane, stream, false).fuse();
-        let cancelled = lifetime.cancelled().fuse();
-        futures::pin_mut!(repair, cancelled);
-        let _ = futures::future::select(repair, cancelled).await;
-        repairs.finish_responder(peer, lane);
-    });
+            let repair = run_repair(host, worker, &lifetime, peer, lane, stream, false).fuse();
+            let cancelled = lifetime.cancelled().fuse();
+            futures::pin_mut!(repair, cancelled);
+            let _ = futures::future::select(repair, cancelled).await;
+            repairs.finish_responder(peer, lane);
+        })
+        .is_err()
+    {
+        refused_repairs.finish_responder(peer, lane);
+    }
 }
 
 fn request_repair_after_live_failure(
+    spawner: RoomGenerationSpawner,
     host: Rc<BrowserHost>,
     worker: BrowserReplicaHandle,
     handle: BrowserNetHandle,
-    lifetime: RoomGenerationLifetime,
+    lifetime: RoomGenerationToken,
     source: crate::net::PeerId,
     lane: RoomLane,
     entry: hhhs::EntryHash,
@@ -2676,6 +2883,7 @@ fn request_repair_after_live_failure(
     };
     if is_routine_repair_initiator(local, source) {
         spawn_repair_initiator(
+            spawner,
             host,
             worker,
             handle,
@@ -2686,7 +2894,7 @@ fn request_repair_after_live_failure(
         );
         return;
     }
-    spawn_local(async move {
+    let _ = spawner.spawn(async move {
         if !lifetime.is_alive() {
             return;
         }
@@ -2718,7 +2926,7 @@ fn request_repair_after_live_failure(
 async fn run_repair(
     host: Rc<BrowserHost>,
     worker: BrowserReplicaHandle,
-    lifetime: &RoomGenerationLifetime,
+    lifetime: &RoomGenerationToken,
     peer: iroh::EndpointId,
     lane: RoomLane,
     stream: IrohSyncStream,
@@ -2744,7 +2952,7 @@ async fn run_repair(
 
 fn report_repair(
     host: Rc<BrowserHost>,
-    lifetime: &RoomGenerationLifetime,
+    lifetime: &RoomGenerationToken,
     peer: iroh::EndpointId,
     lane: RoomLane,
     role: &'static str,
@@ -2929,4 +3137,52 @@ fn now_ms() -> u64 {
         .duration_since(web_time::UNIX_EPOCH)
         .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod generation_scope_tests {
+    use super::*;
+
+    #[test]
+    fn generation_exit_is_first_writer_wins() {
+        let token = RoomGenerationToken::new(17);
+        token.close(RoomGenerationExitCause::Superseded);
+        token.close(RoomGenerationExitCause::Failed("late failure".into()));
+
+        assert_eq!(token.generation(), 17);
+        assert!(!token.is_alive());
+        assert_eq!(
+            token.exit_cause(),
+            Some(RoomGenerationExitCause::Superseded)
+        );
+    }
+
+    #[test]
+    fn closed_generation_refuses_new_children() {
+        let scope = OwnedRoomGenerationScope::new(23);
+        let spawner = scope.spawner();
+        scope.close(RoomGenerationExitCause::Completed);
+
+        assert_eq!(
+            spawner.spawn(async {}),
+            Err(RoomGenerationExitCause::Completed)
+        );
+    }
+
+    #[test]
+    fn dropping_owner_closes_the_parent_and_refuses_new_children() {
+        let scope = OwnedRoomGenerationScope::new(29);
+        let token = scope.token();
+        let spawner = scope.spawner();
+        drop(scope);
+
+        assert_eq!(
+            token.exit_cause(),
+            Some(RoomGenerationExitCause::ParentClosed)
+        );
+        assert_eq!(
+            spawner.spawn(async {}),
+            Err(RoomGenerationExitCause::ParentClosed)
+        );
+    }
 }

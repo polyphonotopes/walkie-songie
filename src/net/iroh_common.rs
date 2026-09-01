@@ -275,6 +275,13 @@ pub enum NativeNetworkEvent {
     NeighborDown {
         endpoint_id: EndpointId,
     },
+    /// A browser custom-transport offer attempt opened after exact attempt
+    /// fencing. This is distinct from gossip membership: same endpoint identity
+    /// may retain its neighbor slot while the concrete WebRTC placement changes.
+    #[cfg(target_arch = "wasm32")]
+    DirectReady {
+        endpoint_id: EndpointId,
+    },
     Message {
         delivered_from: EndpointId,
         bytes: Vec<u8>,

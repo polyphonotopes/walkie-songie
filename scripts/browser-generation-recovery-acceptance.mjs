@@ -45,16 +45,19 @@ const trialSpecs = [
     kind: "rejected-combined-frame",
     query: "sessionRejectRealtimeOnce=1",
     expectedDelta: 0,
+    restartedRole: "offerer",
   },
   {
     kind: "drain-before-commit",
     query: "sessionDrainCut=before",
     expectedDelta: 0,
+    restartedRole: "answerer",
   },
   {
     kind: "drain-after-commit",
     query: "sessionDrainCut=after",
     expectedDelta: 1,
+    restartedRole: "offerer",
   },
 ];
 if (trialSelector) {
@@ -182,6 +185,42 @@ async function openPeer(context, label, url, diagnostics, renewalTraces, workerS
   return page;
 }
 
+async function primeEndpointIdentity(context, origin, suffix) {
+  const page = await context.newPage();
+  let endpointId = null;
+  page.on("console", (message) => {
+    const match = /local custom addr = \S*_([0-9a-f]{64})/.exec(message.text());
+    if (match) endpointId = match[1];
+  });
+  const room = `carrierprime-${alphabetic(Date.now())}-${alphabetic(suffix)}`;
+  await page.goto(`${origin}/#${room}`, { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("all-around-keyboard", { state: "attached", timeout: timeoutMs });
+  const observed = await waitUntil(() => endpointId, "primed browser endpoint identity");
+  await page.close();
+  return observed;
+}
+
+function directAttempt(entry) {
+  return /data channel OPEN to [0-9a-f]+ attempt=([0-9a-f]{16})/.exec(entry.text)?.[1] ?? null;
+}
+
+async function waitForFreshDirectAttempt(diagnostics, afterIndex, kind) {
+  return waitUntil(() => {
+    const fresh = diagnostics.slice(afterIndex);
+    const source = fresh.findLast(
+      (entry) => entry.label === "source" && directAttempt(entry),
+    );
+    const peer = fresh.findLast((entry) => entry.label === "peer" && directAttempt(entry));
+    const sourceAttempt = source && directAttempt(source);
+    const peerAttempt = peer && directAttempt(peer);
+    return (
+      sourceAttempt &&
+      peerAttempt &&
+      sourceAttempt === peerAttempt && { attempt: sourceAttempt, source, peer }
+    );
+  }, `${kind} matching fresh direct WebRTC attempt`);
+}
+
 async function waitForSynchronized(page, requireDirect = true) {
   await page.waitForFunction(
     (directRequired) => {
@@ -304,7 +343,7 @@ async function waitForStableAuthoritativeBaseline(workerStates, kind) {
   throw new Error(`timed out waiting for ${kind} stable authoritative pre-fault baseline`);
 }
 
-async function runTrial({ browser, origin, kind, query, expectedDelta }) {
+async function runTrial({ browser, origin, kind, query, expectedDelta, restartedRole }) {
   const diagnostics = [];
   const renewalTraces = [];
   const workerStates = [];
@@ -312,8 +351,24 @@ async function runTrial({ browser, origin, kind, query, expectedDelta }) {
   // the fault kind inside one segment prevents an invalid hash from making
   // each page silently generate a different room.
   const room = `${kind.replace(/[^a-z]/g, "")}-${alphabetic(Date.now())}-${alphabetic(process.pid)}`;
-  const sourceContext = await browser.newContext({ serviceWorkers: "allow" });
-  const peerContext = await browser.newContext({ serviceWorkers: "allow" });
+  const firstContext = await browser.newContext({ serviceWorkers: "allow" });
+  const secondContext = await browser.newContext({ serviceWorkers: "allow" });
+  const [firstEndpointId, secondEndpointId] = await Promise.all([
+    primeEndpointIdentity(firstContext, origin, process.pid * 2),
+    primeEndpointIdentity(secondContext, origin, process.pid * 2 + 1),
+  ]);
+  assert.notEqual(firstEndpointId, secondEndpointId, `${kind} primed duplicate endpoint ids`);
+  const firstIsOfferer = firstEndpointId < secondEndpointId;
+  const sourceIsFirst = restartedRole === "offerer" ? firstIsOfferer : !firstIsOfferer;
+  const sourceContext = sourceIsFirst ? firstContext : secondContext;
+  const peerContext = sourceIsFirst ? secondContext : firstContext;
+  const sourceEndpointId = sourceIsFirst ? firstEndpointId : secondEndpointId;
+  const peerEndpointId = sourceIsFirst ? secondEndpointId : firstEndpointId;
+  assert.equal(
+    sourceEndpointId < peerEndpointId,
+    restartedRole === "offerer",
+    `${kind} did not select the requested restarted endpoint role`,
+  );
   const sourceUrl = `${origin}/?sessionTrace=1&renewalReplayStale=1&acceptanceWorkerStateTrace=1&${query}#${room}`;
   const peerUrl = `${origin}/?sessionTrace=1&renewalReplayStale=1&acceptanceWorkerStateTrace=1#${room}`;
   const source = await openPeer(
@@ -423,6 +478,7 @@ async function runTrial({ browser, origin, kind, query, expectedDelta }) {
       ),
     );
     const workerStateObservationArmedAt = Date.now();
+    const freshDirectTraceIndex = diagnostics.length;
 
     await togglePitch(source);
     await waitUntil(
@@ -518,10 +574,12 @@ async function runTrial({ browser, origin, kind, query, expectedDelta }) {
           ),
       `${kind} stale old-session traffic refusal`,
     );
-    await Promise.all([
-      waitForSynchronized(source, false),
-      waitForSynchronized(peer, false),
-    ]);
+    const freshDirect = await waitForFreshDirectAttempt(
+      diagnostics,
+      freshDirectTraceIndex,
+      kind,
+    );
+    await Promise.all([waitForSynchronized(source), waitForSynchronized(peer)]);
     await Promise.all([waitForOverlay(source, expectedDelta === 1), waitForOverlay(peer, expectedDelta === 1)]);
     await source.waitForFunction(
       () => Array.from(document.querySelector("all-around-keyboard")?.pressedNotes ?? []).length === 0,
@@ -582,6 +640,9 @@ async function runTrial({ browser, origin, kind, query, expectedDelta }) {
     return {
       kind,
       room,
+      restartedRole,
+      sourceEndpointId,
+      peerEndpointId,
       initialGeneration: initialWorker.generation,
       recoveredGeneration: recoveredWorker.generation,
       initialEpoch: initialInstall.epoch,
@@ -608,6 +669,7 @@ async function runTrial({ browser, origin, kind, query, expectedDelta }) {
           armedTraceIndex: staleReplayArmTraceIndex,
         },
         exactAbsentOrOneDurableTransaction: true,
+        freshDirectAttemptInstalledOnBothPeers: freshDirect.attempt,
         postRecoveryAuthoritativeConvergence: true,
       },
       diagnostics,

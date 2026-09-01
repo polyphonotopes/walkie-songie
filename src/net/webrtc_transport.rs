@@ -65,7 +65,10 @@ use std::{
     time::Duration,
 };
 
-use futures::{StreamExt, channel::mpsc};
+use futures::{
+    StreamExt,
+    channel::{mpsc, oneshot},
+};
 use iroh::endpoint::transports::{
     CustomEndpoint, CustomSender, CustomTransport, RecvInfo, Transmit,
 };
@@ -89,13 +92,43 @@ pub const WEBRTC_TRANSPORT_ID: u64 = 0x5765_6252_5443;
 
 /// The data-channel label. Versioned so a future wire-incompatible change can bump
 /// it and refuse to interop, mirroring the ALPN discipline in [`super::iroh_common`].
-const DATA_CHANNEL_LABEL: &str = "walkie/iroh-quic/1";
+const DATA_CHANNEL_LABEL: &str = "walkie/iroh-quic/2";
+
+/// One WebRTC offer attempt. The endpoint id is intentionally stable across a
+/// room-placement restart, so it cannot fence callbacks or signaling from the
+/// retired browser `RTCPeerConnection`. A fresh random attempt is minted by the
+/// deterministic offerer for every replacement link and carried by every SDP/ICE
+/// payload belonging to that link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RtcAttempt([u8; 8]);
+
+impl RtcAttempt {
+    fn fresh() -> Self {
+        loop {
+            let value = rand::random::<[u8; 8]>();
+            if value != [0; 8] {
+                return Self(value);
+            }
+        }
+    }
+}
+
+impl fmt::Display for RtcAttempt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
 
 /// STUN gets server-reflexive candidates so two peers behind different NATs can
 /// find a direct path. **No TURN, ever** — TURN is a relay, and iroh-relay is
 /// already our (better) fallback (design §4.1, §6). Same-machine tabs and same-LAN
 /// peers connect on host candidates without touching this at all.
 const STUN_SERVERS: &[&str] = &["stun:stun.l.google.com:19302"];
+const MAX_SIGNALING_PEERS: usize = 64;
 
 // ---------------------------------------------------------------------------
 // CustomAddr codec: peer endpoint id <-> TransportAddr::Custom.
@@ -132,11 +165,12 @@ fn short(peer: &[u8; 32]) -> String {
 #[serde(tag = "t", rename_all = "lowercase")]
 pub enum RtcPayload {
     /// The offerer's session description.
-    Offer { sdp: String },
+    Offer { attempt: RtcAttempt, sdp: String },
     /// The answerer's session description.
-    Answer { sdp: String },
+    Answer { attempt: RtcAttempt, sdp: String },
     /// A trickled ICE candidate.
     Ice {
+        attempt: RtcAttempt,
         candidate: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mid: Option<String>,
@@ -161,8 +195,29 @@ pub struct SignalOut {
 pub enum Command {
     /// Establish (or confirm) a link toward this peer.
     Dial([u8; 32]),
+    /// Rendezvous observed a previously known endpoint id under a fresh browser
+    /// placement incarnation. Retire the old carrier immediately; the
+    /// deterministic offerer originates a fresh attempt, while the answerer waits.
+    PeerReincarnated {
+        peer: [u8; 32],
+        acknowledged: oneshot::Sender<ReincarnationFence>,
+    },
     /// A signaling payload arrived from `from`.
     Signal { from: [u8; 32], payload: RtcPayload },
+    /// A callback observed a terminal state for this exact offer attempt. Late
+    /// callbacks from a retired link cannot evict its replacement.
+    LinkTerminal { peer: [u8; 32], attempt: RtcAttempt },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ReincarnationFence {
+    retired_attempt: Option<RtcAttempt>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DirectReady {
+    pub(crate) peer: [u8; 32],
+    pub(crate) attempt: RtcAttempt,
 }
 
 /// The handles the rendezvous loop needs to bridge signaling for this transport.
@@ -180,7 +235,11 @@ pub struct WebRtcSignalPort {
     /// Driver → rendezvous: signaling to publish. `take`n once by the loop.
     pub outbound: Rc<RefCell<Option<mpsc::UnboundedReceiver<SignalOut>>>>,
     shared: SharedRef,
-    ready: async_broadcast::Sender<[u8; 32]>,
+    ready: async_broadcast::Sender<DirectReady>,
+    /// Keeps the broadcast open across brief intervals with no active waiter.
+    /// `async-broadcast` closes permanently when its final receiver disappears.
+    _ready_keepalive: async_broadcast::InactiveReceiver<DirectReady>,
+    incarnation: [u8; 8],
 }
 
 impl fmt::Debug for WebRtcSignalPort {
@@ -192,6 +251,28 @@ impl fmt::Debug for WebRtcSignalPort {
 }
 
 impl WebRtcSignalPort {
+    /// Random identity for this concrete browser transport placement. It changes
+    /// when a room generation reopens even though the persisted endpoint id does
+    /// not, allowing rendezvous peers to distinguish reincarnation from keepalive.
+    pub fn incarnation(&self) -> [u8; 8] {
+        self.incarnation
+    }
+
+    /// Queue a same-identity placement replacement and resolve only after the
+    /// serial carrier driver has retired the old attempt (and originated a new
+    /// one when this endpoint is the deterministic offerer).
+    pub async fn reincarnate(&self, peer: [u8; 32]) -> Option<ReincarnationFence> {
+        let (acknowledged, response) = oneshot::channel();
+        self.commands
+            .unbounded_send(Command::PeerReincarnated { peer, acknowledged })
+            .ok()?;
+        response.await.ok()
+    }
+
+    pub(crate) fn subscribe_ready(&self) -> async_broadcast::Receiver<DirectReady> {
+        self.ready.new_receiver()
+    }
+
     pub fn is_connected(&self, peer: &[u8; 32]) -> bool {
         self.shared
             .try_borrow()
@@ -218,14 +299,58 @@ impl WebRtcSignalPort {
         n0_future::time::timeout(timeout, async {
             loop {
                 match ready.recv().await {
-                    Ok(connected) if connected == peer => return,
+                    Ok(connected) if connected.peer == peer => return true,
                     Ok(_) | Err(async_broadcast::RecvError::Overflowed(_)) => {}
-                    Err(async_broadcast::RecvError::Closed) => return,
+                    Err(async_broadcast::RecvError::Closed) => return false,
                 }
             }
         })
         .await
-        .is_ok()
+        .unwrap_or(false)
+    }
+
+    /// Wait for an open link whose offer attempt is not the one acknowledged as
+    /// retired. This cannot be satisfied by the old still-open channel between
+    /// enqueueing and processing [`Command::PeerReincarnated`].
+    pub async fn wait_fresh_connected(
+        &self,
+        peer: [u8; 32],
+        fence: ReincarnationFence,
+        timeout: Duration,
+    ) -> bool {
+        let is_fresh = || {
+            self.shared.try_borrow().ok().is_some_and(|shared| {
+                shared.links.get(&peer).is_some_and(|link| {
+                    Some(link.attempt) != fence.retired_attempt
+                        && link.channel.as_ref().is_some_and(|channel| {
+                            channel.ready_state() == RtcDataChannelState::Open
+                        })
+                })
+            })
+        };
+        if is_fresh() {
+            return true;
+        }
+        let mut ready = self.ready.new_receiver();
+        if is_fresh() {
+            return true;
+        }
+        n0_future::time::timeout(timeout, async {
+            loop {
+                match ready.recv().await {
+                    Ok(connected)
+                        if connected.peer == peer
+                            && Some(connected.attempt) != fence.retired_attempt =>
+                    {
+                        return true;
+                    }
+                    Ok(_) | Err(async_broadcast::RecvError::Overflowed(_)) => {}
+                    Err(async_broadcast::RecvError::Closed) => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
     }
 }
 
@@ -245,18 +370,23 @@ struct Shared {
     recv_waker: Option<Waker>,
     /// Per-peer link state, keyed by remote endpoint id bytes.
     links: HashMap<[u8; 32], PeerLink>,
+    /// At most one pre-offer ICE attempt per peer. This keeps candidate ordering
+    /// correct without allowing ICE alone to retire a live link. Each vector is
+    /// independently bounded by [`MAX_EARLY_ICE_CANDIDATES`].
+    early_ice: HashMap<[u8; 32], EarlyIce>,
     /// Peers with an in-flight `Dial` command, so `poll_send` fires at most one
     /// dial per peer before a link exists.
     dialing: HashSet<[u8; 32]>,
     /// `poll_send` uses this to kick a lazy dial.
     cmd_tx: mpsc::UnboundedSender<Command>,
     /// Data-channel readiness notifications for direct-first rendezvous.
-    ready: async_broadcast::Sender<[u8; 32]>,
+    ready: async_broadcast::Sender<DirectReady>,
 }
 
 /// One peer's WebRTC connection state.
 struct PeerLink {
     pc: RtcPeerConnection,
+    attempt: RtcAttempt,
     /// The data channel once created (offerer) or received (answerer).
     channel: Option<RtcDataChannel>,
     /// True once the remote description is set — ICE candidates that arrive before
@@ -265,9 +395,19 @@ struct PeerLink {
     pending_ice: Vec<(String, Option<String>, Option<u16>)>,
     logged_first_send: bool,
     logged_first_recv: bool,
+    /// Cached answer makes an exact duplicate Offer idempotent without applying
+    /// the same remote description twice.
+    answer_sdp: Option<String>,
     /// JS closures kept alive for the connection's lifetime.
     _closures: Vec<AnyClosure>,
 }
+
+struct EarlyIce {
+    attempt: RtcAttempt,
+    candidates: Vec<(String, Option<String>, Option<u16>)>,
+}
+
+const MAX_EARLY_ICE_CANDIDATES: usize = 64;
 
 /// Type-erased storage so heterogeneous closures can share one `Vec`; dropping the
 /// `PeerLink` drops them and detaches the JS handlers. The inner closures are never
@@ -310,14 +450,17 @@ impl WebRtcTransport {
     pub fn new(local_id: [u8; 32]) -> (Self, WebRtcSignalPort) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded::<Command>();
         let (signal_tx, signal_rx) = mpsc::unbounded::<SignalOut>();
-        let (mut ready, _ready_rx) = async_broadcast::broadcast(64);
+        let (mut ready, ready_rx) = async_broadcast::broadcast(64);
         ready.set_overflow(true);
+        let ready_keepalive = ready_rx.deactivate();
+        let incarnation = RtcAttempt::fresh().0;
 
         let shared: SharedRef = Rc::new(RefCell::new(Shared {
             local_id,
             recv_queue: VecDeque::new(),
             recv_waker: None,
             links: HashMap::new(),
+            early_ice: HashMap::new(),
             dialing: HashSet::new(),
             cmd_tx: cmd_tx.clone(),
             ready: ready.clone(),
@@ -334,6 +477,8 @@ impl WebRtcTransport {
             outbound: Rc::new(RefCell::new(Some(signal_rx))),
             shared,
             ready,
+            _ready_keepalive: ready_keepalive,
+            incarnation,
         };
         (transport, port)
     }
@@ -517,8 +662,32 @@ async fn run_driver(
     while let Some(cmd) = commands.next().await {
         match cmd {
             Command::Dial(peer) => handle_dial(&shared, &signal_tx, peer).await,
+            Command::PeerReincarnated { peer, acknowledged } => {
+                let prior = current_attempt(&shared, peer);
+                if let Some(attempt) = prior {
+                    tracing::info!(
+                        target: "walkie::webrtc",
+                        "peer {} placement reincarnated; retiring offer attempt {}",
+                        short(&peer),
+                        attempt
+                    );
+                    retire_link(&shared, peer, attempt);
+                }
+                handle_dial(&shared, &signal_tx, peer).await;
+                let _ = acknowledged.send(ReincarnationFence {
+                    retired_attempt: prior,
+                });
+            }
             Command::Signal { from, payload } => {
                 handle_signal(&shared, &signal_tx, from, payload).await
+            }
+            Command::LinkTerminal { peer, attempt } => {
+                if current_attempt(&shared, peer) == Some(attempt) {
+                    retire_link(&shared, peer, attempt);
+                    // Only the deterministic offerer originates a replacement;
+                    // `handle_dial` leaves the answerer ready to receive one.
+                    handle_dial(&shared, &signal_tx, peer).await;
+                }
             }
         }
     }
@@ -539,13 +708,49 @@ fn configuration() -> RtcConfiguration {
     config
 }
 
+fn current_attempt(shared: &SharedRef, peer: [u8; 32]) -> Option<RtcAttempt> {
+    shared.borrow().links.get(&peer).map(|link| link.attempt)
+}
+
+fn attempt_is_current(shared: &SharedRef, peer: [u8; 32], attempt: RtcAttempt) -> bool {
+    current_attempt(shared, peer) == Some(attempt)
+}
+
+/// Remove only the exact attempt being retired. Every JS handler is detached
+/// before close, and every callback also checks the attempt, so a queued callback
+/// from this connection cannot mutate or evict its replacement.
+fn retire_link(shared: &SharedRef, peer: [u8; 32], attempt: RtcAttempt) -> bool {
+    let removed = {
+        let mut state = shared.borrow_mut();
+        if state.links.get(&peer).map(|link| link.attempt) != Some(attempt) {
+            return false;
+        }
+        state.dialing.remove(&peer);
+        state.links.remove(&peer)
+    };
+    let Some(link) = removed else {
+        return false;
+    };
+    link.pc.set_onicecandidate(None);
+    link.pc.set_onconnectionstatechange(None);
+    link.pc.set_ondatachannel(None);
+    if let Some(channel) = link.channel.as_ref() {
+        channel.set_onmessage(None);
+        channel.set_onopen(None);
+        channel.close();
+    }
+    link.pc.close();
+    true
+}
+
 /// Wire a data channel's `onmessage`/`onopen` and register its closures. Captures a
 /// clone of the `Rc` (not a borrow), so it is safe to call while `Shared` is
 /// borrowed elsewhere.
 fn wire_channel(
     shared: &SharedRef,
-    ready: async_broadcast::Sender<[u8; 32]>,
+    ready: async_broadcast::Sender<DirectReady>,
     peer: [u8; 32],
+    attempt: RtcAttempt,
     channel: &RtcDataChannel,
     closures: &mut Vec<AnyClosure>,
 ) {
@@ -554,9 +759,16 @@ fn wire_channel(
     let shared_msg = shared.clone();
     let remote_addr = webrtc_custom_addr(&peer);
     let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {
+        if !attempt_is_current(&shared_msg, peer, attempt) {
+            return;
+        }
         let bytes = js_sys::Uint8Array::new(&event.data()).to_vec();
         let mut s = shared_msg.borrow_mut();
-        if let Some(link) = s.links.get_mut(&peer) {
+        if let Some(link) = s
+            .links
+            .get_mut(&peer)
+            .filter(|link| link.attempt == attempt)
+        {
             if !link.logged_first_recv {
                 link.logged_first_recv = true;
                 tracing::info!(
@@ -575,13 +787,18 @@ fn wire_channel(
     }) as Box<dyn FnMut(MessageEvent)>);
     channel.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
 
+    let shared_open = shared.clone();
     let onopen = Closure::wrap(Box::new(move || {
+        if !attempt_is_current(&shared_open, peer, attempt) {
+            return;
+        }
         tracing::info!(
             target: "walkie::webrtc",
-            "data channel OPEN to {} — direct path is live",
-            short(&peer)
+            "data channel OPEN to {} attempt={} — fresh direct path is live",
+            short(&peer),
+            attempt
         );
-        let _ = ready.try_broadcast(peer);
+        let _ = ready.try_broadcast(DirectReady { peer, attempt });
     }) as Box<dyn FnMut()>);
     channel.set_onopen(Some(onopen.as_ref().unchecked_ref()));
 
@@ -592,27 +809,36 @@ fn wire_channel(
 /// Store an inbound (answerer-side) data channel into its link and wire it.
 fn attach_incoming_channel(
     shared: &SharedRef,
-    ready: async_broadcast::Sender<[u8; 32]>,
+    ready: async_broadcast::Sender<DirectReady>,
     peer: [u8; 32],
+    attempt: RtcAttempt,
     channel: RtcDataChannel,
 ) {
+    if !attempt_is_current(shared, peer, attempt) {
+        channel.close();
+        return;
+    }
     let mut closures = Vec::new();
-    wire_channel(shared, ready, peer, &channel, &mut closures);
+    wire_channel(shared, ready, peer, attempt, &channel, &mut closures);
     let mut s = shared.borrow_mut();
-    if let Some(link) = s.links.get_mut(&peer) {
+    if let Some(link) = s
+        .links
+        .get_mut(&peer)
+        .filter(|link| link.attempt == attempt)
+    {
         link.channel = Some(channel);
         link._closures.extend(closures);
     }
 }
 
-/// Ensure a `PeerLink` exists toward `peer`, creating and wiring the
-/// `RtcPeerConnection` if not. Returns `(pc, created)` — `created` is true only on
-/// first creation, so the caller offers exactly once. Returns `None` for our own id
-/// or on `RtcPeerConnection` construction failure.
+/// Ensure the exact offer `attempt` has a `PeerLink`, creating and wiring the
+/// `RtcPeerConnection` if absent. A caller must explicitly retire a different
+/// attempt first; Answer/ICE are never allowed to replace one implicitly.
 fn ensure_link(
     shared: &SharedRef,
     signal_tx: &mpsc::UnboundedSender<SignalOut>,
     peer: [u8; 32],
+    attempt: RtcAttempt,
     offerer: bool,
 ) -> Option<(RtcPeerConnection, bool)> {
     let mut s = shared.borrow_mut();
@@ -620,7 +846,15 @@ fn ensure_link(
         return None;
     }
     if let Some(link) = s.links.get(&peer) {
-        return Some((link.pc.clone(), false));
+        return (link.attempt == attempt).then(|| (link.pc.clone(), false));
+    }
+    if s.links.len() >= MAX_SIGNALING_PEERS {
+        tracing::debug!(
+            target: "walkie::webrtc",
+            "refusing WebRTC link for {}: peer capacity reached",
+            short(&peer)
+        );
+        return None;
     }
 
     let pc = match RtcPeerConnection::new_with_configuration(&configuration()) {
@@ -645,6 +879,7 @@ fn ensure_link(
             let _ = ice_tx.unbounded_send(SignalOut {
                 to: peer,
                 payload: RtcPayload::Ice {
+                    attempt,
                     candidate: candidate.candidate(),
                     mid: candidate.sdp_mid(),
                     index: candidate.sdp_m_line_index(),
@@ -655,15 +890,26 @@ fn ensure_link(
     pc.set_onicecandidate(Some(onicecandidate.as_ref().unchecked_ref()));
     closures.push(AnyClosure::Ice(onicecandidate));
 
-    // Observability: log every connectionState transition (design risk #6).
+    // Observability and terminal cleanup. `Disconnected` is deliberately not
+    // terminal: browsers use it for transient ICE disruption. A fresh placement
+    // Hello/Offer remains the stronger reincarnation signal.
     let pc_for_state = pc.clone();
+    let terminal_tx = s.cmd_tx.clone();
     let onstate = Closure::wrap(Box::new(move || {
+        let state = pc_for_state.connection_state();
         tracing::info!(
             target: "walkie::webrtc",
-            "peer {} connectionState = {:?}",
+            "peer {} attempt={} connectionState = {:?}",
             short(&peer),
-            pc_for_state.connection_state()
+            attempt,
+            state
         );
+        if matches!(
+            state,
+            web_sys::RtcPeerConnectionState::Failed | web_sys::RtcPeerConnectionState::Closed
+        ) {
+            let _ = terminal_tx.unbounded_send(Command::LinkTerminal { peer, attempt });
+        }
     }) as Box<dyn FnMut()>);
     pc.set_onconnectionstatechange(Some(onstate.as_ref().unchecked_ref()));
     closures.push(AnyClosure::Unit(onstate));
@@ -676,14 +922,20 @@ fn ensure_link(
         init.set_ordered(false);
         init.set_max_retransmits(0);
         let dc = pc.create_data_channel_with_data_channel_dict(DATA_CHANNEL_LABEL, &init);
-        wire_channel(shared, ready.clone(), peer, &dc, &mut closures);
+        wire_channel(shared, ready.clone(), peer, attempt, &dc, &mut closures);
         channel = Some(dc);
     } else {
         // The answerer receives the channel via `ondatachannel`.
         let shared_for_dc = shared.clone();
         let ready_for_dc = ready;
         let ondatachannel = Closure::wrap(Box::new(move |event: RtcDataChannelEvent| {
-            attach_incoming_channel(&shared_for_dc, ready_for_dc.clone(), peer, event.channel());
+            attach_incoming_channel(
+                &shared_for_dc,
+                ready_for_dc.clone(),
+                peer,
+                attempt,
+                event.channel(),
+            );
         }) as Box<dyn FnMut(RtcDataChannelEvent)>);
         pc.set_ondatachannel(Some(ondatachannel.as_ref().unchecked_ref()));
         closures.push(AnyClosure::Chan(ondatachannel));
@@ -693,11 +945,13 @@ fn ensure_link(
         peer,
         PeerLink {
             pc: pc.clone(),
+            attempt,
             channel,
             remote_desc_set: false,
             pending_ice: Vec::new(),
             logged_first_send: false,
             logged_first_recv: false,
+            answer_sdp: None,
             _closures: closures,
         },
     );
@@ -716,12 +970,18 @@ async fn handle_dial(
     if peer == local_id {
         return;
     }
-    let offerer = local_id < peer;
-    let Some((pc, created)) = ensure_link(shared, signal_tx, peer, offerer) else {
+    if !local_is_offerer(local_id, peer) {
+        return;
+    }
+    if current_attempt(shared, peer).is_some() {
+        return;
+    }
+    let attempt = RtcAttempt::fresh();
+    let Some((pc, created)) = ensure_link(shared, signal_tx, peer, attempt, true) else {
         return;
     };
-    if !offerer || !created {
-        return; // answerer waits; a repeat dial to an existing link is a no-op.
+    if !created {
+        return;
     }
 
     // Offerer: createOffer -> setLocalDescription -> publish the offer.
@@ -729,20 +989,28 @@ async fn handle_dial(
         Ok(offer) => offer.unchecked_into::<RtcSessionDescriptionInit>(),
         Err(error) => {
             tracing::warn!(target: "walkie::webrtc", "createOffer failed for {}: {error:?}", short(&peer));
+            retire_link(shared, peer, attempt);
             return;
         }
     };
     if let Err(error) = JsFuture::from(pc.set_local_description(&offer)).await {
         tracing::warn!(target: "walkie::webrtc", "setLocalDescription(offer) failed for {}: {error:?}", short(&peer));
+        retire_link(shared, peer, attempt);
         return;
     }
     if let Some(sdp) = offer.get_sdp() {
-        tracing::info!(target: "walkie::webrtc", "dialing {} — sending offer", short(&peer));
+        tracing::info!(target: "walkie::webrtc", "dialing {} attempt={} — sending offer", short(&peer), attempt);
         let _ = signal_tx.unbounded_send(SignalOut {
             to: peer,
-            payload: RtcPayload::Offer { sdp },
+            payload: RtcPayload::Offer { attempt, sdp },
         });
+    } else {
+        retire_link(shared, peer, attempt);
     }
+}
+
+fn local_is_offerer(local: [u8; 32], peer: [u8; 32]) -> bool {
+    local < peer
 }
 
 /// Handle an inbound signaling payload from `from`.
@@ -756,43 +1024,115 @@ async fn handle_signal(
         return;
     }
     match payload {
-        RtcPayload::Offer { sdp } => {
-            // We are the answerer. Create the link if the offer beat our own dial.
-            let Some((pc, _)) = ensure_link(shared, signal_tx, from, false) else {
+        RtcPayload::Offer { attempt, sdp } => {
+            let local = shared.borrow().local_id;
+            if !local_is_offerer(from, local) {
+                tracing::debug!(
+                    target: "walkie::webrtc",
+                    "ignoring offer from non-offerer {} attempt={}",
+                    short(&from),
+                    attempt
+                );
+                return;
+            }
+            // A changed attempt is the unambiguous same-endpoint reincarnation
+            // signal. Retire the old connection even if the browser still calls it
+            // Connected/Disconnected; those states can lag the remote restart.
+            if let Some(current) = current_attempt(shared, from)
+                && current != attempt
+            {
+                tracing::info!(
+                    target: "walkie::webrtc",
+                    "fresh offer from {} replaces attempt {} with {}",
+                    short(&from),
+                    current,
+                    attempt
+                );
+                retire_link(shared, from, current);
+            }
+            let Some((pc, _)) = ensure_link(shared, signal_tx, from, attempt, false) else {
                 return;
             };
+            adopt_early_ice(shared, from, attempt);
+
+            // An exact duplicate belongs to the current attempt. Re-send the
+            // cached answer without reapplying its remote description.
+            if let Some(answer_sdp) = shared
+                .borrow()
+                .links
+                .get(&from)
+                .filter(|link| link.attempt == attempt)
+                .and_then(|link| link.answer_sdp.clone())
+            {
+                let _ = signal_tx.unbounded_send(SignalOut {
+                    to: from,
+                    payload: RtcPayload::Answer {
+                        attempt,
+                        sdp: answer_sdp,
+                    },
+                });
+                return;
+            }
             let desc = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
             desc.set_sdp(&sdp);
             if let Err(error) = JsFuture::from(pc.set_remote_description(&desc)).await {
-                tracing::warn!(target: "walkie::webrtc", "setRemoteDescription(offer) failed for {}: {error:?}", short(&from));
+                tracing::warn!(target: "walkie::webrtc", "setRemoteDescription(offer) failed for {} attempt={}: {error:?}", short(&from), attempt);
+                retire_link(shared, from, attempt);
                 return;
             }
-            flush_after_remote_desc(shared, from, &pc).await;
+            flush_after_remote_desc(shared, from, attempt, &pc).await;
 
             let answer = match JsFuture::from(pc.create_answer()).await {
                 Ok(answer) => answer.unchecked_into::<RtcSessionDescriptionInit>(),
                 Err(error) => {
                     tracing::warn!(target: "walkie::webrtc", "createAnswer failed for {}: {error:?}", short(&from));
+                    retire_link(shared, from, attempt);
                     return;
                 }
             };
             if let Err(error) = JsFuture::from(pc.set_local_description(&answer)).await {
                 tracing::warn!(target: "walkie::webrtc", "setLocalDescription(answer) failed for {}: {error:?}", short(&from));
+                retire_link(shared, from, attempt);
                 return;
             }
             if let Some(sdp) = answer.get_sdp() {
-                tracing::info!(target: "walkie::webrtc", "answering {}", short(&from));
+                if let Some(link) = shared
+                    .borrow_mut()
+                    .links
+                    .get_mut(&from)
+                    .filter(|link| link.attempt == attempt)
+                {
+                    link.answer_sdp = Some(sdp.clone());
+                } else {
+                    return;
+                }
+                tracing::info!(target: "walkie::webrtc", "answering {} attempt={}", short(&from), attempt);
                 let _ = signal_tx.unbounded_send(SignalOut {
                     to: from,
-                    payload: RtcPayload::Answer { sdp },
+                    payload: RtcPayload::Answer { attempt, sdp },
                 });
             }
         }
-        RtcPayload::Answer { sdp } => {
+        RtcPayload::Answer { attempt, sdp } => {
+            let local = shared.borrow().local_id;
+            if !local_is_offerer(local, from) {
+                tracing::debug!(
+                    target: "walkie::webrtc",
+                    "ignoring answer from non-answerer {} attempt={}",
+                    short(&from),
+                    attempt
+                );
+                return;
+            }
             // We are the offerer; the link already exists.
-            let pc = shared.borrow().links.get(&from).map(|link| link.pc.clone());
+            let pc = shared
+                .borrow()
+                .links
+                .get(&from)
+                .filter(|link| link.attempt == attempt)
+                .map(|link| link.pc.clone());
             let Some(pc) = pc else {
-                tracing::warn!(target: "walkie::webrtc", "answer from {} with no link", short(&from));
+                tracing::debug!(target: "walkie::webrtc", "ignoring stale answer from {} attempt={}", short(&from), attempt);
                 return;
             };
             // Only apply an answer while we are the offerer awaiting one. A
@@ -812,12 +1152,14 @@ async fn handle_signal(
             let desc = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
             desc.set_sdp(&sdp);
             if let Err(error) = JsFuture::from(pc.set_remote_description(&desc)).await {
-                tracing::warn!(target: "walkie::webrtc", "setRemoteDescription(answer) failed for {}: {error:?}", short(&from));
+                tracing::warn!(target: "walkie::webrtc", "setRemoteDescription(answer) failed for {} attempt={}: {error:?}", short(&from), attempt);
+                retire_link(shared, from, attempt);
                 return;
             }
-            flush_after_remote_desc(shared, from, &pc).await;
+            flush_after_remote_desc(shared, from, attempt, &pc).await;
         }
         RtcPayload::Ice {
+            attempt,
             candidate,
             mid,
             index,
@@ -829,16 +1171,14 @@ async fn handle_signal(
                 .borrow()
                 .links
                 .get(&from)
+                .filter(|link| link.attempt == attempt)
                 .map(|link| (link.pc.clone(), link.remote_desc_set));
             match state {
                 Some((pc, true)) => {
                     add_ice(&pc, &candidate, mid.as_deref(), index).await;
                 }
-                Some((_, false)) => buffer_ice(shared, from, candidate, mid, index),
-                None => {
-                    let _ = ensure_link(shared, signal_tx, from, false);
-                    buffer_ice(shared, from, candidate, mid, index);
-                }
+                Some((_, false)) => buffer_ice(shared, from, attempt, candidate, mid, index),
+                None => buffer_early_ice(shared, from, attempt, candidate, mid, index),
             }
         }
     }
@@ -847,25 +1187,80 @@ async fn handle_signal(
 fn buffer_ice(
     shared: &SharedRef,
     peer: [u8; 32],
+    attempt: RtcAttempt,
     candidate: String,
     mid: Option<String>,
     index: Option<u16>,
 ) {
-    if let Some(link) = shared.borrow_mut().links.get_mut(&peer) {
-        link.pending_ice.push((candidate, mid, index));
+    if let Some(link) = shared
+        .borrow_mut()
+        .links
+        .get_mut(&peer)
+        .filter(|link| link.attempt == attempt)
+    {
+        if link.pending_ice.len() < MAX_EARLY_ICE_CANDIDATES {
+            link.pending_ice.push((candidate, mid, index));
+        }
+    }
+}
+
+fn buffer_early_ice(
+    shared: &SharedRef,
+    peer: [u8; 32],
+    attempt: RtcAttempt,
+    candidate: String,
+    mid: Option<String>,
+    index: Option<u16>,
+) {
+    let mut state = shared.borrow_mut();
+    if !state.early_ice.contains_key(&peer) && state.early_ice.len() >= MAX_SIGNALING_PEERS {
+        return;
+    }
+    let early = state.early_ice.entry(peer).or_insert_with(|| EarlyIce {
+        attempt,
+        candidates: Vec::new(),
+    });
+    if early.attempt != attempt {
+        early.attempt = attempt;
+        early.candidates.clear();
+    }
+    if early.candidates.len() < MAX_EARLY_ICE_CANDIDATES {
+        early.candidates.push((candidate, mid, index));
+    }
+}
+
+fn adopt_early_ice(shared: &SharedRef, peer: [u8; 32], attempt: RtcAttempt) {
+    let mut state = shared.borrow_mut();
+    let pending = state
+        .early_ice
+        .remove(&peer)
+        .filter(|early| early.attempt == attempt)
+        .map(|early| early.candidates)
+        .unwrap_or_default();
+    if let Some(link) = state
+        .links
+        .get_mut(&peer)
+        .filter(|link| link.attempt == attempt)
+    {
+        link.pending_ice.extend(pending);
     }
 }
 
 /// Mark the remote description set and flush any ICE candidates that arrived early.
-async fn flush_after_remote_desc(shared: &SharedRef, peer: [u8; 32], pc: &RtcPeerConnection) {
+async fn flush_after_remote_desc(
+    shared: &SharedRef,
+    peer: [u8; 32],
+    attempt: RtcAttempt,
+    pc: &RtcPeerConnection,
+) {
     let pending = {
         let mut s = shared.borrow_mut();
         match s.links.get_mut(&peer) {
-            Some(link) => {
+            Some(link) if link.attempt == attempt => {
                 link.remote_desc_set = true;
                 std::mem::take(&mut link.pending_ice)
             }
-            None => Vec::new(),
+            Some(_) | None => Vec::new(),
         }
     };
     for (candidate, mid, index) in pending {
@@ -909,5 +1304,44 @@ mod tests {
     fn malformed_data_is_rejected() {
         let short = CustomAddr::from_parts(WEBRTC_TRANSPORT_ID, &[0x01, 0x02, 0x03]);
         assert_eq!(endpoint_bytes_of(&short), None);
+    }
+
+    #[test]
+    fn deterministic_roles_cover_restarted_offerer_and_answerer() {
+        let lower = [0x11; 32];
+        let higher = [0x22; 32];
+        assert!(local_is_offerer(lower, higher));
+        assert!(!local_is_offerer(higher, lower));
+    }
+
+    #[test]
+    fn every_signal_is_bound_to_the_offer_attempt() {
+        let attempt = RtcAttempt([7; 8]);
+        for payload in [
+            RtcPayload::Offer {
+                attempt,
+                sdp: "offer".into(),
+            },
+            RtcPayload::Answer {
+                attempt,
+                sdp: "answer".into(),
+            },
+            RtcPayload::Ice {
+                attempt,
+                candidate: "candidate".into(),
+                mid: None,
+                index: Some(0),
+            },
+        ] {
+            let encoded = serde_json::to_string(&payload).unwrap();
+            assert!(encoded.contains("\"attempt\":[7,7,7,7,7,7,7,7]"));
+            let decoded: RtcPayload = serde_json::from_str(&encoded).unwrap();
+            let decoded_attempt = match decoded {
+                RtcPayload::Offer { attempt, .. }
+                | RtcPayload::Answer { attempt, .. }
+                | RtcPayload::Ice { attempt, .. } => attempt,
+            };
+            assert_eq!(decoded_attempt, attempt);
+        }
     }
 }
