@@ -14,9 +14,9 @@ tauri-build = { version = "=2.6.3", features = [] }
 
 [dependencies]
 iroh = { version = "=1.0.3" }
-hhhs-store = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "a33046622a02e892f2bfee49604ad332956ed3be" }
-hhhs-proof = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "a33046622a02e892f2bfee49604ad332956ed3be" }
-hhhs-sync = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "a33046622a02e892f2bfee49604ad332956ed3be", features = ["driver"] }
+hhhs-store = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "4344742c69b868e9df4005eeab23fa101fdd48fc" }
+hhhs-proof = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "4344742c69b868e9df4005eeab23fa101fdd48fc" }
+hhhs-sync = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "4344742c69b868e9df4005eeab23fa101fdd48fc", features = ["driver"] }
 tauri = { version = "=2.11.5", features = [] }
 tokio = { version = "1.32", features = ["sync", "time"] }
 walkie-songie = { path = "..", features = ["tauri-app"] }
