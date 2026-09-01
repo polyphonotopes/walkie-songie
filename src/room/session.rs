@@ -536,6 +536,22 @@ pub(crate) fn is_session_carrier(bytes: &[u8]) -> bool {
     bytes.starts_with(SESSION_CARRIER_DOMAIN)
 }
 
+/// Acceptance-only classifier used to retain one real signed offer for a
+/// deliberate stale-delivery browser gate. Production builds have neither the
+/// classifier nor the replay control surface.
+#[cfg(feature = "browser-acceptance-faults")]
+pub(crate) fn is_session_offer(bytes: &[u8]) -> bool {
+    session_offer_target(bytes).is_some()
+}
+
+#[cfg(feature = "browser-acceptance-faults")]
+pub(crate) fn session_offer_target(bytes: &[u8]) -> Option<ActorId> {
+    match SessionCarrierBody::decode(bytes).ok()? {
+        SessionCarrierBody::Offer { target, .. } => Some(target),
+        SessionCarrierBody::Answer { .. } | SessionCarrierBody::Event { .. } => None,
+    }
+}
+
 pub(crate) async fn run_room_session_task(
     mut inbox: mpsc::Receiver<RoomSessionTaskInput>,
     reifications: mpsc::Sender<RoomSessionReification>,
@@ -1350,7 +1366,7 @@ impl RoomSessionTask {
         durable_view: SharedPitchSet,
         durable_revision: u64,
     ) -> Result<(), String> {
-        let (ready, projection) = {
+        let (ready, kind) = {
             let active = self
                 .active
                 .get_mut(&peer)
@@ -1371,21 +1387,24 @@ impl RoomSessionTask {
             let kind = active
                 .confirm(admission, durable_revision, &history, durable_view.clone())?
                 .unwrap_or(RoomSessionProjectionKind::Confirmed);
-            (active.retry_reifications()?, active.projection_event(kind))
+            (active.retry_reifications()?, kind)
         };
-        for (other_peer, other) in &mut self.active {
-            if *other_peer != peer {
-                other.advance_durable(durable_revision, &history, durable_view.clone())?;
-            }
-        }
+        let projection = self.advance_companions_and_select_projection(
+            peer,
+            kind,
+            durable_revision,
+            &history,
+            &durable_view,
+        )?;
         self.update_foundation_horizon(&history, &durable_view, durable_revision);
         let durable = ready
             .iter()
             .map(|(plan, _)| durable_correlation(plan.correlation()))
             .collect();
-        if self.presentation_peer == Some(peer) {
+        if let Some(projection) = projection {
             self.emit_realtime_with_reset(
-                peer,
+                self.presentation_peer
+                    .expect("selected projection requires a presentation peer"),
                 RoomSessionRealtimeEgress {
                     projection,
                     carrier: None,
@@ -1417,13 +1436,17 @@ impl RoomSessionTask {
         let Some(peer) = self.active.iter().find_map(|(peer, active)| {
             (active.session.manifest_digest() == manifest).then_some(*peer)
         }) else {
-            for active in self.active.values_mut() {
-                active.advance_durable(durable_revision, &history, durable_view.clone())?;
-            }
-            self.update_foundation_horizon(&history, &durable_view, durable_revision);
-            return self.start_ready_renewals().await;
+            // A retained command from another/superseded compact session is
+            // still ordinary canonical music. Advance every active projection
+            // through the common path so the selected presentation receives
+            // the corresponding ordered egress. Mutating it silently here
+            // would consume a projection sequence and make the next visible
+            // event appear to skip.
+            return self
+                .advance_all(history, durable_view, durable_revision)
+                .await;
         };
-        let (ready, projection) = {
+        let (ready, kind) = {
             let active = self
                 .active
                 .get_mut(&peer)
@@ -1444,21 +1467,24 @@ impl RoomSessionTask {
             let kind = active
                 .confirm(admission, durable_revision, &history, durable_view.clone())?
                 .unwrap_or(RoomSessionProjectionKind::Confirmed);
-            (active.retry_reifications()?, active.projection_event(kind))
+            (active.retry_reifications()?, kind)
         };
-        for (other_peer, other) in &mut self.active {
-            if *other_peer != peer {
-                other.advance_durable(durable_revision, &history, durable_view.clone())?;
-            }
-        }
+        let projection = self.advance_companions_and_select_projection(
+            peer,
+            kind,
+            durable_revision,
+            &history,
+            &durable_view,
+        )?;
         self.update_foundation_horizon(&history, &durable_view, durable_revision);
         let durable = ready
             .iter()
             .map(|(plan, _)| durable_correlation(plan.correlation()))
             .collect();
-        if self.presentation_peer == Some(peer) {
+        if let Some(projection) = projection {
             self.emit_realtime_with_reset(
-                peer,
+                self.presentation_peer
+                    .expect("selected projection requires a presentation peer"),
                 RoomSessionRealtimeEgress {
                     projection,
                     carrier: None,
@@ -1470,6 +1496,49 @@ impl RoomSessionTask {
         }
         self.enqueue_reifications(peer, ready).await?;
         self.start_ready_renewals().await
+    }
+
+    /// Advance every pair-session over one canonical revision while publishing
+    /// exactly the projection selected as the room's presentation authority.
+    ///
+    /// A projection sequence belongs to its pair-session. Constructing an
+    /// event for a non-selected pair and then discarding it creates an
+    /// observable sequence gap if that pair is ever presented; discarding the
+    /// selected companion's `advance_durable` transition hides canonical
+    /// growth immediately. This helper makes both cases structurally
+    /// impossible for local and observed confirmations.
+    fn advance_companions_and_select_projection(
+        &mut self,
+        source_peer: ActorId,
+        source_kind: RoomSessionProjectionKind,
+        durable_revision: u64,
+        history: &DagSnapshot,
+        durable_view: &SharedPitchSet,
+    ) -> Result<Option<RoomSessionProjection>, String> {
+        let selected = self.presentation_peer;
+        let mut projection = if selected == Some(source_peer) {
+            Some(
+                self.active
+                    .get(&source_peer)
+                    .ok_or("durable session confirmation has no active peer")?
+                    .projection_event(source_kind),
+            )
+        } else {
+            None
+        };
+
+        for (peer, active) in &mut self.active {
+            if *peer == source_peer {
+                continue;
+            }
+            if let Some(kind) =
+                active.advance_durable(durable_revision, history, durable_view.clone())?
+                && selected == Some(*peer)
+            {
+                projection = Some(active.projection_event(kind));
+            }
+        }
+        Ok(projection)
     }
 
     async fn enqueue_reifications(
@@ -2457,6 +2526,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
 
     use futures::executor::block_on;
+    use hhhs_web_browser::{WorkerEvent, WorkerGeneration};
 
     use super::*;
     use crate::room::v5::RoomReplicas;
@@ -2777,6 +2847,157 @@ mod tests {
         assert_eq!(receiver.kernel.ready_cut(), kernel_before);
         assert!(receiver.projection.snapshot() == projection_before);
         assert_eq!(receiver.logical_time, logical_time_before);
+    }
+
+    #[test]
+    fn unrelated_durable_growth_is_emitted_before_the_next_session_projection() {
+        let (owner, member) = renewal_foundations();
+        let session_id = 53;
+        let (authorized, _) = authorize_fixture(&owner, &member, session_id, 1, None).unwrap();
+        let keys = initiator_keys(&owner, &member, session_id);
+        let active = ActiveSession::new(owner.clone(), authorized, session_id, keys, 0).unwrap();
+
+        let initial_root = *history_root(&owner.history).as_bytes();
+        let mut gate = RoomSessionProjectionGate::default();
+        assert_eq!(
+            gate.canonical(owner.durable_revision, initial_root),
+            Ok(true)
+        );
+        assert_eq!(
+            gate.accept(&active.projection_event(RoomSessionProjectionKind::Reset)),
+            Ok(true)
+        );
+
+        let delivered = Rc::new(RefCell::new(Vec::<WorkerEvent>::new()));
+        let captured = Rc::clone(&delivered);
+        let events = WorkerEventPort::new(WorkerGeneration::new(1), move |event| {
+            captured.borrow_mut().push(event);
+            Ok(())
+        });
+        let (reifications, _) = mpsc::channel(1);
+        let mut task = RoomSessionTask::new(
+            reifications,
+            Rc::new(TestRenewalStore::default()),
+            test_lease_clock(),
+        );
+        task.events = Some(events);
+        task.presentation_peer = Some(member.local);
+        task.active.insert(member.local, active);
+
+        let mut entries = owner.history.entries_topo();
+        entries.push(Entry::new(
+            b"unrelated retained session command".to_vec(),
+            owner.history.frontier(),
+        ));
+        let advanced_history = DagSnapshot::from_entries(entries);
+        let advanced_revision = owner.durable_revision.saturating_add(1);
+        let mut advanced_view = owner.durable_view.clone();
+        advanced_view.pitch_classes.insert(degree());
+        block_on(task.advance_all(advanced_history.clone(), advanced_view, advanced_revision))
+            .unwrap();
+
+        let first = delivered.borrow_mut().remove(0);
+        let RoomSessionEgress::Realtime(first) = decode(first.payload()).unwrap() else {
+            panic!("durable advance did not emit a realtime projection");
+        };
+        assert_eq!(first.projection.kind, RoomSessionProjectionKind::Advanced);
+        assert_eq!(first.projection.sequence, 1);
+        assert_eq!(
+            gate.canonical(
+                advanced_revision,
+                *history_root(&advanced_history).as_bytes()
+            ),
+            Ok(true)
+        );
+        assert_eq!(gate.accept(&first.projection), Ok(true));
+
+        let active = task.active.get_mut(&member.local).unwrap();
+        active
+            .local_event(
+                MusicOp::RemoveDegree { degree: degree() },
+                0,
+                &DisabledRoomSessionTraceClock,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let next = active.projection_event(RoomSessionProjectionKind::Predicted);
+        assert_eq!(next.sequence, 2);
+        assert_eq!(gate.accept(&next), Ok(true));
+    }
+
+    #[test]
+    fn confirmation_advances_and_returns_the_selected_companion_projection() {
+        let (owner, member) = renewal_foundations();
+        let source_peer = member.local;
+        let selected_peer = ActorId([99; 32]);
+
+        let (source_authorized, _) = authorize_fixture(&owner, &member, 54, 1, None).unwrap();
+        let source = ActiveSession::new(
+            owner.clone(),
+            source_authorized,
+            54,
+            initiator_keys(&owner, &member, 54),
+            0,
+        )
+        .unwrap();
+        let (selected_authorized, _) = authorize_fixture(&owner, &member, 55, 1, None).unwrap();
+        let selected = ActiveSession::new(
+            owner.clone(),
+            selected_authorized,
+            55,
+            initiator_keys(&owner, &member, 55),
+            0,
+        )
+        .unwrap();
+
+        let (reifications, _) = mpsc::channel(1);
+        let mut task = RoomSessionTask::new(
+            reifications,
+            Rc::new(TestRenewalStore::default()),
+            test_lease_clock(),
+        );
+        task.active.insert(source_peer, source);
+        task.active.insert(selected_peer, selected);
+        task.presentation_peer = Some(selected_peer);
+
+        let mut entries = owner.history.entries_topo();
+        entries.push(Entry::new(
+            b"canonical confirmation from another pair".to_vec(),
+            owner.history.frontier(),
+        ));
+        let advanced_history = DagSnapshot::from_entries(entries);
+        let advanced_revision = owner.durable_revision.saturating_add(1);
+        let mut advanced_view = owner.durable_view.clone();
+        advanced_view.pitch_classes.insert(degree());
+
+        // Model the source pair having already consumed its matching durable
+        // confirmation before the task advances every companion pair.
+        assert!(
+            task.active
+                .get_mut(&source_peer)
+                .unwrap()
+                .advance_durable(advanced_revision, &advanced_history, advanced_view.clone(),)
+                .unwrap()
+                .is_some()
+        );
+        let projection = task
+            .advance_companions_and_select_projection(
+                source_peer,
+                RoomSessionProjectionKind::Confirmed,
+                advanced_revision,
+                &advanced_history,
+                &advanced_view,
+            )
+            .unwrap()
+            .expect("selected companion advance must be published");
+
+        assert_eq!(projection.session_id, 55);
+        assert_eq!(projection.kind, RoomSessionProjectionKind::Advanced);
+        assert_eq!(projection.sequence, 1);
+        assert_eq!(projection.durable_revision, advanced_revision);
+        assert_eq!(projection.view, advanced_view);
     }
 
     #[test]

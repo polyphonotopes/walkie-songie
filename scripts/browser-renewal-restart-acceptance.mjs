@@ -43,8 +43,14 @@ assert.ok(
   artifactContains(dist, "renewalCut"),
   "instrumented artifact does not contain the acceptance-only renewal cut hook",
 );
+assert.ok(
+  artifactContains(dist, "renewalReplayStale"),
+  "instrumented artifact does not contain the acceptance-only stale-offer replay hook",
+);
 const timeoutMs = Number(process.env.WALKIE_ACCEPTANCE_TIMEOUT_MS ?? 90_000);
 const targetKey = 36;
+const staleOfferStorageKey = "walkie-acceptance-stale-renewal-offer";
+const staleReplayArmStorageKey = "walkie-acceptance-stale-renewal-replay-armed";
 
 for (const required of ["index.html", "sw.js", "all-around-keyboard.esm.min.js"]) {
   assert.ok(existsSync(join(dist, required)), `missing release artifact: ${join(dist, required)}`);
@@ -107,14 +113,16 @@ function alphabetic(value) {
   return result;
 }
 
-function attachDiagnostics(page, label, diagnostics, renewalTraces) {
+function attachDiagnostics(page, label, diagnostics, renewalTraces, onRenewalTrace) {
   page.on("console", (message) => {
     const entry = { label, type: message.type(), text: message.text() };
     diagnostics.push(entry);
     const prefix = "[session_renewal_trace] ";
     if (!entry.text.startsWith(prefix)) return;
     try {
-      renewalTraces.push({ label, ...JSON.parse(entry.text.slice(prefix.length)) });
+      const trace = { label, ...JSON.parse(entry.text.slice(prefix.length)) };
+      renewalTraces.push(trace);
+      onRenewalTrace?.(trace);
     } catch (error) {
       renewalTraces.push({ label, parseError: String(error), raw: entry.text });
     }
@@ -124,9 +132,9 @@ function attachDiagnostics(page, label, diagnostics, renewalTraces) {
   });
 }
 
-async function openPeer(context, label, url, diagnostics, renewalTraces) {
+async function openPeer(context, label, url, diagnostics, renewalTraces, onRenewalTrace) {
   const page = await context.newPage();
-  attachDiagnostics(page, label, diagnostics, renewalTraces);
+  attachDiagnostics(page, label, diagnostics, renewalTraces, onRenewalTrace);
   await page.goto(url, { waitUntil: "domcontentloaded" });
   await page.waitForSelector("all-around-keyboard", { state: "attached", timeout: timeoutMs });
   return page;
@@ -139,6 +147,12 @@ async function waitUntil(predicate, description) {
     if (value) return value;
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
   }
+  // A console event can land in the same task turn that expires the polling
+  // deadline. Observe it once more before reporting failure so a successful
+  // boundary event cannot be serialized into the failure diagnostics while
+  // the assertion still claims it was absent.
+  const boundaryValue = predicate();
+  if (boundaryValue) return boundaryValue;
   throw new Error(`timed out waiting for ${description}`);
 }
 
@@ -182,35 +196,92 @@ try {
   };
   const cutContext = await browser.newContext({ serviceWorkers: "allow" });
   const peerContext = await browser.newContext({ serviceWorkers: "allow" });
-  const cutUrl = `${origin}/?sessionTrace=1&renewalCut=1#${room}`;
-  const normalUrl = `${origin}/?sessionTrace=1#${room}`;
+  const cutUrl = `${origin}/?sessionTrace=1&renewalCut=1&renewalReplayStale=1#${room}`;
+  const normalUrl = `${origin}/?sessionTrace=1&renewalReplayStale=1&renewalReplayArmed=1#${room}`;
+  const peerUrl = `${origin}/?sessionTrace=1&renewalReplayStale=1#${room}`;
 
-  let cutPage = await openPeer(cutContext, "cut", cutUrl, diagnostics, renewalTraces);
-  const peerPage = await openPeer(peerContext, "peer", normalUrl, diagnostics, renewalTraces);
-
-  const cut = await waitUntil(
-    () =>
-      renewalTraces.find(
-        (trace) => trace.label === "cut" && trace.stage === "FloorPersistedBeforeEgressCut",
-      ),
-    "a durable renewal floor followed by the injected pre-egress cut",
+  let resolveCutTrace;
+  const cutTracePromise = new Promise((resolvePromise) => {
+    resolveCutTrace = resolvePromise;
+  });
+  let cutTermination;
+  let cutDiagnosticIndex;
+  let cutPage = await openPeer(
+    cutContext,
+    "cut",
+    cutUrl,
+    diagnostics,
+    renewalTraces,
+    (trace) => {
+      if (trace.stage !== "FloorPersistedBeforeEgressCut" || cutTermination) return;
+      // Terminate the page/worker directly from the console event callback.
+      // Any DOM or storage inspection before close would leave the deliberately
+      // cut task alive long enough to heal in memory and invalidate the crash
+      // boundary this gate is meant to exercise.
+      cutDiagnosticIndex = diagnostics.length;
+      cutTermination = cutPage.close();
+      resolveCutTrace(trace);
+    },
   );
+  const peerPage = await openPeer(peerContext, "peer", peerUrl, diagnostics, renewalTraces);
+
+  let cutTimeout;
+  const cut = await Promise.race([
+    cutTracePromise,
+    new Promise((_, reject) =>
+      (cutTimeout = setTimeout(
+        () => reject(new Error("timed out waiting for the injected pre-egress cut")),
+        timeoutMs,
+      )),
+    ),
+  ]);
+  clearTimeout(cutTimeout);
+  await cutTermination;
+  await waitUntil(
+    () =>
+      diagnostics
+        .slice(cutDiagnosticIndex)
+        .find(
+          (entry) =>
+            entry.label === "peer" &&
+            (entry.text.includes("connectionState = Disconnected") ||
+              entry.text.includes("connectionState = Failed")),
+        ),
+    "the surviving peer to observe termination of the old WebRTC placement",
+  );
+  // Give the browser one task turn after its observable path fence before
+  // binding the replacement endpoint with the same persisted identity.
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
   assert.ok(cut.epoch > 0, "the persisted cut floor has no positive epoch");
   assert.equal(cut.floor_epoch, cut.epoch, "the cut did not report the persisted floor");
-  assert.equal(await overlayCount(cutPage, targetKey), 0, "cut exposed speculative pitch state");
   assert.equal(await overlayCount(peerPage, targetKey), 0, "peer exposed speculative pitch state");
+  const terminatedState = await cutContext.storageState();
+  const retainedStaleOffer = terminatedState.origins
+    .find((entry) => entry.origin === origin)
+    ?.localStorage.find((entry) => entry.name === staleOfferStorageKey)?.value;
+  assert.ok(retainedStaleOffer, "cut page did not retain the real signed epoch-1 offer");
+  await peerPage.evaluate(
+    ({ armKey, offerKey, value }) => {
+      localStorage.setItem(offerKey, value);
+      localStorage.setItem(armKey, "1");
+    },
+    {
+      armKey: staleReplayArmStorageKey,
+      offerKey: staleOfferStorageKey,
+      value: retainedStaleOffer,
+    },
+  );
 
   // Closing the only page in this context terminates its dedicated worker. The
   // same context is retained so the restarted page must recover the floor from
   // the real origin-scoped IndexedDB database.
-  await cutPage.close();
   cutPage = await openPeer(cutContext, "reopened", normalUrl, diagnostics, renewalTraces);
 
   const recovered = await waitUntil(
     () =>
       renewalTraces.find(
         (trace) =>
-          trace.label === "reopened" &&
+          (trace.label === "peer" || trace.label === "reopened") &&
           trace.stage === "RecoveredFloor" &&
           trace.floor_epoch === cut.epoch,
       ),
@@ -246,6 +317,41 @@ try {
       ),
     "the peer to authenticate and install the same higher session",
   );
+  const staleRefusal = await waitUntil(
+    () =>
+      renewalTraces.find(
+        (trace) =>
+          (trace.label === "peer" || trace.label === "reopened") &&
+          trace.stage === "StaleOfferRefused" &&
+          trace.epoch <= recovered.floor_epoch &&
+          trace.floor_epoch >= recovered.floor_epoch,
+      ),
+    "the restarted worker to refuse the deliberately replayed stale signed offer",
+  );
+  const postRefusalSession = await waitUntil(
+    () => {
+      const installs = renewalTraces.filter(
+        (trace) =>
+          trace.stage === "SessionInstalled" && trace.epoch > staleRefusal.floor_epoch,
+      );
+      for (const install of installs) {
+        const otherLabel = install.label === "peer" ? "reopened" : "peer";
+        const counterpart = installs.find(
+          (candidate) =>
+            candidate.label === otherLabel && candidate.epoch === install.epoch,
+        );
+        if (counterpart) {
+          return {
+            epoch: install.epoch,
+            first: install,
+            counterpart,
+          };
+        }
+      }
+      return undefined;
+    },
+    "both workers to install the authenticated higher session prompted by stale-floor recovery",
+  );
 
   const reopenedRegressions = renewalTraces.filter(
     (trace) =>
@@ -277,7 +383,7 @@ try {
   assert.deepEqual(pageFailures, [], `uncaught browser errors: ${JSON.stringify(pageFailures)}`);
 
   const report = {
-    schema: "walkie.browser-renewal-restart@2",
+    schema: "walkie.browser-renewal-restart@3",
     runStartedAt: runStartedAt.toISOString(),
     capturedAt: new Date().toISOString(),
     room,
@@ -295,14 +401,14 @@ try {
     higherOffer,
     reopenedInstall,
     peerInstall,
-    staleOfferRefused: renewalTraces.some(
-      (trace) => trace.stage === "StaleOfferRefused" && trace.floor_epoch >= cut.epoch,
-    ),
+    staleOfferRefused: staleRefusal,
+    postRefusalSession,
     assertions: {
       realIndexedDbTerminateReopen: true,
       persistedFloorNeverRegressed: true,
       oldSpeculativeStateNeverReopened: true,
       higherEpochAuthenticatedByBothPeers: true,
+      staleSignedOfferDeliveredAndRefused: true,
       addRemoveConvergedAfterRecovery: true,
     },
   };

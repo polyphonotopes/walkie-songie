@@ -252,7 +252,7 @@ send_wrapper = { version = "0.6", optional = true }
 
 gloo-timers = { version = "0.3", features = ["futures"], optional = true }
 web-sys = { version = "0.3", optional = true, features = [
-    "Window", "WorkerGlobalScope", "Performance", "Location", "console",
+    "Window", "WorkerGlobalScope", "Performance", "Location", "Storage", "console",
     "Document", "Element", "HtmlElement", "HtmlButtonElement", "HtmlTextAreaElement", "HtmlInputElement", "HtmlSelectElement",
     "HtmlCollection", "DomTokenList", "NodeList",
     "AudioContext", "AudioContextState", "AudioWorklet", "AudioWorkletNode", "AudioWorkletNodeOptions",

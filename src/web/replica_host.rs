@@ -17,6 +17,9 @@ use futures::{
 };
 use wasm_bindgen_futures::spawn_local;
 
+#[cfg(feature = "browser-acceptance-faults")]
+use crate::room::session::{RoomSessionRenewalTraceStage, is_session_offer, session_offer_target};
+
 use crate::{
     client::{
         AppError, AppErrorCode, AppEvent, AppEventEnvelope, AppSnapshot, CLIENT_PROTOCOL_VERSION,
@@ -75,6 +78,71 @@ fn session_tracing_enabled() -> bool {
 #[cfg(feature = "browser-acceptance-faults")]
 fn session_renewal_test_cut_enabled() -> bool {
     session_tracing_enabled() && browser_query_flag("renewalCut")
+}
+
+#[cfg(feature = "browser-acceptance-faults")]
+fn session_renewal_stale_replay_enabled() -> bool {
+    session_tracing_enabled() && browser_query_flag("renewalReplayStale")
+}
+
+#[cfg(feature = "browser-acceptance-faults")]
+const STALE_RENEWAL_OFFER_KEY: &str = "walkie-acceptance-stale-renewal-offer";
+
+#[cfg(feature = "browser-acceptance-faults")]
+const STALE_RENEWAL_REPLAY_ARM_KEY: &str = "walkie-acceptance-stale-renewal-replay-armed";
+
+#[cfg(feature = "browser-acceptance-faults")]
+fn session_renewal_stale_replay_armed() -> bool {
+    browser_query_flag("renewalReplayArmed")
+        || web_sys::window()
+            .and_then(|window| window.local_storage().ok())
+            .flatten()
+            .and_then(|storage| storage.get_item(STALE_RENEWAL_REPLAY_ARM_KEY).ok())
+            .flatten()
+            .as_deref()
+            == Some("1")
+}
+
+#[cfg(feature = "browser-acceptance-faults")]
+fn retain_stale_renewal_offer(bytes: &[u8]) {
+    let encoded = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if let Some(storage) = web_sys::window()
+        .and_then(|window| window.local_storage().ok())
+        .flatten()
+        && storage
+            .get_item(STALE_RENEWAL_OFFER_KEY)
+            .ok()
+            .flatten()
+            .is_none()
+    {
+        let _ = storage.set_item(STALE_RENEWAL_OFFER_KEY, &encoded);
+    }
+}
+
+#[cfg(feature = "browser-acceptance-faults")]
+fn load_stale_renewal_offer() -> Option<Vec<u8>> {
+    let storage = web_sys::window()?.local_storage().ok()??;
+    let encoded = storage.get_item(STALE_RENEWAL_OFFER_KEY).ok()??;
+    if encoded.len() % 2 != 0 {
+        return None;
+    }
+    (0..encoded.len())
+        .step_by(2)
+        .map(|offset| u8::from_str_radix(&encoded[offset..offset + 2], 16).ok())
+        .collect()
+}
+
+#[cfg(feature = "browser-acceptance-faults")]
+fn clear_stale_renewal_offer() {
+    if let Some(storage) = web_sys::window()
+        .and_then(|window| window.local_storage().ok())
+        .flatten()
+    {
+        let _ = storage.remove_item(STALE_RENEWAL_OFFER_KEY);
+    }
 }
 
 fn browser_query_flag(name: &str) -> bool {
@@ -1229,6 +1297,12 @@ fn spawn_room_loop(
                             }
                             NativeNetworkEvent::Message { bytes, .. } => {
                                 if is_session_carrier(&bytes) {
+                                    #[cfg(feature = "browser-acceptance-faults")]
+                                    if session_renewal_stale_replay_enabled()
+                                        && is_session_offer(&bytes)
+                                    {
+                                        retain_stale_renewal_offer(&bytes);
+                                    }
                                     if let Err(error) = worker
                                         .send_session(RoomSessionIngress::Carrier {
                                             bytes,
@@ -1464,6 +1538,12 @@ fn spawn_session_loop(
     reset_outstanding: Rc<Cell<bool>>,
 ) {
     let draining = Rc::new(Cell::new(false));
+    #[cfg(feature = "browser-acceptance-faults")]
+    let stale_replay_enabled = session_renewal_stale_replay_enabled();
+    #[cfg(feature = "browser-acceptance-faults")]
+    let retained_offer = Rc::new(RefCell::new(load_stale_renewal_offer()));
+    #[cfg(feature = "browser-acceptance-faults")]
+    let stale_offer_replayed = Rc::new(Cell::new(false));
     spawn_local(async move {
         while alive.get() {
             let Some(event) = worker.next_session_event().await else {
@@ -1471,6 +1551,14 @@ fn spawn_session_loop(
             };
             match event {
                 RoomSessionEgress::Carrier(carrier) => {
+                    #[cfg(feature = "browser-acceptance-faults")]
+                    if stale_replay_enabled
+                        && retained_offer.borrow().is_none()
+                        && is_session_offer(&carrier)
+                    {
+                        retain_stale_renewal_offer(&carrier);
+                        *retained_offer.borrow_mut() = Some(carrier.clone());
+                    }
                     let host = host.clone();
                     let handle = handle.clone();
                     spawn_local(async move {
@@ -1586,6 +1674,37 @@ fn spawn_session_loop(
                 }
                 RoomSessionEgress::RenewalTrace(trace) => {
                     log_session_renewal_trace(&trace);
+                    #[cfg(feature = "browser-acceptance-faults")]
+                    if stale_replay_enabled
+                        && session_renewal_stale_replay_armed()
+                        && trace.stage == RoomSessionRenewalTraceStage::SessionInstalled
+                        && !stale_offer_replayed.get()
+                        && let Some(stale_offer) = retained_offer
+                            .borrow()
+                            .clone()
+                            .or_else(load_stale_renewal_offer)
+                        && session_offer_target(&stale_offer)
+                            == Some(host.identity.capability_actor_id())
+                    {
+                        stale_offer_replayed.set(true);
+                        clear_stale_renewal_offer();
+                        let host = host.clone();
+                        let worker = worker.clone();
+                        spawn_local(async move {
+                            if let Err(error) = worker
+                                .send_session(RoomSessionIngress::Carrier {
+                                    bytes: stale_offer,
+                                    received_at_micros: browser_time_micros(),
+                                })
+                                .await
+                            {
+                                host.emit_diagnostic(
+                                    "session_stale_offer_replay",
+                                    &format!("acceptance stale-offer delivery failed: {error}"),
+                                );
+                            }
+                        });
+                    }
                 }
             }
         }

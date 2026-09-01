@@ -33,6 +33,10 @@ assert.equal(
 
 const forbidden = [
   "renewalCut",
+  "renewalReplayStale",
+  "renewalReplayArmed",
+  "walkie-acceptance-stale-renewal-offer",
+  "walkie-acceptance-stale-renewal-replay-armed",
   "FloorPersistedBeforeEgressCut",
   "injected renewal crash cut",
 ];
@@ -56,6 +60,7 @@ const report = {
   },
   assertions: {
     renewalCutQueryAbsent: true,
+    staleOfferReplayQueryAbsent: true,
     renewalCutTraceStageAbsent: true,
     renewalCutDiagnosticAbsent: true,
   },
