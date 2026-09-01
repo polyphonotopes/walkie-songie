@@ -20,7 +20,7 @@ export const requiredPassingTrials = 2;
 export const grossCeilingMultiplier = 4;
 
 const metricDefinitions = Object.freeze([
-  ["localDomMutation", "steady local DOM mutation", "localDomMutationP95"],
+  ["localDomMutation", "steady reversible local effective-view DOM mutation", "localDomMutationP95"],
   ["localVisible", "steady local visibility", "localVisibleP95"],
   ["peerDomMutation", "steady peer DOM mutation", "peerDomMutationP95"],
   ["peerVisible", "steady peer visibility", "peerVisibleP95"],
@@ -31,7 +31,7 @@ const metricDefinitions = Object.freeze([
 const thesisTargetDefinitions = Object.freeze([
   [
     "localVisibleFeedback",
-    "reversible local pressed-feedback acknowledgement",
+    "reversible generation-scoped local effective-view acknowledgement",
     "localVisibleFeedbackP95",
   ],
   [

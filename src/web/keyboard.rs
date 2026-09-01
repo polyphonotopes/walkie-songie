@@ -6,7 +6,7 @@
 //! - Intent out via typed `keyboardintent` events
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use dominator::{Dom, clone, html};
@@ -203,7 +203,8 @@ const BASS_CLEF: &str = "𝄢";
 const TREBLE_CLEF: &str = "𝄞";
 
 /// Sync keyboard state with active pitches from ALL peers.
-/// - Toggle pitches show with sunny/manual overlay
+/// - Toggle pitches show the canonical set plus the bounded, reversible local
+///   membership prediction while an exact worker outcome is pending
 /// - Emoji pieces show as emoji indicators on keys
 /// - Voice pitches show with wavy overlay and shout emoji
 /// - Bass/treble clef indicators show lowest/highest notes
@@ -212,15 +213,31 @@ pub fn sync_active_pitches(state: &Arc<AppState>) {
     let room = room_handle.lock_ref();
     let tuning = state.tuning.lock_ref();
     let pc_count = tuning.pitch_class_count() as i32;
+    let tuning_id = tuning.id();
     drop(tuning);
 
-    // Toggle pitch classes (manual/ambient toggles)
-    let toggle_notes: Vec<u8> = room
+    // One derived local effective view: the worker-owned canonical pitch
+    // classes plus exact generation-scoped pending membership intent. This
+    // never writes RoomProjection, SharedPitchSet, MIDI, carrier, or storage.
+    let mut toggle_notes: BTreeSet<u8> = room
         .shared_pitches()
         .iter()
         .filter_map(|pc| u8::try_from(pc.index()).ok())
         .collect();
-    sync_toggle_overlays(&toggle_notes);
+    for (target, desired_active) in state.pending_membership_predictions() {
+        if target.tuning_id != tuning_id {
+            continue;
+        }
+        let Ok(index) = u8::try_from(target.degree.index()) else {
+            continue;
+        };
+        if desired_active {
+            toggle_notes.insert(index);
+        } else {
+            toggle_notes.remove(&index);
+        }
+    }
+    sync_toggle_overlays(&toggle_notes.into_iter().collect::<Vec<_>>());
 
     // Piece pitch classes (emoji pieces)
     let pieces = room.all_pieces();

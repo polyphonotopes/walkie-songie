@@ -680,11 +680,14 @@ function assertCompactSessionPipeline({
     peerGate.atMicros,
     "peer signal application",
   );
+  // Local membership-shaped presentation is deliberately generation-scoped
+  // and reversible. It must precede the worker confirmation; assertSingleMutation
+  // above proves an agreeing confirmation did not repaint it.
   pushDuration(
-    timings.localSignalToDom,
-    sourceMutation.at * 1_000,
+    timings.localEffectiveViewToWorkerConfirmation,
     sourceSignal.atMicros,
-    "local signal-to-DOM",
+    sourceMutation.at * 1_000,
+    "local effective-view mutation to worker confirmation",
   );
   pushDuration(
     timings.peerSignalToDom,
@@ -813,7 +816,7 @@ const timings = {
   peerSidebandAck: [],
   peerGate: [],
   peerSignal: [],
-  localSignalToDom: [],
+  localEffectiveViewToWorkerConfirmation: [],
   peerSignalToDom: [],
   localDomToRender: [],
   peerDomToRender: [],
@@ -962,13 +965,13 @@ try {
     performanceTargets: {
       localVisibleFeedback: {
         targetMs: 5,
-        metric: "intent to reversible all-around-keyboard pressedNotes acknowledgement",
-        observedSteadyP95Ms: steady.localPressedFeedback?.p95 ?? null,
+        metric: "intent to reversible generation-scoped local effective-view DOM mutation",
+        observedSteadyP95Ms: steady.localDomMutation?.p95 ?? null,
         met:
-          Number.isFinite(steady.localPressedFeedback?.p95) &&
-          steady.localPressedFeedback.p95 < 5,
+          Number.isFinite(steady.localDomMutation?.p95) &&
+          steady.localDomMutation.p95 < 5,
         note:
-          "This generation-scoped acknowledgement is bounded and reversible; canonical sunny membership, durable confirmation, component rendering, and paint are reported separately.",
+          "This effective view is canonical SharedPitchSet plus bounded reversible intent tokens. Exact confirmation must not repaint; rejection or generation reset rolls it back. Canonical confirmation, component rendering, and paint are reported separately.",
       },
       remoteCausalProjection: {
         targetMs: 15,

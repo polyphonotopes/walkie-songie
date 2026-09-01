@@ -1,8 +1,8 @@
 //! Bounded, reversible window-local acknowledgement of input intent.
 //!
-//! This never materializes or derives a `SharedPitchSet`. It only records
-//! which controls are awaiting a worker outcome so the UI/audio boundary can
-//! acknowledge a press without pretending canonical membership changed.
+//! This never materializes or writes a `SharedPitchSet`. It records which
+//! controls are awaiting a worker outcome so presentation can derive one
+//! reversible effective view without pretending canonical membership changed.
 
 use serde::{Deserialize, Serialize};
 
@@ -243,6 +243,20 @@ impl<const CAPACITY: usize> PerformanceFeedback<CAPACITY> {
         degrees
     }
 
+    /// Latest membership-shaped presentation prediction for each pending
+    /// target. This is a read-only input to the local effective view; it must
+    /// never author room state, MIDI, carrier frames, or durable records.
+    pub(crate) fn pending_membership_predictions(&self) -> Vec<(TunedDegree, bool)> {
+        let mut predictions: Vec<_> = self
+            .slots
+            .iter()
+            .flatten()
+            .map(|pending| (pending.target, pending.desired_active))
+            .collect();
+        predictions.sort_by_key(|(target, _)| *target);
+        predictions
+    }
+
     /// The latest desired membership for a target, used only to interpret a
     /// subsequent user tap while that earlier intent is still pending.
     pub(crate) fn desired(&self, target: &TunedDegree) -> Option<bool> {
@@ -381,6 +395,10 @@ mod tests {
         assert_eq!(feedback.len(), 1);
         assert_eq!(feedback.pending_pressed_degrees(), vec![degree(5)]);
         assert_eq!(feedback.desired(&degree(5)), Some(false));
+        assert_eq!(
+            feedback.pending_membership_predictions(),
+            vec![(degree(5), false)]
+        );
         assert!(
             feedback
                 .begin(

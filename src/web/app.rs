@@ -397,10 +397,10 @@ impl AppState {
         }
     }
 
-    /// Presence of a pitch class in the projected (authoritative) snapshot —
-    /// the exact set `apply_room_view` computed and the projection paints.
-    /// The tap handler reads this to derive an absolute, idempotent intent
-    /// (`AddDegree`/`RemoveDegree`) instead of a store-blind toggle involution.
+    /// Effective presence used to interpret the next local tap. A pending,
+    /// generation-scoped intent temporarily overrides the authoritative
+    /// snapshot; it remains reversible presentation state and never authors
+    /// membership itself.
     pub fn degree_is_active(&self, pitch_class: PitchClass) -> bool {
         let Some(pitch) = self.current_native_pitch(pitch_class) else {
             return false;
@@ -596,6 +596,12 @@ impl AppState {
 
     pub(crate) fn pending_pressed_degrees(&self) -> Vec<TunedDegree> {
         self.performance_feedback.borrow().pending_pressed_degrees()
+    }
+
+    pub(crate) fn pending_membership_predictions(&self) -> Vec<(TunedDegree, bool)> {
+        self.performance_feedback
+            .borrow()
+            .pending_membership_predictions()
     }
 
     fn apply_realtime_midi(&self, midi: RealtimeMidiSnapshot) {
