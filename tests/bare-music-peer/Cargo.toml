@@ -14,8 +14,8 @@ publish = false
 # two dependencies back in the same change.
 tutti-music = { path = "../../../tutti/tutti-music" }
 tutti-music-hhhs = { path = "../../../tutti/tutti-music-hhhs" }
-hhhs = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "833f7029925a9867b96325e5c6d0ada9346415e6" }
-hhhs-proof = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "833f7029925a9867b96325e5c6d0ada9346415e6" }
-hhhs-replica = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "833f7029925a9867b96325e5c6d0ada9346415e6" }
-hhhs-store = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "833f7029925a9867b96325e5c6d0ada9346415e6" }
-hhhs-sync = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "833f7029925a9867b96325e5c6d0ada9346415e6", features = ["driver"] }
+hhhs = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "6a3a96ee88e570ce3004edd88672e63434986050" }
+hhhs-proof = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "6a3a96ee88e570ce3004edd88672e63434986050" }
+hhhs-replica = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "6a3a96ee88e570ce3004edd88672e63434986050" }
+hhhs-store = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "6a3a96ee88e570ce3004edd88672e63434986050" }
+hhhs-sync = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "6a3a96ee88e570ce3004edd88672e63434986050", features = ["driver"] }
