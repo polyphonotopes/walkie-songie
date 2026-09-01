@@ -13,9 +13,10 @@ use std::{
 };
 
 use futures::SinkExt;
-use hhhs::{Digest, EntryHash};
+use hhhs::{DagRead, Digest, EntryHash};
 use hhhs_replica::{
-    AsyncTransactionSink, DurableReplicaHost, ReplicaRecord, ReplicaRepairSnapshot,
+    AdmissionRequest, AsyncTransactionSink, DurableReplicaHost, ReplicaRecord,
+    ReplicaRepairSnapshot,
 };
 use hhhs_store::{MemoryStorage, StorageTransaction, history_root};
 use hhhs_sync::{
@@ -31,7 +32,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use crate::{
     net::{PeerId, ReplicaLiveRecord, repair_lane, replica_frontier_digest},
     room::v5::{
-        ActorId, MusicOp, RoomCommand, RoomIdentity, RoomLane, RoomPresence, RoomReplicas, RoomView,
+        ActorId, MusicOp, RoomCommand, RoomDurableContext, RoomIdentity, RoomLane, RoomPresence,
+        RoomReplicas, RoomView, lane_trusted_root,
     },
     tuning::TunedPeriodicPitch,
 };
@@ -334,7 +336,7 @@ pub(crate) struct RoomDataPlane<D>
 where
     D: AsyncTransactionSink,
 {
-    room: RoomReplicas<MemoryStorage, MemoryStorage>,
+    room: RoomDurableContext,
     music: DurableLane<D>,
     extension: DurableLane<D>,
     signing_key: hhhs_proof::SigningKey,
@@ -355,17 +357,60 @@ where
         extension_transactions: Vec<StorageTransaction>,
     ) -> Result<Self, String> {
         let identity = RoomIdentity::from_object(Digest(request.object));
-        let room = RoomReplicas::from_transaction_logs(
+        let replicas = RoomReplicas::from_transaction_logs(
             identity,
             request.owner,
             music_transactions,
             extension_transactions,
         )
         .map_err(|error| error.to_string())?;
+        let (room, music_replica, extension_replica) = replicas.into_durable_parts();
         let signing_key = hhhs_proof::SigningKey::from_bytes(&request.identity_seed);
         let local_actor = ActorId::from_signing_key(&signing_key);
-        let mut music = CachedRepairHost::new(room.music_durable_host(music_log));
-        let mut extension = CachedRepairHost::new(room.extension_durable_host(extension_log));
+        let mut music_host = DurableReplicaHost::try_new(music_replica, music_log)
+            .map_err(|error| format!("claiming durable music lane: {}", error.reason()))?;
+        let mut extension_host = DurableReplicaHost::try_new(extension_replica, extension_log)
+            .map_err(|error| format!("claiming durable extension lane: {}", error.reason()))?;
+        if !music_host
+            .snapshot()
+            .map_err(|error| error.to_string())?
+            .history
+            .contains(&room.root_for_lane(RoomLane::Music))
+        {
+            let prepared = music_host
+                .preparation()
+                .map_err(|error| error.to_string())?
+                .prepare(AdmissionRequest::trusted_root(lane_trusted_root(
+                    room.identity().music,
+                    request.owner,
+                )))
+                .map_err(|error| error.to_string())?;
+            music_host
+                .commit_prepared(prepared)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        if !extension_host
+            .snapshot()
+            .map_err(|error| error.to_string())?
+            .history
+            .contains(&room.root_for_lane(RoomLane::Extension))
+        {
+            let prepared = extension_host
+                .preparation()
+                .map_err(|error| error.to_string())?
+                .prepare(AdmissionRequest::trusted_root(lane_trusted_root(
+                    room.identity().extension,
+                    request.owner,
+                )))
+                .map_err(|error| error.to_string())?;
+            extension_host
+                .commit_prepared(prepared)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        let mut music = CachedRepairHost::new(music_host);
+        let mut extension = CachedRepairHost::new(extension_host);
 
         let grant_authority = request
             .authority_seed
@@ -374,12 +419,24 @@ where
             if ActorId::from_signing_key(authority) != request.owner {
                 return Err("Room worker authority does not match room owner".into());
             }
+            let music_snapshot = music
+                .inner()
+                .snapshot()
+                .map_err(|error| error.to_string())?;
             if room
-                .capabilities_for_lane(local_actor, RoomLane::Music)
+                .capabilities_for_lane(local_actor, RoomLane::Music, &music_snapshot)
                 .is_empty()
             {
                 let prepared = room
-                    .prepare_member_grant(RoomLane::Music, authority, local_actor)
+                    .prepare_member_grant(
+                        RoomLane::Music,
+                        music
+                            .inner()
+                            .preparation()
+                            .map_err(|error| error.to_string())?,
+                        authority,
+                        local_actor,
+                    )
                     .map_err(|error| error.to_string())?;
                 music
                     .inner_mut()
@@ -387,12 +444,24 @@ where
                     .await
                     .map_err(|error| error.to_string())?;
             }
+            let extension_snapshot = extension
+                .inner()
+                .snapshot()
+                .map_err(|error| error.to_string())?;
             if room
-                .capabilities_for_lane(local_actor, RoomLane::Extension)
+                .capabilities_for_lane(local_actor, RoomLane::Extension, &extension_snapshot)
                 .is_empty()
             {
                 let prepared = room
-                    .prepare_member_grant(RoomLane::Extension, authority, local_actor)
+                    .prepare_member_grant(
+                        RoomLane::Extension,
+                        extension
+                            .inner()
+                            .preparation()
+                            .map_err(|error| error.to_string())?,
+                        authority,
+                        local_actor,
+                    )
                     .map_err(|error| error.to_string())?;
                 extension
                     .inner_mut()
@@ -427,27 +496,64 @@ where
         }
     }
 
-    fn projection(&self) -> RoomWorkerProjection {
-        let (view, music, extension) = self.room.view_with_frontiers();
-        let music_snapshot = self.room.music_snapshot();
-        RoomWorkerProjection {
+    fn lane_snapshot(&self, lane: RoomLane) -> Result<hhhs_store::StorageSnapshot, String> {
+        self.lane(lane)
+            .inner()
+            .snapshot()
+            .map_err(|error| error.to_string())
+    }
+
+    fn music_snapshot(&self) -> Result<hhhs_store::StorageSnapshot, String> {
+        self.lane_snapshot(RoomLane::Music)
+    }
+
+    fn view(&self) -> Result<RoomView, String> {
+        let music = self.music_snapshot()?;
+        let extension = self.lane_snapshot(RoomLane::Extension)?;
+        Ok(self.room.view_with_snapshots(&music, &extension).0)
+    }
+
+    fn capabilities_for_lane(
+        &self,
+        actor: ActorId,
+        lane: RoomLane,
+    ) -> Result<Vec<EntryHash>, String> {
+        let snapshot = self.lane_snapshot(lane)?;
+        Ok(self.room.capabilities_for_lane(actor, lane, &snapshot))
+    }
+
+    fn projection(&self) -> Result<RoomWorkerProjection, String> {
+        let music_snapshot = self.music_snapshot()?;
+        let extension_snapshot = self.lane_snapshot(RoomLane::Extension)?;
+        let (view, music, extension) = self
+            .room
+            .view_with_snapshots(&music_snapshot, &extension_snapshot);
+        Ok(RoomWorkerProjection {
             view,
             music_revision: music_snapshot.sequence,
             music_history_root: *history_root(&music_snapshot.history).as_bytes(),
             music_frontier: *replica_frontier_digest(&music).as_bytes(),
             extension_frontier: *replica_frontier_digest(&extension).as_bytes(),
-        }
+        })
     }
 
     async fn commit(&mut self, command: RoomCommand) -> Result<(EntryHash, ReplicaRecord), String> {
         let lane = command.lane();
-        let capabilities = self.room.capabilities_for_lane(self.local_actor, lane);
+        let capabilities = self.capabilities_for_lane(self.local_actor, lane)?;
         if capabilities.is_empty() {
             return Err("local actor has no live capability for this Room-v5 lane".into());
         }
         let prepared = self
             .room
-            .prepare_author_presenting(&self.signing_key, &capabilities, command)
+            .prepare_author_presenting(
+                self.lane(lane)
+                    .inner()
+                    .preparation()
+                    .map_err(|error| error.to_string())?,
+                &self.signing_key,
+                &capabilities,
+                command,
+            )
             .map_err(|error| error.to_string())?;
         let committed = self
             .lane_mut(lane)
@@ -473,15 +579,22 @@ where
         ),
         String,
     > {
-        let capabilities = self
-            .room
-            .capabilities_for_lane(self.local_actor, RoomLane::Music);
+        let capabilities = self.capabilities_for_lane(self.local_actor, RoomLane::Music)?;
         if capabilities.is_empty() {
             return Err("local actor has no live capability for the music session".into());
         }
         let (prepared, entry) = self
             .room
-            .prepare_reified_music(&self.signing_key, &capabilities, plan, command)
+            .prepare_reified_music(
+                self.music
+                    .inner()
+                    .preparation()
+                    .map_err(|error| error.to_string())?,
+                &self.signing_key,
+                &capabilities,
+                plan,
+                command,
+            )
             .map_err(|error| error.to_string())?;
         let committed = self
             .music
@@ -500,16 +613,14 @@ where
     }
 
     fn session_foundation(&self, peer: ActorId) -> Result<RoomSessionFoundation, String> {
-        let local_grants = self
-            .room
-            .capabilities_for_lane(self.local_actor, RoomLane::Music);
-        let peer_grants = self.room.capabilities_for_lane(peer, RoomLane::Music);
+        let local_grants = self.capabilities_for_lane(self.local_actor, RoomLane::Music)?;
+        let peer_grants = self.capabilities_for_lane(peer, RoomLane::Music)?;
         if local_grants.is_empty() || peer_grants.is_empty() {
             return Err(
                 "session peer does not yet have a complete admitted music foundation".into(),
             );
         }
-        let snapshot = self.room.music_snapshot();
+        let snapshot = self.music_snapshot()?;
         let root = self
             .room
             .owner_capabilities()
@@ -527,7 +638,7 @@ where
             music_root: root,
             local_grants,
             peer_grants,
-            durable_view: self.room.view().music.shared_pitches,
+            durable_view: self.view()?.music.shared_pitches,
         })
     }
 
@@ -549,12 +660,20 @@ where
         };
         let mut granted = Vec::new();
         for lane in [RoomLane::Music, RoomLane::Extension] {
-            if !self.room.capabilities_for_lane(peer, lane).is_empty() {
+            if !self.capabilities_for_lane(peer, lane)?.is_empty() {
                 continue;
             }
             let prepared = self
                 .room
-                .prepare_member_grant(lane, &authority, peer)
+                .prepare_member_grant(
+                    lane,
+                    self.lane(lane)
+                        .inner()
+                        .preparation()
+                        .map_err(|error| error.to_string())?,
+                    &authority,
+                    peer,
+                )
                 .map_err(|error| error.to_string())?;
             let committed = self
                 .lane_mut(lane)
@@ -591,7 +710,8 @@ where
     ) -> Result<hhhs_replica::DurableEntryAdmission, String> {
         self.lane(lane)
             .inner()
-            .replica()
+            .preparation()
+            .map_err(|error| error.to_string())?
             .durable_entry_admission(entry)
             .ok_or_else(|| format!("durable {lane:?} entry {entry:?} is not retained"))
     }
@@ -602,15 +722,26 @@ where
         sequence: u64,
         pitch: Option<TunedPeriodicPitch>,
     ) -> Result<Vec<u8>, String> {
-        let capabilities = self.room.capabilities_for(self.local_actor);
+        let music = self.music_snapshot()?;
+        let extension = self.lane_snapshot(RoomLane::Extension)?;
+        let capabilities = self
+            .room
+            .capabilities_for(self.local_actor, &music, &extension);
         self.room
-            .sign_presence(&self.signing_key, &capabilities, session, sequence, pitch)
+            .sign_presence(
+                &music,
+                &self.signing_key,
+                &capabilities,
+                session,
+                sequence,
+                pitch,
+            )
             .map_err(|error| error.to_string())
     }
 
     fn verify_presence(&self, bytes: &[u8]) -> Result<RoomPresenceWire, String> {
         self.room
-            .verify_presence(bytes)
+            .verify_presence(&self.music_snapshot()?, bytes)
             .map(RoomPresenceWire::from)
             .map_err(|error| error.to_string())
     }
@@ -859,7 +990,7 @@ where
     }
 
     fn publish_projection(&mut self, events: &WorkerEventPort) -> Result<u64, String> {
-        let next = self.room()?.projection();
+        let next = self.room()?.projection()?;
         if self.projection.as_ref() == Some(&next) {
             return Ok(self.revision);
         }
@@ -899,9 +1030,9 @@ where
                     .map_err(|error| error.to_string())?;
                 let durable_advance = (lane == RoomLane::Music && self.session.is_some())
                     .then(|| {
-                        let snapshot = self.room()?.room.music_snapshot();
+                        let snapshot = self.room()?.music_snapshot()?;
                         let durable_revision = snapshot.sequence;
-                        let durable_view = self.room()?.room.view().music.shared_pitches;
+                        let durable_view = self.room()?.view()?.music.shared_pitches;
                         Ok::<_, String>((snapshot.history, durable_view, durable_revision))
                     })
                     .transpose()?;
@@ -950,9 +1081,9 @@ where
                 let durable_advance = (entries.iter().any(|(lane, _)| *lane == RoomLane::Music)
                     && self.session.is_some())
                 .then(|| {
-                    let snapshot = self.room()?.room.music_snapshot();
+                    let snapshot = self.room()?.music_snapshot()?;
                     let durable_revision = snapshot.sequence;
-                    let durable_view = self.room()?.room.view().music.shared_pitches;
+                    let durable_view = self.room()?.view()?.music.shared_pitches;
                     Ok::<_, String>((snapshot.history, durable_view, durable_revision))
                 })
                 .transpose()?;
@@ -993,9 +1124,9 @@ where
                 Ok(RoomWorkerResponse::SessionPeerStarted)
             }
             RoomWorkerCommand::ResetSessionProjection => {
-                let snapshot = self.room()?.room.music_snapshot();
+                let snapshot = self.room()?.music_snapshot()?;
                 let durable_revision = snapshot.sequence;
-                let durable_view = self.room()?.room.view().music.shared_pitches;
+                let durable_view = self.room()?.view()?.music.shared_pitches;
                 let (reply, response) = futures::channel::oneshot::channel();
                 self.session
                     .as_mut()
@@ -1044,9 +1175,9 @@ where
                         .encode(),
                     )
                     .map_err(|error| error.to_string())?;
-                let snapshot = self.room()?.room.music_snapshot();
+                let snapshot = self.room()?.music_snapshot()?;
                 let durable_revision = snapshot.sequence;
-                let durable_view = self.room()?.room.view().music.shared_pitches;
+                let durable_view = self.room()?.view()?.music.shared_pitches;
                 self.session
                     .as_mut()
                     .expect("session runtime checked above")
@@ -1105,7 +1236,7 @@ where
                     let session_renewal_test_cut = open.session_renewal_test_cut;
                     let room = self.factory.open(open).await?;
                     let actor = room.local_actor;
-                    let projection = room.projection();
+                    let projection = room.projection()?;
                     self.room = Some(room);
                     self.projection = Some(projection.clone());
                     self.revision = 0;
@@ -1158,9 +1289,9 @@ where
                     if accepted && lane == RoomLane::Music && self.session.is_some() {
                         let durable_admission =
                             self.room()?.durable_entry_admission(lane, entry)?;
-                        let snapshot = self.room()?.room.music_snapshot();
+                        let snapshot = self.room()?.music_snapshot()?;
                         let durable_revision = snapshot.sequence;
-                        let durable_view = self.room()?.room.view().music.shared_pitches;
+                        let durable_view = self.room()?.view()?.music.shared_pitches;
                         let input =
                             if hhhs_session::ReifiedSessionCommand::has_domain(&observed.payload) {
                                 RoomSessionTaskInput::Observed {
@@ -1207,7 +1338,11 @@ where
                         _ => false,
                     };
                     let music_revision_before = repaired_music
-                        .then(|| self.room().map(|room| room.room.music_snapshot().sequence))
+                        .then(|| {
+                            self.room()
+                                .and_then(|room| room.music_snapshot())
+                                .map(|snapshot| snapshot.sequence)
+                        })
                         .transpose()?;
                     let step = match operation {
                         RoomWorkerRepairRequest::StartInitiator { session, lane } => {
@@ -1234,13 +1369,13 @@ where
                             close_error,
                         } => self.room_mut()?.finish_repair(session, close_error)?,
                     };
-                    let music_revision_after = self.room()?.room.music_snapshot().sequence;
+                    let music_revision_after = self.room()?.music_snapshot()?.sequence;
                     let music_revision_advanced =
                         repair_revision_advanced(music_revision_before, music_revision_after);
                     if music_revision_advanced && self.session.is_some() {
-                        let snapshot = self.room()?.room.music_snapshot();
+                        let snapshot = self.room()?.music_snapshot()?;
                         let durable_revision = snapshot.sequence;
-                        let durable_view = self.room()?.room.view().music.shared_pitches;
+                        let durable_view = self.room()?.view()?.music.shared_pitches;
                         self.session
                             .as_mut()
                             .expect("session runtime checked above")
@@ -1290,9 +1425,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc};
-
     use futures::executor::block_on;
+    use hhhs_store::StorageRecoveryState;
     use hhhs_web_browser::{InProcessWorkerHost, WorkerEventKind, WorkerRequestKind};
 
     use super::*;
@@ -1301,14 +1435,30 @@ mod tests {
         tuning::{TunedDegree, Tuning},
     };
 
-    #[derive(Clone, Default)]
-    struct MemoryLog(Rc<RefCell<Vec<StorageTransaction>>>);
+    #[derive(Default)]
+    struct MemoryLog {
+        transactions: Vec<StorageTransaction>,
+        recovery_state: StorageRecoveryState,
+    }
 
     impl AsyncTransactionSink for MemoryLog {
         type Error = std::convert::Infallible;
 
-        async fn persist(&mut self, transaction: &StorageTransaction) -> Result<(), Self::Error> {
-            self.0.borrow_mut().push(transaction.clone());
+        fn writer_lease_active(&self) -> bool {
+            true
+        }
+
+        fn recovered_state(&self) -> StorageRecoveryState {
+            self.recovery_state
+        }
+
+        async fn persist(
+            &mut self,
+            transaction: &StorageTransaction,
+            expected: StorageRecoveryState,
+        ) -> Result<(), Self::Error> {
+            self.transactions.push(transaction.clone());
+            self.recovery_state = expected;
             Ok(())
         }
     }
@@ -1614,8 +1764,8 @@ mod tests {
             );
 
             repair_lane_between(&mut alice, &mut bob, 42, RoomLane::Music).await;
-            let alice_projection = alice.service().room().unwrap().projection();
-            let bob_projection = bob.service().room().unwrap().projection();
+            let alice_projection = alice.service().room().unwrap().projection().unwrap();
+            let bob_projection = bob.service().room().unwrap().projection().unwrap();
             assert_eq!(alice_projection.view.music, bob_projection.view.music);
             assert_eq!(
                 alice_projection.music_frontier,
@@ -1641,8 +1791,8 @@ mod tests {
             repair_lane_between(&mut alice, &mut bob, 7, RoomLane::Music).await;
             repair_lane_between(&mut alice, &mut bob, 8, RoomLane::Extension).await;
 
-            let alice_projection = alice.service().room().unwrap().projection();
-            let bob_projection = bob.service().room().unwrap().projection();
+            let alice_projection = alice.service().room().unwrap().projection().unwrap();
+            let bob_projection = bob.service().room().unwrap().projection().unwrap();
             assert_eq!(alice_projection, bob_projection);
             assert_eq!(alice_projection.view.music.live.len(), 2);
 
@@ -1693,6 +1843,7 @@ mod tests {
                     .room()
                     .unwrap()
                     .projection()
+                    .unwrap()
                     .view
                     .music
                     .shared_pitches
@@ -1706,6 +1857,7 @@ mod tests {
                     .room()
                     .unwrap()
                     .projection()
+                    .unwrap()
                     .view
                     .music
                     .shared_pitches
@@ -1721,6 +1873,7 @@ mod tests {
                         .room()
                         .unwrap()
                         .projection()
+                        .unwrap()
                         .view
                         .music
                         .shared_pitches

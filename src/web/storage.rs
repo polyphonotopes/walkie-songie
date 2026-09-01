@@ -294,6 +294,78 @@ async fn get_bytes(db: &IdbDatabase, key: &str) -> Result<Option<Vec<u8>>, Strin
     result
 }
 
+/// Load one blob only after checking its JS typed-array length against the
+/// remaining Rust-side budget. This avoids `Uint8Array::to_vec` allocating an
+/// attacker-sized legacy row before migration can reject it.
+#[cfg(feature = "browser-net")]
+async fn get_bounded_bytes(
+    db: &IdbDatabase,
+    key: &str,
+    maximum: usize,
+) -> Result<Option<Vec<u8>>, String> {
+    use std::{cell::RefCell, rc::Rc};
+
+    let transaction = db
+        .transaction_with_str(STORE_NAME)
+        .map_err(|_| "Failed to create bounded read transaction")?;
+    let store = transaction
+        .object_store(STORE_NAME)
+        .map_err(|_| "Failed to get bounded read store")?;
+    let request = store
+        .get(&JsValue::from_str(key))
+        .map_err(|_| "Failed to get bounded journal row")?;
+    let (tx, rx) = futures::channel::oneshot::channel();
+    let tx = Rc::new(RefCell::new(Some(tx)));
+    let success_tx = Rc::clone(&tx);
+    let onsuccess = Closure::once(Box::new(move |event: web_sys::Event| {
+        let result = (|| {
+            let target = event.target().ok_or("bounded journal read has no target")?;
+            let request: IdbRequest = target.unchecked_into();
+            let value = request
+                .result()
+                .map_err(|_| "bounded journal read has no result")?;
+            if value.is_undefined() || value.is_null() {
+                return Ok(None);
+            }
+            let array = js_sys::Uint8Array::new(&value);
+            let length = usize::try_from(array.length())
+                .map_err(|_| "bounded journal row length exceeds this browser")?;
+            if length > maximum {
+                return Err("bounded journal row exceeds its remaining migration budget");
+            }
+            Ok(Some(array.to_vec()))
+        })()
+        .map_err(str::to_owned);
+        if let Some(tx) = success_tx.borrow_mut().take() {
+            let _ = tx.send(result);
+        }
+    }) as Box<dyn FnOnce(_)>);
+    request.set_onsuccess(Some(onsuccess.as_ref().unchecked_ref()));
+    let error_tx = tx;
+    let onerror = Closure::once(Box::new(move |_event: web_sys::Event| {
+        if let Some(tx) = error_tx.borrow_mut().take() {
+            let _ = tx.send(Err("bounded IndexedDB journal read failed".to_owned()));
+        }
+    }) as Box<dyn FnOnce(_)>);
+    request.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+    let result = rx
+        .await
+        .map_err(|_| "bounded IndexedDB read callback closed")?;
+    request.set_onsuccess(None);
+    request.set_onerror(None);
+    result
+}
+
+#[cfg(feature = "browser-net")]
+struct IdbCloseGuard(IdbDatabase);
+
+#[cfg(feature = "browser-net")]
+impl Drop for IdbCloseGuard {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 /// Persist one byte blob and await the IndexedDB transaction-complete event.
 /// Request success alone is not durable because the containing transaction may
 /// still abort afterward.
@@ -392,86 +464,6 @@ fn session_renewal_key(key: crate::room::session::RoomSessionRenewalKey) -> Stri
     )
 }
 
-/// Append one encoded transaction and advance its manifest in the same
-/// IndexedDB transaction. Request success alone is not the durability boundary:
-/// the transaction can still abort afterward.
-#[cfg(feature = "browser-net")]
-async fn append_replica_transaction(
-    db: &IdbDatabase,
-    record_key: &str,
-    record: &[u8],
-    count_key: &str,
-    next_count: u64,
-) -> Result<(), String> {
-    use std::{cell::RefCell, rc::Rc};
-
-    let transaction = db
-        .transaction_with_str_and_mode(STORE_NAME, web_sys::IdbTransactionMode::Readwrite)
-        .map_err(|_| "Failed to create transaction")?;
-    let store: IdbObjectStore = transaction
-        .object_store(STORE_NAME)
-        .map_err(|_| "Failed to get store")?;
-
-    let arr = js_sys::Uint8Array::from(record);
-    store
-        .put_with_key(&arr, &JsValue::from_str(record_key))
-        .map_err(|_| "Failed to append replica transaction")?;
-    let count = js_sys::Uint8Array::from(next_count.to_le_bytes().as_slice());
-    store
-        .put_with_key(&count, &JsValue::from_str(count_key))
-        .map_err(|_| "Failed to advance replica manifest")?;
-
-    let (tx, rx) = futures::channel::oneshot::channel();
-    let tx = Rc::new(RefCell::new(Some(tx)));
-
-    let complete_tx = tx.clone();
-    let oncomplete = Closure::once(Box::new(move |_event: web_sys::Event| {
-        if let Some(tx) = complete_tx.borrow_mut().take() {
-            let _ = tx.send(Ok(()));
-        }
-    }) as Box<dyn FnOnce(_)>);
-    transaction.set_oncomplete(Some(oncomplete.as_ref().unchecked_ref()));
-
-    let error_tx = tx.clone();
-    let onerror = Closure::once(Box::new(move |_event: web_sys::Event| {
-        if let Some(tx) = error_tx.borrow_mut().take() {
-            let _ = tx.send(Err("IndexedDB journal transaction failed".to_owned()));
-        }
-    }) as Box<dyn FnOnce(_)>);
-    transaction.set_onerror(Some(onerror.as_ref().unchecked_ref()));
-
-    let abort_tx = tx;
-    let onabort = Closure::once(Box::new(move |_event: web_sys::Event| {
-        if let Some(tx) = abort_tx.borrow_mut().take() {
-            let _ = tx.send(Err("IndexedDB journal transaction aborted".to_owned()));
-        }
-    }) as Box<dyn FnOnce(_)>);
-    transaction.set_onabort(Some(onabort.as_ref().unchecked_ref()));
-
-    // Both writes have been queued; begin committing without waiting for their
-    // success events to make an otherwise unnecessary trip through a busy
-    // browser event loop. Atomicity and the transaction `complete` boundary are
-    // unchanged.
-    // `IDBTransaction.commit()` is standardized and supported by the browsers
-    // in Walkie's compatibility set. The pinned `web-sys` binding still marks
-    // it deprecated, so keep the allowance scoped to this one call.
-    #[allow(deprecated)]
-    if transaction.commit().is_err() {
-        transaction.set_oncomplete(None);
-        transaction.set_onerror(None);
-        transaction.set_onabort(None);
-        return Err("Failed to commit IndexedDB journal transaction".to_owned());
-    }
-
-    let result = rx
-        .await
-        .map_err(|_| "IndexedDB transaction callback closed")?;
-    transaction.set_oncomplete(None);
-    transaction.set_onerror(None);
-    transaction.set_onabort(None);
-    result
-}
-
 /// Async durable owner for one Room-v5 HHHS replica log.
 ///
 /// This is deliberately not a `ReplicaStorage` implementation: IndexedDB is
@@ -482,9 +474,7 @@ async fn append_replica_transaction(
 /// never rewrite earlier room history.
 #[cfg(feature = "browser-net")]
 pub struct IndexedDbReplicaLogV5 {
-    db: IdbDatabase,
-    prefix: String,
-    transactions: Vec<hhhs_store::StorageTransaction>,
+    inner: hhhs_web_browser::IndexedDbReplicaLog,
 }
 
 #[cfg(feature = "browser-net")]
@@ -494,72 +484,26 @@ impl IndexedDbReplicaLogV5 {
         owner: crate::room::v5::ActorId,
         lane: crate::room::v5::RoomLane,
     ) -> Result<Self, String> {
-        let db = open_db().await?;
         let prefix = replica_log_prefix_v5(room, owner, lane);
-        let count = match get_bytes(&db, &replica_count_key(&prefix)).await? {
-            None => 0,
-            Some(bytes) => {
-                let bytes: [u8; 8] = bytes
-                    .try_into()
-                    .map_err(|_| "invalid Room-v5 replica manifest length")?;
-                usize::try_from(u64::from_le_bytes(bytes))
-                    .map_err(|_| "Room-v5 replica manifest exceeds this browser's limits")?
-            }
-        };
-        let mut transactions = Vec::with_capacity(count);
-        // Bound the number of simultaneous IndexedDB requests while avoiding
-        // one event-loop round trip per historical transaction during replay.
-        const LOAD_BATCH: usize = 64;
-        for start in (0..count).step_by(LOAD_BATCH) {
-            let end = count.min(start + LOAD_BATCH);
-            let keys: Vec<_> = (start..end)
-                .map(|sequence| replica_record_key(&prefix, sequence))
-                .collect();
-            let records =
-                futures::future::try_join_all(keys.iter().map(|key| get_bytes(&db, key))).await?;
-            for (offset, record) in records.into_iter().enumerate() {
-                let sequence = start + offset;
-                let record = record
-                    .ok_or_else(|| format!("Room-v5 replica transaction {sequence} is missing"))?;
-                transactions.push(hhhs_store::decode_storage_transaction(&record).map_err(
-                    |error| format!("invalid Room-v5 replica transaction {sequence}: {error}"),
-                )?);
-            }
-        }
-        Ok(Self {
-            db,
-            prefix,
-            transactions,
-        })
+        let options = hhhs_web_browser::IndexedDbLogOptions::new(DB_NAME)
+            .with_database_version(DB_VERSION)
+            .with_transaction_store(STORE_NAME);
+        let mut inner = hhhs_web_browser::IndexedDbReplicaLog::open(
+            hhhs_web_browser::ReplicaLogId::derive(prefix.as_bytes()),
+            options,
+        )
+        .await
+        .map_err(|error| format!("failed to open sealed Room-v5 replica log: {error}"))?;
+
+        let trusted_root = crate::room::v5::trusted_root_transaction(room, owner, lane)
+            .map_err(|error| format!("failed to prepare Room-v5 trusted root: {error}"))?;
+        migrate_legacy_replica_log(&prefix, &trusted_root, &mut inner).await?;
+        Ok(Self { inner })
     }
 
     /// Decode the complete validated log for replay into a fresh memory store.
     pub fn transactions(&self) -> Result<Vec<hhhs_store::StorageTransaction>, String> {
-        Ok(self.transactions.clone())
-    }
-
-    /// Atomically append one transaction and advance the replay manifest. The
-    /// caller must not publish the prepared admission until this resolves.
-    pub async fn persist(
-        &mut self,
-        transaction: &hhhs_store::StorageTransaction,
-    ) -> Result<(), String> {
-        let sequence = self.transactions.len();
-        let next_count = u64::try_from(sequence)
-            .ok()
-            .and_then(|sequence| sequence.checked_add(1))
-            .ok_or_else(|| "Room-v5 replica manifest overflow".to_owned())?;
-        let encoded = hhhs_store::encode_storage_transaction(transaction);
-        append_replica_transaction(
-            &self.db,
-            &replica_record_key(&self.prefix, sequence),
-            &encoded,
-            &replica_count_key(&self.prefix),
-            next_count,
-        )
-        .await?;
-        self.transactions.push(transaction.clone());
-        Ok(())
+        Ok(self.inner.recovered_transactions())
     }
 }
 
@@ -567,12 +511,93 @@ impl IndexedDbReplicaLogV5 {
 impl hhhs_replica::AsyncTransactionSink for IndexedDbReplicaLogV5 {
     type Error = String;
 
+    fn writer_lease_active(&self) -> bool {
+        hhhs_replica::AsyncTransactionSink::writer_lease_active(&self.inner)
+    }
+
+    fn recovered_state(&self) -> hhhs_store::StorageRecoveryState {
+        hhhs_replica::AsyncTransactionSink::recovered_state(&self.inner)
+    }
+
     async fn persist(
         &mut self,
         transaction: &hhhs_store::StorageTransaction,
+        expected: hhhs_store::StorageRecoveryState,
     ) -> Result<(), Self::Error> {
-        IndexedDbReplicaLogV5::persist(self, transaction).await
+        hhhs_replica::AsyncTransactionSink::persist(&mut self.inner, transaction, expected)
+            .await
+            .map_err(|error| error.to_string())
     }
+}
+
+/// Move the pre-sealed count-key log into HHHS's checked log without deleting
+/// the old rows. Older already-open tabs cannot observe the new log and are
+/// not fenced by its Web Lock because only upgraded writers honor that lock.
+/// Mixed-version same-origin use is therefore unsupported during this one-way
+/// migration; close old tabs before opening the upgraded room.
+#[cfg(feature = "browser-net")]
+async fn migrate_legacy_replica_log(
+    prefix: &str,
+    trusted_root: &hhhs_store::StorageTransaction,
+    sealed: &mut hhhs_web_browser::IndexedDbReplicaLog,
+) -> Result<(), String> {
+    use hhhs_replica::AsyncTransactionSink as _;
+
+    let legacy = load_legacy_replica_transactions(prefix).await?;
+    if legacy.is_empty() {
+        return Ok(());
+    }
+
+    let plan =
+        crate::room::legacy_log::plan_migration(trusted_root, &legacy, sealed.transactions())?;
+    for append in plan {
+        let transaction = match append.source {
+            crate::room::legacy_log::LegacyMigrationSource::TrustedRoot => trusted_root,
+            crate::room::legacy_log::LegacyMigrationSource::Legacy(index) => legacy
+                .get(index)
+                .ok_or("legacy Room-v5 migration planner returned an invalid index")?,
+        };
+        sealed
+            .persist(transaction, append.expected_state)
+            .await
+            .map_err(|error| format!("failed to migrate Room-v5 transaction: {error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "browser-net")]
+async fn load_legacy_replica_transactions(
+    prefix: &str,
+) -> Result<Vec<hhhs_store::StorageTransaction>, String> {
+    let db = open_db().await?;
+    let _close = IdbCloseGuard(db.clone());
+    let manifest_key = replica_count_key(prefix);
+    let manifest_before = get_bounded_bytes(&db, &manifest_key, 8).await?;
+    let count = crate::room::legacy_log::decode_manifest_count(manifest_before.as_deref())?;
+
+    let mut transactions = Vec::new();
+    transactions
+        .try_reserve_exact(count)
+        .map_err(|_| "cannot reserve the bounded legacy Room-v5 transaction list")?;
+    let mut retained_bytes = 0_usize;
+    for sequence in 0..count {
+        let remaining = crate::room::legacy_log::MAX_LEGACY_ENCODED_BYTES
+            .checked_sub(retained_bytes)
+            .ok_or("legacy Room-v5 migration byte budget was exceeded")?;
+        let record =
+            get_bounded_bytes(&db, &replica_record_key(prefix, sequence), remaining).await?;
+        transactions.push(crate::room::legacy_log::decode_legacy_row(
+            sequence,
+            record,
+            &mut retained_bytes,
+        )?);
+    }
+    let manifest_after = get_bounded_bytes(&db, &manifest_key, 8).await?;
+    crate::room::legacy_log::require_stable_manifest(
+        manifest_before.as_deref(),
+        manifest_after.as_deref(),
+    )?;
+    Ok(transactions)
 }
 
 #[cfg(feature = "browser-net")]

@@ -1,6 +1,8 @@
 //! Capability-native Room-v5 protocol and application projections.
 
 pub mod events;
+#[cfg(any(test, all(target_arch = "wasm32", feature = "browser-net")))]
+pub(crate) mod legacy_log;
 pub mod projection;
 #[cfg(any(test, all(target_arch = "wasm32", feature = "browser-net")))]
 pub(crate) mod session;

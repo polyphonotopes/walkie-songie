@@ -22,14 +22,14 @@ use hhhs_proof::{
     VerifierRegistry,
 };
 use hhhs_replica::{
-    AdmissionOutcome, AdmissionPolicy, AdmissionRequest, AdmittedAuthority, AsyncTransactionSink,
-    CapabilityBundle, CapabilityExportError, DurableReplicaHost, PreparedAdmission, Replica,
-    ReplicaError, ReplicaRecord, ReplicaRepairHost,
+    AdmissionOutcome, AdmissionPolicy, AdmissionRequest, AdmittedAuthority, CapabilityBundle,
+    CapabilityExportError, PreparedAdmission, Replica, ReplicaError, ReplicaPreparation,
+    ReplicaRecord, ReplicaRepairHost,
 };
 use hhhs_session::ReificationPlan;
 use hhhs_store::{
     Materializer, MemoryStorage, ProjectionCheckpoint, ProjectionKey, ReplicaStorage, SecretKey,
-    SecretValue, StorageTransaction,
+    SecretValue, StorageSnapshot, StorageTransaction,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
@@ -1304,6 +1304,15 @@ where
     extension: LaneReplica<ES>,
 }
 
+/// Replica-independent room identity used beside the two sealed durable lane
+/// owners in the worker. It contains no storage or publishing handle.
+pub(crate) struct RoomDurableContext {
+    identity: RoomIdentity,
+    owner: ActorId,
+    music_root: EntryHash,
+    extension_root: EntryHash,
+}
+
 impl RoomReplicas<MemoryStorage, MemoryStorage> {
     pub fn memory(room_name: &str, owner: ActorId) -> Result<Self, RoomError> {
         Self::initialize(
@@ -1324,12 +1333,20 @@ impl RoomReplicas<MemoryStorage, MemoryStorage> {
     ) -> Result<Self, RoomError> {
         let music_storage = MemoryStorage::new();
         let extension_storage = MemoryStorage::new();
-        let room = Self::initialize(
-            identity,
+        let (music, music_root, music_root_entry) = build_empty_lane(
+            RoomLane::Music,
+            identity.music,
             owner,
             music_storage.clone(),
+        )?;
+        let (extension, extension_root, extension_root_entry) = build_empty_lane(
+            RoomLane::Extension,
+            identity.extension,
+            owner,
             extension_storage.clone(),
         )?;
+        require_complete_log_root(&music, &music_root_entry, &music_transactions)?;
+        require_complete_log_root(&extension, &extension_root_entry, &extension_transactions)?;
         for transaction in music_transactions {
             music_storage
                 .commit(transaction)
@@ -1340,6 +1357,14 @@ impl RoomReplicas<MemoryStorage, MemoryStorage> {
                 .commit(transaction)
                 .map_err(|error| RoomError::Recovery(error.to_string()))?;
         }
+        let room = Self {
+            identity,
+            owner,
+            music_root,
+            extension_root,
+            music,
+            extension,
+        };
         hhhs_sync::RepairHost::capture(&room.music_repair_host(), [0; 16])
             .map_err(|error| RoomError::Recovery(error.to_string()))?;
         hhhs_sync::RepairHost::capture(&room.extension_repair_host(), [0; 16])
@@ -1571,14 +1596,14 @@ where
     ) -> Result<PreparedMemberGrant, RoomError> {
         let prepared = match lane {
             RoomLane::Music => prepare_member_grant_on(
-                &self.music,
+                self.music.preparation(),
                 self.identity.music,
                 self.music_root,
                 owner_key,
                 member,
             )?,
             RoomLane::Extension => prepare_member_grant_on(
-                &self.extension,
+                self.extension.preparation(),
                 self.identity.extension,
                 self.extension_root,
                 owner_key,
@@ -1958,24 +1983,29 @@ where
         ReplicaRepairHost::new(self.extension.clone())
     }
 
-    pub fn music_durable_host<D>(
-        &self,
-        durability: D,
-    ) -> DurableReplicaHost<MS, RoomAdmissionPolicy, D>
-    where
-        D: AsyncTransactionSink,
-    {
-        DurableReplicaHost::new(self.music.clone(), durability)
-    }
-
-    pub fn extension_durable_host<D>(
-        &self,
-        durability: D,
-    ) -> DurableReplicaHost<ES, RoomAdmissionPolicy, D>
-    where
-        D: AsyncTransactionSink,
-    {
-        DurableReplicaHost::new(self.extension.clone(), durability)
+    /// Consume both lane Replicas before constructing their durable owners.
+    /// No clone capable of publishing survives this boundary.
+    pub(crate) fn into_durable_parts(
+        self,
+    ) -> (RoomDurableContext, LaneReplica<MS>, LaneReplica<ES>) {
+        let Self {
+            identity,
+            owner,
+            music_root,
+            extension_root,
+            music,
+            extension,
+        } = self;
+        (
+            RoomDurableContext {
+                identity,
+                owner,
+                music_root,
+                extension_root,
+            },
+            music,
+            extension,
+        )
     }
 
     fn replica(&self, lane: RoomLane) -> ReplicaRef<'_, MS, ES> {
@@ -1983,6 +2013,282 @@ where
             RoomLane::Music => ReplicaRef::Music(&self.music),
             RoomLane::Extension => ReplicaRef::Extension(&self.extension),
         }
+    }
+}
+
+impl RoomDurableContext {
+    pub(crate) fn identity(&self) -> &RoomIdentity {
+        &self.identity
+    }
+
+    pub(crate) const fn owner(&self) -> ActorId {
+        self.owner
+    }
+
+    pub(crate) const fn root_for_lane(&self, lane: RoomLane) -> EntryHash {
+        match lane {
+            RoomLane::Music => self.music_root,
+            RoomLane::Extension => self.extension_root,
+        }
+    }
+
+    pub(crate) fn owner_capabilities(&self) -> MemberCapabilities {
+        MemberCapabilities {
+            music: vec![self.music_root],
+            extension: vec![self.extension_root],
+        }
+    }
+
+    pub(crate) fn capabilities_for_lane(
+        &self,
+        actor: ActorId,
+        lane: RoomLane,
+        snapshot: &StorageSnapshot,
+    ) -> Vec<EntryHash> {
+        let root = match lane {
+            RoomLane::Music => self.music_root,
+            RoomLane::Extension => self.extension_root,
+        };
+        live_grants_for(&snapshot.history, root, actor)
+    }
+
+    pub(crate) fn capabilities_for(
+        &self,
+        actor: ActorId,
+        music: &StorageSnapshot,
+        extension: &StorageSnapshot,
+    ) -> MemberCapabilities {
+        MemberCapabilities {
+            music: self.capabilities_for_lane(actor, RoomLane::Music, music),
+            extension: self.capabilities_for_lane(actor, RoomLane::Extension, extension),
+        }
+    }
+
+    pub(crate) fn view_with_snapshots(
+        &self,
+        music_snapshot: &StorageSnapshot,
+        extension_snapshot: &StorageSnapshot,
+    ) -> (RoomView, Position, Position) {
+        let music_frontier = music_snapshot.history.frontier();
+        let extension_frontier = extension_snapshot.history.frontier();
+        let music = materialize_music(&music_snapshot.history, &[self.music_root]);
+        let extension = materialize_extension(&extension_snapshot.history, &[self.extension_root]);
+        let pieces = match music.tuning.validate("active Room v5 tuning") {
+            Ok(active) => extension
+                .pieces
+                .iter()
+                .filter(|(_, piece)| piece.pitch.validate(&active).is_ok())
+                .map(|(id, piece)| (*id, piece.clone()))
+                .collect(),
+            Err(_) => BTreeMap::new(),
+        };
+        (
+            RoomView {
+                music,
+                pieces,
+                pieces_locked: extension.pieces_locked,
+                available_emojis: extension.available_emojis,
+            },
+            music_frontier,
+            extension_frontier,
+        )
+    }
+
+    pub(crate) fn prepare_member_grant(
+        &self,
+        lane: RoomLane,
+        replica: ReplicaPreparation<'_, MemoryStorage, RoomAdmissionPolicy>,
+        owner_key: &SigningKey,
+        member: ActorId,
+    ) -> Result<PreparedMemberGrant, RoomError> {
+        let (namespace, root) = match lane {
+            RoomLane::Music => (self.identity.music, self.music_root),
+            RoomLane::Extension => (self.identity.extension, self.extension_root),
+        };
+        Ok(PreparedMemberGrant {
+            lane,
+            member,
+            prepared: prepare_member_grant_on(replica, namespace, root, owner_key, member)?,
+        })
+    }
+
+    pub(crate) fn prepare_author_presenting(
+        &self,
+        replica: ReplicaPreparation<'_, MemoryStorage, RoomAdmissionPolicy>,
+        key: &SigningKey,
+        presented: &[EntryHash],
+        command: RoomCommand,
+    ) -> Result<PreparedRoomCommand, RoomError> {
+        let actor = ActorId::from_signing_key(key);
+        let lane = command.lane();
+        let namespace = self.identity.namespace(lane);
+        let presented = presented.to_vec();
+        let area = match &command {
+            RoomCommand::Music(command) => music_command_area(namespace, command),
+            RoomCommand::Extension(command) => extension_command_area(namespace, command),
+        };
+        let payload = match command {
+            RoomCommand::Music(command) => {
+                encode_music_command(namespace, actor, &presented, command)?
+            }
+            RoomCommand::Extension(command) => {
+                encode_extension_command(namespace, actor, &presented, command)?
+            }
+        };
+        Ok(PreparedRoomCommand {
+            lane,
+            prepared: replica.prepare_ed25519(payload, area, Right::Invoke, presented, key)?,
+        })
+    }
+
+    pub(crate) fn prepare_reified_music(
+        &self,
+        replica: ReplicaPreparation<'_, MemoryStorage, RoomAdmissionPolicy>,
+        key: &SigningKey,
+        presented: &[EntryHash],
+        plan: &ReificationPlan,
+        command: MusicOp,
+    ) -> Result<(PreparedRoomCommand, Entry), RoomError> {
+        let actor = ActorId::from_signing_key(key);
+        let namespace = self.identity.music;
+        let area = music_command_area(namespace, &command);
+        let command = encode_music_command(namespace, actor, presented, command)?;
+        let entry = plan
+            .entry(&command)
+            .map_err(|error| RoomError::Session(error.to_string()))?;
+        let context = replica
+            .clone()
+            .presentation_context(&entry, area.clone(), Right::Invoke)?;
+        let presentation =
+            Ed25519Verifier::present(key, presented.to_vec(), &context).map_err(|error| {
+                RoomError::Session(format!("foundation presentation failed: {error:?}"))
+            })?;
+        let prepared = replica.prepare(AdmissionRequest::presented(
+            entry.clone(),
+            presentation,
+            area,
+            Right::Invoke,
+        ))?;
+        Ok((
+            PreparedRoomCommand {
+                lane: RoomLane::Music,
+                prepared,
+            },
+            entry,
+        ))
+    }
+
+    pub(crate) fn sign_presence(
+        &self,
+        snapshot: &StorageSnapshot,
+        key: &SigningKey,
+        capabilities: &MemberCapabilities,
+        session: u64,
+        sequence: u64,
+        pitch: Option<TunedPeriodicPitch>,
+    ) -> Result<Vec<u8>, PresenceError> {
+        if capabilities.music.is_empty() || capabilities.music.len() > MAX_PRESENTED_GRANTS {
+            return Err(PresenceError::Unauthorized);
+        }
+        let at = snapshot.history.frontier();
+        let actor = ActorId::from_signing_key(key);
+        let authority = CapabilitySnapshot::<LazyReach>::capture_with(
+            &snapshot.history,
+            [self.music_root],
+            LazyReach::new,
+        );
+        if !authority
+            .authorize(&AuthorizationRequest {
+                receiver: actor.receiver(),
+                area: music_notes_area(self.identity.music),
+                right: Right::Invoke,
+                presented: capabilities.music.clone(),
+                at: at.clone(),
+                from: at.clone(),
+            })
+            .is_allowed()
+        {
+            return Err(PresenceError::Unauthorized);
+        }
+        let claims = PresenceClaims {
+            generation: ROOM_PROTOCOL_GENERATION,
+            room: *self.identity.object.as_bytes(),
+            actor,
+            session,
+            sequence,
+            pitch,
+            at: at.0.iter().map(|entry| *entry.as_bytes()).collect(),
+        };
+        let action = Digest::of(&presence_claims_bytes(&claims)?);
+        let context = PresentationContext::new(
+            self.identity.music,
+            action,
+            at,
+            music_notes_area(self.identity.music),
+            Right::Invoke,
+        )
+        .map_err(|_| PresenceError::InvalidProof)?;
+        let proof = Ed25519Verifier::present(key, capabilities.music.clone(), &context)
+            .map_err(|_| PresenceError::InvalidProof)?
+            .encode();
+        encode_presence_envelope(&PresenceEnvelope { claims, proof })
+    }
+
+    pub(crate) fn verify_presence(
+        &self,
+        snapshot: &StorageSnapshot,
+        bytes: &[u8],
+    ) -> Result<RoomPresence, PresenceError> {
+        let envelope = decode_presence_envelope(bytes)?;
+        let claims = &envelope.claims;
+        if claims.generation != ROOM_PROTOCOL_GENERATION
+            || claims.room != *self.identity.object.as_bytes()
+        {
+            return Err(PresenceError::WrongRoom);
+        }
+        let at = Position::of(claims.at.iter().map(|bytes| EntryHash(Digest(*bytes))));
+        let canonical_at: Vec<_> = at.0.iter().map(|entry| *entry.as_bytes()).collect();
+        if canonical_at != claims.at {
+            return Err(PresenceError::NonCanonical);
+        }
+        let action = Digest::of(&presence_claims_bytes(claims)?);
+        let context = PresentationContext::new(
+            self.identity.music,
+            action,
+            at,
+            music_notes_area(self.identity.music),
+            Right::Invoke,
+        )
+        .map_err(|_| PresenceError::InvalidProof)?;
+        let proof = PresentationEnvelope::decode(&envelope.proof)
+            .map_err(|_| PresenceError::InvalidProof)?;
+        let mut verifiers = VerifierRegistry::new();
+        verifiers
+            .register(Arc::new(Ed25519Verifier))
+            .map_err(|_| PresenceError::InvalidProof)?;
+        let verified = verifiers
+            .verify(&proof, &context)
+            .map_err(|_| PresenceError::InvalidProof)?;
+        if verified.receiver() != &claims.actor.receiver() {
+            return Err(PresenceError::InvalidProof);
+        }
+        let capabilities = CapabilitySnapshot::<LazyReach>::capture_with(
+            &snapshot.history,
+            [self.music_root],
+            LazyReach::new,
+        );
+        if !capabilities
+            .authorize(&verified.authorization_request(snapshot.history.frontier()))
+            .is_allowed()
+        {
+            return Err(PresenceError::Unauthorized);
+        }
+        Ok(RoomPresence {
+            actor: claims.actor,
+            session: claims.session,
+            sequence: claims.sequence,
+            pitch: claims.pitch,
+        })
     }
 }
 
@@ -2014,16 +2320,20 @@ fn initialize_lane<S: ReplicaStorage + 'static>(
     owner: ActorId,
     storage: S,
 ) -> Result<(LaneReplica<S>, EntryHash), RoomError> {
-    let root = hhhs_cap::entry(
-        &CapabilityOp::Grant(Grant {
-            issuer: owner.receiver(),
-            receiver: owner.receiver(),
-            area: Area::root(namespace),
-            rights: Rights::ALL,
-            parent: None,
-        }),
-        Position::empty(),
-    );
+    let (replica, root_id, root) = build_empty_lane(lane, namespace, owner, storage)?;
+    if !replica.snapshot().history.contains(&root_id) {
+        replica.admit(AdmissionRequest::trusted_root(root))?;
+    }
+    Ok((replica, root_id))
+}
+
+fn build_empty_lane<S: ReplicaStorage + 'static>(
+    lane: RoomLane,
+    namespace: Digest,
+    owner: ActorId,
+    storage: S,
+) -> Result<(LaneReplica<S>, EntryHash, Entry), RoomError> {
+    let root = lane_trusted_root(namespace, owner);
     let root_id = root.hash();
     let mut builder = Replica::builder(
         storage,
@@ -2036,10 +2346,55 @@ fn initialize_lane<S: ReplicaStorage + 'static>(
         builder = builder.max_replica_record_bytes(vocabulary.max_replica_record_bytes);
     }
     let replica = builder.build()?;
-    if !replica.snapshot().history.contains(&root_id) {
-        replica.admit(AdmissionRequest::trusted_root(root))?;
+    Ok((replica, root_id, root))
+}
+
+pub(crate) fn lane_trusted_root(namespace: Digest, owner: ActorId) -> Entry {
+    hhhs_cap::entry(
+        &CapabilityOp::Grant(Grant {
+            issuer: owner.receiver(),
+            receiver: owner.receiver(),
+            area: Area::root(namespace),
+            rights: Rights::ALL,
+            parent: None,
+        }),
+        Position::empty(),
+    )
+}
+
+fn require_complete_log_root<S: ReplicaStorage + 'static>(
+    replica: &LaneReplica<S>,
+    root: &Entry,
+    transactions: &[StorageTransaction],
+) -> Result<(), RoomError> {
+    let Some(first) = transactions.first() else {
+        return Ok(());
+    };
+    let expected = replica.prepare(AdmissionRequest::trusted_root(root.clone()))?;
+    if hhhs_store::encode_storage_transaction(first)
+        != hhhs_store::encode_storage_transaction(expected.transaction())
+    {
+        return Err(RoomError::Recovery(
+            "durable lane log does not begin with its exact trusted-root transaction".into(),
+        ));
     }
-    Ok((replica, root_id))
+    Ok(())
+}
+
+pub(crate) fn trusted_root_transaction(
+    identity: &RoomIdentity,
+    owner: ActorId,
+    lane: RoomLane,
+) -> Result<StorageTransaction, RoomError> {
+    let namespace = match lane {
+        RoomLane::Music => identity.music,
+        RoomLane::Extension => identity.extension,
+    };
+    let (replica, _, root) = build_empty_lane(lane, namespace, owner, MemoryStorage::new())?;
+    Ok(replica
+        .prepare(AdmissionRequest::trusted_root(root))?
+        .transaction()
+        .clone())
 }
 
 fn delegate_member<S: ReplicaStorage + 'static>(
@@ -2067,7 +2422,7 @@ fn delegate_member<S: ReplicaStorage + 'static>(
 }
 
 fn prepare_member_grant_on<S: ReplicaStorage + 'static>(
-    replica: &LaneReplica<S>,
+    replica: ReplicaPreparation<'_, S, RoomAdmissionPolicy>,
     namespace: Digest,
     root: EntryHash,
     owner_key: &SigningKey,
@@ -2754,14 +3109,37 @@ mod tests {
                 MusicOp::AddDegree { degree: degree(4) }.into(),
             )
             .unwrap();
-        let music_log = vec![prepared.transaction().clone()];
+        let music_log = vec![
+            trusted_root_transaction(&identity, owner, RoomLane::Music).unwrap(),
+            prepared.transaction().clone(),
+        ];
         room.commit_prepared(prepared).unwrap();
+        let extension_log =
+            vec![trusted_root_transaction(&identity, owner, RoomLane::Extension).unwrap()];
 
         let recovered =
-            RoomReplicas::from_transaction_logs(identity, owner, music_log, Vec::new()).unwrap();
+            RoomReplicas::from_transaction_logs(identity, owner, music_log, extension_log).unwrap();
         assert_eq!(recovered.view(), room.view());
         assert_eq!(recovered.owner_capabilities(), room.owner_capabilities());
         assert_eq!(recovered.extension_snapshot().history.all_hashes().len(), 1);
+    }
+
+    #[test]
+    fn external_transaction_log_refuses_another_lanes_real_capability_root() {
+        let owner_key = key(1);
+        let owner = ActorId::from_signing_key(&owner_key);
+        let identity = RoomIdentity::from_name("bright-river-song");
+        let wrong_root = trusted_root_transaction(&identity, owner, RoomLane::Extension).unwrap();
+        let error = match RoomReplicas::from_transaction_logs(
+            identity,
+            owner,
+            vec![wrong_root],
+            Vec::new(),
+        ) {
+            Ok(_) => panic!("wrong lane root was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("trusted-root transaction"));
     }
 
     #[test]
