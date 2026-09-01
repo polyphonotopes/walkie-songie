@@ -57,6 +57,12 @@ const FOUNDATION_PROFILE: &[u8] = b"walkie hhhs ed25519 seat foundation v1";
 const EXPORT_DOMAIN: &[u8] = b"walkie hhhs xchacha exporter context v1";
 const PITCH_EDIT: SessionEventCode = SessionEventCode::new(1);
 const MAX_EVENTS_PER_SEAT: u32 = 64;
+/// Begin replacing a drained session while one final causal dot remains.
+///
+/// This is an application availability reserve, not an HHHS semantic limit.
+/// If traffic consumes the reserve before the old prediction suffix drains,
+/// the hard-limit durable fallback remains authoritative.
+const SESSION_RENEWAL_RESERVE: u32 = 1;
 const MAX_SESSION_MESSAGE_BYTES: u32 = 2_048;
 const SESSION_CAPACITY: usize = 128;
 const REPLAY_WIDTH: usize = 64;
@@ -1005,7 +1011,7 @@ impl RoomSessionTask {
             .active
             .iter()
             .filter_map(|(peer, active)| {
-                (((active.foundation.local.0 < peer.0 && active.is_saturated())
+                (((active.foundation.local.0 < peer.0 && active.needs_renewal())
                     || self.renewal_needed.contains(peer))
                     && active.is_drained()
                     && !self.pending.contains_key(peer))
@@ -1826,14 +1832,16 @@ impl ActiveSession {
     }
 
     fn is_saturated(&self) -> bool {
-        self.sender.highest_sealed_counter() >= MAX_EVENTS_PER_SEAT
-            || self
-                .kernel
-                .ready_cut()
-                .context()
-                .counters()
-                .iter()
-                .any(|counter| *counter >= MAX_EVENTS_PER_SEAT)
+        self.sender.remaining_causal_events() == 0 || self.kernel.event_budget_exhausted()
+    }
+
+    fn needs_renewal(&self) -> bool {
+        self.sender.remaining_causal_events() <= SESSION_RENEWAL_RESERVE
+            || [self.local_seat, self.remote_seat].into_iter().any(|seat| {
+                self.kernel
+                    .remaining_event_budget(seat)
+                    .is_some_and(|remaining| remaining <= SESSION_RENEWAL_RESERVE)
+            })
     }
 
     fn local_event(
@@ -2109,7 +2117,8 @@ impl ActiveSession {
         history: &DagSnapshot,
         durable: DurableProjection<PitchProjectionState>,
     ) -> Result<(), String> {
-        self.projection
+        let transition = self
+            .projection
             .resynchronize(
                 ProjectionGeneration::new(self.projection.generation().get().saturating_add(1)),
                 &self.kernel,
@@ -2118,6 +2127,9 @@ impl ActiveSession {
                 &PitchProjector,
             )
             .map_err(|error| error.to_string())?;
+        if !matches!(transition.change(), SessionProjectionChange::Reset { .. }) {
+            return Err("session projection resynchronization did not produce a reset".into());
+        }
         self.durable_revision = revision;
         Ok(())
     }
@@ -2710,6 +2722,38 @@ mod tests {
         assert!(authorize_fixture(&owner, &member, 11, 1, Some(&recovered)).is_err());
         assert!(authorize_fixture(&owner, &member, 33, 3, Some(&recovered)).is_err());
         assert!(authorize_fixture(&owner, &member, 44, 4, Some(&recovered)).is_ok());
+    }
+
+    #[test]
+    fn session_requests_renewal_with_one_causal_dot_reserved() {
+        let (owner, member) = renewal_foundations();
+        let session_id = 50;
+        let (authorized, _) = authorize_fixture(&owner, &member, session_id, 1, None).unwrap();
+        let keys = initiator_keys(&owner, &member, session_id);
+        let mut active = ActiveSession::new(owner, authorized, session_id, keys, 0).unwrap();
+        for _ in 0..MAX_EVENTS_PER_SEAT.saturating_sub(SESSION_RENEWAL_RESERVE) {
+            active
+                .local_event(
+                    MusicOp::AddDegree { degree: degree() },
+                    0,
+                    &DisabledRoomSessionTraceClock,
+                    false,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            active.sender.remaining_causal_events(),
+            SESSION_RENEWAL_RESERVE
+        );
+        assert_eq!(
+            active.kernel.remaining_event_budget(active.local_seat),
+            Some(SESSION_RENEWAL_RESERVE)
+        );
+        assert!(active.needs_renewal());
+        assert!(!active.is_saturated());
     }
 
     #[test]
