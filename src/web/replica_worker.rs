@@ -223,11 +223,22 @@ impl RoomSessionRenewalStore for BrowserSessionRenewalStore {
     fn persist<'a>(
         &'a self,
         key: RoomSessionRenewalKey,
+        expected_frontier: hhhs::Position,
         floor: Vec<u8>,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + 'a>> {
         Box::pin(async move {
             match self
-                .request(key, RoomSessionRenewalStoreOperation::Persist(floor))
+                .request(
+                    key,
+                    RoomSessionRenewalStoreOperation::Persist {
+                        expected_frontier: expected_frontier
+                            .0
+                            .iter()
+                            .map(|entry| *entry.as_bytes())
+                            .collect(),
+                        floor,
+                    },
+                )
                 .await?
             {
                 RoomSessionRenewalStoreValue::Persisted => Ok(()),

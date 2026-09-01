@@ -638,18 +638,18 @@ where
         &mut self,
         key: RoomSessionRenewalKey,
         floor: Vec<u8>,
-        require_current_base: bool,
+        expected_frontier: Option<Vec<[u8; 32]>>,
     ) -> Result<(), String> {
         self.validate_session_renewal_key(key)?;
         let decoded = SessionRenewalFloor::from_bytes(&floor)
             .map_err(|error| format!("invalid session renewal floor: {error}"))?;
         let current = self.music_snapshot()?;
-        if require_current_base && decoded.base() != &current.history.frontier() {
-            return Err(
-                "session renewal floor does not name the music replica's current frontier".into(),
-            );
+        if let Some(expected) = expected_frontier.as_ref()
+            && super::session::position_bytes(decoded.base()) != *expected
+        {
+            return Err("session renewal floor and install frontier differ".into());
         }
-        if !require_current_base
+        if expected_frontier.is_none()
             && decoded
                 .base()
                 .0
@@ -669,14 +669,26 @@ where
         floors.floors.insert(key.peer, floor);
         let bytes = encode(&floors)?;
         let checkpoint_key = Self::session_renewal_checkpoint_key()?;
+        let mut frontier_matches = expected_frontier.is_none();
         let prepared = self
             .music
             .inner()
-            .prepare_local_transaction(move |view, local| {
+            .prepare_local_transaction(|view, local| {
+                if let Some(expected) = expected_frontier.as_ref() {
+                    frontier_matches = super::session::position_bytes(view.position()) == *expected;
+                    if !frontier_matches {
+                        return Ok(());
+                    }
+                }
                 local.save_checkpoint(view.checkpoint(checkpoint_key, bytes)?);
                 Ok(())
             })
             .map_err(|error| error.to_string())?;
+        if !frontier_matches {
+            return Err(
+                "session renewal install no longer names the prepared transaction frontier".into(),
+            );
+        }
         self.music
             .inner_mut()
             .commit_prepared_local_transaction(prepared)
@@ -1406,14 +1418,17 @@ where
                         .room()?
                         .load_session_renewal_floor(request.key)
                         .map(RoomSessionRenewalStoreValue::Loaded),
-                    RoomSessionRenewalStoreOperation::Persist(floor) => self
+                    RoomSessionRenewalStoreOperation::Persist {
+                        expected_frontier,
+                        floor,
+                    } => self
                         .room_mut()?
-                        .persist_session_renewal_floor(request.key, floor, true)
+                        .persist_session_renewal_floor(request.key, floor, Some(expected_frontier))
                         .await
                         .map(|()| RoomSessionRenewalStoreValue::Persisted),
                     RoomSessionRenewalStoreOperation::MigrateLegacy(floor) => self
                         .room_mut()?
-                        .persist_session_renewal_floor(request.key, floor, false)
+                        .persist_session_renewal_floor(request.key, floor, None)
                         .await
                         .map(|()| RoomSessionRenewalStoreValue::Persisted),
                 };
@@ -1778,7 +1793,13 @@ mod tests {
             let _checked_floor = SessionRenewalFloor::from_bytes(&floor).unwrap();
 
             plane
-                .persist_session_renewal_floor(key, floor.clone(), true)
+                .persist_session_renewal_floor(
+                    key,
+                    floor.clone(),
+                    Some(crate::room::session::position_bytes(
+                        &before.history.frontier(),
+                    )),
+                )
                 .await
                 .unwrap();
 
@@ -1815,10 +1836,16 @@ mod tests {
             let sequence_before_stale_refusal = after_public.sequence;
             assert!(
                 plane
-                    .persist_session_renewal_floor(key, floor.clone(), true)
+                    .persist_session_renewal_floor(
+                        key,
+                        floor.clone(),
+                        Some(crate::room::session::position_bytes(
+                            &before.history.frontier(),
+                        )),
+                    )
                     .await
                     .unwrap_err()
-                    .contains("current frontier")
+                    .contains("prepared transaction frontier")
             );
             assert_eq!(
                 plane.music_snapshot().unwrap().sequence,
@@ -1830,7 +1857,7 @@ mod tests {
                 ..key
             };
             plane
-                .persist_session_renewal_floor(migrated_key, floor.clone(), false)
+                .persist_session_renewal_floor(migrated_key, floor.clone(), None)
                 .await
                 .unwrap();
             assert_eq!(

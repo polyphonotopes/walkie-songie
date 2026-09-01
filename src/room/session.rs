@@ -31,10 +31,10 @@ use hhhs_session::{
     ReifiedSessionCommand, ReplayDisposition, SeatFoundationClaim, SessionAdmission, SessionDot,
     SessionEpoch, SessionEvent, SessionEventCode, SessionKernel, SessionKeyEpoch, SessionLeaseTime,
     SessionManifest, SessionPolicy, SessionProjectionChange, SessionProjectionHost,
-    SessionProjector, SessionReceiverLane, SessionRenewalFloor, SessionSeat, SessionSenderLane,
-    SimulationTime, VerifiedSeatFoundation, XChaCha20Poly1305Key, XChaCha20Poly1305Profile,
-    XChaChaCompactPacketCodec, XChaChaCounterNonceSource, authorize_session,
-    authorize_session_renewal, xchacha20poly1305_profile_id,
+    SessionProjector, SessionReceiverLane, SessionRenewalFloor, SessionRenewalInstall, SessionSeat,
+    SessionSenderLane, SimulationTime, VerifiedSeatFoundation, XChaCha20Poly1305Key,
+    XChaCha20Poly1305Profile, XChaChaCompactPacketCodec, XChaChaCounterNonceSource,
+    authorize_session, authorize_session_renewal, xchacha20poly1305_profile_id,
 };
 use hhhs_store::history_root;
 use hhhs_web_browser::{WorkerApplicationChannel, WorkerEventKind, WorkerEventPort};
@@ -199,6 +199,7 @@ pub(crate) trait RoomSessionRenewalStore {
     fn persist<'a>(
         &'a self,
         key: RoomSessionRenewalKey,
+        expected_frontier: Position,
         floor: Vec<u8>,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + 'a>>;
 }
@@ -206,7 +207,10 @@ pub(crate) trait RoomSessionRenewalStore {
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub(crate) enum RoomSessionRenewalStoreOperation {
     Load,
-    Persist(Vec<u8>),
+    Persist {
+        expected_frontier: Vec<[u8; 32]>,
+        floor: Vec<u8>,
+    },
     MigrateLegacy(Vec<u8>),
 }
 
@@ -1096,13 +1100,21 @@ impl RoomSessionTask {
         let persisted = match authorization {
             PairAuthorization::Initial { session, floor } => self
                 .renewal_store
-                .persist(key, floor.to_bytes())
+                .persist(key, floor.base().clone(), floor.to_bytes())
                 .await
                 .map(|()| (session, floor)),
             PairAuthorization::Renewal(renewal) => {
                 let store = Rc::clone(&self.renewal_store);
                 renewal
-                    .install_with_async(move |bytes| async move { store.persist(key, bytes).await })
+                    .install_with_async(move |install: SessionRenewalInstall| async move {
+                        store
+                            .persist(
+                                key,
+                                install.expected_frontier().clone(),
+                                install.floor_bytes().to_vec(),
+                            )
+                            .await
+                    })
                     .await
                     .map(|installed| installed.into_parts())
             }
@@ -3136,9 +3148,15 @@ mod tests {
         fn persist<'a>(
             &'a self,
             key: RoomSessionRenewalKey,
+            expected_frontier: Position,
             floor: Vec<u8>,
         ) -> Pin<Box<dyn Future<Output = Result<(), String>> + 'a>> {
             Box::pin(async move {
+                let decoded = SessionRenewalFloor::from_bytes(&floor)
+                    .map_err(|error| format!("invalid test renewal floor: {error}"))?;
+                if decoded.base() != &expected_frontier {
+                    return Err("test renewal floor and install frontier differ".into());
+                }
                 self.persist_calls
                     .set(self.persist_calls.get().saturating_add(1));
                 if self.fail_persist.get() {
@@ -5070,7 +5088,7 @@ fn export_context(manifest: Digest, binding: Digest) -> Vec<u8> {
     bytes
 }
 
-fn position_bytes(position: &Position) -> Vec<[u8; 32]> {
+pub(super) fn position_bytes(position: &Position) -> Vec<[u8; 32]> {
     position.0.iter().map(|entry| *entry.as_bytes()).collect()
 }
 
