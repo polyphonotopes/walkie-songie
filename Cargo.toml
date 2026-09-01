@@ -169,17 +169,17 @@ egui = { version = "0.36.1", optional = true }
 # Exact HHHS main candidate qualified as one dependency graph. The completed
 # 03e67df browser lifecycle checkpoint remains the control; do not mix
 # generations across crates.
-hhhs = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "c5d4eca2396de9fc2325c94344c4371dd1c549e6" }
-hhhs-sync = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "c5d4eca2396de9fc2325c94344c4371dd1c549e6", features = ["driver"] }
-hhhs-cap = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "c5d4eca2396de9fc2325c94344c4371dd1c549e6" }
-hhhs-proof = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "c5d4eca2396de9fc2325c94344c4371dd1c549e6" }
-hhhs-store = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "c5d4eca2396de9fc2325c94344c4371dd1c549e6" }
-hhhs-replica = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "c5d4eca2396de9fc2325c94344c4371dd1c549e6" }
-hhhs-session = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "c5d4eca2396de9fc2325c94344c4371dd1c549e6", features = ["replica", "xchacha20poly1305"] }
+hhhs = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "833f7029925a9867b96325e5c6d0ada9346415e6" }
+hhhs-sync = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "833f7029925a9867b96325e5c6d0ada9346415e6", features = ["driver"] }
+hhhs-cap = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "833f7029925a9867b96325e5c6d0ada9346415e6" }
+hhhs-proof = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "833f7029925a9867b96325e5c6d0ada9346415e6" }
+hhhs-store = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "833f7029925a9867b96325e5c6d0ada9346415e6" }
+hhhs-replica = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "833f7029925a9867b96325e5c6d0ada9346415e6" }
+hhhs-session = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "833f7029925a9867b96325e5c6d0ada9346415e6", features = ["replica", "xchacha20poly1305"] }
 # Browser placement protocol and in-process parity host. The actual Worker and
 # IndexedDB handles remain wasm-only inside this crate, while its typed service
 # seam is testable on native targets.
-hhhs-web-browser = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "c5d4eca2396de9fc2325c94344c4371dd1c549e6" }
+hhhs-web-browser = { version = "0.4.5", git = "https://gitlab.com/micahscopes/hhhs-rs.git", rev = "833f7029925a9867b96325e5c6d0ada9346415e6" }
 ciborium = "0.2"
 # futures-signals drives the HHHS reactive read model (room::mirror) on ALL targets
 # (native plugin + wasm UI); dominator (wasm-only, below) consumes the same signals.
