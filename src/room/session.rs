@@ -51,6 +51,14 @@ use super::{
 
 pub(crate) const ROOM_SESSION_CHANNEL: WorkerApplicationChannel =
     WorkerApplicationChannel::new(0x5455_5454);
+/// Worker-internal response lane for renewal-floor storage requests.
+///
+/// Requests leave the session task through [`ROOM_SESSION_CHANNEL`] so the
+/// window can serialize them through the ordinary Room worker command lane.
+/// Replies bypass the blocked session inbox and resolve the exact pending
+/// store future on this dedicated bounded application lane.
+pub(crate) const ROOM_SESSION_RENEWAL_RESPONSE_CHANNEL: WorkerApplicationChannel =
+    WorkerApplicationChannel::new(0x5455_5455);
 const SESSION_PAYLOAD_VERSION: u16 = 1;
 const SESSION_CARRIER_DOMAIN: &[u8] = b"walkie hhhs pitch session carrier v1\0";
 const SESSION_PROTOCOL_LABEL: &[u8] = b"walkie hhhs pitch session establishment v1";
@@ -162,7 +170,7 @@ pub(crate) struct RoomSessionServicePort {
 /// The room object and both actor identities are included so a floor can never
 /// be reused by another room or pair. Direction matters: each receiver owns and
 /// persists its own anti-replay floor.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 pub(crate) struct RoomSessionRenewalKey {
     pub room: [u8; 32],
     pub local: [u8; 32],
@@ -176,6 +184,13 @@ pub(crate) struct RoomSessionRenewalKey {
 /// recoverable egress, persist the next floor, and only then activate. A crash
 /// in that cut can cost availability, but must never reopen the old epoch.
 pub(crate) trait RoomSessionRenewalStore {
+    /// Bind this store instance to the current worker generation's event port.
+    ///
+    /// In-memory tests need no event port. The browser implementation uses it
+    /// only to request a transaction from the sealed Room replica owner; it
+    /// never writes the physical log itself.
+    fn configure(&self, _events: WorkerEventPort) {}
+
     fn load<'a>(
         &'a self,
         key: RoomSessionRenewalKey,
@@ -186,6 +201,32 @@ pub(crate) trait RoomSessionRenewalStore {
         key: RoomSessionRenewalKey,
         floor: Vec<u8>,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + 'a>>;
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub(crate) enum RoomSessionRenewalStoreOperation {
+    Load,
+    Persist(Vec<u8>),
+    MigrateLegacy(Vec<u8>),
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub(crate) struct RoomSessionRenewalStoreRequest {
+    pub request: u64,
+    pub key: RoomSessionRenewalKey,
+    pub operation: RoomSessionRenewalStoreOperation,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub(crate) enum RoomSessionRenewalStoreValue {
+    Loaded(Option<Vec<u8>>),
+    Persisted,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub(crate) struct RoomSessionRenewalStoreResponse {
+    pub request: u64,
+    pub result: Result<RoomSessionRenewalStoreValue, String>,
 }
 
 /// Receiver-owned monotonic clock for session lease authorization.
@@ -227,6 +268,9 @@ pub(crate) enum RoomSessionEgress {
         intent_token: PerformanceIntentToken,
         reason: String,
     },
+    /// Receiver-local durability request. This is not a carrier frame and
+    /// never leaves the local worker/window placement.
+    RenewalStore(RoomSessionRenewalStoreRequest),
     Diagnostic(String),
     RenewalTrace(RoomSessionRenewalTrace),
 }
@@ -549,6 +593,22 @@ pub(crate) fn decode_session_egress(bytes: &[u8]) -> Result<RoomSessionEgress, S
     decode(bytes)
 }
 
+pub(crate) fn encode_session_egress(value: &RoomSessionEgress) -> Result<Vec<u8>, String> {
+    encode(value)
+}
+
+pub(crate) fn encode_session_renewal_store_response(
+    value: &RoomSessionRenewalStoreResponse,
+) -> Result<Vec<u8>, String> {
+    encode(value)
+}
+
+pub(crate) fn decode_session_renewal_store_response(
+    bytes: &[u8],
+) -> Result<RoomSessionRenewalStoreResponse, String> {
+    decode(bytes)
+}
+
 impl SessionCarrierBody {
     fn encode(&self) -> Result<Vec<u8>, String> {
         let payload = encode(self)?;
@@ -732,6 +792,7 @@ impl RoomSessionTask {
                 #[cfg(feature = "browser-acceptance-faults")]
                 renewal_test_cut,
             } => {
+                self.renewal_store.configure(events.clone());
                 self.events = Some(events);
                 self.trace_enabled = trace_enabled;
                 #[cfg(feature = "browser-acceptance-faults")]

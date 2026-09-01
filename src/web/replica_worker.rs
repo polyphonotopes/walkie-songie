@@ -2,6 +2,8 @@
 
 use std::{
     cell::{Cell, RefCell},
+    collections::BTreeMap,
+    future::Future,
     pin::Pin,
     rc::Rc,
     task::Poll,
@@ -16,8 +18,8 @@ use futures_signals::signal::{Mutable, ReadOnlyMutable};
 use hhhs_web_browser::WorkerGeneration;
 use hhhs_web_browser::{
     DedicatedWorkerClient, ProjectionSubscription, ProjectionUpdate, SubscriptionId,
-    WorkerClientError, WorkerEvent, WorkerEventKind, WorkerRequestKind, WorkerResetReason,
-    serve_dedicated_worker_with_application_frames,
+    WorkerClientError, WorkerEvent, WorkerEventKind, WorkerEventPort, WorkerRequestKind,
+    WorkerResetReason, serve_dedicated_worker_with_application_frames,
 };
 use js_sys::Array;
 use wasm_bindgen::prelude::*;
@@ -25,9 +27,13 @@ use web_sys::{Blob, BlobPropertyBag, Url};
 
 use crate::room::{
     session::{
-        ROOM_SESSION_CHANNEL, RoomSessionEgress, RoomSessionIngress, RoomSessionLeaseClock,
-        RoomSessionServicePort, RoomSessionTaskInput, RoomSessionTraceClock, RoomSessionTraceToken,
-        decode_session_egress, encode_session_ingress, run_room_session_task,
+        ROOM_SESSION_CHANNEL, ROOM_SESSION_RENEWAL_RESPONSE_CHANNEL, RoomSessionEgress,
+        RoomSessionIngress, RoomSessionLeaseClock, RoomSessionRenewalKey, RoomSessionRenewalStore,
+        RoomSessionRenewalStoreOperation, RoomSessionRenewalStoreRequest,
+        RoomSessionRenewalStoreResponse, RoomSessionRenewalStoreValue, RoomSessionServicePort,
+        RoomSessionTaskInput, RoomSessionTraceClock, RoomSessionTraceToken, decode_session_egress,
+        decode_session_renewal_store_response, encode_session_egress, encode_session_ingress,
+        encode_session_renewal_store_response, run_room_session_task,
     },
     v5::RoomIdentity,
     worker::{
@@ -41,7 +47,7 @@ use crate::room::{
 #[cfg(feature = "browser-acceptance-faults")]
 use crate::room::worker::encode_projection_witness;
 
-use super::storage::{IndexedDbReplicaLogV5, IndexedDbSessionRenewalStore};
+use super::storage::{IndexedDbReplicaLogV5, load_legacy_session_renewal};
 
 #[cfg(feature = "browser-acceptance-faults")]
 thread_local! {
@@ -86,6 +92,150 @@ impl BrowserSessionTraceClock {
 impl RoomSessionTraceClock for BrowserSessionTraceClock {
     fn now_micros(&self) -> Option<u64> {
         self.performance.as_ref().and_then(performance_time_micros)
+    }
+}
+
+const MAX_PENDING_RENEWAL_STORE_REQUESTS: usize = 4;
+
+#[derive(Default)]
+struct BrowserSessionRenewalStoreState {
+    events: Option<WorkerEventPort>,
+    next_request: u64,
+    pending: BTreeMap<u64, oneshot::Sender<Result<RoomSessionRenewalStoreValue, String>>>,
+}
+
+/// Browser session-floor adapter whose only live writer is the sealed Room
+/// replica host.
+///
+/// The session task can be awaiting this future, so the exact response is
+/// resolved directly by the dedicated worker's application-frame callback.
+/// The window merely routes a typed command back through the serial worker
+/// service; it never interprets or persists the floor.
+#[derive(Default)]
+struct BrowserSessionRenewalStore {
+    state: RefCell<BrowserSessionRenewalStoreState>,
+}
+
+impl BrowserSessionRenewalStore {
+    async fn request(
+        &self,
+        key: RoomSessionRenewalKey,
+        operation: RoomSessionRenewalStoreOperation,
+    ) -> Result<RoomSessionRenewalStoreValue, String> {
+        let (request, events, response) = {
+            let mut state = self.state.borrow_mut();
+            if state.pending.len() >= MAX_PENDING_RENEWAL_STORE_REQUESTS {
+                return Err("session renewal store request queue is full".into());
+            }
+            let events = state
+                .events
+                .clone()
+                .ok_or("session renewal store has no active worker event port")?;
+            state.next_request = state
+                .next_request
+                .checked_add(1)
+                .ok_or("session renewal store request identity exhausted")?;
+            let request = state.next_request;
+            let (sender, response) = oneshot::channel();
+            state.pending.insert(request, sender);
+            (request, events, response)
+        };
+        let event = RoomSessionEgress::RenewalStore(RoomSessionRenewalStoreRequest {
+            request,
+            key,
+            operation,
+        });
+        if let Err(error) = events
+            .send_application_frame(ROOM_SESSION_CHANNEL, encode_session_egress(&event)?)
+            .await
+        {
+            self.state.borrow_mut().pending.remove(&request);
+            return Err(error.to_string());
+        }
+        response
+            .await
+            .map_err(|_| "session renewal store response was dropped".to_owned())?
+    }
+
+    fn resolve(&self, response: RoomSessionRenewalStoreResponse) -> Result<(), String> {
+        let sender = self
+            .state
+            .borrow_mut()
+            .pending
+            .remove(&response.request)
+            .ok_or_else(|| {
+                format!(
+                    "session renewal store response {} is stale or unknown",
+                    response.request
+                )
+            })?;
+        sender
+            .send(response.result)
+            .map_err(|_| "session renewal store requester was dropped".to_owned())
+    }
+}
+
+impl RoomSessionRenewalStore for BrowserSessionRenewalStore {
+    fn configure(&self, events: WorkerEventPort) {
+        let mut state = self.state.borrow_mut();
+        for (_, pending) in std::mem::take(&mut state.pending) {
+            let _ = pending.send(Err(
+                "session renewal store generation was replaced before completion".into(),
+            ));
+        }
+        state.events = Some(events);
+    }
+
+    fn load<'a>(
+        &'a self,
+        key: RoomSessionRenewalKey,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>> + 'a>> {
+        Box::pin(async move {
+            match self
+                .request(key, RoomSessionRenewalStoreOperation::Load)
+                .await?
+            {
+                RoomSessionRenewalStoreValue::Loaded(Some(floor)) => Ok(Some(floor)),
+                RoomSessionRenewalStoreValue::Loaded(None) => {
+                    let Some(legacy) = load_legacy_session_renewal(key).await? else {
+                        return Ok(None);
+                    };
+                    match self
+                        .request(
+                            key,
+                            RoomSessionRenewalStoreOperation::MigrateLegacy(legacy.clone()),
+                        )
+                        .await?
+                    {
+                        RoomSessionRenewalStoreValue::Persisted => Ok(Some(legacy)),
+                        RoomSessionRenewalStoreValue::Loaded(_) => Err(
+                            "session renewal migration received a load response for persist".into(),
+                        ),
+                    }
+                }
+                RoomSessionRenewalStoreValue::Persisted => {
+                    Err("session renewal load received a persist response".into())
+                }
+            }
+        })
+    }
+
+    fn persist<'a>(
+        &'a self,
+        key: RoomSessionRenewalKey,
+        floor: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + 'a>> {
+        Box::pin(async move {
+            match self
+                .request(key, RoomSessionRenewalStoreOperation::Persist(floor))
+                .await?
+            {
+                RoomSessionRenewalStoreValue::Persisted => Ok(()),
+                RoomSessionRenewalStoreValue::Loaded(_) => {
+                    Err("session renewal persist received a load response".into())
+                }
+            }
+        })
     }
 }
 
@@ -260,10 +410,11 @@ pub fn start_walkie_replica_worker() {
     const SESSION_QUEUE_CAPACITY: usize = 64;
     let (task_sender, task_receiver) = mpsc::channel(SESSION_QUEUE_CAPACITY);
     let (reification_sender, reification_receiver) = mpsc::channel(SESSION_QUEUE_CAPACITY);
+    let renewal_store = Rc::new(BrowserSessionRenewalStore::default());
     wasm_bindgen_futures::spawn_local(run_room_session_task(
         task_receiver,
         reification_sender,
-        Rc::new(IndexedDbSessionRenewalStore),
+        renewal_store.clone(),
         Rc::new(BrowserSessionLeaseClock::new()),
         Rc::new(BrowserSessionTraceClock::new()),
     ));
@@ -272,13 +423,18 @@ pub fn start_walkie_replica_worker() {
         reifications: reification_receiver,
     };
     let mut application_sender = task_sender;
+    let renewal_store_for_responses = renewal_store;
     serve_dedicated_worker_with_application_frames(
         RoomReplicaWorkerService::with_session(BrowserRoomWorkerFactory, session),
         hhhs_web_browser::DEFAULT_MAX_PENDING_REQUESTS,
         move |channel, bytes| {
-            application_sender
-                .try_send(RoomSessionTaskInput::Application { channel, bytes })
-                .map_err(|error| error.to_string())
+            if channel == ROOM_SESSION_RENEWAL_RESPONSE_CHANNEL {
+                renewal_store_for_responses.resolve(decode_session_renewal_store_response(&bytes)?)
+            } else {
+                application_sender
+                    .try_send(RoomSessionTaskInput::Application { channel, bytes })
+                    .map_err(|error| error.to_string())
+            }
         },
     )
     .expect("Room-v5 dedicated worker service must start in a worker global")
@@ -788,6 +944,47 @@ impl BrowserReplicaHandle {
             log_session_trace_token("worker_queue_acknowledged", token, window_time_micros());
         }
         result
+    }
+
+    /// Route one receiver-local renewal-floor operation through the serial
+    /// Room worker owner, then return the exact result directly to the blocked
+    /// session-store future. The window is transport only and never stores or
+    /// interprets the floor.
+    pub(super) async fn service_session_renewal_store(
+        &self,
+        request: RoomSessionRenewalStoreRequest,
+    ) -> Result<(), String> {
+        let request_id = request.request;
+        let response = match self
+            .command(RoomWorkerCommand::SessionRenewalStore(request))
+            .await
+        {
+            Ok(RoomWorkerResponse::SessionRenewalStore(response)) => response,
+            Ok(other) => RoomSessionRenewalStoreResponse {
+                request: request_id,
+                result: Err(format!(
+                    "Replica worker returned the wrong renewal-store response: {other:?}"
+                )),
+            },
+            Err(error) => RoomSessionRenewalStoreResponse {
+                request: request_id,
+                result: Err(error),
+            },
+        };
+        let failure = response.result.as_ref().err().cloned();
+        self.client
+            .send_application_frame(
+                ROOM_SESSION_RENEWAL_RESPONSE_CHANNEL,
+                encode_session_renewal_store_response(&response)?,
+            )
+            .await
+            .map_err(worker_error)?;
+        match failure {
+            Some(error) => Err(format!(
+                "sealed session renewal-floor transaction failed: {error}"
+            )),
+            None => Ok(()),
+        }
     }
 
     pub(super) async fn drain_session(&self) -> Result<bool, String> {

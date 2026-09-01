@@ -18,7 +18,8 @@ use hhhs_replica::{
     AdmissionRequest, AsyncTransactionSink, DurableReplicaHost, ReplicaRecord,
     ReplicaRepairSnapshot,
 };
-use hhhs_store::{MemoryStorage, StorageTransaction, history_root};
+use hhhs_session::SessionRenewalFloor;
+use hhhs_store::{MemoryStorage, ProjectionKey, StorageTransaction, history_root};
 use hhhs_sync::{
     CachedRepairHost, RepairAttemptStatus, RepairDisposition, RepairRetryReason, SessionOutcome,
     StepwiseRepairAttempt,
@@ -38,10 +39,17 @@ use crate::{
     tuning::TunedPeriodicPitch,
 };
 
-use super::session::{RoomSessionFoundation, RoomSessionServicePort, RoomSessionTaskInput};
+use super::session::{
+    RoomSessionFoundation, RoomSessionRenewalKey, RoomSessionRenewalStoreOperation,
+    RoomSessionRenewalStoreRequest, RoomSessionRenewalStoreResponse, RoomSessionRenewalStoreValue,
+    RoomSessionServicePort, RoomSessionTaskInput,
+};
 
 const ROOM_WORKER_PAYLOAD_VERSION: u16 = 2;
 const MAX_ACTIVE_REPAIR_SESSIONS: usize = 8;
+const MAX_SESSION_RENEWAL_PEERS: usize = 64;
+const SESSION_RENEWAL_CHECKPOINT_NAME: &str = "walkie/session-renewal-floors";
+const SESSION_RENEWAL_CHECKPOINT_SCHEMA: u32 = 1;
 
 type DurableLane<D> =
     CachedRepairHost<DurableReplicaHost<MemoryStorage, super::v5::RoomAdmissionPolicy, D>>;
@@ -52,6 +60,11 @@ pub(crate) type RoomWorkerOpenFuture<'a, D> =
 struct Versioned<T> {
     version: u16,
     body: T,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+struct SessionRenewalFloors {
+    floors: BTreeMap<[u8; 32], Vec<u8>>,
 }
 
 fn encode<T: Serialize>(body: &T) -> Result<Vec<u8>, String> {
@@ -190,6 +203,7 @@ pub(crate) enum RoomWorkerCommand {
     StartSessionPeer(ActorId),
     ResetSessionProjection,
     DrainSession,
+    SessionRenewalStore(RoomSessionRenewalStoreRequest),
     SignPresence {
         session: u64,
         sequence: u64,
@@ -330,6 +344,7 @@ pub(crate) enum RoomWorkerResponse {
         committed: bool,
         projection_revision: u64,
     },
+    SessionRenewalStore(RoomSessionRenewalStoreResponse),
     InboundApplied {
         accepted: bool,
         entry: [u8; 32],
@@ -567,6 +582,109 @@ where
         Ok(self.room.view_with_snapshots(&music, &extension).0)
     }
 
+    fn validate_session_renewal_key(&self, key: RoomSessionRenewalKey) -> Result<(), String> {
+        if key.room != *self.room.identity().object.as_bytes() {
+            return Err("session renewal key names another room".into());
+        }
+        if key.local != self.local_actor.0 {
+            return Err("session renewal key names another local actor".into());
+        }
+        if key.peer == key.local {
+            return Err("session renewal key cannot name the local actor as its peer".into());
+        }
+        Ok(())
+    }
+
+    fn session_renewal_checkpoint_key() -> Result<ProjectionKey, String> {
+        ProjectionKey::new(
+            SESSION_RENEWAL_CHECKPOINT_NAME,
+            SESSION_RENEWAL_CHECKPOINT_SCHEMA,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn session_renewal_floors(&self) -> Result<SessionRenewalFloors, String> {
+        let key = Self::session_renewal_checkpoint_key()?;
+        let snapshot = self.music_snapshot()?;
+        let Some(checkpoint) = snapshot.checkpoint(&key) else {
+            return Ok(SessionRenewalFloors::default());
+        };
+        if !checkpoint.is_intact() {
+            return Err("session renewal checkpoint failed its integrity check".into());
+        }
+        let floors: SessionRenewalFloors = decode(checkpoint.bytes())?;
+        if floors.floors.len() > MAX_SESSION_RENEWAL_PEERS {
+            return Err(format!(
+                "session renewal checkpoint has {} peers; maximum is {MAX_SESSION_RENEWAL_PEERS}",
+                floors.floors.len()
+            ));
+        }
+        Ok(floors)
+    }
+
+    fn load_session_renewal_floor(
+        &self,
+        key: RoomSessionRenewalKey,
+    ) -> Result<Option<Vec<u8>>, String> {
+        self.validate_session_renewal_key(key)?;
+        Ok(self
+            .session_renewal_floors()?
+            .floors
+            .get(&key.peer)
+            .cloned())
+    }
+
+    async fn persist_session_renewal_floor(
+        &mut self,
+        key: RoomSessionRenewalKey,
+        floor: Vec<u8>,
+        require_current_base: bool,
+    ) -> Result<(), String> {
+        self.validate_session_renewal_key(key)?;
+        let decoded = SessionRenewalFloor::from_bytes(&floor)
+            .map_err(|error| format!("invalid session renewal floor: {error}"))?;
+        let current = self.music_snapshot()?;
+        if require_current_base && decoded.base() != &current.history.frontier() {
+            return Err(
+                "session renewal floor does not name the music replica's current frontier".into(),
+            );
+        }
+        if !require_current_base
+            && decoded
+                .base()
+                .0
+                .iter()
+                .any(|entry| !current.history.contains(entry))
+        {
+            return Err("legacy session renewal floor names unavailable music history".into());
+        }
+        let mut floors = self.session_renewal_floors()?;
+        if !floors.floors.contains_key(&key.peer)
+            && floors.floors.len() >= MAX_SESSION_RENEWAL_PEERS
+        {
+            return Err(format!(
+                "session renewal checkpoint already has {MAX_SESSION_RENEWAL_PEERS} peers"
+            ));
+        }
+        floors.floors.insert(key.peer, floor);
+        let bytes = encode(&floors)?;
+        let checkpoint_key = Self::session_renewal_checkpoint_key()?;
+        let prepared = self
+            .music
+            .inner()
+            .prepare_local_transaction(move |view, local| {
+                local.save_checkpoint(view.checkpoint(checkpoint_key, bytes)?);
+                Ok(())
+            })
+            .map_err(|error| error.to_string())?;
+        self.music
+            .inner_mut()
+            .commit_prepared_local_transaction(prepared)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     fn capabilities_for_lane(
         &self,
         actor: ActorId,
@@ -584,7 +702,7 @@ where
             .view_with_snapshots(&music_snapshot, &extension_snapshot);
         Ok(RoomWorkerProjection {
             view,
-            music_revision: music_snapshot.sequence,
+            music_revision: public_music_revision(&music_snapshot),
             music_history_root: *history_root(&music_snapshot.history).as_bytes(),
             music_frontier: *replica_frontier_digest(&music).as_bytes(),
             extension_frontier: *replica_frontier_digest(&extension).as_bytes(),
@@ -687,7 +805,7 @@ where
             local: self.local_actor,
             peer,
             signing_key: self.signing_key.clone(),
-            durable_revision: snapshot.sequence,
+            durable_revision: public_music_revision(&snapshot),
             history: snapshot.history,
             music_root: root,
             local_grants,
@@ -961,6 +1079,12 @@ fn repair_revision_advanced(before: Option<u64>, after: u64) -> bool {
     before.is_some_and(|before| after > before)
 }
 
+fn public_music_revision(snapshot: &hhhs_store::StorageSnapshot) -> u64 {
+    // Physical storage sequence also advances for receiver-local checkpoints
+    // such as renewal floors. Only DAG growth advances canonical music state.
+    snapshot.history_epoch.get()
+}
+
 pub(crate) trait RoomWorkerFactory: 'static {
     type Durability: AsyncTransactionSink + 'static;
 
@@ -1089,7 +1213,7 @@ where
                 let durable_advance = (lane == RoomLane::Music && self.session.is_some())
                     .then(|| {
                         let snapshot = self.room()?.music_snapshot()?;
-                        let durable_revision = snapshot.sequence;
+                        let durable_revision = public_music_revision(&snapshot);
                         let durable_view = self.room()?.view()?.music.shared_pitches;
                         Ok::<_, String>((snapshot.history, durable_view, durable_revision))
                     })
@@ -1140,7 +1264,7 @@ where
                     && self.session.is_some())
                 .then(|| {
                     let snapshot = self.room()?.music_snapshot()?;
-                    let durable_revision = snapshot.sequence;
+                    let durable_revision = public_music_revision(&snapshot);
                     let durable_view = self.room()?.view()?.music.shared_pitches;
                     Ok::<_, String>((snapshot.history, durable_view, durable_revision))
                 })
@@ -1183,7 +1307,7 @@ where
             }
             RoomWorkerCommand::ResetSessionProjection => {
                 let snapshot = self.room()?.music_snapshot()?;
-                let durable_revision = snapshot.sequence;
+                let durable_revision = public_music_revision(&snapshot);
                 let durable_view = self.room()?.view()?.music.shared_pitches;
                 let (reply, response) = futures::channel::oneshot::channel();
                 self.session
@@ -1250,7 +1374,7 @@ where
                     )
                     .map_err(|error| error.to_string())?;
                 let snapshot = self.room()?.music_snapshot()?;
-                let durable_revision = snapshot.sequence;
+                let durable_revision = public_music_revision(&snapshot);
                 let durable_view = self.room()?.view()?.music.shared_pitches;
                 self.session
                     .as_mut()
@@ -1275,6 +1399,30 @@ where
                     committed: true,
                     projection_revision,
                 })
+            }
+            RoomWorkerCommand::SessionRenewalStore(request) => {
+                let result = match request.operation {
+                    RoomSessionRenewalStoreOperation::Load => self
+                        .room()?
+                        .load_session_renewal_floor(request.key)
+                        .map(RoomSessionRenewalStoreValue::Loaded),
+                    RoomSessionRenewalStoreOperation::Persist(floor) => self
+                        .room_mut()?
+                        .persist_session_renewal_floor(request.key, floor, true)
+                        .await
+                        .map(|()| RoomSessionRenewalStoreValue::Persisted),
+                    RoomSessionRenewalStoreOperation::MigrateLegacy(floor) => self
+                        .room_mut()?
+                        .persist_session_renewal_floor(request.key, floor, false)
+                        .await
+                        .map(|()| RoomSessionRenewalStoreValue::Persisted),
+                };
+                Ok(RoomWorkerResponse::SessionRenewalStore(
+                    RoomSessionRenewalStoreResponse {
+                        request: request.request,
+                        result,
+                    },
+                ))
             }
             RoomWorkerCommand::SignPresence {
                 session,
@@ -1370,7 +1518,7 @@ where
                         let durable_admission =
                             self.room()?.durable_entry_admission(lane, entry)?;
                         let snapshot = self.room()?.music_snapshot()?;
-                        let durable_revision = snapshot.sequence;
+                        let durable_revision = public_music_revision(&snapshot);
                         let durable_view = self.room()?.view()?.music.shared_pitches;
                         let input =
                             if hhhs_session::ReifiedSessionCommand::has_domain(&observed.payload) {
@@ -1421,7 +1569,7 @@ where
                         .then(|| {
                             self.room()
                                 .and_then(|room| room.music_snapshot())
-                                .map(|snapshot| snapshot.sequence)
+                                .map(|snapshot| public_music_revision(&snapshot))
                         })
                         .transpose()?;
                     let step = match operation {
@@ -1449,12 +1597,13 @@ where
                             close_error,
                         } => self.room_mut()?.finish_repair(session, close_error)?,
                     };
-                    let music_revision_after = self.room()?.music_snapshot()?.sequence;
+                    let music_revision_after =
+                        public_music_revision(&self.room()?.music_snapshot()?);
                     let music_revision_advanced =
                         repair_revision_advanced(music_revision_before, music_revision_after);
                     if music_revision_advanced && self.session.is_some() {
                         let snapshot = self.room()?.music_snapshot()?;
-                        let durable_revision = snapshot.sequence;
+                        let durable_revision = public_music_revision(&snapshot);
                         let durable_view = self.room()?.view()?.music.shared_pitches;
                         self.session
                             .as_mut()
@@ -1588,6 +1737,167 @@ mod tests {
         assert!(!repair_revision_advanced(Some(5), 4));
         assert!(repair_revision_advanced(Some(4), 5));
         assert!(repair_revision_advanced(Some(4), 7));
+    }
+
+    #[test]
+    fn renewal_floor_is_restart_safe_without_false_public_music_growth() {
+        block_on(async {
+            let request = open_request("renewal-floor-host", [0x21; 32]);
+            let mut plane = RoomDataPlane::open(
+                request.clone(),
+                MemoryLog::default(),
+                MemoryLog::default(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+            let key = RoomSessionRenewalKey {
+                room: request.object,
+                local: plane.local_actor.0,
+                peer: [0x42; 32],
+            };
+            let before = plane.music_snapshot().unwrap();
+            let before_projection = plane.projection().unwrap();
+            let mut floor = Vec::new();
+            floor.push(hhhs_session::SESSION_RENEWAL_FLOOR_VERSION);
+            floor.extend_from_slice(&1_u32.to_le_bytes());
+            floor.extend_from_slice(Digest::of(b"test manifest").as_bytes());
+            floor.extend_from_slice(
+                &u16::try_from(before.history.frontier().len())
+                    .unwrap()
+                    .to_le_bytes(),
+            );
+            for head in &before.history.frontier().0 {
+                floor.extend_from_slice(head.as_bytes());
+            }
+            let mut checksum = blake3::Hasher::new();
+            checksum.update(hhhs_session::SESSION_RENEWAL_FLOOR_DOMAIN);
+            checksum.update(&floor);
+            floor.extend_from_slice(checksum.finalize().as_bytes());
+            let _checked_floor = SessionRenewalFloor::from_bytes(&floor).unwrap();
+
+            plane
+                .persist_session_renewal_floor(key, floor.clone(), true)
+                .await
+                .unwrap();
+
+            let after = plane.music_snapshot().unwrap();
+            assert_eq!(after.sequence, before.sequence + 1);
+            assert_eq!(after.history_epoch, before.history_epoch);
+            assert_eq!(after.history.len(), before.history.len());
+            assert_eq!(after.history.frontier(), before.history.frontier());
+            assert_eq!(history_root(&after.history), history_root(&before.history));
+            assert_eq!(
+                plane.load_session_renewal_floor(key).unwrap(),
+                Some(floor.clone())
+            );
+            assert_eq!(
+                plane.projection().unwrap().music_revision,
+                before_projection.music_revision
+            );
+            assert_eq!(
+                plane.projection().unwrap().music_history_root,
+                before_projection.music_history_root
+            );
+
+            let degree = TunedDegree::new(&Tuning::twelve_tet(), 7).unwrap();
+            plane
+                .commit(super::super::v5::MusicOp::AddDegree { degree }.into())
+                .await
+                .unwrap();
+            let after_public = plane.music_snapshot().unwrap();
+            let after_public_projection = plane.projection().unwrap();
+            assert_eq!(
+                after_public_projection.music_revision,
+                before_projection.music_revision + 1
+            );
+            let sequence_before_stale_refusal = after_public.sequence;
+            assert!(
+                plane
+                    .persist_session_renewal_floor(key, floor.clone(), true)
+                    .await
+                    .unwrap_err()
+                    .contains("current frontier")
+            );
+            assert_eq!(
+                plane.music_snapshot().unwrap().sequence,
+                sequence_before_stale_refusal
+            );
+
+            let migrated_key = RoomSessionRenewalKey {
+                peer: [0x43; 32],
+                ..key
+            };
+            plane
+                .persist_session_renewal_floor(migrated_key, floor.clone(), false)
+                .await
+                .unwrap();
+            assert_eq!(
+                plane.projection().unwrap().music_revision,
+                after_public_projection.music_revision
+            );
+            assert_eq!(
+                plane.load_session_renewal_floor(migrated_key).unwrap(),
+                Some(floor.clone())
+            );
+
+            let RoomDataPlane {
+                music, extension, ..
+            } = plane;
+            let (_, music_log) = music.into_inner().into_parts();
+            let (_, extension_log) = extension.into_inner().into_parts();
+            let music_transactions = music_log.transactions.clone();
+            let extension_transactions = extension_log.transactions.clone();
+            let reopened = RoomDataPlane::open(
+                request,
+                music_log,
+                extension_log,
+                music_transactions,
+                extension_transactions,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                reopened.load_session_renewal_floor(key).unwrap(),
+                Some(floor.clone())
+            );
+            assert_eq!(
+                reopened.projection().unwrap().music_revision,
+                after_public_projection.music_revision
+            );
+            assert_eq!(
+                reopened.projection().unwrap().music_history_root,
+                after_public_projection.music_history_root
+            );
+            assert_eq!(
+                reopened.load_session_renewal_floor(migrated_key).unwrap(),
+                Some(floor)
+            );
+        });
+    }
+
+    #[test]
+    fn room_worker_close_is_a_terminal_service_barrier() {
+        block_on(async {
+            let mut host =
+                InProcessWorkerHost::with_defaults(RoomReplicaWorkerService::new(MemoryFactory));
+            open_and_subscribe(&mut host, open_request("terminal-close-host", [0x31; 32])).await;
+            let closed = host
+                .dispatch(WorkerRequestKind::Close, Vec::new())
+                .await
+                .unwrap();
+            assert_eq!(closed.reply.kind(), &WorkerEventKind::Closed);
+            assert!(matches!(
+                decode_response(closed.reply.payload()).unwrap(),
+                RoomWorkerResponse::Closed
+            ));
+            assert!(
+                host.dispatch(WorkerRequestKind::Ping, Vec::new())
+                    .await
+                    .is_err()
+            );
+        });
     }
 
     async fn open_and_subscribe(

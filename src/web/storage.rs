@@ -366,92 +366,19 @@ impl Drop for IdbCloseGuard {
     }
 }
 
-/// Persist one byte blob and await the IndexedDB transaction-complete event.
-/// Request success alone is not durable because the containing transaction may
-/// still abort afterward.
+/// Read the pre-sealed-host renewal floor during one-way migration.
+///
+/// New floors are never written here. The caller first checks the sealed HHHS
+/// checkpoint and, when this legacy value exists, persists it through the
+/// Room worker's `DurableReplicaHost` before session authorization continues.
+/// Keeping the old row recoverable makes an interrupted upgrade retryable
+/// without restoring this database as a live writer.
 #[cfg(feature = "browser-net")]
-async fn put_bytes(db: &IdbDatabase, key: &str, bytes: &[u8]) -> Result<(), String> {
-    use std::{cell::RefCell, rc::Rc};
-
-    let transaction = db
-        .transaction_with_str_and_mode(STORE_NAME, web_sys::IdbTransactionMode::Readwrite)
-        .map_err(|_| "Failed to create write transaction")?;
-    let store: IdbObjectStore = transaction
-        .object_store(STORE_NAME)
-        .map_err(|_| "Failed to get store")?;
-    let value = js_sys::Uint8Array::from(bytes);
-    store
-        .put_with_key(&value, &JsValue::from_str(key))
-        .map_err(|_| "Failed to queue durable byte write")?;
-
-    let (tx, rx) = futures::channel::oneshot::channel();
-    let tx = Rc::new(RefCell::new(Some(tx)));
-    let complete_tx = tx.clone();
-    let oncomplete = Closure::once(Box::new(move |_event: web_sys::Event| {
-        if let Some(tx) = complete_tx.borrow_mut().take() {
-            let _ = tx.send(Ok(()));
-        }
-    }) as Box<dyn FnOnce(_)>);
-    transaction.set_oncomplete(Some(oncomplete.as_ref().unchecked_ref()));
-    let error_tx = tx.clone();
-    let onerror = Closure::once(Box::new(move |_event: web_sys::Event| {
-        if let Some(tx) = error_tx.borrow_mut().take() {
-            let _ = tx.send(Err("IndexedDB byte transaction failed".to_owned()));
-        }
-    }) as Box<dyn FnOnce(_)>);
-    transaction.set_onerror(Some(onerror.as_ref().unchecked_ref()));
-    let abort_tx = tx;
-    let onabort = Closure::once(Box::new(move |_event: web_sys::Event| {
-        if let Some(tx) = abort_tx.borrow_mut().take() {
-            let _ = tx.send(Err("IndexedDB byte transaction aborted".to_owned()));
-        }
-    }) as Box<dyn FnOnce(_)>);
-    transaction.set_onabort(Some(onabort.as_ref().unchecked_ref()));
-
-    #[allow(deprecated)]
-    if transaction.commit().is_err() {
-        transaction.set_oncomplete(None);
-        transaction.set_onerror(None);
-        transaction.set_onabort(None);
-        return Err("Failed to commit IndexedDB byte transaction".to_owned());
-    }
-    let result = rx
-        .await
-        .map_err(|_| "IndexedDB byte transaction callback closed")?;
-    transaction.set_oncomplete(None);
-    transaction.set_onerror(None);
-    transaction.set_onabort(None);
-    result
-}
-
-/// IndexedDB owner for rollback-sensitive pair-session renewal floors.
-#[cfg(feature = "browser-net")]
-#[derive(Default)]
-pub struct IndexedDbSessionRenewalStore;
-
-#[cfg(feature = "browser-net")]
-impl crate::room::session::RoomSessionRenewalStore for IndexedDbSessionRenewalStore {
-    fn load<'a>(
-        &'a self,
-        key: crate::room::session::RoomSessionRenewalKey,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<Vec<u8>>, String>> + 'a>>
-    {
-        Box::pin(async move {
-            let db = open_db().await?;
-            get_bytes(&db, &session_renewal_key(key)).await
-        })
-    }
-
-    fn persist<'a>(
-        &'a self,
-        key: crate::room::session::RoomSessionRenewalKey,
-        floor: Vec<u8>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + 'a>> {
-        Box::pin(async move {
-            let db = open_db().await?;
-            put_bytes(&db, &session_renewal_key(key), &floor).await
-        })
-    }
+pub(crate) async fn load_legacy_session_renewal(
+    key: crate::room::session::RoomSessionRenewalKey,
+) -> Result<Option<Vec<u8>>, String> {
+    let db = open_db().await?;
+    get_bytes(&db, &session_renewal_key(key)).await
 }
 
 #[cfg(feature = "browser-net")]

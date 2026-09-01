@@ -2539,6 +2539,30 @@ fn spawn_session_loop(
                     );
                     host.emit_diagnostic("session_intent_rejected", &reason);
                 }
+                RoomSessionEgress::RenewalStore(request) => {
+                    let host = host.clone();
+                    let worker = worker.clone();
+                    let lifetime = lifetime.clone();
+                    let _ = task_spawner.spawn(async move {
+                        let Some(result) = until_generation_cancelled(
+                            &lifetime,
+                            worker.service_session_renewal_store(request),
+                        )
+                        .await
+                        else {
+                            return;
+                        };
+                        if let Err(error) = result {
+                            host.emit_diagnostic("session_renewal_store", &error);
+                            host.fail_active_room_generation(
+                                worker.generation(),
+                                format!(
+                                    "receiver-local renewal durability failed and requires checked placement reopen: {error}"
+                                ),
+                            );
+                        }
+                    });
+                }
                 RoomSessionEgress::Diagnostic(message) => {
                     host.emit_diagnostic("hhhs_session", &message);
                 }
