@@ -879,9 +879,9 @@ impl RoomSessionTask {
             );
         }
         if let Some(active) = self.active.get(&peer)
-            && !active.is_drained()
+            && active.has_local_reification_wait()
         {
-            return Err("session renewal requires the old speculative suffix to drain".into());
+            return Err("session renewal requires the old local durable suffix to drain".into());
         }
         let renewal_floor = self.load_renewal_floor(&foundation).await?;
         let renewal_floor_epoch = renewal_floor.as_ref().map(SessionRenewalFloor::epoch);
@@ -1114,7 +1114,7 @@ impl RoomSessionTask {
             .filter_map(|(peer, active)| {
                 (((active.foundation.local.0 < peer.0 && active.needs_renewal())
                     || self.renewal_needed.contains(peer))
-                    && active.is_drained()
+                    && !active.has_local_reification_wait()
                     && !self.peer_has_recovery_work(*peer)
                     && !self.pending.contains_key(peer))
                 .then_some(*peer)
@@ -1310,18 +1310,24 @@ impl RoomSessionTask {
                     || self
                         .active
                         .get(&source)
-                        .is_some_and(|active| !active.is_drained())
+                        .is_some_and(ActiveSession::has_local_reification_wait)
                     || self.peer_has_recovery_work(source)
                 {
-                    return Err(
-                        "session answer arrived after its durable base or old suffix changed"
-                            .into(),
-                    );
+                    // The Answer authenticated the offer we actually sent,
+                    // but an old-epoch durable edit advanced the canonical
+                    // frontier while that offer was in flight. HHHS correctly
+                    // refuses authorization at the stale base. Preserve the
+                    // admitted edit, consume no renewal floor, and replace the
+                    // removed offer deterministically from the fresh admitted
+                    // foundation once every local obligation is drained.
+                    self.renewal_needed.insert(source);
+                    return self.start_ready_renewals().await;
                 }
                 if self.renewal_floors.get(&source).and_then(Option::as_ref)
                     != pending.renewal_floor.as_ref()
                 {
-                    return Err("session renewal floor changed during establishment".into());
+                    self.renewal_needed.insert(source);
+                    return self.start_ready_renewals().await;
                 }
                 let authorization = authorize_pair(
                     &pending.foundation,
@@ -3210,6 +3216,51 @@ mod tests {
         .unwrap()
     }
 
+    fn answer_offer(
+        responder: &RoomSessionFoundation,
+        encoded_offer: &[u8],
+        ephemeral: [u8; 32],
+    ) -> Vec<u8> {
+        let SessionCarrierBody::Offer {
+            source,
+            target,
+            session_id,
+            epoch,
+            base,
+            handshake,
+            ..
+        } = SessionCarrierBody::decode(encoded_offer).unwrap()
+        else {
+            panic!("fixture did not encode an Offer");
+        };
+        assert_eq!(source, responder.peer);
+        assert_eq!(target, responder.local);
+        let manifest = build_manifest(responder, session_id, SessionEpoch::new(epoch)).unwrap();
+        assert_eq!(base, position_bytes(manifest.base()));
+        let binding = establishment_binding(&responder.identity, source, target, session_id);
+        let verified = Offer::decode(&handshake)
+            .unwrap()
+            .verify(ProtocolId::derive(SESSION_PROTOCOL_LABEL), binding)
+            .unwrap();
+        let (answer, _) = verified
+            .respond(
+                &responder.signing_key,
+                EphemeralSecret::from_bytes(ephemeral),
+            )
+            .unwrap();
+        let (_, presentation) = local_foundation(responder, &manifest).unwrap();
+        SessionCarrierBody::Answer {
+            source: responder.local,
+            target: source,
+            session_id,
+            grants: hash_bytes(&responder.local_grants),
+            handshake: answer.as_bytes().to_vec(),
+            foundation: presentation,
+        }
+        .encode()
+        .unwrap()
+    }
+
     fn task_state_signature(
         task: &RoomSessionTask,
     ) -> (
@@ -3358,6 +3409,176 @@ mod tests {
         assert!(authorize_fixture(&owner, &member, 11, 1, Some(&recovered)).is_err());
         assert!(authorize_fixture(&owner, &member, 33, 3, Some(&recovered)).is_err());
         assert!(authorize_fixture(&owner, &member, 44, 4, Some(&recovered)).is_ok());
+    }
+
+    #[test]
+    fn stale_answer_after_final_old_epoch_edit_reproposes_from_fresh_frontier() {
+        let (room, owner, mut member) = renewal_room_foundations();
+        let peer = owner.peer;
+        let old_session_id = 0x5201;
+        let (old_authorized, floor) =
+            authorize_fixture(&owner, &member, old_session_id, 1, None).unwrap();
+        let (old_keys, member_old_keys) = session_key_pair(&owner, &member, old_session_id);
+        let active =
+            ActiveSession::new(owner.clone(), old_authorized, old_session_id, old_keys, 0).unwrap();
+        let (member_old_authorized, _) =
+            authorize_fixture(&member, &owner, old_session_id, 1, None).unwrap();
+        let mut member_old = ActiveSession::new(
+            member.clone(),
+            member_old_authorized,
+            old_session_id,
+            member_old_keys,
+            0,
+        )
+        .unwrap();
+        let old_frame = member_old
+            .local_event(
+                MusicOp::AddDegree { degree: degree() },
+                intent(90),
+                0,
+                &DisabledRoomSessionTraceClock,
+                false,
+                None,
+                None,
+            )
+            .unwrap()
+            .frame;
+
+        let delivered = Rc::new(RefCell::new(Vec::<RoomSessionEgress>::new()));
+        let captured = Rc::clone(&delivered);
+        let events = WorkerEventPort::new(WorkerGeneration::new(1), move |event| {
+            captured.borrow_mut().push(decode(event.payload())?);
+            Ok(())
+        });
+        let (reifications, mut queued) = mpsc::channel(4);
+        let store = Rc::new(TestRenewalStore::default());
+        let mut task = RoomSessionTask::new(reifications, store.clone(), test_lease_clock());
+        task.events = Some(events);
+        task.foundations.insert(peer, owner.clone());
+        task.renewal_floors.insert(peer, Some(floor));
+        task.presentation_peer = Some(peer);
+        task.active.insert(peer, active);
+        task.renewal_needed.insert(peer);
+
+        block_on(task.start_ready_renewals()).unwrap();
+        let first_offer = delivered
+            .borrow()
+            .iter()
+            .find_map(|event| match event {
+                RoomSessionEgress::Carrier(bytes) => Some(bytes.clone()),
+                _ => None,
+            })
+            .expect("renewal must emit O1");
+        let first_pending = task.pending.get(&peer).unwrap();
+        assert_eq!(first_pending.manifest.epoch(), SessionEpoch::new(2));
+        assert_eq!(first_pending.manifest.base(), &owner.history.frontier());
+        let first_session_id = first_pending.session_id;
+        let stale_answer = answer_offer(&member, &first_offer, [81; 32]);
+
+        // X remains an ordinary capability-authorized durable record. Its
+        // exact admission advances B -> B1 while O1 is still pending.
+        block_on(task.local_edit(
+            MusicOp::AddDegree { degree: degree() },
+            intent(1),
+            None,
+            None,
+        ))
+        .unwrap();
+        let reification = block_on(queued.next()).expect("old-epoch edit must reify");
+        let (entry, admission) = room
+            .admit_reified_music_for_test(
+                &owner.signing_key,
+                &reification.plan,
+                reification.command,
+            )
+            .unwrap();
+        let snapshot = room.music_snapshot();
+        let durable_view = room.view().music.shared_pitches;
+        let b1 = snapshot.history.frontier();
+        assert_ne!(b1, owner.history.frontier());
+        assert!(durable_view.pitch_classes.contains(&degree()));
+        block_on(task.confirm_local(
+            peer,
+            reification.session,
+            reification.plan,
+            reification.intent_token,
+            entry,
+            admission,
+            snapshot.history.clone(),
+            durable_view.clone(),
+            snapshot.sequence,
+        ))
+        .unwrap();
+
+        let floor_before = task.renewal_floors[&peer].clone().unwrap();
+        let offers_before = delivered
+            .borrow()
+            .iter()
+            .filter(|event| matches!(event, RoomSessionEgress::Carrier(_)))
+            .count();
+        block_on(task.carrier(stale_answer, None, None)).unwrap();
+        assert_eq!(task.renewal_floors[&peer].as_ref(), Some(&floor_before));
+        assert_eq!(store.persist_calls.get(), 0);
+        let second_pending = task
+            .pending
+            .get(&peer)
+            .expect("B1 must immediately produce O2");
+        assert_eq!(second_pending.manifest.epoch(), SessionEpoch::new(2));
+        assert_eq!(second_pending.manifest.base(), &b1);
+        assert_ne!(second_pending.session_id, first_session_id);
+        let second_offer = delivered
+            .borrow()
+            .iter()
+            .filter_map(|event| match event {
+                RoomSessionEgress::Carrier(bytes) => Some(bytes.clone()),
+                _ => None,
+            })
+            .nth(offers_before)
+            .expect("replacement offer must be emitted exactly after stale Answer");
+
+        member.history = snapshot.history.clone();
+        member.durable_view = durable_view.clone();
+        member.durable_revision = snapshot.sequence;
+        let fresh_answer = answer_offer(&member, &second_offer, [82; 32]);
+        block_on(task.carrier(fresh_answer, None, None)).unwrap();
+        assert!(!task.pending.contains_key(&peer));
+        assert!(!task.renewal_needed.contains(&peer));
+        let renewed = task.active.get_mut(&peer).expect("O2 must install");
+        assert_eq!(renewed.session.manifest().epoch(), SessionEpoch::new(2));
+        assert_eq!(renewed.session.manifest().base(), &b1);
+        assert_eq!(renewed.sender.highest_sealed_counter(), 0);
+        let first_new = renewed
+            .local_event(
+                MusicOp::RemoveDegree { degree: degree() },
+                intent(2),
+                0,
+                &DisabledRoomSessionTraceClock,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            first_new.plan.unwrap().correlation().dot().counter(),
+            1,
+            "replacement epoch must restart its causal counter at one"
+        );
+        assert!(matches!(
+            renewed.ingest_remote(
+                &old_frame,
+                0,
+                &DisabledRoomSessionTraceClock,
+                false,
+                None,
+                None,
+            ),
+            Err(RemoteIngestFailure::BeforeMutation(_))
+        ));
+        assert_eq!(
+            history_root(&renewed.foundation.history),
+            history_root(&snapshot.history)
+        );
+        assert_eq!(renewed.foundation.durable_view, durable_view);
     }
 
     #[test]

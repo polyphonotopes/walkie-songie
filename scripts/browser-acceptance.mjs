@@ -56,10 +56,11 @@ const hostConditionStarted = hostCondition();
 // the report and refuse anything beyond two ticks.
 const traceClockQuantizationToleranceMs = 0.2;
 const traceClockQuantizationAdjustments = [];
-// These are release-regression ceilings for the existing durable Room-v5 path,
-// not the tighter target for a future ephemeral performance/session protocol.
 // Use steady-state samples so first-write allocation, JIT, and carrier startup
 // remain visible in the report without making a release gate host-dependent.
+// Canonical Room-v5 rendering and the reversible local pressed-feedback facet
+// are measured separately: the latter acknowledges input without becoming a
+// second SharedPitchSet authority.
 
 for (const required of ["index.html", "sw.js", "all-around-keyboard.esm.min.js"]) {
   assert.ok(existsSync(join(dist, required)), `missing release artifact: ${join(dist, required)}`);
@@ -249,6 +250,24 @@ async function installOverlayObserver(page) {
     window.__walkieAcceptanceObserver?.disconnect();
     window.__walkieAcceptanceEvents = [];
     window.__walkieKeyboardRenders = [];
+    window.__walkiePressedFeedbackEvents = [];
+    if (!window.__walkieOriginalKeyboardUpdateState) {
+      const originalUpdateState = keyboard.updateState;
+      if (typeof originalUpdateState !== "function") {
+        throw new Error("all-around-keyboard updateState is unavailable");
+      }
+      window.__walkieOriginalKeyboardUpdateState = originalUpdateState;
+      keyboard.updateState = function updateStateWithAcceptanceWitness(patch) {
+        const result = originalUpdateState.call(this, patch);
+        if (patch && Object.hasOwn(patch, "pressedNotes")) {
+          window.__walkiePressedFeedbackEvents.push({
+            at: performance.timeOrigin + performance.now(),
+            notes: [...this.pressedNotes],
+          });
+        }
+        return result;
+      };
+    }
     keyboard.onRenderStats = (stats) => {
       window.__walkieKeyboardRenders.push({
         ...stats,
@@ -285,7 +304,36 @@ async function resetOverlayEvents(page) {
   await page.evaluate(() => {
     window.__walkieAcceptanceEvents = [];
     window.__walkieKeyboardRenders = [];
+    window.__walkiePressedFeedbackEvents = [];
   });
+}
+
+async function waitForPressedFeedback(page, note, started, label) {
+  try {
+    await page.waitForFunction(
+      ({ expectedNote, notBefore }) =>
+        (window.__walkiePressedFeedbackEvents ?? []).some(
+          (event) => event.at >= notBefore && event.notes.includes(expectedNote),
+        ),
+      { expectedNote: note, notBefore: started },
+      { timeout: timeoutMs },
+    );
+  } catch (error) {
+    const events = await page
+      .evaluate(() => window.__walkiePressedFeedbackEvents ?? [])
+      .catch(() => []);
+    throw new Error(
+      `${label} did not acknowledge note ${note} through reversible pressed feedback: ${JSON.stringify(events)}`,
+      { cause: error },
+    );
+  }
+  return page.evaluate(
+    ({ expectedNote, notBefore }) =>
+      (window.__walkiePressedFeedbackEvents ?? []).find(
+        (event) => event.at >= notBefore && event.notes.includes(expectedNote),
+      ),
+    { expectedNote: note, notBefore: started },
+  );
 }
 
 async function overlayCount(page, key) {
@@ -673,6 +721,7 @@ async function operate({
   const traceOffset = sessionTraces.length;
   await Promise.all([resetOverlayEvents(source), resetOverlayEvents(peer)]);
   const started = await dispatchPitch(source, note);
+  const pressedFeedback = await waitForPressedFeedback(source, note, started, sourceLabel);
   await Promise.all([
     waitForOverlay(source, key, present, sourceLabel),
     waitForOverlay(peer, key, present, peerLabel),
@@ -690,6 +739,7 @@ async function operate({
     assertSingleOverlayRender(peer, peerLabel),
   ]);
   timings.localDomMutation.push(sourceMutation.at - started);
+  timings.localPressedFeedback.push(pressedFeedback.at - started);
   timings.peerDomMutation.push(peerMutation.at - started);
   timings.localVisible.push(sourceRender.at - started);
   timings.peerVisible.push(peerRender.at - started);
@@ -732,6 +782,7 @@ function assertNoRepairFailures(diagnostics) {
 const diagnostics = [];
 const sessionTraces = [];
 const timings = {
+  localPressedFeedback: [],
   localDomMutation: [],
   peerDomMutation: [],
   localVisible: [],
@@ -911,12 +962,13 @@ try {
     performanceTargets: {
       localVisibleFeedback: {
         targetMs: 5,
-        metric: "intent-to-shared-set DOM mutation",
-        observedSteadyP95Ms: steady.localDomMutation?.p95 ?? null,
+        metric: "intent to reversible all-around-keyboard pressedNotes acknowledgement",
+        observedSteadyP95Ms: steady.localPressedFeedback?.p95 ?? null,
         met:
-          Number.isFinite(steady.localDomMutation?.p95) && steady.localDomMutation.p95 < 5,
+          Number.isFinite(steady.localPressedFeedback?.p95) &&
+          steady.localPressedFeedback.p95 < 5,
         note:
-          "No second SharedPitchSet authority is used; a future sub-5ms pressed-performance acknowledgement must be explicitly ephemeral and reversible.",
+          "This generation-scoped acknowledgement is bounded and reversible; canonical sunny membership, durable confirmation, component rendering, and paint are reported separately.",
       },
       remoteCausalProjection: {
         targetMs: 15,
@@ -939,6 +991,11 @@ try {
       samples: timings.localDomMutation,
       p50: percentile(timings.localDomMutation, 0.5),
       p95: percentile(timings.localDomMutation, 0.95),
+    },
+    localPressedFeedbackLatencyMs: {
+      samples: timings.localPressedFeedback,
+      p50: percentile(timings.localPressedFeedback, 0.5),
+      p95: percentile(timings.localPressedFeedback, 0.95),
     },
     localVisibleLatencyMs: {
       samples: timings.localVisible,

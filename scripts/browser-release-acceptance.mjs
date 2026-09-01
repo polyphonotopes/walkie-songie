@@ -67,6 +67,7 @@ const aggregate = {
     warmupSamplesExcluded: report.warmupSamplesExcluded,
     hostCondition: report.hostCondition,
     steadyStateLatencyMs: report.steadyStateLatencyMs,
+    performanceTargets: report.performanceTargets,
     reconnectMs: report.reconnectMs,
     evaluation: evaluation.trials[index],
   })),

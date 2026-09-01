@@ -43,8 +43,22 @@ test("a catastrophic trial is never outvoted", () => {
   assert.equal(evaluation.outcome, "failed");
 });
 
-test("one trial reports every durable-path budget", () => {
-  const evaluation = evaluateLatencyTrial(report(1));
+test("host load never relaxes a thesis target", () => {
+  const overloaded = report(0.5);
+  overloaded.hostCondition = { finished: { loadAverage: { oneMinute: 999 } } };
+  overloaded.performanceTargets.localVisibleFeedback.observedSteadyP95Ms =
+    latencyBudgetsMs.localVisibleFeedbackP95;
+  overloaded.performanceTargets.localVisibleFeedback.met = false;
+  const evaluation = evaluateLatencyTrial(overloaded);
+  assert.equal(evaluation.strictPassed, false);
+  assert.equal(
+    evaluation.checks.find(check => check.id === "localVisibleFeedback")?.passed,
+    false,
+  );
+});
+
+test("one trial reports every canonical and thesis budget", () => {
+  const evaluation = evaluateLatencyTrial(report(0.5));
   assert.equal(evaluation.strictPassed, true);
   assert.equal(evaluation.grossPassed, true);
   assert.deepEqual(
@@ -56,6 +70,8 @@ test("one trial reports every durable-path budget", () => {
       "peerVisible",
       "localRenderDuration",
       "peerRenderDuration",
+      "localVisibleFeedback",
+      "remoteCausalProjection",
       "reconnect",
     ],
   );
@@ -70,6 +86,18 @@ function report(factor) {
       peerVisible: { p95: latencyBudgetsMs.peerVisibleP95 * factor },
       localRenderDuration: { p95: latencyBudgetsMs.localKeyboardRenderP95 * factor },
       peerRenderDuration: { p95: latencyBudgetsMs.peerKeyboardRenderP95 * factor },
+    },
+    performanceTargets: {
+      localVisibleFeedback: {
+        targetMs: latencyBudgetsMs.localVisibleFeedbackP95,
+        observedSteadyP95Ms: latencyBudgetsMs.localVisibleFeedbackP95 * factor,
+        met: factor < 1,
+      },
+      remoteCausalProjection: {
+        targetMs: latencyBudgetsMs.remoteCausalProjectionP95,
+        observedSteadyP95Ms: latencyBudgetsMs.remoteCausalProjectionP95 * factor,
+        met: factor < 1,
+      },
     },
     reconnectMs: latencyBudgetsMs.reconnect * factor,
   };

@@ -51,8 +51,39 @@ struct ActiveRoom {
 struct RuntimeState {
     sequence: u64,
     snapshot: AppSnapshot,
+    peer_sync: BTreeMap<ActorId, PeerSyncState>,
     subscribers: Vec<Channel<AppEventEnvelope>>,
     active_room: Option<ActiveRoom>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct PeerSyncState {
+    required: u8,
+    complete: u8,
+}
+
+impl PeerSyncState {
+    fn update_requirements(&mut self, support: ProtocolSupport, path: PeerPath) -> bool {
+        self.required = support.bits();
+        self.complete &= self.required;
+        if path == PeerPath::Disconnected {
+            self.complete = 0;
+        }
+        self.synchronized()
+    }
+
+    fn mark_lane(&mut self, lane: RoomLane, synchronized: bool) -> bool {
+        if synchronized {
+            self.complete |= lane.tag();
+        } else {
+            self.complete &= !lane.tag();
+        }
+        self.synchronized()
+    }
+
+    const fn synchronized(self) -> bool {
+        self.required != 0 && self.complete & self.required == self.required
+    }
 }
 
 struct MidiRuntime {
@@ -83,6 +114,7 @@ impl AppRuntime {
             state: Arc::new(Mutex::new(RuntimeState {
                 sequence: 0,
                 snapshot: AppSnapshot::empty(Capabilities::tauri_desktop()),
+                peer_sync: BTreeMap::new(),
                 subscribers: Vec::new(),
                 active_room: None,
             })),
@@ -313,15 +345,12 @@ impl AppRuntime {
                 (DiscoverySource, PeerPath, ProtocolSupport),
             > = BTreeMap::new();
             if let Some(endpoint_id) = bootstrap {
+                let support = bootstrap_support.unwrap_or(ProtocolSupport::WALKIE);
                 peers.insert(
                     endpoint_id,
-                    (
-                        bootstrap_source,
-                        PeerPath::Connecting,
-                        bootstrap_support.unwrap_or(ProtocolSupport::WALKIE),
-                    ),
+                    (bootstrap_source, PeerPath::Connecting, support),
                 );
-                runtime.update_peer(endpoint_id, bootstrap_source, PeerPath::Connecting, false);
+                runtime.update_peer(endpoint_id, bootstrap_source, PeerPath::Connecting, support);
             }
 
             let mut path_refresh = tokio::time::interval(Duration::from_secs(1));
@@ -416,12 +445,12 @@ impl AppRuntime {
                     _ = path_refresh.tick() => {
                         for endpoint_id in peers.keys().copied().collect::<Vec<_>>() {
                             let path = map_peer_path(network.peer_path(endpoint_id).await);
-                            let Some((source, previous, _)) = peers.get_mut(&endpoint_id) else {
+                            let Some((source, previous, support)) = peers.get_mut(&endpoint_id) else {
                                 continue;
                             };
                             if *previous != path {
                                 *previous = path;
-                                runtime.update_peer(endpoint_id, *source, path, false);
+                                runtime.update_peer(endpoint_id, *source, path, *support);
                             }
                         }
                     }
@@ -460,7 +489,7 @@ impl AppRuntime {
                                 endpoint_id,
                                 DiscoverySource::AddressLookup,
                                 PeerPath::Connecting,
-                                false,
+                                support,
                             );
                         }
                         None => rendezvous_rx = None,
@@ -500,7 +529,7 @@ impl AppRuntime {
                                         endpoint_id,
                                         DiscoverySource::Mdns,
                                         PeerPath::Connecting,
-                                        false,
+                                        ProtocolSupport::WALKIE,
                                     );
                                 }
                                 NativeNetworkEvent::MdnsExpired { endpoint_id } => {
@@ -520,7 +549,7 @@ impl AppRuntime {
                                         .unwrap_or(discovery);
                                     let path = map_peer_path(network.peer_path(endpoint_id).await);
                                     peers.insert(endpoint_id, (source, path, support));
-                                    runtime.update_peer(endpoint_id, source, path, false);
+                                    runtime.update_peer(endpoint_id, source, path, support);
                                     if let Err(error) = maybe_grant_peer(
                                         &durable,
                                         room_authority.as_ref().unwrap_or(&signing_key),
@@ -544,13 +573,13 @@ impl AppRuntime {
                                     }
                                 }
                                 NativeNetworkEvent::NeighborDown { endpoint_id } => {
-                                    if let Some((source, path, _)) = peers.get_mut(&endpoint_id) {
+                                    if let Some((source, path, support)) = peers.get_mut(&endpoint_id) {
                                         *path = PeerPath::Disconnected;
                                         runtime.update_peer(
                                             endpoint_id,
                                             *source,
                                             PeerPath::Disconnected,
-                                            false,
+                                            *support,
                                         );
                                     }
                                 }
@@ -665,6 +694,7 @@ impl AppRuntime {
         state.snapshot.room_name = room_name.clone();
         state.snapshot.room_topic = Some(topic_string.clone());
         state.snapshot.room_ticket = Some(ticket_string.clone());
+        state.peer_sync.clear();
         state.snapshot.peers.clear();
         state.snapshot.voices.clear();
         emit_locked(
@@ -693,6 +723,7 @@ impl AppRuntime {
         state.snapshot.pieces_locked = false;
         state.snapshot.available_emojis = None;
         state.snapshot.voices.clear();
+        state.peer_sync.clear();
         state.snapshot.peers.clear();
         emit_locked(
             &mut state,
@@ -1151,12 +1182,17 @@ impl AppRuntime {
         endpoint_id: iroh::EndpointId,
         discovery: DiscoverySource,
         path: PeerPath,
-        synchronized: bool,
+        support: ProtocolSupport,
     ) {
         let Ok(mut state) = self.lock() else {
             return;
         };
         let author = ActorId(*endpoint_id.as_bytes());
+        let synchronized = state
+            .peer_sync
+            .entry(author)
+            .or_default()
+            .update_requirements(support, path);
         let mut peer = PeerSnapshot {
             author,
             endpoint_id: endpoint_id.to_string(),
@@ -1171,10 +1207,7 @@ impl AppRuntime {
             .iter_mut()
             .find(|existing| existing.author == author)
         {
-            if path != PeerPath::Disconnected {
-                peer.synchronized |= existing.synchronized;
-                peer.round_trip_ms = existing.round_trip_ms;
-            }
+            peer.round_trip_ms = existing.round_trip_ms;
             *existing = peer.clone();
         } else {
             state.snapshot.peers.push(peer.clone());
@@ -1188,15 +1221,29 @@ impl AppRuntime {
             return;
         };
         let author = ActorId(*endpoint_id.as_bytes());
+        state.peer_sync.remove(&author);
         state.snapshot.peers.retain(|peer| peer.author != author);
         emit_locked(&mut state, AppEvent::PeerRemoved { author });
     }
 
-    fn mark_peer_synchronized(&self, endpoint_id: iroh::EndpointId) {
+    fn mark_peer_lane_synchronized(
+        &self,
+        endpoint_id: iroh::EndpointId,
+        lane: RoomLane,
+        synchronized: bool,
+    ) {
         let Ok(mut state) = self.lock() else {
             return;
         };
         let author = ActorId(*endpoint_id.as_bytes());
+        let synchronized = state
+            .peer_sync
+            .entry(author)
+            .or_insert(PeerSyncState {
+                required: lane.tag(),
+                complete: 0,
+            })
+            .mark_lane(lane, synchronized);
         let Some(peer) = state
             .snapshot
             .peers
@@ -1205,10 +1252,10 @@ impl AppRuntime {
         else {
             return;
         };
-        if peer.synchronized {
+        if peer.synchronized == synchronized {
             return;
         }
-        peer.synchronized = true;
+        peer.synchronized = synchronized;
         let peer = peer.clone();
         emit_locked(&mut state, AppEvent::PeerUpdated { peer });
     }
@@ -1396,6 +1443,7 @@ fn spawn_replica_initiator(
         let connection = match endpoint.connect(peer, lane.repair_alpn()).await {
             Ok(connection) => connection,
             Err(error) => {
+                runtime.mark_peer_lane_synchronized(peer, lane, false);
                 runtime.emit_diagnostic(
                     "replica_repair_dial",
                     &format!(
@@ -1409,6 +1457,7 @@ fn spawn_replica_initiator(
         let stream = match IrohSyncStream::open(&connection).await {
             Ok(stream) => stream.owning(connection),
             Err(error) => {
+                runtime.mark_peer_lane_synchronized(peer, lane, false);
                 runtime.emit_diagnostic("replica_repair_stream", &error.to_string());
                 return;
             }
@@ -1429,7 +1478,9 @@ fn spawn_replica_initiator(
         )
         .await
         {
-            Ok(outcome) if !outcome.incomplete && !outcome.root_mismatch => {
+            Ok(confirmed)
+                if confirmed.disposition() == hhhs_sync::RepairDisposition::Synchronized =>
+            {
                 let view = {
                     let mut durable = durable.lock().await;
                     durable.capabilities = durable
@@ -1438,16 +1489,26 @@ fn spawn_replica_initiator(
                     durable.room.view()
                 };
                 runtime.apply_room_view(view);
-                runtime.mark_peer_synchronized(peer);
+                runtime.mark_peer_lane_synchronized(peer, lane, true);
             }
-            Ok(outcome) => runtime.emit_diagnostic(
-                "replica_repair_incomplete",
-                &format!("{lane:?} repair with {peer} ended incomplete: {outcome:?}"),
-            ),
-            Err(error) => runtime.emit_diagnostic(
-                "replica_repair",
-                &format!("{lane:?} repair with {peer} failed: {error}"),
-            ),
+            Ok(confirmed) => {
+                runtime.mark_peer_lane_synchronized(peer, lane, false);
+                runtime.emit_diagnostic(
+                    "replica_repair_incomplete",
+                    &format!(
+                        "{lane:?} repair with {peer} requires {:?}: {:?}",
+                        confirmed.disposition(),
+                        confirmed.outcome()
+                    ),
+                );
+            }
+            Err(error) => {
+                runtime.mark_peer_lane_synchronized(peer, lane, false);
+                runtime.emit_diagnostic(
+                    "replica_repair",
+                    &format!("{lane:?} repair with {peer} failed: {error}"),
+                );
+            }
         }
     });
 }
@@ -1476,7 +1537,9 @@ fn spawn_replica_responder(
         )
         .await
         {
-            Ok(outcome) if !outcome.incomplete && !outcome.root_mismatch => {
+            Ok(confirmed)
+                if confirmed.disposition() == hhhs_sync::RepairDisposition::Synchronized =>
+            {
                 let view = {
                     let mut durable = durable.lock().await;
                     durable.capabilities = durable
@@ -1485,16 +1548,26 @@ fn spawn_replica_responder(
                     durable.room.view()
                 };
                 runtime.apply_room_view(view);
-                runtime.mark_peer_synchronized(peer);
+                runtime.mark_peer_lane_synchronized(peer, lane, true);
             }
-            Ok(outcome) => runtime.emit_diagnostic(
-                "replica_repair_incomplete",
-                &format!("{lane:?} repair from {peer} ended incomplete: {outcome:?}"),
-            ),
-            Err(error) => runtime.emit_diagnostic(
-                "replica_repair",
-                &format!("{lane:?} repair from {peer} failed: {error}"),
-            ),
+            Ok(confirmed) => {
+                runtime.mark_peer_lane_synchronized(peer, lane, false);
+                runtime.emit_diagnostic(
+                    "replica_repair_incomplete",
+                    &format!(
+                        "{lane:?} repair from {peer} requires {:?}: {:?}",
+                        confirmed.disposition(),
+                        confirmed.outcome()
+                    ),
+                );
+            }
+            Err(error) => {
+                runtime.mark_peer_lane_synchronized(peer, lane, false);
+                runtime.emit_diagnostic(
+                    "replica_repair",
+                    &format!("{lane:?} repair from {peer} failed: {error}"),
+                );
+            }
         }
     });
 }
@@ -1637,6 +1710,28 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_peer_sync_requires_every_lane_and_regresses_on_later_failure() {
+        let mut sync = PeerSyncState::default();
+        assert!(!sync.update_requirements(ProtocolSupport::WALKIE, PeerPath::Direct));
+        assert!(!sync.mark_lane(RoomLane::Music, true));
+        assert!(sync.mark_lane(RoomLane::Extension, true));
+
+        // A later RetryFresh, policy divergence, transport failure, or other
+        // non-synchronized Music result must revoke the peer-wide UI claim
+        // without erasing the still-complete Extension lane.
+        assert!(!sync.mark_lane(RoomLane::Music, false));
+        assert_eq!(sync.complete, RoomLane::Extension.tag());
+        assert!(sync.mark_lane(RoomLane::Music, true));
+
+        assert!(!sync.update_requirements(ProtocolSupport::WALKIE, PeerPath::Disconnected,));
+        assert_eq!(sync.complete, 0);
+
+        let mut music_only = PeerSyncState::default();
+        assert!(!music_only.update_requirements(ProtocolSupport::MUSIC, PeerPath::Relayed));
+        assert!(music_only.mark_lane(RoomLane::Music, true));
+    }
 
     #[test]
     fn production_host_exposes_only_room_v5_replica_protocols() {

@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 
-// Regression ceilings for the durable Room-v5 path. These are deliberately
-// looser than the future realtime/session protocol target, but they remain
-// strict enough to catch a return to the pre-worker multi-hundred-ms local
-// path.
+// Regression ceilings for canonical Room-v5 rendering plus the two causal
+// music thesis targets. Host load is diagnostic only and never changes these
+// values.
 export const latencyBudgetsMs = Object.freeze({
+  localVisibleFeedbackP95: 5,
+  remoteCausalProjectionP95: 15,
   localDomMutationP95: 15,
   localVisibleP95: 30,
   peerDomMutationP95: 75,
@@ -25,6 +26,19 @@ const metricDefinitions = Object.freeze([
   ["peerVisible", "steady peer visibility", "peerVisibleP95"],
   ["localRenderDuration", "steady local keyboard render", "localKeyboardRenderP95"],
   ["peerRenderDuration", "steady peer keyboard render", "peerKeyboardRenderP95"],
+]);
+
+const thesisTargetDefinitions = Object.freeze([
+  [
+    "localVisibleFeedback",
+    "reversible local pressed-feedback acknowledgement",
+    "localVisibleFeedbackP95",
+  ],
+  [
+    "remoteCausalProjection",
+    "remote carrier receipt to worker-owned HHHS projection",
+    "remoteCausalProjectionP95",
+  ],
 ]);
 
 export function percentile(samples, fraction) {
@@ -48,6 +62,15 @@ export function evaluateLatencyTrial(report) {
     assert.ok(Number.isFinite(actualMs), `missing finite ${reportKey} p95`);
     return latencyCheck(reportKey, label, actualMs, budgetMs);
   });
+  for (const [reportKey, label, budgetKey] of thesisTargetDefinitions) {
+    const target = report.performanceTargets?.[reportKey];
+    const actualMs = target?.observedSteadyP95Ms;
+    const budgetMs = latencyBudgetsMs[budgetKey];
+    assert.ok(Number.isFinite(actualMs), `missing finite ${reportKey} p95`);
+    assert.equal(target?.targetMs, budgetMs, `${reportKey} target does not match release policy`);
+    assert.equal(target?.met, actualMs < budgetMs, `${reportKey} met flag is inconsistent`);
+    checks.push(latencyCheck(reportKey, label, actualMs, budgetMs, true));
+  }
   assert.ok(Number.isFinite(report.reconnectMs), "missing finite reconnect latency");
   checks.push(latencyCheck("reconnect", "reconnect", report.reconnectMs, latencyBudgetsMs.reconnect));
   return {
@@ -87,14 +110,14 @@ export function evaluateReleaseTrials(reports) {
   };
 }
 
-function latencyCheck(id, label, actualMs, budgetMs) {
+function latencyCheck(id, label, actualMs, budgetMs, exclusive = false) {
   const grossCeilingMs = budgetMs * grossCeilingMultiplier;
   return {
     id,
     label,
     actualMs,
     budgetMs,
-    passed: actualMs <= budgetMs,
+    passed: exclusive ? actualMs < budgetMs : actualMs <= budgetMs,
     grossCeilingMs,
     grossPassed: actualMs <= grossCeilingMs,
   };
