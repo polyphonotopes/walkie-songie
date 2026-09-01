@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
-import { mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -22,7 +22,6 @@ const reportPath = resolve(
     join(repository, "output/playwright/browser-production-safety.json"),
 );
 const runStartedAt = new Date();
-rmSync(reportPath, { force: true });
 const artifactProfile = process.env.WALKIE_ARTIFACT_PROFILE ?? "unspecified";
 
 assert.equal(
@@ -30,6 +29,11 @@ assert.equal(
   "production",
   "renewal-cut exclusion must be proved against the explicitly identified production artifact",
 );
+assert.ok(
+  existsSync(dist) && statSync(dist).isDirectory(),
+  "production-artifact directory does not exist",
+);
+rmSync(reportPath, { force: true });
 
 const forbidden = [
   "renewalCut",
@@ -39,6 +43,12 @@ const forbidden = [
   "walkie-acceptance-stale-renewal-replay-armed",
   "FloorPersistedBeforeEgressCut",
   "injected renewal crash cut",
+  "sessionRejectRealtimeOnce",
+  "sessionDrainCut",
+  "acceptanceWorkerStateTrace",
+  "walkie-acceptance-authoritative-worker-state",
+  "acceptance-injected generation failure",
+  "replica_worker_state",
 ];
 const surviving = forbidden.filter((needle) => artifactContains(dist, needle));
 assert.deepEqual(
@@ -63,6 +73,8 @@ const report = {
     staleOfferReplayQueryAbsent: true,
     renewalCutTraceStageAbsent: true,
     renewalCutDiagnosticAbsent: true,
+    generationFailureQueriesAbsent: true,
+    fullProjectionDumpAbsent: true,
   },
 };
 

@@ -12,6 +12,8 @@ use futures::{
     channel::{mpsc, oneshot},
 };
 use futures_signals::signal::{Mutable, ReadOnlyMutable};
+#[cfg(feature = "browser-acceptance-faults")]
+use hhhs_web_browser::WorkerGeneration;
 use hhhs_web_browser::{
     DedicatedWorkerClient, ProjectionSubscription, ProjectionUpdate, SubscriptionId,
     WorkerClientError, WorkerEvent, WorkerEventKind, WorkerRequestKind, WorkerResetReason,
@@ -36,7 +38,15 @@ use crate::room::{
     },
 };
 
+#[cfg(feature = "browser-acceptance-faults")]
+use crate::room::worker::encode_projection_witness;
+
 use super::storage::{IndexedDbReplicaLogV5, IndexedDbSessionRenewalStore};
+
+#[cfg(feature = "browser-acceptance-faults")]
+thread_local! {
+    static ACCEPTANCE_REALTIME_REJECTION_CONSUMED: Cell<bool> = const { Cell::new(false) };
+}
 
 struct BrowserSessionLeaseClock {
     performance: Option<web_sys::Performance>,
@@ -100,6 +110,64 @@ fn session_tracing_enabled() -> bool {
                 .split('&')
                 .any(|part| part.contains("sessionTrace=1"))
         })
+}
+
+#[cfg(feature = "browser-acceptance-faults")]
+fn reject_realtime_once_enabled() -> bool {
+    web_sys::window()
+        .and_then(|window| window.location().search().ok())
+        .is_some_and(|search| {
+            search
+                .trim_start_matches('?')
+                .split('&')
+                .any(|part| part == "sessionRejectRealtimeOnce=1")
+        })
+}
+
+#[cfg(feature = "browser-acceptance-faults")]
+fn take_realtime_rejection() -> bool {
+    reject_realtime_once_enabled()
+        && ACCEPTANCE_REALTIME_REJECTION_CONSUMED.with(|consumed| !consumed.replace(true))
+}
+
+#[cfg(feature = "browser-acceptance-faults")]
+fn authoritative_worker_state_trace_enabled() -> bool {
+    web_sys::window()
+        .and_then(|window| window.location().search().ok())
+        .is_some_and(|search| {
+            search.trim_start_matches('?').split('&').any(|part| {
+                part == "acceptanceWorkerStateTrace=1"
+                    || part == "sessionRejectRealtimeOnce=1"
+                    || matches!(part, "sessionDrainCut=before" | "sessionDrainCut=after")
+            })
+        })
+}
+
+#[cfg(feature = "browser-acceptance-faults")]
+fn log_authoritative_worker_state(generation: WorkerGeneration, projection: &RoomWorkerProjection) {
+    if !authoritative_worker_state_trace_enabled() {
+        return;
+    }
+    let projection = match encode_projection_witness(projection) {
+        Ok(projection) => projection,
+        Err(error) => {
+            web_sys::console::warn_1(
+                &format!(
+                    "[replica_worker_state_error] generation={} {error}",
+                    generation.get()
+                )
+                .into(),
+            );
+            return;
+        }
+    };
+    web_sys::console::info_1(
+        &format!(
+            "[replica_worker_state] generation={} projection={projection}",
+            generation.get()
+        )
+        .into(),
+    );
 }
 
 fn log_session_trace(
@@ -226,6 +294,7 @@ struct WindowWorkerState {
     on_projection: Rc<dyn Fn(RoomWorkerProjection)>,
     on_outbound_record: Rc<dyn Fn(Vec<u8>)>,
     on_diagnostic: Rc<dyn Fn(String)>,
+    on_failure: Rc<dyn Fn(String)>,
 }
 
 const REPAIR_FRAME_QUEUE_CAPACITY: usize = 8;
@@ -373,6 +442,14 @@ impl WindowWorkerState {
             kind,
             value: projection.clone(),
         }));
+        #[cfg(feature = "browser-acceptance-faults")]
+        if let Some(generation) = self
+            .subscription
+            .as_ref()
+            .map(ProjectionSubscription::generation)
+        {
+            log_authoritative_worker_state(generation, &projection);
+        }
         let mut pending = Vec::new();
         for (target, waiter) in self.projection_waiters.drain(..) {
             if target <= revision {
@@ -385,10 +462,19 @@ impl WindowWorkerState {
     }
 
     fn fail(&mut self, message: String) {
+        if matches!(
+            self.lifecycle.get_cloned(),
+            BrowserReplicaLifecycle::Failed { .. }
+                | BrowserReplicaLifecycle::Closing
+                | BrowserReplicaLifecycle::Closed
+        ) {
+            return;
+        }
         (self.on_diagnostic)(message.clone());
         self.lifecycle.set(BrowserReplicaLifecycle::Failed {
             message: message.clone(),
         });
+        (self.on_failure)(message.clone());
         for (_, waiter) in self.projection_waiters.drain(..) {
             let _ = waiter.send(Err(message.clone()));
         }
@@ -409,11 +495,16 @@ pub(super) struct BrowserReplicaHandle {
     repair_failure: Rc<RefCell<Option<String>>>,
     repair_serial: Rc<futures::lock::Mutex<()>>,
     session_events: Rc<RefCell<mpsc::Receiver<RoomSessionEgress>>>,
+    failure_events: Rc<RefCell<mpsc::Receiver<String>>>,
     trace_scope: u64,
     trace_sequence: Rc<Cell<u64>>,
 }
 
 impl BrowserReplicaHandle {
+    pub(super) fn generation(&self) -> u64 {
+        self.client.current_generation().get()
+    }
+
     pub(super) async fn open(
         request: RoomWorkerOpen,
         on_projection: impl Fn(RoomWorkerProjection) + 'static,
@@ -428,6 +519,9 @@ impl BrowserReplicaHandle {
         } else {
             0
         };
+        let (failure_sender, failure_receiver) = mpsc::channel(1);
+        let failure_sender = Rc::new(RefCell::new(failure_sender));
+        let failure_events = Rc::new(RefCell::new(failure_receiver));
         let state = Rc::new(RefCell::new(WindowWorkerState {
             subscription: None,
             projection: Mutable::new(None),
@@ -437,6 +531,12 @@ impl BrowserReplicaHandle {
             on_projection: Rc::new(on_projection),
             on_outbound_record: Rc::new(on_outbound_record),
             on_diagnostic: Rc::new(on_diagnostic),
+            on_failure: {
+                let failure_sender = Rc::clone(&failure_sender);
+                Rc::new(move |message| {
+                    let _ = failure_sender.borrow_mut().try_send(message);
+                })
+            },
         }));
         let state_for_events = Rc::clone(&state);
         let (repair_sender, repair_receiver) = mpsc::channel(REPAIR_FRAME_QUEUE_CAPACITY);
@@ -467,6 +567,20 @@ impl BrowserReplicaHandle {
                         Err(format!("unsupported worker application channel {}", channel.get()))
                     } else {
                         decode_session_egress(event.payload()).and_then(|event| {
+                            #[cfg(feature = "browser-acceptance-faults")]
+                            if reject_realtime_once_enabled()
+                                && matches!(
+                                    &event,
+                                    RoomSessionEgress::Realtime(realtime)
+                                        if !realtime.durable.is_empty()
+                                )
+                                && take_realtime_rejection()
+                            {
+                                return Err(
+                                    "acceptance-injected rejection of one combined realtime frame"
+                                        .into(),
+                                );
+                            }
                             let trace = match &event {
                                 RoomSessionEgress::Realtime(realtime) => realtime.trace.clone(),
                                 _ => None,
@@ -492,6 +606,11 @@ impl BrowserReplicaHandle {
                             window_time_micros(),
                         );
                     }
+                    if let Err(error) = accepted.as_ref() {
+                        state_for_events.borrow_mut().fail(format!(
+                            "Replica worker application frame was rejected before bounded window acceptance: {error}"
+                        ));
+                    }
                     wasm_bindgen_futures::spawn_local(async move {
                         match accepted {
                             Ok(trace) => {
@@ -512,6 +631,12 @@ impl BrowserReplicaHandle {
                                 let _ = client
                                     .reject_application_frame(delivery, error)
                                     .await;
+                                // Rejection invalidates the stateful producer's
+                                // whole placement generation.  Do not leave the
+                                // dedicated worker alive to drain reifications,
+                                // durability, repair, or later commands after a
+                                // truncated combined frame.
+                                client.terminate();
                             }
                         }
                     });
@@ -599,6 +724,7 @@ impl BrowserReplicaHandle {
                 repair_failure,
                 repair_serial: Rc::new(futures::lock::Mutex::new(())),
                 session_events,
+                failure_events,
                 trace_scope,
                 trace_sequence: Rc::new(Cell::new(0)),
             },
@@ -674,6 +800,14 @@ impl BrowserReplicaHandle {
     pub(super) async fn next_session_event(&self) -> Option<RoomSessionEgress> {
         futures::future::poll_fn(|context| {
             let mut receiver = self.session_events.borrow_mut();
+            Pin::new(&mut *receiver).poll_next(context)
+        })
+        .await
+    }
+
+    pub(super) async fn next_failure(&self) -> Option<String> {
+        futures::future::poll_fn(|context| {
+            let mut receiver = self.failure_events.borrow_mut();
             Pin::new(&mut *receiver).poll_next(context)
         })
         .await
@@ -855,6 +989,11 @@ impl BrowserReplicaHandle {
             .borrow()
             .lifecycle
             .set(BrowserReplicaLifecycle::Closed);
+    }
+
+    pub(super) fn fail_and_terminate(&self, message: String) {
+        self.state.borrow_mut().fail(message);
+        self.client.terminate();
     }
 
     pub(super) fn projection(&self) -> Option<RoomWorkerProjection> {

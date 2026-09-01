@@ -3,6 +3,8 @@
 pub mod events;
 #[cfg(any(test, all(target_arch = "wasm32", feature = "browser-net")))]
 pub(crate) mod legacy_log;
+#[cfg(any(test, target_arch = "wasm32"))]
+pub(crate) mod performance_feedback;
 pub mod projection;
 #[cfg(any(test, all(target_arch = "wasm32", feature = "browser-net")))]
 pub(crate) mod session;

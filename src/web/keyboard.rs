@@ -258,10 +258,16 @@ pub fn sync_active_pitches(state: &Arc<AppState>) {
     // Update bass/treble clef indicators
     sync_clef_indicators(&all_pitches, pc_count);
 
-    // Textured overlays carry the semantic facets above. Clear the component's
-    // plain pressed/lit state together so it performs at most one render for
-    // this projection revision.
-    update_keyboard_state(&[], &[]);
+    // Textured overlays carry canonical semantic facets. The component's plain
+    // pressed state is a deliberately distinct, reversible acknowledgement of
+    // local input awaiting its exact worker outcome; it is never optimistic
+    // SharedPitchSet membership.
+    let pending_pressed: Vec<u8> = state
+        .pending_pressed_degrees()
+        .into_iter()
+        .filter_map(|degree| u8::try_from(degree.degree.index()).ok())
+        .collect();
+    update_keyboard_state(&pending_pressed, &[]);
 }
 
 /// Sync bass and treble clef indicators on the keyboard.

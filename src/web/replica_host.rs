@@ -7,14 +7,16 @@
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
+    future::Future,
     rc::Rc,
     time::Duration,
 };
 
 use futures::{
-    SinkExt, StreamExt,
+    FutureExt, SinkExt, StreamExt,
     channel::{mpsc, oneshot},
 };
+use futures_signals::signal::{Mutable, SignalExt};
 use wasm_bindgen_futures::spawn_local;
 
 #[cfg(feature = "browser-acceptance-faults")]
@@ -33,6 +35,9 @@ use crate::{
         ReplicaRepairHint, ReplicaRepairProbe, ReplicaRoomNetworkConfig, RoomRealtime, SyncStream,
         WalkieIdentity, is_routine_repair_initiator, spawn_rendezvous_v5,
     },
+    room::performance_feedback::{
+        PerformanceFeedbackEvent, PerformanceFeedbackResolution, PerformanceIntentToken,
+    },
     room::session::{
         RoomSessionCompactTrace, RoomSessionEgress, RoomSessionIngress, RoomSessionProjectionGate,
         RoomSessionProjectionKind, RoomSessionRealtimeEgress, RoomSessionRenewalTrace,
@@ -50,6 +55,17 @@ use crate::{
 };
 
 use super::replica_worker::BrowserReplicaHandle;
+
+#[cfg(feature = "browser-acceptance-faults")]
+use crate::room::worker::SessionDrainTestCut;
+
+#[cfg(feature = "browser-acceptance-faults")]
+use crate::room::worker::{RoomWorkerProjection, encode_projection_witness};
+
+#[cfg(feature = "browser-acceptance-faults")]
+thread_local! {
+    static SESSION_DRAIN_CUT_CONSUMED: Cell<bool> = const { Cell::new(false) };
+}
 
 /// End the current browser task before accepting more already-buffered work.
 ///
@@ -71,6 +87,31 @@ fn browser_time_micros() -> Option<u64> {
         .then_some((milliseconds.max(0.0) * 1_000.0).round() as u64)
 }
 
+#[cfg(feature = "browser-acceptance-faults")]
+fn log_opened_authoritative_worker_state(
+    generation: u64,
+    projection: &RoomWorkerProjection,
+) -> Result<(), String> {
+    if !browser_query_flag("acceptanceWorkerStateTrace") {
+        return Ok(());
+    }
+    let projection = encode_projection_witness(projection)?;
+    let encoded = format!("{{\"generation\":{generation},\"projection\":{projection}}}");
+    let storage = web_sys::window()
+        .and_then(|window| window.local_storage().ok())
+        .flatten()
+        .ok_or("acceptance page has no localStorage for the checked Open projection")?;
+    storage
+        .set_item("walkie-acceptance-authoritative-worker-state", &encoded)
+        .map_err(|error| {
+            format!("could not mirror the checked Open projection to localStorage: {error:?}")
+        })?;
+    web_sys::console::info_1(
+        &format!("[replica_worker_state] generation={generation} projection={projection}").into(),
+    );
+    Ok(())
+}
+
 fn session_tracing_enabled() -> bool {
     browser_query_flag("sessionTrace")
 }
@@ -86,7 +127,27 @@ fn session_renewal_stale_replay_enabled() -> bool {
 }
 
 #[cfg(feature = "browser-acceptance-faults")]
+fn take_session_drain_test_cut() -> Option<SessionDrainTestCut> {
+    let cut = web_sys::window()
+        .and_then(|window| window.location().search().ok())
+        .and_then(|search| {
+            search
+                .trim_start_matches('?')
+                .split('&')
+                .find_map(|part| match part {
+                    "sessionDrainCut=before" => Some(SessionDrainTestCut::BeforeCommit),
+                    "sessionDrainCut=after" => Some(SessionDrainTestCut::AfterCommit),
+                    _ => None,
+                })
+        });
+    cut.filter(|_| SESSION_DRAIN_CUT_CONSUMED.with(|consumed| !consumed.replace(true)))
+}
+
+#[cfg(feature = "browser-acceptance-faults")]
 const STALE_RENEWAL_OFFER_KEY: &str = "walkie-acceptance-stale-renewal-offer";
+
+#[cfg(feature = "browser-acceptance-faults")]
+const STALE_RENEWAL_OFFER_DIGEST_KEY: &str = "walkie-acceptance-stale-renewal-offer-digest";
 
 #[cfg(feature = "browser-acceptance-faults")]
 const STALE_RENEWAL_REPLAY_ARM_KEY: &str = "walkie-acceptance-stale-renewal-replay-armed";
@@ -119,6 +180,10 @@ fn retain_stale_renewal_offer(bytes: &[u8]) {
             .is_none()
     {
         let _ = storage.set_item(STALE_RENEWAL_OFFER_KEY, &encoded);
+        let _ = storage.set_item(
+            STALE_RENEWAL_OFFER_DIGEST_KEY,
+            &hhhs::Digest::of(bytes).to_hex(),
+        );
     }
 }
 
@@ -142,6 +207,7 @@ fn clear_stale_renewal_offer() {
         .flatten()
     {
         let _ = storage.remove_item(STALE_RENEWAL_OFFER_KEY);
+        let _ = storage.remove_item(STALE_RENEWAL_OFFER_DIGEST_KEY);
     }
 }
 
@@ -188,6 +254,7 @@ fn log_session_renewal_trace(trace: &RoomSessionRenewalTrace) {
 enum RoomControl {
     Commit {
         command: RoomCommand,
+        intent_token: Option<PerformanceIntentToken>,
         response: oneshot::Sender<Result<CommandAck, AppError>>,
     },
     Presence {
@@ -204,7 +271,62 @@ enum RoomControl {
 
 struct ActiveRoom {
     control: mpsc::Sender<RoomControl>,
+    lifetime: RoomGenerationLifetime,
+    worker: BrowserReplicaHandle,
+    generation: u64,
+    operation: u64,
+    restart: RoomRestartSpec,
+    failed: Rc<Cell<bool>>,
+    stopped: oneshot::Receiver<()>,
+}
+
+#[derive(Clone)]
+struct RoomGenerationLifetime {
     alive: Rc<Cell<bool>>,
+    cancelled: Mutable<bool>,
+}
+
+impl RoomGenerationLifetime {
+    fn new() -> Self {
+        Self {
+            alive: Rc::new(Cell::new(true)),
+            cancelled: Mutable::new(false),
+        }
+    }
+
+    fn is_alive(&self) -> bool {
+        self.alive.get()
+    }
+
+    fn cancel(&self) {
+        self.alive.set(false);
+        self.cancelled.set(true);
+    }
+
+    async fn cancelled(&self) {
+        self.cancelled.signal().wait_for(true).await;
+    }
+}
+
+async fn until_generation_cancelled<F: Future>(
+    lifetime: &RoomGenerationLifetime,
+    future: F,
+) -> Option<F::Output> {
+    let future = future.fuse();
+    let cancelled = lifetime.cancelled().fuse();
+    futures::pin_mut!(future, cancelled);
+    match futures::future::select(future, cancelled).await {
+        futures::future::Either::Left((output, _)) => Some(output),
+        futures::future::Either::Right(((), _)) => None,
+    }
+}
+
+#[derive(Clone)]
+struct RoomRestartSpec {
+    room_name: Option<String>,
+    config: ReplicaRoomNetworkConfig,
+    bootstrap_source: DiscoverySource,
+    room_authority: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -300,6 +422,10 @@ struct HostState {
     snapshot: AppSnapshot,
     peer_sync: BTreeMap<ActorId, PeerSyncState>,
     subscribers: Vec<Rc<dyn Fn(AppEventEnvelope)>>,
+    performance_feedback: Rc<dyn Fn(PerformanceFeedbackEvent) -> Result<bool, String>>,
+    performance_generation: u64,
+    performance_sequence: u64,
+    room_operation: u64,
     active_room: Option<ActiveRoom>,
 }
 
@@ -316,11 +442,15 @@ pub struct BrowserHost {
 
 struct QueuedCommand {
     command: ClientCommand,
+    intent_token: Option<PerformanceIntentToken>,
     on_error: Box<dyn FnOnce(String)>,
 }
 
+const WINDOW_COMMAND_CAPACITY: usize = 64;
+
 thread_local! {
-    static COMMANDS: RefCell<Option<mpsc::UnboundedSender<QueuedCommand>>> = const { RefCell::new(None) };
+    static COMMANDS: RefCell<Option<mpsc::Sender<QueuedCommand>>> = const { RefCell::new(None) };
+    static HOST: RefCell<Option<Rc<BrowserHost>>> = const { RefCell::new(None) };
 }
 
 fn browser_capabilities() -> Capabilities {
@@ -343,7 +473,10 @@ fn peer_override_seed() -> Option<[u8; 32]> {
     })
 }
 
-pub async fn init(on_event: impl Fn(AppEventEnvelope) + 'static) -> Result<(), String> {
+pub async fn init(
+    on_event: impl Fn(AppEventEnvelope) + 'static,
+    on_performance_feedback: impl Fn(PerformanceFeedbackEvent) -> Result<bool, String> + 'static,
+) -> Result<(), String> {
     let seed = match peer_override_seed() {
         Some(seed) => seed,
         None => super::storage::get_or_create_identity_seed().await,
@@ -357,16 +490,31 @@ pub async fn init(on_event: impl Fn(AppEventEnvelope) + 'static) -> Result<(), S
             snapshot,
             peer_sync: BTreeMap::new(),
             subscribers: Vec::new(),
+            performance_feedback: Rc::new(on_performance_feedback),
+            performance_generation: 0,
+            performance_sequence: 0,
+            room_operation: 0,
             active_room: None,
         })),
         identity,
     });
     host.register(Rc::new(on_event));
-    let (commands, mut command_rx) = mpsc::unbounded::<QueuedCommand>();
+    let (commands, mut command_rx) = mpsc::channel::<QueuedCommand>(WINDOW_COMMAND_CAPACITY);
     COMMANDS.with(|slot| *slot.borrow_mut() = Some(commands));
+    HOST.with(|slot| *slot.borrow_mut() = Some(host.clone()));
     spawn_local(async move {
         while let Some(queued) = command_rx.next().await {
-            if let Err(error) = host.dispatch(queued.command).await {
+            if let Err(error) = host.dispatch(queued.command, queued.intent_token).await {
+                if let Some(intent_token) = queued.intent_token {
+                    if error.code == AppErrorCode::Internal {
+                        host.reset_performance_feedback(intent_token.generation);
+                    } else {
+                        host.resolve_performance_intent(
+                            intent_token,
+                            PerformanceFeedbackResolution::Rejected,
+                        );
+                    }
+                }
                 let detail = error
                     .detail
                     .as_deref()
@@ -381,18 +529,66 @@ pub async fn init(on_event: impl Fn(AppEventEnvelope) + 'static) -> Result<(), S
 }
 
 pub fn dispatch(command: ClientCommand, on_error: impl Fn(String) + 'static) {
+    let intent_token = match performance_target(&command) {
+        Some((target, desired_active)) => {
+            match HOST.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .ok_or("browser networking is not initialized".to_owned())?
+                    .begin_performance_intent(target, desired_active)
+            }) {
+                Ok(token) => Some(token),
+                Err(error) => {
+                    on_error(error);
+                    return;
+                }
+            }
+        }
+        None => None,
+    };
     let queued = QueuedCommand {
         command,
+        intent_token,
         on_error: Box::new(on_error),
     };
-    let result = COMMANDS.with(|slot| match slot.borrow().as_ref() {
+    let result = COMMANDS.with(|slot| match slot.borrow_mut().as_mut() {
         Some(commands) => commands
-            .unbounded_send(queued)
-            .map_err(|error| error.into_inner()),
-        None => Err(queued),
+            .try_send(queued)
+            .map_err(|error| (error.is_full(), error.into_inner())),
+        None => Err((false, queued)),
     });
-    if let Err(queued) = result {
-        (queued.on_error)("browser networking is not initialized".to_owned());
+    match result {
+        Ok(()) => {
+            if let Some(intent_token) = intent_token
+                && let Err(error) = HOST.with(|slot| {
+                    slot.borrow()
+                        .as_ref()
+                        .ok_or("browser networking is not initialized".to_owned())?
+                        .commit_performance_intent(intent_token)
+                })
+            {
+                HOST.with(|slot| {
+                    if let Some(host) = slot.borrow().as_ref() {
+                        host.reset_performance_feedback(intent_token.generation);
+                        host.emit_diagnostic("performance_feedback_commit", &error);
+                    }
+                });
+            }
+        }
+        Err((full, queued)) => {
+            if let Some(intent_token) = queued.intent_token {
+                HOST.with(|slot| {
+                    if let Some(host) = slot.borrow().as_ref() {
+                        host.rollback_performance_intent(intent_token);
+                    }
+                });
+            }
+            (queued.on_error)(if full {
+                "browser command queue is full".to_owned()
+            } else {
+                "browser networking is not initialized or has closed".to_owned()
+            });
+        }
     }
 }
 
@@ -441,52 +637,184 @@ impl BrowserHost {
         self.state.borrow().sequence
     }
 
-    async fn dispatch(self: &Rc<Self>, command: ClientCommand) -> Result<CommandAck, AppError> {
+    fn begin_performance_intent(
+        &self,
+        target: TunedDegree,
+        desired_active: bool,
+    ) -> Result<PerformanceIntentToken, String> {
+        let (token, feedback) = {
+            let mut state = self.state.borrow_mut();
+            if state.active_room.is_none() || state.performance_generation == 0 {
+                return Err("enter a room before changing shared state".into());
+            }
+            let sequence = state
+                .performance_sequence
+                .checked_add(1)
+                .ok_or("performance intent sequence exhausted")?;
+            state.performance_sequence = sequence;
+            (
+                PerformanceIntentToken {
+                    generation: state.performance_generation,
+                    sequence,
+                },
+                Rc::clone(&state.performance_feedback),
+            )
+        };
+        feedback(PerformanceFeedbackEvent::Begin {
+            token,
+            target,
+            desired_active,
+        })?;
+        Ok(token)
+    }
+
+    fn resolve_performance_intent(
+        &self,
+        token: PerformanceIntentToken,
+        resolution: PerformanceFeedbackResolution,
+    ) {
+        let feedback = Rc::clone(&self.state.borrow().performance_feedback);
+        if let Err(error) = feedback(PerformanceFeedbackEvent::Resolved { token, resolution }) {
+            self.emit_diagnostic("performance_feedback", &error);
+        }
+    }
+
+    fn commit_performance_intent(&self, token: PerformanceIntentToken) -> Result<(), String> {
+        let feedback = Rc::clone(&self.state.borrow().performance_feedback);
+        feedback(PerformanceFeedbackEvent::CommitBegin { token }).map(|_| ())
+    }
+
+    fn rollback_performance_intent(&self, token: PerformanceIntentToken) {
+        let feedback = Rc::clone(&self.state.borrow().performance_feedback);
+        if let Err(error) = feedback(PerformanceFeedbackEvent::RollbackBegin { token }) {
+            self.emit_diagnostic("performance_feedback_rollback", &error);
+        }
+    }
+
+    fn reset_performance_feedback(&self, generation: u64) {
+        let feedback = Rc::clone(&self.state.borrow().performance_feedback);
+        match feedback(PerformanceFeedbackEvent::Reset { generation }) {
+            Ok(_) =>
+            {
+                #[cfg(feature = "browser-acceptance-faults")]
+                if browser_query_flag("acceptanceWorkerStateTrace") {
+                    self.emit_diagnostic(
+                        "performance_feedback_reset_applied",
+                        &format!("generation {generation}"),
+                    );
+                }
+            }
+            Err(error) => self.emit_diagnostic("performance_feedback_reset", &error),
+        }
+    }
+
+    fn invalidate_performance_generation(&self, generation: u64) {
+        let feedback = {
+            let mut state = self.state.borrow_mut();
+            if state.performance_generation != generation {
+                return;
+            }
+            state.performance_generation = 0;
+            Rc::clone(&state.performance_feedback)
+        };
+        if let Err(error) = feedback(PerformanceFeedbackEvent::Reset { generation }) {
+            self.emit_diagnostic("performance_feedback_worker_loss", &error);
+        }
+    }
+
+    fn install_performance_generation(&self, generation: u64) -> Result<(), AppError> {
+        let (feedback, event) = {
+            let mut state = self.state.borrow_mut();
+            let event = if state.performance_generation == generation {
+                PerformanceFeedbackEvent::Reset { generation }
+            } else if state.performance_generation < generation {
+                state.performance_generation = generation;
+                state.performance_sequence = 0;
+                PerformanceFeedbackEvent::InstallGeneration { generation }
+            } else {
+                return Err(AppError::new(
+                    AppErrorCode::Internal,
+                    "replacement worker generation regressed",
+                ));
+            };
+            (Rc::clone(&state.performance_feedback), event)
+        };
+        feedback(event).map_err(|error| {
+            AppError::new(
+                AppErrorCode::Internal,
+                "could not install worker feedback generation",
+            )
+            .with_detail(error)
+        })?;
+        Ok(())
+    }
+
+    async fn dispatch(
+        self: &Rc<Self>,
+        command: ClientCommand,
+        intent_token: Option<PerformanceIntentToken>,
+    ) -> Result<CommandAck, AppError> {
         match command {
             ClientCommand::EnterRoom { room_name } => self.enter_room(room_name).await,
             ClientCommand::JoinTicket { ticket } => self.join_ticket(ticket).await,
             ClientCommand::LeaveRoom => self.leave_room().await,
             ClientCommand::SetTuning { definition } => {
                 definition.validate("room tuning").map_err(invalid_tuning)?;
-                self.submit(MusicOp::SetTuning { definition }.into()).await
+                self.submit(MusicOp::SetTuning { definition }.into(), None)
+                    .await
             }
             ClientCommand::AddDegree { pitch } => {
                 self.validate_degree(pitch)?;
-                self.submit(MusicOp::AddDegree { degree: pitch }.into())
-                    .await
+                self.submit(
+                    MusicOp::AddDegree { degree: pitch }.into(),
+                    Some(require_intent_token(intent_token)?),
+                )
+                .await
             }
             ClientCommand::RemoveDegree { pitch } => {
                 self.validate_degree(pitch)?;
-                self.submit(MusicOp::RemoveDegree { degree: pitch }.into())
-                    .await
+                self.submit(
+                    MusicOp::RemoveDegree { degree: pitch }.into(),
+                    Some(require_intent_token(intent_token)?),
+                )
+                .await
             }
             ClientCommand::SetRoundTable { config } => {
                 let config = config.validate().map_err(|error| {
                     AppError::new(AppErrorCode::InvalidCommand, "invalid round-table config")
                         .with_detail(error.to_string())
                 })?;
-                self.submit(MusicOp::SetRoundTable { config }.into()).await
+                self.submit(MusicOp::SetRoundTable { config }.into(), None)
+                    .await
             }
             ClientCommand::AddPitch { pitch } => {
                 self.validate_pitch(pitch)?;
-                self.submit(MusicOp::AddPitch { pitch }.into()).await
+                self.submit(
+                    MusicOp::AddPitch { pitch }.into(),
+                    Some(require_intent_token(intent_token)?),
+                )
+                .await
             }
             ClientCommand::RemovePitch { pitch } => {
                 self.validate_pitch(pitch)?;
-                self.submit(MusicOp::RemovePitch { pitch }.into()).await
+                self.submit(
+                    MusicOp::RemovePitch { pitch }.into(),
+                    Some(require_intent_token(intent_token)?),
+                )
+                .await
             }
             ClientCommand::PutPiece { emoji, pitch } => {
                 self.validate_pitch(pitch)?;
-                self.submit(ExtensionCommand::PutPiece { emoji, pitch }.into())
+                self.submit(ExtensionCommand::PutPiece { emoji, pitch }.into(), None)
                     .await
             }
             ClientCommand::MovePiece { piece, pitch } => {
                 self.validate_pitch(pitch)?;
-                self.submit(ExtensionCommand::MovePiece { piece, pitch }.into())
+                self.submit(ExtensionCommand::MovePiece { piece, pitch }.into(), None)
                     .await
             }
             ClientCommand::RemovePiece { piece } => {
-                self.submit(ExtensionCommand::RemovePiece { piece }.into())
+                self.submit(ExtensionCommand::RemovePiece { piece }.into(), None)
                     .await
             }
             ClientCommand::SetRoomConfig {
@@ -499,6 +827,7 @@ impl BrowserHost {
                         available_emojis,
                     }
                     .into(),
+                    None,
                 )
                 .await
             }
@@ -563,7 +892,35 @@ impl BrowserHost {
         bootstrap_source: DiscoverySource,
         room_authority: Option<hhhs_proof::SigningKey>,
     ) -> Result<CommandAck, AppError> {
+        let operation = {
+            let mut state = self.state.borrow_mut();
+            state.room_operation = state.room_operation.saturating_add(1).max(1);
+            state.room_operation
+        };
         self.stop_active_room().await;
+        self.launch_room(
+            RoomRestartSpec {
+                room_name,
+                config,
+                bootstrap_source,
+                room_authority: room_authority.map(|authority| authority.to_bytes()),
+            },
+            operation,
+        )
+        .await
+    }
+
+    async fn launch_room(
+        self: &Rc<Self>,
+        restart: RoomRestartSpec,
+        operation: u64,
+    ) -> Result<CommandAck, AppError> {
+        let room_name = restart.room_name.clone();
+        let config = restart.config.clone();
+        let bootstrap_source = restart.bootstrap_source;
+        let room_authority = restart
+            .room_authority
+            .map(|bytes| hhhs_proof::SigningKey::from_bytes(&bytes));
         let local_actor = self.identity.capability_actor_id();
         if let Some(authority) = room_authority.as_ref() {
             if ActorId::from_signing_key(authority) != config.owner {
@@ -595,8 +952,9 @@ impl BrowserHost {
         )
         .with_session_trace(session_tracing_enabled());
         #[cfg(feature = "browser-acceptance-faults")]
-        let worker_open =
-            worker_open.with_session_renewal_test_cut(session_renewal_test_cut_enabled());
+        let worker_open = worker_open
+            .with_session_renewal_test_cut(session_renewal_test_cut_enabled())
+            .with_session_drain_test_cut(take_session_drain_test_cut());
         let (worker, opened) = BrowserReplicaHandle::open(
             worker_open,
             move |projection| match projection_gate
@@ -653,7 +1011,15 @@ impl BrowserHost {
                     && matches!(
                         worker.lifecycle().get_cloned(),
                         super::replica_worker::BrowserReplicaLifecycle::Ready { .. }
-                    ) => {}
+                    ) =>
+            {
+                #[cfg(feature = "browser-acceptance-faults")]
+                if let Err(error) =
+                    log_opened_authoritative_worker_state(worker.generation(), &projection)
+                {
+                    self.emit_diagnostic("acceptance_authoritative_worker_state", &error);
+                }
+            }
             RoomWorkerResponse::Opened { .. } => {
                 worker.terminate();
                 return Err(AppError::new(
@@ -663,15 +1029,20 @@ impl BrowserHost {
             }
             _ => unreachable!("BrowserReplicaHandle validates its Open response"),
         }
+        self.install_performance_generation(worker.generation())?;
 
         let room_identity = config.room.clone();
         let topic = config.topic();
         let topic_string = topic.to_string();
         let bootstrap = config.bootstrap.as_ref().map(|address| address.id);
         let bootstrap_support = config.bootstrap_support;
-        let network = BrowserRoomNetwork::bind(self.identity.iroh_secret(), config)
-            .await
-            .map_err(network_error)?;
+        let network = match BrowserRoomNetwork::bind(self.identity.iroh_secret(), config).await {
+            Ok(network) => network,
+            Err(error) => {
+                worker.terminate();
+                return Err(network_error(error));
+            }
+        };
         let handle = network.handle();
         let ticket = handle.settle_ticket(Duration::from_secs(5)).await;
         let ticket_string = ticket.to_string();
@@ -692,7 +1063,7 @@ impl BrowserHost {
             (None, None)
         };
 
-        let alive = Rc::new(Cell::new(true));
+        let lifetime = RoomGenerationLifetime::new();
         let repairs = RepairCoordinator::default();
         let peers = Rc::new(RefCell::new(BTreeMap::<
             iroh::EndpointId,
@@ -714,6 +1085,39 @@ impl BrowserHost {
                 bootstrap_support.unwrap_or(ProtocolSupport::WALKIE),
             );
         }
+        if self.state.borrow().room_operation != operation {
+            worker.terminate();
+            let _ = network.shutdown().await;
+            return Err(shutting_down());
+        }
+        let failed = Rc::new(Cell::new(false));
+        let (stopped_tx, stopped) = oneshot::channel();
+        let task_lifetime = lifetime.clone();
+        let task_failed = failed.clone();
+        {
+            let mut state = self.state.borrow_mut();
+            // The operation was checked immediately above and there is no
+            // await between that check and this install.  Install ownership
+            // before spawning any task so even future scheduling changes
+            // cannot create an unowned worker/network/Web-Lock generation.
+            debug_assert_eq!(state.room_operation, operation);
+            state.active_room = Some(ActiveRoom {
+                control,
+                lifetime,
+                worker: worker.clone(),
+                generation: worker.generation(),
+                operation,
+                restart,
+                failed,
+                stopped,
+            });
+            state.snapshot.room_name = room_name.clone();
+            state.snapshot.room_topic = Some(topic_string.clone());
+            state.snapshot.room_ticket = Some(ticket_string.clone());
+            state.snapshot.peers.clear();
+            state.peer_sync.clear();
+            state.snapshot.voices.clear();
+        }
         spawn_room_loop(
             self.clone(),
             worker.clone(),
@@ -723,32 +1127,30 @@ impl BrowserHost {
             rendezvous_rx,
             rendezvous_guard,
             peers.clone(),
-            alive.clone(),
+            task_lifetime.clone(),
             room_identity,
             repairs.clone(),
             session_gate.clone(),
             session_reset_outstanding.clone(),
+            task_failed,
+            stopped_tx,
         );
         spawn_session_loop(
             self.clone(),
             worker.clone(),
             handle.clone(),
-            alive.clone(),
+            task_lifetime.clone(),
             session_gate,
             session_reset_outstanding,
         );
-        spawn_periodic_repair(self.clone(), worker, handle, peers, alive.clone());
-
-        {
-            let mut state = self.state.borrow_mut();
-            state.active_room = Some(ActiveRoom { control, alive });
-            state.snapshot.room_name = room_name.clone();
-            state.snapshot.room_topic = Some(topic_string.clone());
-            state.snapshot.room_ticket = Some(ticket_string.clone());
-            state.snapshot.peers.clear();
-            state.peer_sync.clear();
-            state.snapshot.voices.clear();
-        }
+        spawn_periodic_repair(
+            self.clone(),
+            worker.clone(),
+            handle,
+            peers,
+            task_lifetime.clone(),
+        );
+        spawn_worker_failure_loop(self.clone(), worker.clone(), task_lifetime);
         self.emit(AppEvent::RoomChanged {
             room_name,
             room_topic: Some(topic_string),
@@ -760,6 +1162,10 @@ impl BrowserHost {
     }
 
     async fn leave_room(self: &Rc<Self>) -> Result<CommandAck, AppError> {
+        {
+            let mut state = self.state.borrow_mut();
+            state.room_operation = state.room_operation.saturating_add(1).max(1);
+        }
         self.stop_active_room().await;
         {
             let mut state = self.state.borrow_mut();
@@ -783,22 +1189,113 @@ impl BrowserHost {
     }
 
     async fn stop_active_room(&self) {
-        let active = self.state.borrow_mut().active_room.take();
+        let (active, generation) = {
+            let mut state = self.state.borrow_mut();
+            (state.active_room.take(), state.performance_generation)
+        };
+        if generation != 0 {
+            self.reset_performance_feedback(generation);
+        }
         if let Some(mut active) = active {
-            active.alive.set(false);
+            active.lifetime.cancel();
             let (response, closed) = oneshot::channel();
-            if active
-                .control
-                .send(RoomControl::Shutdown { response })
-                .await
-                .is_ok()
-            {
-                let _ = closed.await;
-            }
+            let _ = active.control.try_send(RoomControl::Shutdown { response });
+            drop(closed);
+            let _ = active.stopped.await;
         }
     }
 
-    async fn submit(&self, command: RoomCommand) -> Result<CommandAck, AppError> {
+    fn fail_active_room_generation(self: &Rc<Self>, generation: u64, reason: String) {
+        let mut active = {
+            let mut state = self.state.borrow_mut();
+            if state.active_room.as_ref().map(|active| active.generation) != Some(generation) {
+                return;
+            }
+            state
+                .active_room
+                .take()
+                .expect("matching active room generation was checked")
+        };
+
+        self.emit_diagnostic(
+            "replica_worker_generation_failed",
+            &format!("generation {generation}: {reason}"),
+        );
+        self.reset_performance_feedback(generation);
+        active.failed.set(true);
+        active.lifetime.cancel();
+        active.worker.fail_and_terminate(reason);
+        self.emit_diagnostic(
+            "replica_worker_generation_terminal",
+            &format!(
+                "generation {generation} lifecycle={:?}",
+                active.worker.lifecycle().get_cloned()
+            ),
+        );
+
+        // Wake the room loop even when it is otherwise idle.  If this bounded
+        // lane is full, queued work already wakes it; `alive = false` prevents
+        // another iteration.  The worker was synchronously terminated above,
+        // so an in-flight request settles as cancelled or as an already
+        // committed IndexedDB transaction before the checked reopen.
+        let (response, closed) = oneshot::channel();
+        let _ = active.control.try_send(RoomControl::Shutdown { response });
+        drop(closed);
+
+        let operation = active.operation;
+        let restart = active.restart;
+        let stopped = active.stopped;
+        let host = self.clone();
+        spawn_local(async move {
+            let _ = stopped.await;
+            // `terminate()` releases the worker-owned Web Lock asynchronously.
+            // HHHS itself refuses a second writer immediately, so retry that
+            // fail-closed acquisition on a bounded, operation-fenced schedule.
+            // A user leave/join increments `room_operation` and cancels every
+            // stale retry before it can install an old room.
+            const REOPEN_BACKOFF_MS: [u32; 6] = [0, 25, 100, 300, 900, 2_000];
+            for (attempt, delay_ms) in REOPEN_BACKOFF_MS.into_iter().enumerate() {
+                if delay_ms != 0 {
+                    gloo_timers::future::TimeoutFuture::new(delay_ms).await;
+                }
+                let should_restart = {
+                    let state = host.state.borrow();
+                    state.room_operation == operation && state.active_room.is_none()
+                };
+                if !should_restart {
+                    return;
+                }
+                match host.launch_room(restart.clone(), operation).await {
+                    Ok(_) => {
+                        host.emit_diagnostic(
+                            "replica_worker_generation_recovered",
+                            "reopened the sealed canonical placement and established a fresh worker generation",
+                        );
+                        return;
+                    }
+                    Err(error) => host.emit_diagnostic(
+                        "replica_worker_generation_recovery",
+                        &format!(
+                            "automatic canonical reopen attempt {}/{} failed: {}",
+                            attempt + 1,
+                            REOPEN_BACKOFF_MS.len(),
+                            error.message
+                        ),
+                    ),
+                }
+            }
+            host.emit_diagnostic(
+                "replica_worker_generation_recovery_exhausted",
+                "sealed canonical placement remained unavailable after bounded reopen attempts",
+            );
+        });
+    }
+
+    async fn submit(
+        &self,
+        command: RoomCommand,
+        intent_token: Option<PerformanceIntentToken>,
+    ) -> Result<CommandAck, AppError> {
         let mut control = self
             .state
             .borrow()
@@ -810,6 +1307,7 @@ impl BrowserHost {
         control
             .send(RoomControl::Commit {
                 command,
+                intent_token,
                 response: tx,
             })
             .await
@@ -1071,11 +1569,13 @@ fn spawn_room_loop(
     mut rendezvous: Option<mpsc::Receiver<(iroh::EndpointId, ProtocolSupport)>>,
     rendezvous_guard: Option<crate::net::RendezvousHandle>,
     peers: Rc<RefCell<BTreeMap<iroh::EndpointId, (DiscoverySource, PeerPath, ProtocolSupport)>>>,
-    alive: Rc<Cell<bool>>,
+    lifetime: RoomGenerationLifetime,
     room_identity: crate::room::v5::RoomIdentity,
     repairs: RepairCoordinator,
     _session_gate: Rc<RefCell<RoomSessionProjectionGate>>,
     session_reset_outstanding: Rc<Cell<bool>>,
+    failed: Rc<Cell<bool>>,
+    stopped: oneshot::Sender<()>,
 ) {
     let local_actor = host.identity.capability_actor_id();
     spawn_local(async move {
@@ -1084,7 +1584,7 @@ fn spawn_room_loop(
         let mut presence_sequence = 0_u64;
         let mut realtime_replay = BTreeMap::<(crate::net::PeerId, u64), u64>::new();
         let mut shutdown_response = None;
-        while alive.get() {
+        while lifetime.is_alive() {
             let control_next = control.next();
             let inbound_next = network.next_inbound();
             let rendezvous_next = async {
@@ -1094,31 +1594,66 @@ fn spawn_room_loop(
                 }
             };
             futures::pin_mut!(control_next, inbound_next, rendezvous_next);
-            match futures::future::select(
+            let next = futures::future::select(
                 futures::future::select(control_next, inbound_next),
                 rendezvous_next,
             )
-            .await
-            {
+            .fuse();
+            let cancelled = lifetime.cancelled().fuse();
+            futures::pin_mut!(next, cancelled);
+            let selected = match futures::future::select(next, cancelled).await {
+                futures::future::Either::Left((selected, _)) => selected,
+                futures::future::Either::Right(((), _)) => break,
+            };
+            match selected {
                 futures::future::Either::Left((futures::future::Either::Left((control, _)), _)) => {
                     match control {
-                        Some(RoomControl::Commit { command, response }) => {
+                        Some(RoomControl::Commit {
+                            command,
+                            intent_token,
+                            response,
+                        }) => {
                             let result = match command {
                                 RoomCommand::Music(command) if is_session_pitch_edit(&command) => {
-                                    worker
-                                        .send_session(RoomSessionIngress::LocalPitchEdit {
-                                            command,
-                                            trace_token: None,
-                                        })
-                                        .await
-                                        .map(|()| host.sequence())
+                                    let intent_token = require_intent_token(intent_token);
+                                    match intent_token {
+                                        Ok(intent_token) => worker
+                                            .send_session(RoomSessionIngress::LocalPitchEdit {
+                                                command,
+                                                intent_token,
+                                                trace_token: None,
+                                            })
+                                            .await
+                                            .map(|()| host.sequence())
+                                            .map_err(|error| {
+                                                AppError::new(
+                                                    AppErrorCode::Internal,
+                                                    "compact session intent outcome is ambiguous",
+                                                )
+                                                .with_detail(error)
+                                            }),
+                                        Err(error) => Err(error),
+                                    }
                                 }
-                                command => worker.commit(command).await.map(|receipt| {
-                                    let _ = (receipt.entry, receipt.projection_revision);
-                                    host.sequence()
-                                }),
-                            }
-                            .map_err(persistence_error);
+                                command => {
+                                    if intent_token.is_some() {
+                                        Err(AppError::new(
+                                            AppErrorCode::Internal,
+                                            "non-pitch command carried a performance intent token",
+                                        ))
+                                    } else {
+                                        worker
+                                            .commit(command)
+                                            .await
+                                            .map(|receipt| {
+                                                let _ =
+                                                    (receipt.entry, receipt.projection_revision);
+                                                host.sequence()
+                                            })
+                                            .map_err(persistence_error)
+                                    }
+                                }
+                            };
                             let _ = response.send(
                                 result.map(|accepted_sequence| CommandAck { accepted_sequence }),
                             );
@@ -1237,7 +1772,7 @@ fn spawn_room_loop(
                             spawn_repair_responder(
                                 host.clone(),
                                 worker.clone(),
-                                alive.clone(),
+                                lifetime.clone(),
                                 repair.endpoint_id,
                                 lane,
                                 repair.stream.owning(repair.connection),
@@ -1273,7 +1808,7 @@ fn spawn_room_loop(
                                                 host.clone(),
                                                 worker.clone(),
                                                 handle.clone(),
-                                                alive.clone(),
+                                                lifetime.clone(),
                                                 endpoint_id,
                                                 lane,
                                                 repairs.clone(),
@@ -1398,7 +1933,7 @@ fn spawn_room_loop(
                                                 host.clone(),
                                                 worker.clone(),
                                                 handle.clone(),
-                                                alive.clone(),
+                                                lifetime.clone(),
                                                 source,
                                                 lane,
                                                 entry,
@@ -1418,7 +1953,7 @@ fn spawn_room_loop(
                                         host.clone(),
                                         worker.clone(),
                                         handle.clone(),
-                                        alive.clone(),
+                                        lifetime.clone(),
                                         source,
                                         hint.lane,
                                         repairs.clone(),
@@ -1441,7 +1976,7 @@ fn spawn_room_loop(
                                             host.clone(),
                                             worker.clone(),
                                             handle.clone(),
-                                            alive.clone(),
+                                            lifetime.clone(),
                                             source,
                                             probe.lane,
                                             repairs.clone(),
@@ -1471,7 +2006,7 @@ fn spawn_room_loop(
                                                 host.clone(),
                                                 worker.clone(),
                                                 handle.clone(),
-                                                alive.clone(),
+                                                lifetime.clone(),
                                                 *peer,
                                                 lane,
                                                 repairs.clone(),
@@ -1483,7 +2018,16 @@ fn spawn_room_loop(
                             NativeNetworkEvent::Diagnostic(message) => {
                                 host.emit_diagnostic("browser_network", &message)
                             }
-                            NativeNetworkEvent::Closed => break,
+                            NativeNetworkEvent::Closed => {
+                                if lifetime.is_alive() {
+                                    host.fail_active_room_generation(
+                                        worker.generation(),
+                                        "browser-native network event stream closed unexpectedly"
+                                            .into(),
+                                    );
+                                }
+                                break;
+                            }
                             NativeNetworkEvent::MdnsDiscovered { .. }
                             | NativeNetworkEvent::MdnsExpired { .. } => {}
                         },
@@ -1508,14 +2052,17 @@ fn spawn_room_loop(
             }
             yield_browser_task().await;
         }
-        alive.set(false);
+        lifetime.cancel();
         let _ = network.shutdown().await;
-        if let Err(error) = worker.close().await {
+        if !failed.get()
+            && let Err(error) = worker.close().await
+        {
             host.emit_diagnostic("replica_worker_close", &error);
         }
         if let Some(response) = shutdown_response {
             let _ = response.send(());
         }
+        let _ = stopped.send(());
     });
 }
 
@@ -1529,11 +2076,51 @@ fn is_session_pitch_edit(command: &MusicOp) -> bool {
     )
 }
 
+fn performance_target(command: &ClientCommand) -> Option<(TunedDegree, bool)> {
+    match command {
+        ClientCommand::AddDegree { pitch } => Some((*pitch, true)),
+        ClientCommand::RemoveDegree { pitch } => Some((*pitch, false)),
+        ClientCommand::AddPitch { pitch } => Some((pitch.degree(), true)),
+        ClientCommand::RemovePitch { pitch } => Some((pitch.degree(), false)),
+        _ => None,
+    }
+}
+
+fn require_intent_token(
+    intent_token: Option<PerformanceIntentToken>,
+) -> Result<PerformanceIntentToken, AppError> {
+    intent_token.ok_or_else(|| {
+        AppError::new(
+            AppErrorCode::Internal,
+            "shared pitch edit lost its performance intent token",
+        )
+    })
+}
+
+fn spawn_worker_failure_loop(
+    host: Rc<BrowserHost>,
+    worker: BrowserReplicaHandle,
+    lifetime: RoomGenerationLifetime,
+) {
+    spawn_local(async move {
+        let Some(reason) = until_generation_cancelled(&lifetime, worker.next_failure()).await
+        else {
+            return;
+        };
+        let Some(reason) = reason else {
+            return;
+        };
+        if lifetime.is_alive() {
+            host.fail_active_room_generation(worker.generation(), reason);
+        }
+    });
+}
+
 fn spawn_session_loop(
     host: Rc<BrowserHost>,
     worker: BrowserReplicaHandle,
     handle: BrowserNetHandle,
-    alive: Rc<Cell<bool>>,
+    lifetime: RoomGenerationLifetime,
     gate: Rc<RefCell<RoomSessionProjectionGate>>,
     reset_outstanding: Rc<Cell<bool>>,
 ) {
@@ -1545,9 +2132,25 @@ fn spawn_session_loop(
     #[cfg(feature = "browser-acceptance-faults")]
     let stale_offer_replayed = Rc::new(Cell::new(false));
     spawn_local(async move {
-        while alive.get() {
-            let Some(event) = worker.next_session_event().await else {
-                break;
+        while lifetime.is_alive() {
+            let event = {
+                let next = worker.next_session_event().fuse();
+                let cancelled = lifetime.cancelled().fuse();
+                futures::pin_mut!(next, cancelled);
+                match futures::future::select(next, cancelled).await {
+                    futures::future::Either::Left((event, _)) => event,
+                    futures::future::Either::Right(((), _)) => break,
+                }
+            };
+            let Some(event) = event else {
+                if lifetime.is_alive() {
+                    host.fail_active_room_generation(
+                        worker.generation(),
+                        "worker session event stream closed before the room generation stopped"
+                            .into(),
+                    );
+                }
+                return;
             };
             match event {
                 RoomSessionEgress::Carrier(carrier) => {
@@ -1561,8 +2164,14 @@ fn spawn_session_loop(
                     }
                     let host = host.clone();
                     let handle = handle.clone();
+                    let lifetime = lifetime.clone();
                     spawn_local(async move {
-                        if let Err(error) = handle.broadcast(carrier).await {
+                        let Some(result) =
+                            until_generation_cancelled(&lifetime, handle.broadcast(carrier)).await
+                        else {
+                            return;
+                        };
+                        if let Err(error) = result {
                             host.emit_diagnostic(
                                 "session_carrier_broadcast",
                                 &format!("session establishment broadcast failed: {error}"),
@@ -1574,8 +2183,15 @@ fn spawn_session_loop(
                     projection,
                     carrier,
                     durable,
+                    intent_token,
                     trace,
                 }) => {
+                    let durable_intent_resolved = matches!(
+                        projection.kind,
+                        RoomSessionProjectionKind::Confirmed
+                            | RoomSessionProjectionKind::Corrected
+                            | RoomSessionProjectionKind::Advanced
+                    );
                     match gate.borrow_mut().accept(&projection) {
                         Ok(true) => {
                             if let Some(trace) = trace.as_ref() {
@@ -1583,6 +2199,7 @@ fn spawn_session_loop(
                             }
                             if projection.kind == RoomSessionProjectionKind::Reset {
                                 reset_outstanding.set(false);
+                                host.reset_performance_feedback(worker.generation());
                             }
                             host.apply_session_pitch_view(projection.view);
                             if let Some(trace) = trace.as_ref() {
@@ -1596,8 +2213,17 @@ fn spawn_session_loop(
                                 let host = host.clone();
                                 let worker = worker.clone();
                                 let reset_outstanding = reset_outstanding.clone();
+                                let lifetime = lifetime.clone();
                                 spawn_local(async move {
-                                    match worker.reset_session_projection().await {
+                                    let Some(result) = until_generation_cancelled(
+                                        &lifetime,
+                                        worker.reset_session_projection(),
+                                    )
+                                    .await
+                                    else {
+                                        return;
+                                    };
+                                    match result {
                                         Ok(true) => {
                                             // Keep coalescing requests until the accepted Reset
                                             // snapshot itself crosses the sideband.
@@ -1621,16 +2247,29 @@ fn spawn_session_loop(
                             }
                         }
                     }
+                    if durable_intent_resolved && let Some(intent_token) = intent_token {
+                        host.resolve_performance_intent(
+                            intent_token,
+                            PerformanceFeedbackResolution::Accepted,
+                        );
+                    }
 
                     if let Some(carrier) = carrier {
                         let host = host.clone();
                         let handle = handle.clone();
                         let trace = trace.clone();
+                        let lifetime = lifetime.clone();
                         spawn_local(async move {
                             if let Some(trace) = trace.as_ref() {
                                 log_session_trace("carrier_broadcast_call_started", trace);
                             }
-                            if let Err(error) = handle.broadcast(carrier).await {
+                            let Some(result) =
+                                until_generation_cancelled(&lifetime, handle.broadcast(carrier))
+                                    .await
+                            else {
+                                return;
+                            };
+                            if let Err(error) = result {
                                 host.emit_diagnostic(
                                     "session_carrier_broadcast",
                                     &format!("session event broadcast failed: {error}"),
@@ -1645,13 +2284,26 @@ fn spawn_session_loop(
                         let host = host.clone();
                         let worker = worker.clone();
                         let draining = draining.clone();
+                        let lifetime = lifetime.clone();
                         spawn_local(async move {
                             loop {
-                                match worker.drain_session().await {
+                                let Some(result) =
+                                    until_generation_cancelled(&lifetime, worker.drain_session())
+                                        .await
+                                else {
+                                    break;
+                                };
+                                match result {
                                     Ok(true) => {}
                                     Ok(false) => break,
                                     Err(error) => {
                                         host.emit_diagnostic("session_reification", &error);
+                                        host.fail_active_room_generation(
+                                            worker.generation(),
+                                            format!(
+                                                "session reification durability outcome is ambiguous and requires checked placement reopen: {error}"
+                                            ),
+                                        );
                                         break;
                                     }
                                 }
@@ -1660,14 +2312,48 @@ fn spawn_session_loop(
                         });
                     }
                 }
-                RoomSessionEgress::FallbackDurable(command) => {
+                RoomSessionEgress::FallbackDurable {
+                    command,
+                    intent_token,
+                } => {
                     let host = host.clone();
                     let worker = worker.clone();
+                    let lifetime = lifetime.clone();
                     spawn_local(async move {
-                        if let Err(error) = worker.commit(RoomCommand::Music(command)).await {
-                            host.emit_diagnostic("session_durable_fallback", &error);
+                        let Some(result) = until_generation_cancelled(
+                            &lifetime,
+                            worker.commit(RoomCommand::Music(command)),
+                        )
+                        .await
+                        else {
+                            return;
+                        };
+                        match result {
+                            Ok(_) => host.resolve_performance_intent(
+                                intent_token,
+                                PerformanceFeedbackResolution::Accepted,
+                            ),
+                            Err(error) => {
+                                host.emit_diagnostic("session_durable_fallback", &error);
+                                host.fail_active_room_generation(
+                                    worker.generation(),
+                                    format!(
+                                        "durable fallback outcome is ambiguous and requires checked placement reopen: {error}"
+                                    ),
+                                );
+                            }
                         }
                     });
+                }
+                RoomSessionEgress::IntentRejected {
+                    intent_token,
+                    reason,
+                } => {
+                    host.resolve_performance_intent(
+                        intent_token,
+                        PerformanceFeedbackResolution::Rejected,
+                    );
+                    host.emit_diagnostic("session_intent_rejected", &reason);
                 }
                 RoomSessionEgress::Diagnostic(message) => {
                     host.emit_diagnostic("hhhs_session", &message);
@@ -1676,37 +2362,75 @@ fn spawn_session_loop(
                     log_session_renewal_trace(&trace);
                     #[cfg(feature = "browser-acceptance-faults")]
                     if stale_replay_enabled
-                        && session_renewal_stale_replay_armed()
                         && trace.stage == RoomSessionRenewalTraceStage::SessionInstalled
-                        && !stale_offer_replayed.get()
-                        && let Some(stale_offer) = retained_offer
+                    {
+                        let armed = session_renewal_stale_replay_armed();
+                        let stale_offer = retained_offer
                             .borrow()
                             .clone()
-                            .or_else(load_stale_renewal_offer)
-                        && session_offer_target(&stale_offer)
-                            == Some(host.identity.capability_actor_id())
-                    {
-                        stale_offer_replayed.set(true);
-                        clear_stale_renewal_offer();
-                        let host = host.clone();
-                        let worker = worker.clone();
-                        spawn_local(async move {
-                            if let Err(error) = worker
-                                .send_session(RoomSessionIngress::Carrier {
-                                    bytes: stale_offer,
-                                    received_at_micros: browser_time_micros(),
-                                })
-                                .await
-                            {
+                            .or_else(load_stale_renewal_offer);
+                        let target_matches = stale_offer.as_ref().is_some_and(|offer| {
+                            session_offer_target(offer) == Some(host.identity.capability_actor_id())
+                        });
+                        let offer_digest = stale_offer
+                            .as_deref()
+                            .map(|offer| hhhs::Digest::of(offer).to_hex())
+                            .unwrap_or_else(|| "none".into());
+                        host.emit_diagnostic(
+                            "session_stale_offer_replay_probe",
+                            &format!(
+                                "generation {} installed_epoch={} armed={armed} retained={} target_matches={target_matches} offer_digest={offer_digest} already_replayed={}",
+                                worker.generation(),
+                                trace.epoch,
+                                stale_offer.is_some(),
+                                stale_offer_replayed.get()
+                            ),
+                        );
+                        if armed
+                            && !stale_offer_replayed.get()
+                            && target_matches
+                            && let Some(stale_offer) = stale_offer
+                        {
+                            stale_offer_replayed.set(true);
+                            clear_stale_renewal_offer();
+                            let host = host.clone();
+                            let worker = worker.clone();
+                            let lifetime = lifetime.clone();
+                            spawn_local(async move {
                                 host.emit_diagnostic(
                                     "session_stale_offer_replay",
-                                    &format!("acceptance stale-offer delivery failed: {error}"),
+                                    "delivering the retained signed Offer to the recovered worker",
                                 );
-                            }
-                        });
+                                let Some(result) = until_generation_cancelled(
+                                    &lifetime,
+                                    worker.send_session(RoomSessionIngress::Carrier {
+                                        bytes: stale_offer,
+                                        received_at_micros: browser_time_micros(),
+                                    }),
+                                )
+                                .await
+                                else {
+                                    return;
+                                };
+                                if let Err(error) = result {
+                                    host.emit_diagnostic(
+                                        "session_stale_offer_replay",
+                                        &format!("acceptance stale-offer delivery failed: {error}"),
+                                    );
+                                }
+                            });
+                        }
                     }
                 }
             }
+        }
+        if lifetime.is_alive() {
+            host.fail_active_room_generation(
+                worker.generation(),
+                "worker session event stream closed before the room generation stopped".into(),
+            );
+        } else {
+            host.invalidate_performance_generation(worker.generation());
         }
     });
 }
@@ -1716,13 +2440,21 @@ fn spawn_periodic_repair(
     worker: BrowserReplicaHandle,
     handle: BrowserNetHandle,
     peers: Rc<RefCell<BTreeMap<iroh::EndpointId, (DiscoverySource, PeerPath, ProtocolSupport)>>>,
-    alive: Rc<Cell<bool>>,
+    lifetime: RoomGenerationLifetime,
 ) {
     spawn_local(async move {
         let local = crate::net::PeerId(*handle.endpoint_id().as_bytes());
-        while alive.get() {
-            n0_future::time::sleep(Duration::from_secs(27)).await;
-            if !alive.get() {
+        while lifetime.is_alive() {
+            let sleep = n0_future::time::sleep(Duration::from_secs(27)).fuse();
+            let cancelled = lifetime.cancelled().fuse();
+            futures::pin_mut!(sleep, cancelled);
+            if matches!(
+                futures::future::select(sleep, cancelled).await,
+                futures::future::Either::Right(_)
+            ) {
+                break;
+            }
+            if !lifetime.is_alive() {
                 break;
             }
             let supported = {
@@ -1775,7 +2507,7 @@ fn spawn_repair_initiator(
     host: Rc<BrowserHost>,
     worker: BrowserReplicaHandle,
     handle: BrowserNetHandle,
-    alive: Rc<Cell<bool>>,
+    lifetime: RoomGenerationLifetime,
     peer: iroh::EndpointId,
     lane: RoomLane,
     repairs: RepairCoordinator,
@@ -1788,9 +2520,18 @@ fn spawn_repair_initiator(
         loop {
             let mut retry = 0;
             let mut completed = false;
-            while alive.get() {
-                let (session, result) =
-                    run_initiator_repair_attempt(&worker, &handle, &alive, peer, lane).await;
+            while lifetime.is_alive() {
+                let attempt =
+                    run_initiator_repair_attempt(&worker, &handle, &lifetime, peer, lane).fuse();
+                let cancelled = lifetime.cancelled().fuse();
+                futures::pin_mut!(attempt, cancelled);
+                let (session, result) = match futures::future::select(attempt, cancelled).await {
+                    futures::future::Either::Left((result, _)) => result,
+                    futures::future::Either::Right(((), _)) => {
+                        repairs.finish(peer, lane);
+                        return;
+                    }
+                };
                 let retry_fresh = matches!(
                     &result,
                     Ok((
@@ -1807,7 +2548,7 @@ fn spawn_repair_initiator(
                 }
                 report_repair(
                     host.clone(),
-                    &alive,
+                    &lifetime,
                     peer,
                     lane,
                     "initiator",
@@ -1824,11 +2565,20 @@ fn spawn_repair_initiator(
                         "{lane:?} repair with {peer} attempt={session} requires a fresh cut; scheduling another attempt after {delay_ms}ms"
                     ),
                 );
-                n0_future::time::sleep(Duration::from_millis(delay_ms)).await;
+                let sleep = n0_future::time::sleep(Duration::from_millis(delay_ms)).fuse();
+                let cancelled = lifetime.cancelled().fuse();
+                futures::pin_mut!(sleep, cancelled);
+                if matches!(
+                    futures::future::select(sleep, cancelled).await,
+                    futures::future::Either::Right(_)
+                ) {
+                    repairs.finish(peer, lane);
+                    return;
+                }
                 retry += 1;
             }
 
-            if !alive.get() || !completed {
+            if !lifetime.is_alive() || !completed {
                 repairs.finish(peer, lane);
                 break;
             }
@@ -1842,7 +2592,7 @@ fn spawn_repair_initiator(
 async fn run_initiator_repair_attempt(
     worker: &BrowserReplicaHandle,
     handle: &BrowserNetHandle,
-    alive: &Cell<bool>,
+    lifetime: &RoomGenerationLifetime,
     peer: iroh::EndpointId,
     lane: RoomLane,
 ) -> (
@@ -1855,7 +2605,7 @@ async fn run_initiator_repair_attempt(
             return (0, Err(format!("dial: {error}")));
         }
     };
-    if !alive.get() {
+    if !lifetime.is_alive() {
         connection.close(0u32.into(), b"room closed");
         return (0, Err("cancelled because the room closed".into()));
     }
@@ -1871,7 +2621,7 @@ async fn run_initiator_repair_attempt(
 fn spawn_repair_responder(
     host: Rc<BrowserHost>,
     worker: BrowserReplicaHandle,
-    alive: Rc<Cell<bool>>,
+    lifetime: RoomGenerationLifetime,
     peer: iroh::EndpointId,
     lane: RoomLane,
     stream: IrohSyncStream,
@@ -1892,7 +2642,7 @@ fn spawn_repair_responder(
         return;
     }
     spawn_local(async move {
-        if !alive.get() {
+        if !lifetime.is_alive() {
             repairs.finish_responder(peer, lane);
             if let Err(error) = stream.close().await {
                 host.emit_diagnostic(
@@ -1902,7 +2652,10 @@ fn spawn_repair_responder(
             }
             return;
         }
-        run_repair(host, worker, &alive, peer, lane, stream, false).await;
+        let repair = run_repair(host, worker, &lifetime, peer, lane, stream, false).fuse();
+        let cancelled = lifetime.cancelled().fuse();
+        futures::pin_mut!(repair, cancelled);
+        let _ = futures::future::select(repair, cancelled).await;
         repairs.finish_responder(peer, lane);
     });
 }
@@ -1911,7 +2664,7 @@ fn request_repair_after_live_failure(
     host: Rc<BrowserHost>,
     worker: BrowserReplicaHandle,
     handle: BrowserNetHandle,
-    alive: Rc<Cell<bool>>,
+    lifetime: RoomGenerationLifetime,
     source: crate::net::PeerId,
     lane: RoomLane,
     entry: hhhs::EntryHash,
@@ -1922,14 +2675,22 @@ fn request_repair_after_live_failure(
         return;
     };
     if is_routine_repair_initiator(local, source) {
-        spawn_repair_initiator(host, worker, handle, alive, source_endpoint, lane, repairs);
+        spawn_repair_initiator(
+            host,
+            worker,
+            handle,
+            lifetime,
+            source_endpoint,
+            lane,
+            repairs,
+        );
         return;
     }
     spawn_local(async move {
-        if !alive.get() {
+        if !lifetime.is_alive() {
             return;
         }
-        if let Err(error) = handle
+        let broadcast = handle
             .broadcast(
                 ReplicaRepairHint {
                     lane,
@@ -1938,8 +2699,14 @@ fn request_repair_after_live_failure(
                 }
                 .encode(),
             )
-            .await
-        {
+            .fuse();
+        let cancelled = lifetime.cancelled().fuse();
+        futures::pin_mut!(broadcast, cancelled);
+        let result = match futures::future::select(broadcast, cancelled).await {
+            futures::future::Either::Left((result, _)) => result,
+            futures::future::Either::Right(((), _)) => return,
+        };
+        if let Err(error) = result {
             host.emit_diagnostic(
                 "repair_hint_broadcast",
                 &format!("live delivery needs repair; hint failed: {error}"),
@@ -1951,7 +2718,7 @@ fn request_repair_after_live_failure(
 async fn run_repair(
     host: Rc<BrowserHost>,
     worker: BrowserReplicaHandle,
-    alive: &Cell<bool>,
+    lifetime: &RoomGenerationLifetime,
     peer: iroh::EndpointId,
     lane: RoomLane,
     stream: IrohSyncStream,
@@ -1966,7 +2733,7 @@ async fn run_repair(
     }
     report_repair(
         host,
-        alive,
+        lifetime,
         peer,
         lane,
         if initiator { "initiator" } else { "responder" },
@@ -1977,14 +2744,14 @@ async fn run_repair(
 
 fn report_repair(
     host: Rc<BrowserHost>,
-    alive: &Cell<bool>,
+    lifetime: &RoomGenerationLifetime,
     peer: iroh::EndpointId,
     lane: RoomLane,
     role: &'static str,
     session: u64,
     result: Result<(RoomWorkerRepairStatus, RoomWorkerRepairOutcome), String>,
 ) {
-    if !alive.get() {
+    if !lifetime.is_alive() {
         return;
     }
     match result {

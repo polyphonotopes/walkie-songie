@@ -37,14 +37,17 @@ use hhhs_session::{
     authorize_session_renewal, xchacha20poly1305_profile_id,
 };
 use hhhs_store::history_root;
-use hhhs_web_browser::{WorkerApplicationChannel, WorkerEventPort};
+use hhhs_web_browser::{WorkerApplicationChannel, WorkerEventKind, WorkerEventPort};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tutti_music::{MusicOp, SharedPitchSet, TunedDegree, TunedPeriodicPitch};
 use tutti_session::{
     ChannelBinding, EphemeralSecret, Offer, PeerIdentity, PendingInitiator, ProtocolId, SessionKeys,
 };
 
-use super::v5::{ActorId, RoomIdentity};
+use super::{
+    performance_feedback::PerformanceIntentToken,
+    v5::{ActorId, RoomIdentity},
+};
 
 pub(crate) const ROOM_SESSION_CHANNEL: WorkerApplicationChannel =
     WorkerApplicationChannel::new(0x5455_5454);
@@ -105,7 +108,9 @@ pub(crate) enum RoomSessionTaskInput {
     },
     LocalCommitted {
         peer: ActorId,
+        session: RoomSessionEpochIdentity,
         plan: ReificationPlan,
+        intent_token: Option<PerformanceIntentToken>,
         entry: Entry,
         durable_admission: DurableEntryAdmission,
         history: DagSnapshot,
@@ -141,8 +146,10 @@ pub(crate) enum RoomSessionTaskInput {
 
 pub(crate) struct RoomSessionReification {
     pub peer: ActorId,
+    pub session: RoomSessionEpochIdentity,
     pub plan: ReificationPlan,
     pub command: MusicOp,
+    pub intent_token: Option<PerformanceIntentToken>,
 }
 
 pub(crate) struct RoomSessionServicePort {
@@ -199,6 +206,7 @@ pub(crate) trait RoomSessionTraceClock {
 pub(crate) enum RoomSessionIngress {
     LocalPitchEdit {
         command: MusicOp,
+        intent_token: PerformanceIntentToken,
         trace_token: Option<RoomSessionTraceToken>,
     },
     Carrier {
@@ -211,7 +219,14 @@ pub(crate) enum RoomSessionIngress {
 pub(crate) enum RoomSessionEgress {
     Carrier(Vec<u8>),
     Realtime(RoomSessionRealtimeEgress),
-    FallbackDurable(MusicOp),
+    FallbackDurable {
+        command: MusicOp,
+        intent_token: PerformanceIntentToken,
+    },
+    IntentRejected {
+        intent_token: PerformanceIntentToken,
+        reason: String,
+    },
     Diagnostic(String),
     RenewalTrace(RoomSessionRenewalTrace),
 }
@@ -245,6 +260,7 @@ pub(crate) struct RoomSessionRealtimeEgress {
     pub projection: RoomSessionProjection,
     pub carrier: Option<Vec<u8>>,
     pub durable: Vec<RoomSessionDurableCorrelation>,
+    pub intent_token: Option<PerformanceIntentToken>,
     pub trace: Option<RoomSessionCompactTrace>,
 }
 
@@ -272,13 +288,25 @@ pub(crate) struct RoomSessionProjection {
 }
 
 /// Stable identity of a compact event queued for ordinary Replica reification.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 pub(crate) struct RoomSessionDurableCorrelation {
     pub manifest: [u8; 32],
     pub epoch: u32,
     pub seat: u8,
     pub counter: u32,
     pub event: [u8; 32],
+}
+
+/// Exact causal epoch which minted one or more pending durable reifications.
+///
+/// Peer identity alone is insufficient because a replacement epoch may become
+/// active before the old epoch's already-queued durable commits return.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) struct RoomSessionEpochIdentity {
+    peer: ActorId,
+    manifest: [u8; 32],
+    session_id: u64,
+    epoch: u32,
 }
 
 /// Window-minted identity for one application intent. The worker returns the
@@ -573,6 +601,14 @@ pub(crate) async fn run_room_session_task(
         }
         if let Err(error) = task.accept(input).await {
             task.diagnostic(error).await;
+            if task.events.is_none() {
+                // Rejected combined application-frame acceptance invalidates
+                // the whole compact generation. Dropping this receiver makes
+                // the next worker request fail closed so the host reopens from
+                // canonical durable state instead of continuing a truncated
+                // session epoch.
+                break;
+            }
         }
     }
 }
@@ -614,7 +650,13 @@ struct ActiveSession {
     lease_clock_origin: u64,
     lease_clock_last: u64,
     durable_revision: u64,
-    awaiting_reification: BTreeMap<SessionDot, MusicOp>,
+    awaiting_reification: BTreeMap<SessionDot, (MusicOp, Option<PerformanceIntentToken>)>,
+}
+
+struct RetiredSession {
+    active: ActiveSession,
+    projection: RoomSessionProjection,
+    outstanding: BTreeSet<RoomSessionDurableCorrelation>,
 }
 
 struct RoomSessionTask {
@@ -623,6 +665,9 @@ struct RoomSessionTask {
     foundations: BTreeMap<ActorId, RoomSessionFoundation>,
     pending: BTreeMap<ActorId, PendingSession>,
     active: BTreeMap<ActorId, ActiveSession>,
+    retired: BTreeMap<RoomSessionEpochIdentity, RetiredSession>,
+    inflight_reifications:
+        BTreeMap<RoomSessionEpochIdentity, BTreeSet<RoomSessionDurableCorrelation>>,
     presentation_peer: Option<ActorId>,
     renewal_store: Rc<dyn RoomSessionRenewalStore>,
     lease_clock: Rc<dyn RoomSessionLeaseClock>,
@@ -663,6 +708,8 @@ impl RoomSessionTask {
             foundations: BTreeMap::new(),
             pending: BTreeMap::new(),
             active: BTreeMap::new(),
+            retired: BTreeMap::new(),
+            inflight_reifications: BTreeMap::new(),
             presentation_peer: None,
             renewal_store,
             lease_clock,
@@ -708,10 +755,16 @@ impl RoomSessionTask {
                 match decode::<RoomSessionIngress>(&bytes)? {
                     RoomSessionIngress::LocalPitchEdit {
                         command,
+                        intent_token,
                         trace_token,
                     } => {
-                        self.local_edit(command, trace_token, worker_accepted_at_micros)
-                            .await
+                        self.local_edit(
+                            command,
+                            intent_token,
+                            trace_token,
+                            worker_accepted_at_micros,
+                        )
+                        .await
                     }
                     RoomSessionIngress::Carrier {
                         bytes,
@@ -724,7 +777,9 @@ impl RoomSessionTask {
             }
             RoomSessionTaskInput::LocalCommitted {
                 peer,
+                session,
                 plan,
+                intent_token,
                 entry,
                 durable_admission,
                 history,
@@ -733,7 +788,9 @@ impl RoomSessionTask {
             } => {
                 self.confirm_local(
                     peer,
+                    session,
                     plan,
+                    intent_token,
                     entry,
                     durable_admission,
                     history,
@@ -816,6 +873,11 @@ impl RoomSessionTask {
         if self.pending.contains_key(&peer) {
             return Ok(());
         }
+        if self.peer_has_recovery_work(peer) {
+            return Err(
+                "session renewal requires every retired/in-flight recovery to drain".into(),
+            );
+        }
         if let Some(active) = self.active.get(&peer)
             && !active.is_drained()
         {
@@ -876,6 +938,33 @@ impl RoomSessionTask {
         )
         .await?;
         self.emit(RoomSessionEgress::Carrier(carrier)).await
+    }
+
+    /// True while a replacement epoch could be based on a durable cut which
+    /// does not yet cover work accepted by an older epoch.
+    ///
+    /// This is deliberately peer-wide and exact-epoch-aware.  `active` being
+    /// absent is not evidence of a drained session: retirement removes the
+    /// live kernel before already-queued Replica admissions return.
+    fn peer_has_recovery_work(&self, peer: ActorId) -> bool {
+        self.retired.iter().any(|(session, retired)| {
+            session.peer == peer
+                && (!retired.outstanding.is_empty() || retired.active.has_local_reification_wait())
+        }) || self
+            .inflight_reifications
+            .iter()
+            .any(|(session, inflight)| session.peer == peer && !inflight.is_empty())
+    }
+
+    /// True when replacing `peer`'s epoch could abandon a local durable
+    /// obligation. A remote-only compact prediction is deliberately absent:
+    /// it is reversible presentation state and an authorized higher-epoch
+    /// Reset may replace it after the new floor is durable.
+    fn incoming_renewal_has_local_obligations(&self, peer: ActorId) -> bool {
+        self.active
+            .get(&peer)
+            .is_some_and(ActiveSession::has_local_reification_wait)
+            || self.peer_has_recovery_work(peer)
     }
 
     async fn load_renewal_floor(
@@ -945,11 +1034,12 @@ impl RoomSessionTask {
             self.lease_clock.now_ticks()?,
         )?;
         let installed_epoch = next_floor.epoch();
-        // The task is the sole session mutator, so the already-drained old
-        // session remains frozen across this await. Persist the new floor
-        // before Answer/reset can become observable. A crash in the following
-        // delivery/activation cut is healed by the durable higher-floor
-        // counter-offer path and can never reopen the old epoch.
+        // The task is the sole session mutator, so the old session (either
+        // drained or containing remote-only reversible speculation) remains
+        // frozen across this await. Persist the new floor before Answer/reset
+        // can become observable. A crash in the following delivery/activation
+        // cut is healed by the durable higher-floor counter-offer path and can
+        // never reopen the old epoch.
         self.renewal_floors.insert(peer, Some(next_floor));
 
         #[cfg(feature = "browser-acceptance-faults")]
@@ -978,6 +1068,7 @@ impl RoomSessionTask {
                 projection,
                 carrier,
                 durable: Vec::new(),
+                intent_token: None,
                 trace: None,
             }))
             .await
@@ -1007,6 +1098,16 @@ impl RoomSessionTask {
     }
 
     async fn start_ready_renewals(&mut self) -> Result<(), String> {
+        let retired: Vec<_> = self
+            .renewal_needed
+            .iter()
+            .filter(|peer| !self.active.contains_key(peer) && !self.pending.contains_key(peer))
+            .filter(|peer| !self.peer_has_recovery_work(**peer))
+            .filter_map(|peer| self.foundations.get(peer).cloned())
+            .collect();
+        for foundation in retired {
+            self.begin_session(foundation).await?;
+        }
         let peers: Vec<_> = self
             .active
             .iter()
@@ -1014,6 +1115,7 @@ impl RoomSessionTask {
                 (((active.foundation.local.0 < peer.0 && active.needs_renewal())
                     || self.renewal_needed.contains(peer))
                     && active.is_drained()
+                    && !self.peer_has_recovery_work(*peer)
                     && !self.pending.contains_key(peer))
                 .then_some(*peer)
             })
@@ -1056,8 +1158,22 @@ impl RoomSessionTask {
                     .get(&source)
                     .ok_or("session offer arrived before the peer foundation was ready")?
                     .clone();
-                if target != local.local || base != position_bytes(&local.history.frontier()) {
-                    return Err("session offer targets another actor or stale durable base".into());
+                if target != local.local {
+                    return Err("session offer targets another actor".into());
+                }
+                let offered_epoch = SessionEpoch::new(epoch);
+                if offered_epoch.get() == 0 {
+                    return Err("session offer epoch zero is invalid".into());
+                }
+                if base != position_bytes(&local.history.frontier()) {
+                    self.emit_renewal_trace(
+                        RoomSessionRenewalTraceStage::StaleOfferRefused,
+                        source,
+                        offered_epoch,
+                        None,
+                    )
+                    .await?;
+                    return Err("session offer is bound to a stale durable base".into());
                 }
                 if grants != hash_bytes(&local.peer_grants) {
                     return Err(
@@ -1065,10 +1181,6 @@ impl RoomSessionTask {
                     );
                 }
                 let renewal_floor = self.load_renewal_floor(&local).await?;
-                let offered_epoch = SessionEpoch::new(epoch);
-                if offered_epoch.get() == 0 {
-                    return Err("session offer epoch zero is invalid".into());
-                }
                 match renewal_floor.as_ref() {
                     Some(floor) if offered_epoch <= floor.epoch() => {
                         // The sender is behind a floor which may have persisted
@@ -1092,7 +1204,7 @@ impl RoomSessionTask {
                     }
                     _ => {}
                 }
-                if let Some(pending) = self.pending.get(&source) {
+                let replaces_pending = if let Some(pending) = self.pending.get(&source) {
                     if !prefer_incoming_offer(
                         local.local,
                         source,
@@ -1101,18 +1213,10 @@ impl RoomSessionTask {
                     ) {
                         return Ok(());
                     }
-                    self.pending.remove(&source);
-                }
-                if renewal_floor.is_some()
-                    && self
-                        .active
-                        .get(&source)
-                        .is_some_and(|active| !active.is_drained())
-                {
-                    return Err(
-                        "session renewal arrived before the old speculative suffix drained".into(),
-                    );
-                }
+                    true
+                } else {
+                    false
+                };
                 let manifest = build_manifest(&local, session_id, offered_epoch)?;
                 let binding = establishment_binding(&local.identity, source, target, session_id);
                 let verified_offer = Offer::decode(&handshake)
@@ -1138,6 +1242,23 @@ impl RoomSessionTask {
                     remote_foundation,
                     renewal_floor.as_ref(),
                 )?;
+                // Authentication, the exact durable base/foundations, and
+                // renewal authority have all passed. A recovered peer may now
+                // legitimately replace an old epoch which contains only that
+                // peer's reversible compact prediction. Never cross this cut
+                // while this placement still owes a local reification:
+                // awaiting, in-flight, and retired work remains a hard drain
+                // barrier because it may already have escaped as a durable
+                // promise. `install_session` persists the new floor before its
+                // Answer/Reset is observable.
+                if renewal_floor.is_some() && self.incoming_renewal_has_local_obligations(source) {
+                    return Err(
+                        "session renewal arrived before local durable obligations drained".into(),
+                    );
+                }
+                if replaces_pending {
+                    self.pending.remove(&source);
+                }
                 let answer = SessionCarrierBody::Answer {
                     source: local.local,
                     target: source,
@@ -1190,6 +1311,7 @@ impl RoomSessionTask {
                         .active
                         .get(&source)
                         .is_some_and(|active| !active.is_drained())
+                    || self.peer_has_recovery_work(source)
                 {
                     return Err(
                         "session answer arrived after its durable base or old suffix changed"
@@ -1245,34 +1367,53 @@ impl RoomSessionTask {
                 }
                 let receiver_now = self.lease_clock.now_ticks()?;
                 let trace_clock = Rc::clone(&self.trace_clock);
-                let active = self
-                    .active
-                    .get_mut(&source)
-                    .expect("matching active session checked above");
-                let remote = active.ingest_remote(
-                    &frame,
-                    receiver_now,
-                    trace_clock.as_ref(),
-                    self.trace_enabled,
-                    worker_accepted_at_micros,
-                    carrier_received_at_micros,
-                )?;
+                let remote = {
+                    let active = self
+                        .active
+                        .get_mut(&source)
+                        .expect("matching active session checked above");
+                    active.ingest_remote(
+                        &frame,
+                        receiver_now,
+                        trace_clock.as_ref(),
+                        self.trace_enabled,
+                        worker_accepted_at_micros,
+                        carrier_received_at_micros,
+                    )
+                };
+                let remote = match remote {
+                    Ok(remote) => remote,
+                    Err(RemoteIngestFailure::BeforeMutation(error)) => return Err(error),
+                    Err(RemoteIngestFailure::ContinuityLost(error)) => {
+                        return self.fail_session_generation(format!(
+                            "remote compact event failed after Fresh replay state was consumed: {error}"
+                        ));
+                    }
+                };
                 let Some(mut remote) = remote else {
                     return Ok(());
                 };
                 if self.presentation_peer == Some(source)
                     && let Some(kind) = remote.changed
                 {
-                    let projection = active.projection_event(kind);
+                    let projection = self
+                        .active
+                        .get(&source)
+                        .expect("matching active session retained")
+                        .projection_event(kind);
                     if let Some(trace) = &mut remote.trace {
                         trace.worker_projected_at_micros = trace_clock.now_micros();
                     }
-                    self.emit(RoomSessionEgress::Realtime(RoomSessionRealtimeEgress {
-                        projection,
-                        carrier: None,
-                        durable: Vec::new(),
-                        trace: remote.trace,
-                    }))
+                    self.emit_realtime_or_fail_generation(
+                        source,
+                        RoomSessionRealtimeEgress {
+                            projection,
+                            carrier: None,
+                            durable: Vec::new(),
+                            intent_token: None,
+                            trace: remote.trace,
+                        },
+                    )
                     .await?;
                 }
                 Ok(())
@@ -1283,17 +1424,43 @@ impl RoomSessionTask {
     async fn local_edit(
         &mut self,
         command: MusicOp,
+        intent_token: PerformanceIntentToken,
         trace_token: Option<RoomSessionTraceToken>,
         worker_accepted_at_micros: Option<u64>,
     ) -> Result<(), String> {
+        let Some(events) = self.events.as_ref() else {
+            return Err("worker session event port is not configured".into());
+        };
+        let worker_generation = events.generation().get();
+        if intent_token.generation != worker_generation {
+            return self
+                .reject_intent(
+                    intent_token,
+                    format!(
+                        "stale performance intent generation {}; current worker generation is {worker_generation}",
+                        intent_token.generation
+                    ),
+                )
+                .await;
+        }
         if !is_pitch_edit(&command) {
-            return Err("compact session only accepts shared pitch-set edits".into());
+            return self
+                .reject_intent(
+                    intent_token,
+                    "compact session only accepts shared pitch-set edits".into(),
+                )
+                .await;
         }
         let Some(peer) = self
             .presentation_peer
             .filter(|peer| self.active.contains_key(peer))
         else {
-            return self.emit(RoomSessionEgress::FallbackDurable(command)).await;
+            return self
+                .emit(RoomSessionEgress::FallbackDurable {
+                    command,
+                    intent_token,
+                })
+                .await;
         };
         if self
             .active
@@ -1304,40 +1471,85 @@ impl RoomSessionTask {
             // asked to seal counter 65. Keep the user's edit live by routing it
             // through the ordinary durable path; the ensuing canonical advance
             // supplies the exact base for renewal.
-            return self.emit(RoomSessionEgress::FallbackDurable(command)).await;
+            return self
+                .emit(RoomSessionEgress::FallbackDurable {
+                    command,
+                    intent_token,
+                })
+                .await;
+        }
+        if let Err(error) = self
+            .active
+            .get(&peer)
+            .expect("selected active session")
+            .preflight_local_event()
+        {
+            return self.reject_intent(intent_token, error).await;
         }
         // Reserve the bounded worker-side reification lane before mutating the
         // session kernel. Only this task produces reifications, so the permit
         // remains ours until start_send below.
         let mut reserved_reification = self.reifications.clone();
-        poll_fn(|context| Pin::new(&mut reserved_reification).poll_ready(context))
+        if poll_fn(|context| Pin::new(&mut reserved_reification).poll_ready(context))
             .await
-            .map_err(|_| "session reification queue closed".to_owned())?;
-        let receiver_now = self.lease_clock.now_ticks()?;
+            .is_err()
+        {
+            return self
+                .reject_intent(intent_token, "session reification queue closed".into())
+                .await;
+        }
+        let receiver_now = match self.lease_clock.now_ticks() {
+            Ok(now) => now,
+            Err(error) => return self.reject_intent(intent_token, error).await,
+        };
         let trace_clock = Rc::clone(&self.trace_clock);
-        let (local, carrier, projection) = {
+        let local_result = {
             let active = self.active.get_mut(&peer).expect("selected active session");
-            let mut local = active.local_event(
+            active.local_event(
                 command,
+                intent_token,
                 receiver_now,
                 trace_clock.as_ref(),
                 self.trace_enabled,
                 trace_token,
                 worker_accepted_at_micros,
-            )?;
-            let carrier = SessionCarrierBody::Event {
-                source: active.foundation.local,
-                target: peer,
-                session_id: active.session_id,
-                frame: local.frame.clone(),
-            }
-            .encode()?;
-            let projection = active.projection_event(RoomSessionProjectionKind::Predicted);
-            if let Some(trace) = &mut local.trace {
-                trace.worker_projected_at_micros = trace_clock.now_micros();
-            }
-            (local, carrier, projection)
+            )
         };
+        let mut local = match local_result {
+            Ok(local) => local,
+            Err(error) => {
+                return self.fail_session_generation(format!(
+                    "compact local event failed after session mutation: {error}"
+                ));
+            }
+        };
+        let (source, session_id) = {
+            let active = self.active.get(&peer).expect("selected active session");
+            (active.foundation.local, active.session_id)
+        };
+        let carrier = match (SessionCarrierBody::Event {
+            source,
+            target: peer,
+            session_id,
+            frame: local.frame.clone(),
+        })
+        .encode()
+        {
+            Ok(carrier) => carrier,
+            Err(error) => {
+                return self.fail_session_generation(format!(
+                    "compact carrier encoding failed after session mutation: {error}"
+                ));
+            }
+        };
+        let projection = {
+            let active = self.active.get(&peer).expect("selected active session");
+            let projection = active.projection_event(RoomSessionProjectionKind::Predicted);
+            projection
+        };
+        if let Some(trace) = &mut local.trace {
+            trace.worker_projected_at_micros = trace_clock.now_micros();
+        }
         let durable = local
             .plan
             .as_ref()
@@ -1345,33 +1557,78 @@ impl RoomSessionTask {
             .into_iter()
             .collect();
         if let Some(plan) = local.plan.as_ref() {
-            Pin::new(&mut reserved_reification)
+            let session = self
+                .active
+                .get(&peer)
+                .expect("selected active session")
+                .identity();
+            let correlation = durable_correlation(plan.correlation());
+            self.inflight_reifications
+                .entry(session)
+                .or_default()
+                .insert(correlation);
+            if Pin::new(&mut reserved_reification)
                 .start_send(RoomSessionReification {
                     peer,
+                    session,
                     plan: plan.clone(),
                     command: local.command.clone(),
+                    intent_token: Some(intent_token),
                 })
-                .map_err(|_| "reserved session reification enqueue failed".to_owned())?;
+                .is_err()
+            {
+                if let Some(inflight) = self.inflight_reifications.get_mut(&session) {
+                    inflight.remove(&correlation);
+                    if inflight.is_empty() {
+                        self.inflight_reifications.remove(&session);
+                    }
+                }
+                return self.fail_session_generation(
+                    "reserved session reification enqueue failed after session mutation".into(),
+                );
+            }
         }
         let realtime = RoomSessionRealtimeEgress {
             projection,
             carrier: Some(carrier),
             durable,
+            intent_token: Some(intent_token),
             trace: local.trace,
         };
-        self.emit_realtime_with_reset(peer, realtime).await
+        self.emit_realtime_or_fail_generation(peer, realtime).await
     }
 
     async fn confirm_local(
         &mut self,
         peer: ActorId,
+        session: RoomSessionEpochIdentity,
         plan: ReificationPlan,
+        intent_token: Option<PerformanceIntentToken>,
         entry: Entry,
         durable_admission: DurableEntryAdmission,
         history: DagSnapshot,
         durable_view: SharedPitchSet,
         durable_revision: u64,
     ) -> Result<(), String> {
+        let correlation = durable_correlation(plan.correlation());
+        let matches_active = self
+            .active
+            .get(&peer)
+            .is_some_and(|active| active.identity() == session);
+        if !matches_active {
+            return self
+                .confirm_retired(
+                    session,
+                    plan,
+                    intent_token,
+                    entry,
+                    durable_admission,
+                    history,
+                    durable_view,
+                    durable_revision,
+                )
+                .await;
+        }
         let (ready, kind) = {
             let active = self
                 .active
@@ -1395,6 +1652,7 @@ impl RoomSessionTask {
                 .unwrap_or(RoomSessionProjectionKind::Confirmed);
             (active.retry_reifications()?, kind)
         };
+        self.remove_inflight_reification(session, correlation)?;
         let projection = self.advance_companions_and_select_projection(
             peer,
             kind,
@@ -1405,16 +1663,17 @@ impl RoomSessionTask {
         self.update_foundation_horizon(&history, &durable_view, durable_revision);
         let durable = ready
             .iter()
-            .map(|(plan, _)| durable_correlation(plan.correlation()))
+            .map(|(plan, _, _)| durable_correlation(plan.correlation()))
             .collect();
         if let Some(projection) = projection {
-            self.emit_realtime_with_reset(
+            self.emit_realtime_or_fail_generation(
                 self.presentation_peer
                     .expect("selected projection requires a presentation peer"),
                 RoomSessionRealtimeEgress {
                     projection,
                     carrier: None,
                     durable,
+                    intent_token,
                     trace: None,
                 },
             )
@@ -1422,6 +1681,107 @@ impl RoomSessionTask {
         }
         self.enqueue_reifications(peer, ready).await?;
         self.start_ready_renewals().await
+    }
+
+    async fn confirm_retired(
+        &mut self,
+        session: RoomSessionEpochIdentity,
+        plan: ReificationPlan,
+        intent_token: Option<PerformanceIntentToken>,
+        entry: Entry,
+        durable_admission: DurableEntryAdmission,
+        history: DagSnapshot,
+        durable_view: SharedPitchSet,
+        durable_revision: u64,
+    ) -> Result<(), String> {
+        let correlation = durable_correlation(plan.correlation());
+        let (projection, ready, drained) = {
+            let retired = self
+                .retired
+                .get_mut(&session)
+                .ok_or("durable session confirmation has neither an active nor retired epoch")?;
+            if !retired.outstanding.contains(&correlation) {
+                return Err(
+                    "durable session confirmation did not match an outstanding retired reification"
+                        .into(),
+                );
+            }
+            let admission = retired
+                .active
+                .planner
+                .record_admission(
+                    &plan,
+                    &entry,
+                    SessionAdmission::from_replica(
+                        &entry,
+                        durable_admission,
+                        MAX_SESSION_MESSAGE_BYTES as usize,
+                    )
+                    .map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
+            retired
+                .active
+                .confirm(admission, durable_revision, &history, durable_view.clone())?;
+            let ready = retired.active.retry_reifications()?;
+            retired.outstanding.remove(&correlation);
+            for (ready_plan, _, _) in &ready {
+                retired
+                    .outstanding
+                    .insert(durable_correlation(ready_plan.correlation()));
+            }
+            retired.projection.sequence = retired
+                .projection
+                .sequence
+                .checked_add(1)
+                .ok_or("retired session projection sequence exhausted")?;
+            retired.projection.durable_revision = durable_revision;
+            retired.projection.durable_root = *history_root(&history).as_bytes();
+            retired.projection.kind = RoomSessionProjectionKind::Confirmed;
+            retired.projection.view = durable_view.clone();
+            (
+                retired.projection.clone(),
+                ready,
+                retired.outstanding.is_empty() && !retired.active.has_local_reification_wait(),
+            )
+        };
+        self.remove_inflight_reification(session, correlation)?;
+        self.enqueue_reifications_for(session.peer, session, ready)
+            .await?;
+        if drained {
+            self.retired.remove(&session);
+        }
+        self.emit(RoomSessionEgress::Realtime(RoomSessionRealtimeEgress {
+            projection,
+            carrier: None,
+            durable: Vec::new(),
+            intent_token,
+            trace: None,
+        }))
+        .await?;
+        self.advance_all(history, durable_view, durable_revision)
+            .await
+    }
+
+    fn remove_inflight_reification(
+        &mut self,
+        session: RoomSessionEpochIdentity,
+        correlation: RoomSessionDurableCorrelation,
+    ) -> Result<(), String> {
+        let remove_session = {
+            let inflight = self
+                .inflight_reifications
+                .get_mut(&session)
+                .ok_or("durable confirmation has no matching in-flight session epoch")?;
+            if !inflight.remove(&correlation) {
+                return Err("durable confirmation has no matching in-flight correlation".into());
+            }
+            inflight.is_empty()
+        };
+        if remove_session {
+            self.inflight_reifications.remove(&session);
+        }
+        Ok(())
     }
 
     async fn observe(
@@ -1485,16 +1845,17 @@ impl RoomSessionTask {
         self.update_foundation_horizon(&history, &durable_view, durable_revision);
         let durable = ready
             .iter()
-            .map(|(plan, _)| durable_correlation(plan.correlation()))
+            .map(|(plan, _, _)| durable_correlation(plan.correlation()))
             .collect();
         if let Some(projection) = projection {
-            self.emit_realtime_with_reset(
+            self.emit_realtime_or_fail_generation(
                 self.presentation_peer
                     .expect("selected projection requires a presentation peer"),
                 RoomSessionRealtimeEgress {
                     projection,
                     carrier: None,
                     durable,
+                    intent_token: None,
                     trace: None,
                 },
             )
@@ -1550,17 +1911,57 @@ impl RoomSessionTask {
     async fn enqueue_reifications(
         &mut self,
         peer: ActorId,
-        reifications: impl IntoIterator<Item = (ReificationPlan, MusicOp)>,
+        reifications: impl IntoIterator<
+            Item = (ReificationPlan, MusicOp, Option<PerformanceIntentToken>),
+        >,
     ) -> Result<(), String> {
-        for (plan, command) in reifications {
-            self.reifications
+        let session = self
+            .active
+            .get(&peer)
+            .ok_or("session reification has no active peer")?
+            .identity();
+        self.enqueue_reifications_for(peer, session, reifications)
+            .await
+    }
+
+    async fn enqueue_reifications_for(
+        &mut self,
+        peer: ActorId,
+        session: RoomSessionEpochIdentity,
+        reifications: impl IntoIterator<
+            Item = (ReificationPlan, MusicOp, Option<PerformanceIntentToken>),
+        >,
+    ) -> Result<(), String> {
+        for (plan, command, intent_token) in reifications {
+            let correlation = durable_correlation(plan.correlation());
+            self.inflight_reifications
+                .entry(session)
+                .or_default()
+                .insert(correlation);
+            if self
+                .reifications
                 .send(RoomSessionReification {
                     peer,
+                    session,
                     plan,
                     command,
+                    intent_token,
                 })
                 .await
-                .map_err(|_| "session reification queue closed".to_owned())?;
+                .is_err()
+            {
+                let remove_session =
+                    self.inflight_reifications
+                        .get_mut(&session)
+                        .is_some_and(|inflight| {
+                            inflight.remove(&correlation);
+                            inflight.is_empty()
+                        });
+                if remove_session {
+                    self.inflight_reifications.remove(&session);
+                }
+                return Err("session reification queue closed".to_owned());
+            }
         }
         Ok(())
     }
@@ -1586,6 +1987,7 @@ impl RoomSessionTask {
                 projection,
                 carrier: None,
                 durable: Vec::new(),
+                intent_token: None,
                 trace: None,
             }))
             .await?;
@@ -1616,6 +2018,7 @@ impl RoomSessionTask {
             projection,
             carrier: None,
             durable: Vec::new(),
+            intent_token: None,
             trace: None,
         }))
         .await?;
@@ -1636,38 +2039,51 @@ impl RoomSessionTask {
         }
     }
 
-    async fn emit_realtime_with_reset(
+    async fn emit_realtime_or_fail_generation(
         &mut self,
-        peer: ActorId,
+        _peer: ActorId,
         event: RoomSessionRealtimeEgress,
     ) -> Result<(), String> {
-        let first = self.emit(RoomSessionEgress::Realtime(event.clone())).await;
+        let first = self.emit(RoomSessionEgress::Realtime(event)).await;
         let Err(first_error) = first else {
             return Ok(());
         };
+        self.fail_session_generation(format!(
+            "combined session carrier/projection frame was rejected before window acceptance: {first_error}"
+        ))
+    }
 
-        // The session kernel has already advanced. A rejected bounded-window
-        // acceptance must therefore establish a new projection continuity
-        // generation before retrying; silently continuing would make the
-        // mutation invisible while later deltas appeared contiguous.
-        let projection = self
-            .active
-            .get_mut(&peer)
-            .ok_or("session disappeared while resetting rejected egress")?
-            .reset_projection()?;
-        let recovery = RoomSessionRealtimeEgress {
-            projection,
-            carrier: event.carrier,
-            durable: event.durable,
-            trace: event.trace,
-        };
-        self.emit(RoomSessionEgress::Realtime(recovery))
-            .await
-            .map_err(|recovery_error| {
-                format!(
-                    "session egress was rejected ({first_error}); continuity reset was also rejected ({recovery_error})"
-                )
-            })
+    async fn reject_intent(
+        &self,
+        intent_token: PerformanceIntentToken,
+        reason: String,
+    ) -> Result<(), String> {
+        self.emit(RoomSessionEgress::IntentRejected {
+            intent_token,
+            reason,
+        })
+        .await
+    }
+
+    fn fail_session_generation(&mut self, reason: String) -> Result<(), String> {
+        let terminal = format!(
+            "{reason}; compact generation terminated; reopen canonical state, repair, and establish a fresh epoch"
+        );
+        // This is deliberately the ordinary worker event lane, not the
+        // rejected application-frame lane.  The window must be able to fail
+        // the whole placement even when the bounded realtime queue is the
+        // thing which refused delivery.
+        if let Some(events) = self.events.as_ref() {
+            let _ = events.emit(WorkerEventKind::Error, terminal.as_bytes().to_vec());
+        }
+        self.events = None;
+        self.pending.clear();
+        self.active.clear();
+        self.retired.clear();
+        self.inflight_reifications.clear();
+        self.presentation_peer = None;
+        self.renewal_needed.clear();
+        Err(terminal)
     }
 
     async fn emit(&self, event: RoomSessionEgress) -> Result<(), String> {
@@ -1716,6 +2132,11 @@ struct RemoteSessionEvent {
     trace: Option<RoomSessionCompactTrace>,
 }
 
+enum RemoteIngestFailure {
+    BeforeMutation(String),
+    ContinuityLost(String),
+}
+
 #[cfg(test)]
 struct DisabledRoomSessionTraceClock;
 
@@ -1727,6 +2148,15 @@ impl RoomSessionTraceClock for DisabledRoomSessionTraceClock {
 }
 
 impl ActiveSession {
+    fn identity(&self) -> RoomSessionEpochIdentity {
+        RoomSessionEpochIdentity {
+            peer: self.foundation.peer,
+            manifest: *self.session.manifest_digest().as_bytes(),
+            session_id: self.session_id,
+            epoch: self.session.manifest().epoch().get(),
+        }
+    }
+
     fn new(
         foundation: RoomSessionFoundation,
         session: AuthorizedSession<2>,
@@ -1831,8 +2261,25 @@ impl ActiveSession {
         self.projection.pending_len() == 0 && self.awaiting_reification.is_empty()
     }
 
+    fn has_local_reification_wait(&self) -> bool {
+        !self.awaiting_reification.is_empty()
+    }
+
     fn is_saturated(&self) -> bool {
         self.sender.remaining_causal_events() == 0 || self.kernel.event_budget_exhausted()
+    }
+
+    fn preflight_local_event(&self) -> Result<(), String> {
+        if self.is_saturated() {
+            return Err("session epoch is saturated; use durable fallback until renewal".into());
+        }
+        if self.awaiting_reification.len() >= SESSION_CAPACITY {
+            return Err(format!(
+                "session has {} local events awaiting durable causal dependencies",
+                SESSION_CAPACITY
+            ));
+        }
+        Ok(())
     }
 
     fn needs_renewal(&self) -> bool {
@@ -1847,21 +2294,14 @@ impl ActiveSession {
     fn local_event(
         &mut self,
         command: MusicOp,
+        intent_token: PerformanceIntentToken,
         receiver_clock_ticks: u64,
         trace_clock: &dyn RoomSessionTraceClock,
         trace_enabled: bool,
         trace_token: Option<RoomSessionTraceToken>,
         worker_accepted_at_micros: Option<u64>,
     ) -> Result<LocalSessionEvent, String> {
-        if self.is_saturated() {
-            return Err("session epoch is saturated; use durable fallback until renewal".into());
-        }
-        if self.awaiting_reification.len() >= SESSION_CAPACITY {
-            return Err(format!(
-                "session has {} local events awaiting durable causal dependencies",
-                SESSION_CAPACITY
-            ));
-        }
+        self.preflight_local_event()?;
         self.logical_time = self.logical_time.saturating_add(1);
         let counter = self.sender.highest_sealed_counter().saturating_add(1);
         let header = self
@@ -1904,9 +2344,10 @@ impl ActiveSession {
             .permit_event(receiver_now, event, frame.len())
             .map_err(|error| error.to_string())?;
         let worker_authorized_at_micros = trace_enabled.then(|| trace_clock.now_micros()).flatten();
+        let correlation = compact_correlation(permitted.authenticated());
         let trace = trace_enabled.then(|| RoomSessionCompactTrace {
             token: trace_token,
-            correlation: compact_correlation(permitted.authenticated()),
+            correlation,
             direction: RoomSessionTraceDirection::Local,
             worker_accepted_at_micros,
             carrier_received_at_micros: None,
@@ -1920,7 +2361,8 @@ impl ActiveSession {
         let plan = match self.planner.plan(&self.kernel, dot) {
             Ok(plan) => Some(plan),
             Err(ReificationError::UnreifiedDependency(_)) => {
-                self.awaiting_reification.insert(dot, command.clone());
+                self.awaiting_reification
+                    .insert(dot, (command.clone(), Some(intent_token)));
                 None
             }
             Err(error) => return Err(error.to_string()),
@@ -1933,17 +2375,19 @@ impl ActiveSession {
         })
     }
 
-    fn retry_reifications(&mut self) -> Result<Vec<(ReificationPlan, MusicOp)>, String> {
+    fn retry_reifications(
+        &mut self,
+    ) -> Result<Vec<(ReificationPlan, MusicOp, Option<PerformanceIntentToken>)>, String> {
         let mut ready = Vec::new();
         let dots: Vec<_> = self.awaiting_reification.keys().copied().collect();
         for dot in dots {
             match self.planner.plan(&self.kernel, dot) {
                 Ok(plan) => {
-                    let command = self
+                    let (command, intent_token) = self
                         .awaiting_reification
                         .remove(&dot)
                         .expect("dot came from the bounded wait map");
-                    ready.push((plan, command));
+                    ready.push((plan, command, intent_token));
                 }
                 Err(ReificationError::UnreifiedDependency(_)) => {}
                 Err(error) => return Err(error.to_string()),
@@ -1960,31 +2404,33 @@ impl ActiveSession {
         trace_enabled: bool,
         worker_accepted_at_micros: Option<u64>,
         carrier_received_at_micros: Option<u64>,
-    ) -> Result<Option<RemoteSessionEvent>, String> {
+    ) -> Result<Option<RemoteSessionEvent>, RemoteIngestFailure> {
         let packet = self
             .receiver_codec
             .decode(&self.receiver_binding, frame)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| RemoteIngestFailure::BeforeMutation(error.to_string()))?;
         let at = packet.header().effective_at().ticks();
         let received = self
             .receiver
             .receive(&packet)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| RemoteIngestFailure::BeforeMutation(error.to_string()))?;
         if received.disposition() != ReplayDisposition::Fresh {
             return Ok(None);
         }
         let worker_authenticated_at_micros =
             trace_enabled.then(|| trace_clock.now_micros()).flatten();
-        let receiver_now = self.receiver_lease_time(receiver_clock_ticks)?;
+        let receiver_now = self
+            .receiver_lease_time(receiver_clock_ticks)
+            .map_err(RemoteIngestFailure::ContinuityLost)?;
         let event = received
             .try_decode(decode_pitch_edit)
-            .map_err(|error| error.to_owned())?;
+            .map_err(|error| RemoteIngestFailure::ContinuityLost(error.to_owned()))?;
         let worker_interpreted_at_micros =
             trace_enabled.then(|| trace_clock.now_micros()).flatten();
         let permitted = self
             .session
             .permit_event(receiver_now, event, frame.len())
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| RemoteIngestFailure::ContinuityLost(error.to_string()))?;
         let worker_authorized_at_micros = trace_enabled.then(|| trace_clock.now_micros()).flatten();
         let trace = trace_enabled.then(|| RoomSessionCompactTrace {
             token: None,
@@ -1998,7 +2444,9 @@ impl ActiveSession {
             worker_projected_at_micros: None,
         });
         self.logical_time = self.logical_time.max(at);
-        let changed = self.ingest(permitted)?;
+        let changed = self
+            .ingest(permitted)
+            .map_err(RemoteIngestFailure::ContinuityLost)?;
         Ok(Some(RemoteSessionEvent { changed, trace }))
     }
 
@@ -2139,6 +2587,29 @@ impl ActiveSession {
         let history = self.foundation.history.clone();
         self.resynchronize(self.durable_revision, &history, durable)?;
         Ok(self.projection_event(RoomSessionProjectionKind::Reset))
+    }
+
+    /// Produce a canonical-horizon reset for an epoch that can no longer be
+    /// used safely. The caller removes this `ActiveSession` immediately after
+    /// creating the snapshot; no transient kernel state crosses the boundary.
+    fn retirement_projection(&self) -> Result<RoomSessionProjection, String> {
+        let current = self.projection.snapshot();
+        let generation = current
+            .generation()
+            .get()
+            .checked_add(1)
+            .ok_or("session projection generation exhausted during retirement")?;
+        Ok(RoomSessionProjection {
+            manifest: *self.session.manifest_digest().as_bytes(),
+            session_id: self.session_id,
+            epoch: self.session.manifest().epoch().get(),
+            generation,
+            sequence: 0,
+            durable_revision: self.foundation.durable_revision,
+            durable_root: *history_root(&self.foundation.history).as_bytes(),
+            kind: RoomSessionProjectionKind::Reset,
+            view: self.foundation.durable_view.clone(),
+        })
     }
 
     fn resynchronize_exact(
@@ -2538,10 +3009,18 @@ mod tests {
     use std::cell::{Cell, RefCell};
 
     use futures::executor::block_on;
+    use hhhs_store::MemoryStorage;
     use hhhs_web_browser::{WorkerEvent, WorkerGeneration};
 
     use super::*;
     use crate::room::v5::RoomReplicas;
+
+    fn intent(sequence: u64) -> PerformanceIntentToken {
+        PerformanceIntentToken {
+            generation: 1,
+            sequence,
+        }
+    }
 
     #[derive(Default)]
     struct TestRenewalStore {
@@ -2599,7 +3078,11 @@ mod tests {
         }
     }
 
-    fn renewal_foundations() -> (RoomSessionFoundation, RoomSessionFoundation) {
+    fn renewal_room_foundations() -> (
+        RoomReplicas<MemoryStorage, MemoryStorage>,
+        RoomSessionFoundation,
+        RoomSessionFoundation,
+    ) {
         let owner_key = SigningKey::from_bytes(&[41; 32]);
         let member_key = SigningKey::from_bytes(&[42; 32]);
         let owner = ActorId::from_signing_key(&owner_key);
@@ -2635,7 +3118,12 @@ mod tests {
             durable_view,
             durable_revision: snapshot.sequence,
         };
-        (owner_foundation, member_foundation)
+        (room, owner_foundation, member_foundation)
+    }
+
+    fn renewal_foundations() -> (RoomSessionFoundation, RoomSessionFoundation) {
+        let (_, owner, member) = renewal_room_foundations();
+        (owner, member)
     }
 
     fn authorize_fixture(
@@ -2692,8 +3180,156 @@ mod tests {
         (initiator_keys, responder_keys)
     }
 
+    fn signed_offer(foundation: &RoomSessionFoundation, session_id: u64, epoch: u32) -> Vec<u8> {
+        let manifest = build_manifest(foundation, session_id, SessionEpoch::new(epoch)).unwrap();
+        let binding = establishment_binding(
+            &foundation.identity,
+            foundation.local,
+            foundation.peer,
+            session_id,
+        );
+        let (_, offer) = PendingInitiator::begin(
+            &foundation.signing_key,
+            ProtocolId::derive(SESSION_PROTOCOL_LABEL),
+            binding,
+            session_id,
+            EphemeralSecret::from_bytes([73; 32]),
+        );
+        let (_, presentation) = local_foundation(foundation, &manifest).unwrap();
+        SessionCarrierBody::Offer {
+            source: foundation.local,
+            target: foundation.peer,
+            session_id,
+            epoch,
+            base: position_bytes(manifest.base()),
+            grants: hash_bytes(&foundation.local_grants),
+            handshake: offer.as_bytes().to_vec(),
+            foundation: presentation,
+        }
+        .encode()
+        .unwrap()
+    }
+
+    fn task_state_signature(
+        task: &RoomSessionTask,
+    ) -> (
+        usize,
+        usize,
+        usize,
+        usize,
+        Option<ActorId>,
+        BTreeSet<ActorId>,
+        usize,
+    ) {
+        (
+            task.pending.len(),
+            task.active.len(),
+            task.retired.len(),
+            task.inflight_reifications.len(),
+            task.presentation_peer,
+            task.renewal_needed.clone(),
+            task.renewal_floors.len(),
+        )
+    }
+
     fn degree() -> TunedDegree {
         TunedDegree::new(&tutti_music::Tuning::twelve_tet(), 7).unwrap()
+    }
+
+    #[test]
+    fn stale_base_offer_emits_one_typed_refusal_without_session_mutation() {
+        let (owner, mut member) = renewal_foundations();
+        let offer = signed_offer(&owner, 0x5101, 1);
+        let mut entries = member.history.entries_topo();
+        entries.push(Entry::new(
+            b"durable edit after the retained offer".to_vec(),
+            member.history.frontier(),
+        ));
+        member.history = DagSnapshot::from_entries(entries);
+
+        let delivered = Rc::new(RefCell::new(Vec::<RoomSessionEgress>::new()));
+        let captured = Rc::clone(&delivered);
+        let events = WorkerEventPort::new(WorkerGeneration::new(1), move |event| {
+            captured.borrow_mut().push(decode(event.payload())?);
+            Ok(())
+        });
+        let (reifications, _) = mpsc::channel(1);
+        let mut task = RoomSessionTask::new(
+            reifications,
+            Rc::new(TestRenewalStore::default()),
+            test_lease_clock(),
+        );
+        task.events = Some(events);
+        task.trace_enabled = true;
+        task.foundations.insert(owner.local, member);
+        let before = task_state_signature(&task);
+
+        let error = block_on(task.carrier(offer, None, None)).unwrap_err();
+        assert_eq!(error, "session offer is bound to a stale durable base");
+        assert_eq!(task_state_signature(&task), before);
+        assert_eq!(delivered.borrow().len(), 1);
+        assert!(matches!(
+            &delivered.borrow()[0],
+            RoomSessionEgress::RenewalTrace(RoomSessionRenewalTrace {
+                stage: RoomSessionRenewalTraceStage::StaleOfferRefused,
+                peer,
+                epoch: 1,
+                floor_epoch: None,
+            }) if *peer == owner.local.0
+        ));
+    }
+
+    #[test]
+    fn wrong_target_offer_emits_no_stale_trace_and_does_not_mutate_session() {
+        let (owner, member) = renewal_foundations();
+        let offer = SessionCarrierBody::decode(&signed_offer(&owner, 0x5102, 1)).unwrap();
+        let SessionCarrierBody::Offer {
+            source,
+            session_id,
+            epoch,
+            base,
+            grants,
+            handshake,
+            foundation,
+            ..
+        } = offer
+        else {
+            panic!("fixture did not encode an Offer");
+        };
+        let wrong_target = SessionCarrierBody::Offer {
+            source,
+            target: source,
+            session_id,
+            epoch,
+            base,
+            grants,
+            handshake,
+            foundation,
+        }
+        .encode()
+        .unwrap();
+
+        let delivered = Rc::new(RefCell::new(Vec::<RoomSessionEgress>::new()));
+        let captured = Rc::clone(&delivered);
+        let events = WorkerEventPort::new(WorkerGeneration::new(1), move |event| {
+            captured.borrow_mut().push(decode(event.payload())?);
+            Ok(())
+        });
+        let (reifications, _) = mpsc::channel(1);
+        let mut task = RoomSessionTask::new(
+            reifications,
+            Rc::new(TestRenewalStore::default()),
+            test_lease_clock(),
+        );
+        task.events = Some(events);
+        task.trace_enabled = true;
+        task.foundations.insert(owner.local, member);
+        let before = task_state_signature(&task);
+
+        let error = block_on(task.carrier(wrong_target, None, None)).unwrap_err();
+        assert_eq!(error, "session offer targets another actor");
+        assert_eq!(task_state_signature(&task), before);
+        assert!(delivered.borrow().is_empty());
     }
 
     #[test]
@@ -2735,6 +3371,7 @@ mod tests {
             active
                 .local_event(
                     MusicOp::AddDegree { degree: degree() },
+                    intent(1),
                     0,
                     &DisabledRoomSessionTraceClock,
                     false,
@@ -2767,6 +3404,7 @@ mod tests {
             active
                 .local_event(
                     MusicOp::AddDegree { degree: degree() },
+                    intent(1),
                     0,
                     &DisabledRoomSessionTraceClock,
                     false,
@@ -2781,6 +3419,7 @@ mod tests {
             active
                 .local_event(
                     MusicOp::AddDegree { degree: degree() },
+                    intent(65),
                     0,
                     &DisabledRoomSessionTraceClock,
                     false,
@@ -2791,6 +3430,545 @@ mod tests {
         );
         assert_eq!(active.sender.highest_sealed_counter(), MAX_EVENTS_PER_SEAT);
         assert_eq!(active.kernel.fault(), None);
+    }
+
+    #[test]
+    fn retired_epoch_validates_and_drains_every_exact_durable_admission() {
+        let (room, owner, member) = renewal_room_foundations();
+        let session_id = 57;
+        let (owner_authorized, _) =
+            authorize_fixture(&owner, &member, session_id, 1, None).unwrap();
+        let (member_authorized, _) =
+            authorize_fixture(&member, &owner, session_id, 1, None).unwrap();
+        let (owner_keys, member_keys) = session_key_pair(&owner, &member, session_id);
+        let mut active =
+            ActiveSession::new(owner.clone(), owner_authorized, session_id, owner_keys, 0).unwrap();
+        let first = active
+            .local_event(
+                MusicOp::AddDegree { degree: degree() },
+                intent(1),
+                0,
+                &DisabledRoomSessionTraceClock,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let first_plan = first.plan.clone().expect("first local dot is ready");
+        let second = active
+            .local_event(
+                MusicOp::RemoveDegree { degree: degree() },
+                intent(2),
+                0,
+                &DisabledRoomSessionTraceClock,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(
+            second.plan.is_none(),
+            "second dot waits for the first admission"
+        );
+
+        // Add an unrelated remote-only compact prediction to the epoch before
+        // retirement. It is not a local durable obligation and must not keep
+        // the retired epoch alive after both exact local admissions drain.
+        let remote_degree = TunedDegree::new(&tutti_music::Tuning::twelve_tet(), 9).unwrap();
+        let mut remote_sender = ActiveSession::new(
+            member.clone(),
+            member_authorized,
+            session_id,
+            member_keys,
+            0,
+        )
+        .unwrap();
+        let remote = remote_sender
+            .local_event(
+                MusicOp::AddDegree {
+                    degree: remote_degree,
+                },
+                intent(3),
+                0,
+                &DisabledRoomSessionTraceClock,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            active.ingest_remote(
+                &remote.frame,
+                0,
+                &DisabledRoomSessionTraceClock,
+                false,
+                None,
+                None,
+            ),
+            Ok(Some(_))
+        ));
+        assert!(active.projection.pending_len() > 0);
+
+        // Build a different but fully admitted session record. Its durable
+        // receipt must not discharge the retired epoch's exact correlation.
+        let wrong_session_id = session_id + 1;
+        let (wrong_authorized, _) =
+            authorize_fixture(&owner, &member, wrong_session_id, 1, None).unwrap();
+        let wrong_keys = initiator_keys(&owner, &member, wrong_session_id);
+        let mut wrong_active = ActiveSession::new(
+            owner.clone(),
+            wrong_authorized,
+            wrong_session_id,
+            wrong_keys,
+            0,
+        )
+        .unwrap();
+        let wrong = wrong_active
+            .local_event(
+                MusicOp::RemoveDegree { degree: degree() },
+                intent(9),
+                0,
+                &DisabledRoomSessionTraceClock,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let wrong_plan = wrong.plan.expect("independent first dot is ready");
+        let (wrong_entry, wrong_admission) = room
+            .admit_reified_music_for_test(
+                &owner.signing_key,
+                &wrong_plan,
+                MusicOp::RemoveDegree { degree: degree() },
+            )
+            .unwrap();
+
+        let session = active.identity();
+        let first_correlation = durable_correlation(first_plan.correlation());
+        let delivered = Rc::new(RefCell::new(Vec::<RoomSessionEgress>::new()));
+        let captured = Rc::clone(&delivered);
+        let events = WorkerEventPort::new(WorkerGeneration::new(1), move |event| {
+            captured.borrow_mut().push(decode(event.payload())?);
+            Ok(())
+        });
+        let (reifications, mut queued) = mpsc::channel(2);
+        let store = Rc::new(TestRenewalStore::default());
+        let mut task = RoomSessionTask::new(reifications, store, test_lease_clock());
+        task.events = Some(events);
+        task.foundations.insert(owner.peer, owner.clone());
+        task.retired.insert(
+            session,
+            RetiredSession {
+                projection: active.retirement_projection().unwrap(),
+                active,
+                outstanding: BTreeSet::from([first_correlation]),
+            },
+        );
+        task.inflight_reifications
+            .insert(session, BTreeSet::from([first_correlation]));
+
+        let wrong_snapshot = room.music_snapshot();
+        let wrong_view = room.view().music.shared_pitches;
+        let error = block_on(task.confirm_retired(
+            session,
+            wrong_plan,
+            None,
+            wrong_entry,
+            wrong_admission,
+            wrong_snapshot.history,
+            wrong_view,
+            wrong_snapshot.sequence,
+        ))
+        .unwrap_err();
+        assert!(error.contains("did not match an outstanding"));
+        assert!(
+            task.retired[&session]
+                .outstanding
+                .contains(&first_correlation)
+        );
+
+        let (first_entry, first_admission) = room
+            .admit_reified_music_for_test(&owner.signing_key, &first_plan, first.command)
+            .unwrap();
+        let first_snapshot = room.music_snapshot();
+        let first_view = room.view().music.shared_pitches;
+        block_on(task.confirm_retired(
+            session,
+            first_plan,
+            Some(intent(1)),
+            first_entry,
+            first_admission,
+            first_snapshot.history,
+            first_view,
+            first_snapshot.sequence,
+        ))
+        .unwrap();
+        let ready = block_on(queued.next()).expect("second exact reification was released");
+        let second_correlation = durable_correlation(ready.plan.correlation());
+        assert_eq!(
+            task.retired[&session].outstanding,
+            BTreeSet::from([second_correlation])
+        );
+        assert!(
+            task.retired[&session].active.projection.pending_len() > 0,
+            "unrelated remote prediction remains reversible while local work drains"
+        );
+
+        let (second_entry, second_admission) = room
+            .admit_reified_music_for_test(&owner.signing_key, &ready.plan, ready.command)
+            .unwrap();
+        let second_snapshot = room.music_snapshot();
+        let second_view = room.view().music.shared_pitches;
+        block_on(task.confirm_retired(
+            session,
+            ready.plan,
+            ready.intent_token,
+            second_entry,
+            second_admission,
+            second_snapshot.history,
+            second_view,
+            second_snapshot.sequence,
+        ))
+        .unwrap();
+        assert!(!task.retired.contains_key(&session));
+        assert!(!task.inflight_reifications.contains_key(&session));
+        assert!(!task.peer_has_recovery_work(owner.peer));
+        let sequences: Vec<_> = delivered
+            .borrow()
+            .iter()
+            .filter_map(|event| match event {
+                RoomSessionEgress::Realtime(event) => Some(event.projection.sequence),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sequences, vec![1, 2]);
+    }
+
+    #[test]
+    fn renewal_waits_for_active_awaiting_reification_then_resumes() {
+        let (owner, member) = renewal_foundations();
+        let peer = owner.peer;
+        let session_id = 61;
+        let (authorized, floor) = authorize_fixture(&owner, &member, session_id, 1, None).unwrap();
+        let keys = initiator_keys(&owner, &member, session_id);
+        let mut active =
+            ActiveSession::new(owner.clone(), authorized, session_id, keys, 0).unwrap();
+        active.awaiting_reification.insert(
+            SessionDot::new(SessionEpoch::new(1), active.local_seat, 1),
+            (MusicOp::AddDegree { degree: degree() }, Some(intent(1))),
+        );
+        let events = WorkerEventPort::new(WorkerGeneration::new(1), |_| Ok(()));
+        let (reifications, _) = mpsc::channel(2);
+        let mut task = RoomSessionTask::new(
+            reifications,
+            Rc::new(TestRenewalStore::default()),
+            test_lease_clock(),
+        );
+        task.events = Some(events);
+        task.foundations.insert(peer, owner.clone());
+        task.renewal_floors.insert(peer, Some(floor));
+        task.active.insert(peer, active);
+        task.renewal_needed.insert(peer);
+
+        block_on(task.start_ready_renewals()).unwrap();
+        assert!(!task.pending.contains_key(&peer));
+
+        task.active
+            .get_mut(&peer)
+            .unwrap()
+            .awaiting_reification
+            .clear();
+        block_on(task.start_ready_renewals()).unwrap();
+        assert!(task.pending.contains_key(&peer));
+    }
+
+    #[test]
+    fn renewal_waits_for_retired_inflight_epoch_then_resumes() {
+        let (owner, member) = renewal_foundations();
+        let peer = owner.peer;
+        let session_id = 62;
+        let (authorized, floor) = authorize_fixture(&owner, &member, session_id, 1, None).unwrap();
+        let keys = initiator_keys(&owner, &member, session_id);
+        let active = ActiveSession::new(owner.clone(), authorized, session_id, keys, 0).unwrap();
+        let session = active.identity();
+        let correlation = RoomSessionDurableCorrelation {
+            manifest: session.manifest,
+            epoch: session.epoch,
+            seat: active.local_seat,
+            counter: 1,
+            event: [0x62; 32],
+        };
+        let projection = active.retirement_projection().unwrap();
+        let events = WorkerEventPort::new(WorkerGeneration::new(1), |_| Ok(()));
+        let (reifications, _) = mpsc::channel(2);
+        let mut task = RoomSessionTask::new(
+            reifications,
+            Rc::new(TestRenewalStore::default()),
+            test_lease_clock(),
+        );
+        task.events = Some(events);
+        task.foundations.insert(peer, owner);
+        task.renewal_floors.insert(peer, Some(floor));
+        task.retired.insert(
+            session,
+            RetiredSession {
+                active,
+                projection,
+                outstanding: BTreeSet::from([correlation]),
+            },
+        );
+        task.inflight_reifications
+            .insert(session, BTreeSet::from([correlation]));
+        task.renewal_needed.insert(peer);
+
+        block_on(task.start_ready_renewals()).unwrap();
+        assert!(!task.pending.contains_key(&peer));
+
+        task.retired.get_mut(&session).unwrap().outstanding.clear();
+        task.inflight_reifications.remove(&session);
+        block_on(task.start_ready_renewals()).unwrap();
+        assert!(task.pending.contains_key(&peer));
+    }
+
+    #[test]
+    fn higher_epoch_replaces_remote_only_prediction_without_abandoning_local_work() {
+        let (room, owner, member) = renewal_room_foundations();
+        let old_session_id = 63;
+        let (owner_authorized, _) =
+            authorize_fixture(&owner, &member, old_session_id, 1, None).unwrap();
+        let (member_authorized, member_floor) =
+            authorize_fixture(&member, &owner, old_session_id, 1, None).unwrap();
+        let (owner_keys, member_keys) = session_key_pair(&owner, &member, old_session_id);
+        let mut sender = ActiveSession::new(
+            owner.clone(),
+            owner_authorized,
+            old_session_id,
+            owner_keys,
+            0,
+        )
+        .unwrap();
+        let mut receiver = ActiveSession::new(
+            member.clone(),
+            member_authorized,
+            old_session_id,
+            member_keys,
+            0,
+        )
+        .unwrap();
+        let old = sender
+            .local_event(
+                MusicOp::AddDegree { degree: degree() },
+                intent(1),
+                0,
+                &DisabledRoomSessionTraceClock,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let old_plan = old.plan.clone().expect("first old-epoch dot is ready");
+        let remote = match receiver.ingest_remote(
+            &old.frame,
+            0,
+            &DisabledRoomSessionTraceClock,
+            false,
+            None,
+            None,
+        ) {
+            Ok(Some(remote)) => remote,
+            Ok(None) => panic!("old compact event was unexpectedly classified as replay"),
+            Err(_) => panic!("old compact event was unexpectedly refused"),
+        };
+        assert!(remote.changed.is_some());
+        assert!(!receiver.is_drained());
+        assert!(receiver.awaiting_reification.is_empty());
+        assert!(
+            receiver
+                .projection_event(RoomSessionProjectionKind::Predicted)
+                .view
+                .pitch_classes
+                .contains(&degree())
+        );
+
+        let peer = member.peer;
+        let (reifications, _) = mpsc::channel(2);
+        let mut task = RoomSessionTask::new(
+            reifications,
+            Rc::new(TestRenewalStore::default()),
+            test_lease_clock(),
+        );
+        task.active.insert(peer, receiver);
+        assert!(
+            !task.incoming_renewal_has_local_obligations(peer),
+            "remote-only speculative state must remain replaceable"
+        );
+
+        // The same undrained projection becomes a hard barrier as soon as this
+        // placement owes a local causal reification.
+        let local_dot = SessionDot::new(SessionEpoch::new(1), 1, 9);
+        task.active
+            .get_mut(&peer)
+            .unwrap()
+            .awaiting_reification
+            .insert(
+                local_dot,
+                (MusicOp::RemoveDegree { degree: degree() }, Some(intent(2))),
+            );
+        assert!(task.incoming_renewal_has_local_obligations(peer));
+        task.active
+            .get_mut(&peer)
+            .unwrap()
+            .awaiting_reification
+            .remove(&local_dot);
+        assert!(!task.incoming_renewal_has_local_obligations(peer));
+
+        // Model the fully authorized/persisted replacement boundary. The new
+        // Reset removes only reversible presentation state, and the old
+        // epoch's compact carrier cannot authenticate under the new binding.
+        let new_session_id = 64;
+        let (renewed, _) =
+            authorize_fixture(&member, &owner, new_session_id, 2, Some(&member_floor)).unwrap();
+        let (_, renewed_keys) = session_key_pair(&owner, &member, new_session_id);
+        let mut replacement =
+            ActiveSession::new(member.clone(), renewed, new_session_id, renewed_keys, 0).unwrap();
+        let reset = replacement.projection_event(RoomSessionProjectionKind::Reset);
+        assert!(!reset.view.pitch_classes.contains(&degree()));
+        assert!(matches!(
+            replacement.ingest_remote(
+                &old.frame,
+                0,
+                &DisabledRoomSessionTraceClock,
+                false,
+                None,
+                None,
+            ),
+            Err(RemoteIngestFailure::BeforeMutation(_))
+        ));
+
+        // Reset is not rejection. If the old event later becomes an ordinary
+        // durable Replica admission, exact-history advancement corrects the
+        // replacement epoch to the canonical value.
+        let (_entry, _durable_admission) = room
+            .admit_reified_music_for_test(
+                &owner.signing_key,
+                &old_plan,
+                MusicOp::AddDegree { degree: degree() },
+            )
+            .unwrap();
+        let snapshot = room.music_snapshot();
+        let durable_view = room.view().music.shared_pitches;
+        assert!(
+            replacement
+                .advance_durable(snapshot.sequence, &snapshot.history, durable_view.clone())
+                .unwrap()
+                .is_some()
+        );
+        assert!(durable_view.pitch_classes.contains(&degree()));
+        assert!(
+            replacement
+                .projection_event(RoomSessionProjectionKind::Advanced)
+                .view
+                .pitch_classes
+                .contains(&degree())
+        );
+    }
+
+    #[test]
+    fn rejected_combined_frame_terminates_generation_without_durable_reauthor() {
+        let (owner, member) = renewal_foundations();
+        let session_id = 58;
+        let (authorized, _) = authorize_fixture(&owner, &member, session_id, 1, None).unwrap();
+        let keys = initiator_keys(&owner, &member, session_id);
+        let active = ActiveSession::new(owner.clone(), authorized, session_id, keys, 0).unwrap();
+        let peer = active.foundation.peer;
+        let projection = active.projection_event(RoomSessionProjectionKind::Predicted);
+        let events = WorkerEventPort::new(WorkerGeneration::new(1), |_| {
+            Err("injected bounded application-frame refusal".into())
+        });
+        let (reifications, _) = mpsc::channel(2);
+        let mut task = RoomSessionTask::new(
+            reifications,
+            Rc::new(TestRenewalStore::default()),
+            test_lease_clock(),
+        );
+        task.events = Some(events);
+        task.presentation_peer = Some(peer);
+        task.active.insert(peer, active);
+        let token = intent(9);
+        let error = block_on(task.emit_realtime_or_fail_generation(
+            peer,
+            RoomSessionRealtimeEgress {
+                projection,
+                carrier: Some(vec![1, 2, 3]),
+                durable: Vec::new(),
+                intent_token: Some(token),
+                trace: None,
+            },
+        ))
+        .unwrap_err();
+        assert!(error.contains("generation terminated"));
+        assert!(task.events.is_none());
+        assert!(task.active.is_empty());
+        assert!(task.pending.is_empty());
+        assert!(task.retired.is_empty());
+        assert!(task.inflight_reifications.is_empty());
+    }
+
+    #[test]
+    fn accepted_combined_frame_remains_reversible_across_precommit_crash() {
+        let (owner, member) = renewal_foundations();
+        let session_id = 59;
+        let (authorized, _) = authorize_fixture(&owner, &member, session_id, 1, None).unwrap();
+        let keys = initiator_keys(&owner, &member, session_id);
+        let active = ActiveSession::new(owner, authorized, session_id, keys, 0).unwrap();
+        let peer = active.foundation.peer;
+        let projection = active.projection_event(RoomSessionProjectionKind::Predicted);
+        let delivered = Rc::new(RefCell::new(Vec::<RoomSessionEgress>::new()));
+        let captured = Rc::clone(&delivered);
+        let events = WorkerEventPort::new(WorkerGeneration::new(1), move |event| {
+            captured.borrow_mut().push(decode(event.payload())?);
+            Ok(())
+        });
+        let (reifications, _) = mpsc::channel(2);
+        let mut task = RoomSessionTask::new(
+            reifications,
+            Rc::new(TestRenewalStore::default()),
+            test_lease_clock(),
+        );
+        task.events = Some(events);
+        task.presentation_peer = Some(peer);
+        task.active.insert(peer, active);
+        block_on(task.emit_realtime_or_fail_generation(
+            peer,
+            RoomSessionRealtimeEgress {
+                projection,
+                carrier: Some(vec![4, 5, 6]),
+                durable: Vec::new(),
+                intent_token: Some(intent(10)),
+                trace: None,
+            },
+        ))
+        .unwrap();
+        assert!(task.active.contains_key(&peer));
+        assert_eq!(delivered.borrow().len(), 1);
+        assert!(
+            !delivered
+                .borrow()
+                .iter()
+                .any(|event| matches!(event, RoomSessionEgress::FallbackDurable { .. }))
+        );
+
+        let error = task
+            .fail_session_generation("injected crash before durable admission".into())
+            .unwrap_err();
+        assert!(error.contains("reopen canonical state"));
+        assert!(task.active.is_empty());
+        assert!(
+            !delivered
+                .borrow()
+                .iter()
+                .any(|event| matches!(event, RoomSessionEgress::FallbackDurable { .. }))
+        );
     }
 
     #[test]
@@ -2808,6 +3986,7 @@ mod tests {
         let event = disabled
             .local_event(
                 MusicOp::AddDegree { degree: degree() },
+                intent(1),
                 0,
                 &disabled_clock,
                 false,
@@ -2826,6 +4005,7 @@ mod tests {
         let trace = enabled
             .local_event(
                 MusicOp::AddDegree { degree: degree() },
+                intent(1),
                 0,
                 &enabled_clock,
                 true,
@@ -2855,6 +4035,7 @@ mod tests {
         let local = sender
             .local_event(
                 MusicOp::AddDegree { degree: degree() },
+                intent(1),
                 0,
                 &DisabledRoomSessionTraceClock,
                 false,
@@ -2887,6 +4068,9 @@ mod tests {
                 None,
             )
             .unwrap_err();
+        let RemoteIngestFailure::ContinuityLost(error) = error else {
+            panic!("expired receiver lease was classified as pre-mutation");
+        };
         assert!(error.contains("OutsideLease"));
         assert_eq!(receiver.kernel.ready_cut(), kernel_before);
         assert!(receiver.projection.snapshot() == projection_before);
@@ -2959,6 +4143,7 @@ mod tests {
         active
             .local_event(
                 MusicOp::RemoveDegree { degree: degree() },
+                intent(1),
                 0,
                 &DisabledRoomSessionTraceClock,
                 false,

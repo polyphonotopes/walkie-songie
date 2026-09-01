@@ -88,6 +88,15 @@ pub(crate) struct RoomWorkerOpen {
     pub session_trace: bool,
     #[cfg(feature = "browser-acceptance-faults")]
     pub session_renewal_test_cut: bool,
+    #[cfg(feature = "browser-acceptance-faults")]
+    pub session_drain_test_cut: Option<SessionDrainTestCut>,
+}
+
+#[cfg(feature = "browser-acceptance-faults")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub(crate) enum SessionDrainTestCut {
+    BeforeCommit,
+    AfterCommit,
 }
 
 impl RoomWorkerOpen {
@@ -105,6 +114,8 @@ impl RoomWorkerOpen {
             session_trace: false,
             #[cfg(feature = "browser-acceptance-faults")]
             session_renewal_test_cut: false,
+            #[cfg(feature = "browser-acceptance-faults")]
+            session_drain_test_cut: None,
         }
     }
 
@@ -118,6 +129,15 @@ impl RoomWorkerOpen {
         self.session_renewal_test_cut = enabled;
         self
     }
+
+    #[cfg(feature = "browser-acceptance-faults")]
+    pub(crate) const fn with_session_drain_test_cut(
+        mut self,
+        cut: Option<SessionDrainTestCut>,
+    ) -> Self {
+        self.session_drain_test_cut = cut;
+        self
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -127,6 +147,40 @@ pub(crate) struct RoomWorkerProjection {
     pub music_history_root: [u8; 32],
     pub music_frontier: [u8; 32],
     pub extension_frontier: [u8; 32],
+}
+
+/// JSON-safe, exact acceptance witness for an authoritative worker snapshot.
+///
+/// `RoomView` intentionally uses strongly typed keys in several canonical
+/// maps. JSON objects cannot represent those keys, so diagnostics must not
+/// serialize the view directly. This pinned-schema CBOR encoding is only an
+/// acceptance-time exact structural witness: it has no wire, persistence, or
+/// canonical-identity role. Canonical truth remains the checked revision/root
+/// plus ordinary Room-v5 materialization.
+#[cfg(feature = "browser-acceptance-faults")]
+pub(crate) fn encode_projection_witness(
+    projection: &RoomWorkerProjection,
+) -> Result<String, String> {
+    #[derive(Serialize)]
+    struct ProjectionWitness<'a> {
+        music_revision: u64,
+        music_history_root: &'a [u8; 32],
+        music_frontier: &'a [u8; 32],
+        extension_frontier: &'a [u8; 32],
+        view: Vec<u8>,
+    }
+
+    let mut view = Vec::new();
+    ciborium::into_writer(&projection.view, &mut view)
+        .map_err(|error| format!("could not encode the authoritative Room view: {error}"))?;
+    serde_json::to_string(&ProjectionWitness {
+        music_revision: projection.music_revision,
+        music_history_root: &projection.music_history_root,
+        music_frontier: &projection.music_frontier,
+        extension_frontier: &projection.extension_frontier,
+        view,
+    })
+    .map_err(|error| format!("could not encode the authoritative projection witness: {error}"))
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -927,6 +981,8 @@ where
     subscriptions: BTreeSet<SubscriptionId>,
     session: Option<RoomSessionServicePort>,
     session_peers: BTreeSet<ActorId>,
+    #[cfg(feature = "browser-acceptance-faults")]
+    session_drain_test_cut: Option<SessionDrainTestCut>,
 }
 
 impl<F> RoomReplicaWorkerService<F>
@@ -942,6 +998,8 @@ where
             subscriptions: BTreeSet::new(),
             session: None,
             session_peers: BTreeSet::new(),
+            #[cfg(feature = "browser-acceptance-faults")]
+            session_drain_test_cut: None,
         }
     }
 
@@ -1159,11 +1217,27 @@ where
                         projection_revision: self.revision,
                     });
                 };
+                #[cfg(feature = "browser-acceptance-faults")]
+                if self.session_drain_test_cut == Some(SessionDrainTestCut::BeforeCommit) {
+                    self.session_drain_test_cut = None;
+                    return Err(
+                        "acceptance-injected generation failure before durable session admission"
+                            .into(),
+                    );
+                }
                 let local = self.room()?.local_actor;
                 let (entry, durable_admission, record) = self
                     .room_mut()?
                     .commit_session(&reification.plan, reification.command)
                     .await?;
+                #[cfg(feature = "browser-acceptance-faults")]
+                if self.session_drain_test_cut == Some(SessionDrainTestCut::AfterCommit) {
+                    self.session_drain_test_cut = None;
+                    return Err(
+                        "acceptance-injected generation failure after durable session admission and before publication acknowledgement"
+                            .into(),
+                    );
+                }
                 events
                     .emit(
                         WorkerEventKind::OutboundRecord,
@@ -1184,7 +1258,9 @@ where
                     .task
                     .send(RoomSessionTaskInput::LocalCommitted {
                         peer: reification.peer,
+                        session: reification.session,
                         plan: reification.plan,
+                        intent_token: reification.intent_token,
                         entry,
                         durable_admission,
                         history: snapshot.history,
@@ -1234,6 +1310,10 @@ where
                     let session_trace = open.session_trace;
                     #[cfg(feature = "browser-acceptance-faults")]
                     let session_renewal_test_cut = open.session_renewal_test_cut;
+                    #[cfg(feature = "browser-acceptance-faults")]
+                    {
+                        self.session_drain_test_cut = open.session_drain_test_cut;
+                    }
                     let room = self.factory.open(open).await?;
                     let actor = room.local_actor;
                     let projection = room.projection()?;

@@ -1323,6 +1323,27 @@ impl RoomReplicas<MemoryStorage, MemoryStorage> {
         )
     }
 
+    /// Test-only ordinary Replica admission for exercising the exact
+    /// session-plan -> capability presentation -> durable admission boundary.
+    #[cfg(test)]
+    pub(crate) fn admit_reified_music_for_test(
+        &self,
+        key: &SigningKey,
+        plan: &ReificationPlan,
+        command: MusicOp,
+    ) -> Result<(Entry, hhhs_replica::DurableEntryAdmission), RoomError> {
+        let actor = ActorId::from_signing_key(key);
+        let capabilities = self.capabilities_for_lane(actor, RoomLane::Music);
+        let (prepared, entry) = self.prepare_reified_music(key, &capabilities, plan, command)?;
+        let outcome = self.music.commit_prepared(prepared.into_prepared())?;
+        if outcome.entry != entry.hash() {
+            return Err(RoomError::Session(
+                "test session admission committed an unexpected entry".into(),
+            ));
+        }
+        Ok((entry, outcome.durable_entry_admission()))
+    }
+
     /// Reconstruct deterministic roots, then strictly replay externally
     /// persisted per-lane transactions into the two independent stores.
     pub fn from_transaction_logs(

@@ -19,6 +19,7 @@ use crate::client::{
     PeerPath, RealtimeMidiKind, RealtimeMidiSnapshot,
 };
 use crate::pitch::{PitchDetectorConfig, PitchEvent, SwiftF0Detector};
+use crate::room::performance_feedback::{PerformanceFeedback, PerformanceFeedbackEvent};
 use crate::room::{Piece, RoomEvent, RoomProjection, snapshot_active_pitches};
 use crate::tuning::{PitchClass, TunedDegree, TunedPeriodicPitch, Tuning, TuningDefinition};
 use tutti_music::roundtable::RoundTableConfig;
@@ -62,12 +63,10 @@ pub struct AppState {
     pub native_snapshot: Mutable<Option<AppSnapshot>>,
     /// Highest accepted native event sequence.
     pub native_sequence: Mutable<u64>,
-    /// UI-only intent overlay while a durable degree command is in flight.
-    /// Authoritative snapshots always win once their matching event arrives.
-    pending_degrees: Rc<RefCell<HashMap<TunedDegree, bool>>>,
+    /// Bounded, reversible input acknowledgement. This is never room
+    /// membership and cannot write projection, MIDI, carrier, or durable data.
+    performance_feedback: Rc<RefCell<PerformanceFeedback<32>>>,
     pending_round_table: Rc<RefCell<Option<RoundTableConfig>>>,
-    /// Optimistic absolute-pitch edits awaiting canonical HHHS confirmation.
-    pending_pitches: Rc<RefCell<HashMap<TunedPeriodicPitch, bool>>>,
     /// Default connected-keyboard mode: pitch-class taps edit the durable
     /// round-table pattern instead of the legacy held-degree set.
     pub arpeggiator_edit_mode: Mutable<bool>,
@@ -185,9 +184,8 @@ impl AppState {
             browser_host,
             native_snapshot: Mutable::new(None),
             native_sequence: Mutable::new(0),
-            pending_degrees: Rc::new(RefCell::new(HashMap::new())),
+            performance_feedback: Rc::new(RefCell::new(PerformanceFeedback::default())),
             pending_round_table: Rc::new(RefCell::new(None)),
-            pending_pitches: Rc::new(RefCell::new(HashMap::new())),
             arpeggiator_edit_mode: Mutable::new(true),
             arp_midi_held: Rc::new(RefCell::new(HashSet::new())),
             remote_realtime_notes: Rc::new(RefCell::new(HashMap::new())),
@@ -374,14 +372,6 @@ impl AppState {
                 })
                 .unwrap_or_default()
         };
-        self.pending_degrees.borrow_mut().insert(pitch, active);
-        // Pending intent is used only to make repeated taps idempotent while
-        // admission is in flight. The room adapter is a projection of the
-        // canonical worker snapshot, so writing the intent into it here would
-        // create a second visible authority: the optimistic overlay can be
-        // removed by an intervening snapshot and then added again when the
-        // durable entry materializes.
-        self.project_native_snapshot();
         let command = if active {
             ClientCommand::AddDegree { pitch }
         } else {
@@ -389,11 +379,7 @@ impl AppState {
         };
         let state = self.clone();
         let on_error = move |error: String| {
-            if state.pending_degrees.borrow().get(&pitch) == Some(&active) {
-                state.pending_degrees.borrow_mut().remove(&pitch);
-            }
             state.native_status.set(format!("⚠ {error}"));
-            state.project_native_snapshot();
         };
         #[cfg(feature = "browser-net")]
         if self.browser_host {
@@ -419,39 +405,22 @@ impl AppState {
         let Some(pitch) = self.current_native_pitch(pitch_class) else {
             return false;
         };
-        if let Some(active) = self.pending_degrees.borrow().get(&pitch) {
-            return *active;
+        if let Some(active) = self.performance_feedback.borrow().desired(&pitch) {
+            return active;
         }
-        self.pending_pitches
-            .borrow()
-            .iter()
-            .any(|(candidate, active)| {
-                *active
-                    && candidate.tuning_id == pitch.tuning_id
-                    && candidate.pitch.degree() == pitch.degree
+        self.native_snapshot
+            .lock_ref()
+            .as_ref()
+            .is_some_and(|snapshot| {
+                snapshot.shared_pitches.pitch_classes.contains(&pitch)
+                    || snapshot.shared_pitches.pitches.iter().any(|candidate| {
+                        candidate.tuning_id == pitch.tuning_id
+                            && candidate.pitch.degree() == pitch.degree
+                    })
             })
-            || self
-                .native_snapshot
-                .lock_ref()
-                .as_ref()
-                .is_some_and(|snapshot| {
-                    snapshot.shared_pitches.pitch_classes.contains(&pitch)
-                        || snapshot.shared_pitches.pitches.iter().any(|candidate| {
-                            candidate.tuning_id == pitch.tuning_id
-                                && candidate.pitch.degree() == pitch.degree
-                                && self
-                                    .pending_pitches
-                                    .borrow()
-                                    .get(candidate)
-                                    .copied()
-                                    .unwrap_or(true)
-                        })
-                })
     }
 
     fn set_native_periodic_pitch(self: &Arc<Self>, pitch: TunedPeriodicPitch, active: bool) {
-        self.pending_pitches.borrow_mut().insert(pitch, active);
-        self.project_native_snapshot();
         let command = if active {
             ClientCommand::AddPitch { pitch }
         } else {
@@ -459,11 +428,7 @@ impl AppState {
         };
         let state = self.clone();
         let on_error = move |error: String| {
-            if state.pending_pitches.borrow().get(&pitch) == Some(&active) {
-                state.pending_pitches.borrow_mut().remove(&pitch);
-            }
             state.native_status.set(format!("⚠ {error}"));
-            state.project_native_snapshot();
         };
         #[cfg(feature = "browser-net")]
         if self.browser_host {
@@ -571,8 +536,6 @@ impl AppState {
                 self.remote_realtime_notes.borrow_mut().clear();
                 self.remote_realtime_sessions.borrow_mut().clear();
                 self.pending_round_table.borrow_mut().take();
-                self.pending_degrees.borrow_mut().clear();
-                self.pending_pitches.borrow_mut().clear();
                 self.arp_midi_held.borrow_mut().clear();
             }
             AppEvent::PeerRemoved { author }
@@ -617,15 +580,22 @@ impl AppState {
         if round_table_confirmed {
             self.pending_round_table.borrow_mut().take();
         }
-        if let Some(snapshot) = self.native_snapshot.lock_ref().as_ref() {
-            self.pending_degrees.borrow_mut().retain(|pitch, active| {
-                snapshot.shared_pitches.pitch_classes.contains(pitch) != *active
-            });
-            self.pending_pitches
-                .borrow_mut()
-                .retain(|pitch, active| snapshot.shared_pitches.pitches.contains(pitch) != *active);
-        }
         self.project_native_snapshot();
+    }
+
+    pub(crate) fn apply_performance_feedback(
+        self: &Arc<Self>,
+        event: PerformanceFeedbackEvent,
+    ) -> Result<bool, String> {
+        let changed = self.performance_feedback.borrow_mut().apply(event)?;
+        if changed {
+            sync_active_pitches(self);
+        }
+        Ok(changed)
+    }
+
+    pub(crate) fn pending_pressed_degrees(&self) -> Vec<TunedDegree> {
+        self.performance_feedback.borrow().pending_pressed_degrees()
     }
 
     fn apply_realtime_midi(&self, midi: RealtimeMidiSnapshot) {
@@ -1931,9 +1901,11 @@ async fn init_app() {
         #[cfg(feature = "browser-net")]
         if state.browser_host {
             let event_state = state.clone();
-            if let Err(error) = super::replica_host::init(move |event| {
-                event_state.apply_native_event(event);
-            })
+            let feedback_state = state.clone();
+            if let Err(error) = super::replica_host::init(
+                move |event| event_state.apply_native_event(event),
+                move |event| feedback_state.apply_performance_feedback(event),
+            )
             .await
             {
                 web_sys::console::error_1(
